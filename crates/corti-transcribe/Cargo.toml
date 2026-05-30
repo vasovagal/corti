@@ -1,0 +1,12 @@
+[package]
+name = "corti-transcribe"
+description = "Transcription trait for corti: audio recording → diarized, timestamped transcript."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }

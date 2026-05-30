@@ -1,0 +1,13 @@
+[package]
+name = "corti-aec"
+description = "Offline acoustic echo cancellation for corti: NLMS adaptive filter to remove speaker bleed."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+# When implementing the frequency-domain variant (see design/04-corti-aec.md), optionally add:
+#   rustfft

@@ -1,0 +1,16 @@
+[package]
+name = "corti-detect"
+description = "Mic-in-use start/stop + attribution state machine for corti: turns mic transitions into recordings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+corti-coreaudio = { workspace = true }
+corti-capture = { workspace = true }

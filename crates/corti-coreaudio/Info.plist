@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Embedded into the spike binary's __TEXT,__info_plist section so macOS TCC can attribute and
+         prompt for audio-capture permission. A bare CLI binary without this is silently denied (no
+         prompt, zero IO callbacks). -->
+    <key>CFBundleIdentifier</key>
+    <string>com.vasovagal.corti.spike</string>
+    <key>CFBundleName</key>
+    <string>corti-spike</string>
+    <key>CFBundleExecutable</key>
+    <string>spike</string>
+    <!-- Required by the Core Audio process-tap API to capture system audio. -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>corti records meeting audio to generate transcript notes.</string>
+    <!-- The aggregate device also includes the microphone. -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>corti records your microphone during meetings to generate transcript notes.</string>
+</dict>
+</plist>

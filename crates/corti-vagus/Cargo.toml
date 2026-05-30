@@ -1,0 +1,15 @@
+[package]
+name = "corti-vagus"
+description = "corti's vagus touchpoint: file transcripts as notes by shelling out to the `vagus` CLI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

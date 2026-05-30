@@ -1,0 +1,16 @@
+[package]
+name = "corti-transcribe-aws"
+description = "AWS Transcribe (batch) backend for corti: diarized, timestamped transcripts via S3 + Transcribe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+corti-transcribe = { workspace = true }
+anyhow = { workspace = true }
+
+# When implementing (see design/02-corti-transcribe.md), add:
+#   aws-config, aws-sdk-s3, aws-sdk-transcribe, tokio

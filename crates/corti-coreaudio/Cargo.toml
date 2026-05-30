@@ -1,0 +1,25 @@
+[package]
+name = "corti-coreaudio"
+description = "Owned CoreAudio bindings for corti: mic-in-use detection, per-process attribution, process-tap + aggregate-device capture (Apple Silicon, macOS only)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Apple Silicon / macOS only. This crate is meaningless elsewhere; everything below is gated on macOS.
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-sys = "0.2"
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace"] }
+hound = "3.5"
+
+[dev-dependencies]
+cpal = "0.16"

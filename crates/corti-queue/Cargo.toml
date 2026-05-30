@@ -1,0 +1,16 @@
+[package]
+name = "corti-queue"
+description = "Durable job store for corti: crash-recoverable recording → transcribe → file pipeline state."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+# When implementing (see design/03-corti-queue.md), add:
+#   rusqlite = { version = "0.37", features = ["bundled"] }

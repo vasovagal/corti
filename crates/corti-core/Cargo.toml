@@ -1,0 +1,12 @@
+[package]
+name = "corti-core"
+description = "Shared domain types for corti (the auditory addon to vagus): recordings, transcripts, owning apps."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+chrono = { workspace = true }

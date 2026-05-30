@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/corti-core",
+    "crates/corti-vagus",
+    "crates/corti-coreaudio",
+    "crates/corti-capture",
+    "crates/corti-detect",
+    "crates/corti-transcribe",
+    "crates/corti-transcribe-aws",
+    "crates/corti-transcribe-whisper",
+    "crates/corti-queue",
+    "crates/corti-aec",
+]
+
+# Still to come: app/ (the Tauri tray binary; publish = false). See design/05-app-tauri.md.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/vasovagal/corti"
+# Apple Silicon only, latest macOS only. No Intel, no universal binaries.
+rust-version = "1.90"
+
+[workspace.dependencies]
+# Internal crates. `version` is required alongside `path` so the crates are publishable to crates.io
+# (publish rewrites path deps to version deps).
+corti-core = { path = "crates/corti-core", version = "0.1.0" }
+corti-vagus = { path = "crates/corti-vagus", version = "0.1.0" }
+corti-coreaudio = { path = "crates/corti-coreaudio", version = "0.1.0" }
+corti-capture = { path = "crates/corti-capture", version = "0.1.0" }
+corti-detect = { path = "crates/corti-detect", version = "0.1.0" }
+corti-transcribe = { path = "crates/corti-transcribe", version = "0.1.0" }
+corti-transcribe-aws = { path = "crates/corti-transcribe-aws", version = "0.1.0" }
+corti-transcribe-whisper = { path = "crates/corti-transcribe-whisper", version = "0.1.0" }
+corti-queue = { path = "crates/corti-queue", version = "0.1.0" }
+corti-aec = { path = "crates/corti-aec", version = "0.1.0" }
+
+# Shared third-party deps, pinned once here.
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+[profile.release]
+lto = "thin"
+strip = true

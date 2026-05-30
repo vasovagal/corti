@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.wav
+*.caf
+.DS_Store
+# corti runtime state (should live under ~/Library & ~/.local, never the repo)
+/recordings
+# bundled spike .app output
+dist/

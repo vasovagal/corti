@@ -1,0 +1,18 @@
+[package]
+name = "corti-capture"
+description = "Recording orchestration for corti: drive the capture engine and write 2-track (me/them) WAVs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+dirs = "6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+corti-coreaudio = { workspace = true }
+hound = "3.5"
