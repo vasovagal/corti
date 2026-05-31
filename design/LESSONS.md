@@ -71,12 +71,24 @@ the mic track is clean too. This is why AEC (offline NLMS) is a v1 feature — s
 - For per-app tapping, attribution must also return the **PID** (`MicOwner.pid`) so capture can translate it
   to a process object (`kAudioHardwarePropertyTranslatePIDToProcessObject`).
 
+### 6. Our own capture pins the mic-in-use signal — the falling edge needs process polling
+Once corti starts capturing, it builds an **aggregate device around the mic**, which keeps
+`kAudioDevicePropertyDeviceIsRunningSomewhere` on the physical input device **stuck true for as long as we
+record** — even before any audio flows (the IO is "running" regardless of the TCC grant). So the
+`MicMonitor` *rising* edge works, but the **falling edge never fires while we hold the device**: the call
+ends and the listener stays silent (observed live — a recording started but never finished). Detect
+end-of-call at the **process** level instead: poll `corti_coreaudio::other_app_holds_input(self_pid)` —
+"is any app besides us (and besides `com.apple.*` helpers) still holding mic input?" — and feed that into
+the debounce machine. `corti-detect` stays event-driven while idle (clean signal) and switches to polling
+(`POLL_INTERVAL`, ~1 s) only while a recording is in flight. Excluding our own PID is essential once corti
+ships as a signed `.app` with its own bundle id (it would otherwise rank as a mic owner and never stop).
+
 ## Environment facts
 - Verified on macOS 26.4.1 (Tahoe), Apple Silicon (arm64), `cargo 1.94`, rustup stable.
 - `coreaudio-sys 0.2.17` exposes the HAL property API, aggregate-device + IOProc functions, and all the tap
   *constants* — but **not** `AudioHardwareCreateProcessTap`/`Destroy` (declared by hand in `capture.rs`) and
   not the `CATapDescription` ObjC class (called via objc2).
-- The user's `vagus` CLI is at `/opt/homebrew/bin/vagus` (v0.1.5); corti shells out to it.
+- The user's `vagus` CLI is at `/opt/homebrew/bin/vagus` (v0.1.8); corti shells out to it.
 
 ## Verification commands
 ```sh

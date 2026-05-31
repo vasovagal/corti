@@ -32,9 +32,16 @@ impl Detector {
 ## State machine
 ```
 Idle ──mic on (held ≥ DEBOUNCE)──▶ Recording(meta, recorder)
-Recording ──mic off (held ≥ DEBOUNCE)──▶ finish ▶ emit RecordingFinished ▶ Idle
+Recording ──mic off (held ≥ COALESCE)──▶ finish ▶ emit RecordingFinished ▶ Idle
 Recording ──mic off then on within COALESCE──▶ stay Recording (ignore the blip)
 ```
+Two windows (both `pub const` in the crate): **DEBOUNCE** (1.5 s) gates the rising edge; **COALESCE**
+(2 s) is the *single* falling-edge window — a mic-off must persist ≥ COALESCE to finish, and a mic-on
+within COALESCE cancels the stop. There is no separate falling-edge debounce. Implemented as a pure,
+time-injected machine in `crates/corti-detect/src/machine.rs` (states `Idle`/`Arming`/`Recording`/
+`Coasting`); the macOS worker (`src/platform.rs`) drives it off the HAL thread over an `mpsc` channel.
+The mic-open span used for the `MIN_RECORDING` floor is start → last mic-off (it excludes the coalesce
+tail, so a 2.9 s blip is still discarded).
 
 ## Design notes / gotchas
 - `MicMonitor`'s callback runs on a **CoreAudio HAL thread** (guardrail 9). Do not block it and do not start
@@ -44,6 +51,11 @@ Recording ──mic off then on within COALESCE──▶ stay Recording (ignore 
 - Re-bind on default-input-device change (AirPods connect mid-session): `MicMonitor` is bound to one device
   id; on a `kAudioHardwarePropertyDefaultInputDevice` change, drop and recreate it. (Listener for that
   property is a small addition to `corti-coreaudio::listener`.)
+- **Our own capture pins the mic-in-use signal.** Once recording, corti's aggregate device keeps the
+  device-level `IsRunningSomewhere` true, so the `MicMonitor` falling edge never fires mid-recording. The
+  worker therefore polls `corti_coreaudio::other_app_holds_input(self_pid)` (every `POLL_INTERVAL`) while
+  recording to find the true end-of-call, and only relies on the event-driven listener while idle. (See
+  LESSONS.md trap 6.)
 - Attribution can be wrong/empty; never let it block capture (guardrail 8). `pid = None` ⇒ global tap.
 - Minimum duration floor: discard recordings shorter than ~3 s (accidental mic blips) before emitting.
 
