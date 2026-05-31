@@ -11,6 +11,7 @@ rust-version.workspace = true
 corti-core = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-
-# When implementing (see design/03-corti-queue.md), add:
-#   rusqlite = { version = "0.37", features = ["bundled"] }
+# JobStatus' snake_case wire form is the source of truth for the `status` column (no drift).
+serde_json = { workspace = true }
+# Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency.
+rusqlite = { version = "0.37", features = ["bundled"] }
