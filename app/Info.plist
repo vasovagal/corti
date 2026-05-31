@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Auto-merged into the bundle Info.plist by the Tauri CLI because this file is named exactly `Info.plist`
+  and lives in the crate dir. These three keys are load-bearing (see design/LESSONS.md §1, guardrail 10):
+    - LSUIElement: menu-bar agent, no Dock icon (complements ActivationPolicy::Accessory).
+    - NSAudioCaptureUsageDescription: the audio-capture TCC grant that actually delivers process-tap audio.
+    - NSMicrophoneUsageDescription: required or request_microphone_permission() crashes the process.
+  Do NOT add CFBundleVersion/CFBundleShortVersionString here — Tauri generates those (overriding conflicts).
+-->
+<plist version="1.0">
+<dict>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>corti records meeting audio to generate transcript notes.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>corti records your microphone during meetings to generate transcript notes.</string>
+</dict>
+</plist>

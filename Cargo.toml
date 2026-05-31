@@ -11,9 +11,8 @@ members = [
     "crates/corti-transcribe-whisper",
     "crates/corti-queue",
     "crates/corti-aec",
+    "app",
 ]
-
-# Still to come: app/ (the Tauri tray binary; publish = false). See design/05-app-tauri.md.
 
 [workspace.package]
 version = "0.1.0"

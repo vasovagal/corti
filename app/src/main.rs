@@ -1,0 +1,208 @@
+//! corti — the menu-bar tray app that ties the pipeline together.
+//!
+//! A blinking record icon while a call is captured, and the detect → capture → transcribe → vagus pipeline
+//! behind it. See `design/05-app-tauri.md`. Apple-Silicon + latest-macOS only (guardrail 2).
+//!
+//! ## Shape
+//! - **Tray-only** (`ActivationPolicy::Accessory` + `LSUIElement`): no Dock icon, no window.
+//! - **Detector callback** (off the HAL thread) flips the blink state + status line immediately and hands
+//!   each finished recording to the **pipeline worker** over a channel — it never blocks on transcription.
+//! - **Pipeline worker** is the sole owner of the `corti_queue::Queue` (rusqlite `Connection` is `Send` but
+//!   not `Sync`). It resumes crashed jobs on startup, then runs each recording through the pipeline serially
+//!   on its own thread (transcription blocks; guardrail 9 keeps it off the UI loop).
+//! - **Blink thread** toggles two template icons ~every 500 ms, marshalling AppKit calls to the main thread.
+
+// macOS-only by design — like the rest of the workspace, this compiles to a stub elsewhere.
+#[cfg(target_os = "macos")]
+mod config;
+#[cfg(target_os = "macos")]
+mod permissions;
+#[cfg(target_os = "macos")]
+mod pipeline;
+#[cfg(target_os = "macos")]
+mod transcribe;
+#[cfg(target_os = "macos")]
+mod tray;
+
+#[cfg(target_os = "macos")]
+fn main() {
+    if let Err(e) = imp::run_app() {
+        eprintln!("[corti] fatal: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("corti is macOS-only (Apple Silicon, latest macOS).");
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::Sender;
+
+    use anyhow::{Context, Result};
+    use corti_detect::{Detector, DetectorEvent};
+    use tauri::Manager;
+
+    use crate::config::AppConfig;
+    use crate::pipeline::{self, PipelineMsg};
+    use crate::{permissions, tray};
+
+    /// One filed note shown in the tray's "Recent notes" section.
+    pub struct RecentNote {
+        pub title: String,
+        pub path: PathBuf,
+    }
+
+    /// Shared app state (managed singleton). Everything here is read/written from background threads, so it
+    /// is `Send + Sync`; the tray rebuilds its menu from this snapshot whenever it changes.
+    pub struct AppState {
+        /// Whether a recording is in flight — drives the blink thread.
+        pub recording: AtomicBool,
+        /// The status line shown at the top of the tray menu.
+        pub status: Mutex<String>,
+        /// Most-recent filed notes (front = newest), capped at [`RECENT_LIMIT`].
+        pub recent: Mutex<VecDeque<RecentNote>>,
+        /// Static "Backend: …" label.
+        pub backend_label: String,
+        /// Static "Bucket: …" label (empty when the backend has no bucket).
+        pub bucket_label: String,
+    }
+
+    pub const RECENT_LIMIT: usize = 5;
+
+    impl AppState {
+        fn new(cfg: &AppConfig) -> Self {
+            #[cfg(feature = "aws")]
+            let bucket_label = cfg
+                .aws_bucket
+                .clone()
+                .unwrap_or_else(|| "(unset — export CORTI_AWS_BUCKET)".to_string());
+            #[cfg(not(feature = "aws"))]
+            let bucket_label = String::new();
+
+            Self {
+                recording: AtomicBool::new(false),
+                status: Mutex::new("Starting…".to_string()),
+                recent: Mutex::new(VecDeque::new()),
+                backend_label: cfg.backend_name().to_string(),
+                bucket_label,
+            }
+        }
+    }
+
+    /// Keeps the [`Detector`] alive for the app's lifetime. `Detector` is `Send` but not `Sync`, so the
+    /// `Mutex` makes the managed holder `Send + Sync`. We never lock it — it exists only to own the detector
+    /// (whose `Drop` stops the worker + removes HAL listeners).
+    struct DetectorHandle(#[allow(dead_code)] Mutex<Detector>);
+
+    pub fn run_app() -> Result<()> {
+        let cfg = AppConfig::load();
+
+        let app = tauri::Builder::default()
+            // Global menu handler: catches events from the dynamically-rebuilt tray menu.
+            .on_menu_event(|app, event| tray::handle_menu_event(app, &event))
+            .setup(move |app| {
+                setup(app, &cfg).map_err(|e| {
+                    Box::new(SetupError(format!("{e:#}"))) as Box<dyn std::error::Error>
+                })
+            })
+            .build(tauri::generate_context!())
+            .context("building the tauri app")?;
+
+        // Keep the (windowless) event loop alive. Exit only ever comes from the tray's Quit item
+        // (`app_handle.exit(0)`), so there is nothing to veto here.
+        app.run(|_app, _event| {});
+        Ok(())
+    }
+
+    /// All fallible startup wiring, in dependency order. Runs on the main thread (Tauri's setup hook).
+    fn setup(app: &mut tauri::App, cfg: &AppConfig) -> Result<()> {
+        // Menu-bar agent: no Dock icon, no app menu.
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+        // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
+        app.manage(AppState::new(cfg));
+
+        // Tray + blink (icons swap on the main thread).
+        tray::build_tray(app.handle()).context("building tray")?;
+        tray::spawn_blink(app.handle().clone());
+
+        // Pipeline worker (sole Queue owner). It resumes crashed jobs, then drains the channel serially.
+        let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<PipelineMsg>();
+        {
+            let handle = app.handle().clone();
+            let cfg = cfg.clone();
+            std::thread::Builder::new()
+                .name("corti-pipeline".to_string())
+                .spawn(move || pipeline::run(handle, cfg, pipe_rx))
+                .context("spawning pipeline worker")?;
+        }
+
+        // Detector: mic on/off → recordings. Its callback runs off the HAL thread (guardrail 9).
+        let handle = app.handle().clone();
+        let detector =
+            Detector::start(move |event| handle_detector_event(&handle, &pipe_tx, event))
+                .context("starting detector")?;
+        app.manage(DetectorHandle(Mutex::new(detector)));
+
+        // Best-effort permission check (microphone via the plugin; system-audio via the Settings link).
+        permissions::check_on_startup(app.handle().clone());
+
+        Ok(())
+    }
+
+    /// React to a detector event. Tray/blink updates happen here (fast, non-blocking); the heavy
+    /// transcription work is handed to the pipeline worker over the channel.
+    fn handle_detector_event(
+        app: &tauri::AppHandle,
+        pipe_tx: &Sender<PipelineMsg>,
+        event: DetectorEvent,
+    ) {
+        match event {
+            DetectorEvent::RecordingStarted { meta } => {
+                set_recording(app, true);
+                tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
+            }
+            DetectorEvent::RecordingFinished { meta, audio_path } => {
+                set_recording(app, false);
+                tray::set_status(app, format!("Transcribing — {}…", meta.owning_app.name));
+                if pipe_tx
+                    .send(PipelineMsg::Process { meta, audio_path })
+                    .is_err()
+                {
+                    eprintln!("[corti] pipeline worker gone; dropped a finished recording");
+                }
+            }
+            DetectorEvent::Error(e) => {
+                set_recording(app, false);
+                eprintln!("[corti] detector error: {e}");
+                // A capture failure is most often the missing audio-capture TCC grant (design/LESSONS §1).
+                tray::set_status(app, format!("⚠ {e}"));
+            }
+        }
+    }
+
+    fn set_recording(app: &tauri::AppHandle, on: bool) {
+        if let Some(state) = app.try_state::<AppState>() {
+            state.recording.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// A plain `std::error::Error` so the anyhow setup error coerces cleanly into the `Box<dyn Error>` the
+    /// Tauri setup hook expects (anyhow::Error itself does not implement `std::error::Error`).
+    #[derive(Debug)]
+    struct SetupError(String);
+    impl std::fmt::Display for SetupError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    impl std::error::Error for SetupError {}
+}

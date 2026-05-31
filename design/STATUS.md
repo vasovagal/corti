@@ -8,29 +8,55 @@ Snapshot of what's built, what's stubbed, and the order to tackle the rest. Pair
   Markdown rendering). Fully unit-tested.
 - **corti-vagus** — shells out to `vagus add-note … --print-path`; proven end-to-end (a canned transcript
   became a real, searchable note in a temp vault).
-- **corti-coreaudio** — owned CoreAudio bindings: mic-in-use listener (`MicMonitor`), attribution
-  (`mic_owner` → `MicOwner{app, pid}`), and the **proven** capture engine
+- **corti-coreaudio** — owned CoreAudio bindings: mic-in-use listener (`MicMonitor`),
+  default-input-device-change listener (`DefaultInputDeviceMonitor`, added for corti-detect's mid-session
+  rebind), attribution (`mic_owner` → `MicOwner{app, pid}`), and the **proven** capture engine
   (`CaptureSession` + `TapTarget::{Global, Process(pid)}`). Spike validated a synchronized 3-channel WAV.
 - **corti-capture** — `Recorder` orchestration → 2-track WAV (ch0 = me, ch1 = them) under
   `~/Library/Caches/corti/recordings/`.
+- **corti-detect** — debounce/coalesce state machine (`Detector` + `DetectorEvent`) turning mic on/off
+  transitions into recordings via the `Recorder`. Pure timing logic in `machine.rs` is unit-tested; the
+  macOS worker hops off the HAL thread and rebinds on a default-device change. Live-checkable via
+  `cargo run -p corti-detect --example watch`.
+- **corti-transcribe** — the `Transcriber` trait (sync `transcribe(audio, meta) -> DiarizedTranscript`);
+  the diarized-Markdown renderer already lives in `corti-core`.
+- **corti-transcribe-aws** — AWS Transcribe batch backend (the default). Uses **channel identification**
+  (ch0→`Speaker::Me`, ch1→`Speaker::Other("Them")` — deterministic, no heuristics): re-encode the float
+  WAV → 16-bit PCM, S3 upload, `StartTranscriptionJob`, poll, fetch + parse JSON. The caller injects an
+  `SdkConfig` (`AwsTranscriber::new(&sdk_config, AwsOptions)`); the crate never reads creds. Pure parser +
+  WAV re-encode are unit-tested; live check: `cargo run -p corti-transcribe-aws --example transcribe_file`.
+- **corti-queue** — durable SQLite (WAL, bundled) job store at `~/.local/share/corti/queue.db` (outside any
+  vault). `Queue` + `Job` + `JobUpdate`: `enqueue` (idempotent — job id = recording filename stem), `get`,
+  `set_status`, `update`/`fail`, `resumable` (non-terminal rows to resume on startup), `all`, and
+  `prune_done(cutoff)` (returns pruned WAV paths). `Job::meta()` rebuilds a `RecordingMeta` for resume.
+  Unit-tested incl. reopen-persistence; inspect via `cargo run -p corti-queue --example inspect`.
+- **app/** (`corti-app`, bin `corti`) — the Tauri 2 menu-bar tray that wires the whole pipeline together:
+  `ActivationPolicy::Accessory` + `LSUIElement` (no Dock icon), a blinking template tray icon while
+  recording, and a dynamically-rebuilt menu (status line, recent notes → open, settings, quit). Threading
+  per design 05: the detector callback flips the blink/status and forwards each finished recording over a
+  channel to a single **pipeline worker** that owns the `Queue` (enqueue → store stable `transcribe_job` →
+  transcribe on a blocking thread → persist a transcript sidecar → file via `corti-vagus` → `Done`), with
+  startup `resumable()` crash recovery + `prune_done` retention. Backends are feature-flavored
+  (`default = ["aws"]`, `whisper` opt-in). `cargo build`/`clippy -D warnings`/`fmt`/`test` are clean (incl.
+  the whisper-only build); the live join-call → note loop still needs a **signed bundle** to exercise the
+  TCC audio-capture grant (LESSONS §1) — `cargo tauri build` produces the `.app` (merged `Info.plist` +
+  `Entitlements.plist`).
 
 ## Stubbed (compiling shells, ready to implement) 🚧
 Each has a design doc and a `lib.rs` that compiles with the intended public API + `todo!`/`bail!` bodies.
-- **corti-detect** → [`01-corti-detect.md`](01-corti-detect.md) — mic on/off state machine → drives Recorder.
-- **corti-transcribe** → [`02-corti-transcribe.md`](02-corti-transcribe.md) — `Transcriber` trait (the
-  integration contract; the diarized-Markdown renderer already lives in `corti-core`).
-- **corti-transcribe-aws** → [`02-corti-transcribe.md`](02-corti-transcribe.md) — AWS Transcribe batch.
 - **corti-transcribe-whisper** → [`02-corti-transcribe.md`](02-corti-transcribe.md) — local whisper.
-- **corti-queue** → [`03-corti-queue.md`](03-corti-queue.md) — durable job store + crash recovery.
 - **corti-aec** → [`04-corti-aec.md`](04-corti-aec.md) — offline NLMS echo canceller (speaker-bleed removal).
-- **app/** → [`05-app-tauri.md`](05-app-tauri.md) — Tauri 2 tray binary; wires the pipeline.
 
 ## Recommended build order when you resume
-1. **corti-detect** — pure logic; gives the first real "join huddle → 2-track WAV appears" loop.
-2. **corti-transcribe + corti-transcribe-aws** — turns WAV → diarized Markdown → note via corti-vagus.
-   (Full pipeline working, headphones path, no AEC yet.)
-3. **corti-queue** — make it crash-safe.
-4. **app/** — the tray, once there's a pipeline to drive.
+1. ~~**corti-detect**~~ — **done** (pure logic; first real "join huddle → 2-track WAV appears" loop).
+2. ~~**corti-transcribe + corti-transcribe-aws**~~ — **done** (WAV → diarized Markdown; channel-id Me/Them,
+   caller-injected `SdkConfig`). Pairs with corti-vagus to file the note. Headphones path, no AEC yet.
+3. ~~**corti-queue**~~ — **done** (durable SQLite WAL store; `resumable()` drives crash recovery on
+   startup). Idempotent by recording-stem id. The aws backend now takes a stable `AwsOptions.job_name`, and
+   the app stores it as `transcribe_job` + reuses it on resume so a re-poll re-attaches to the existing job
+   instead of re-submitting (the parse/poll path was already idempotent).
+4. ~~**app/**~~ — **done** (the Tauri tray; `enqueue` → transcribe → corti-vagus → `Done`, resuming
+   `resumable()` rows on startup). Live capture loop pending a signed bundle (TCC; LESSONS §1).
 5. **corti-aec** — quality polish for speaker users.
 6. **corti-transcribe-whisper** — offline transcription flavor.
 

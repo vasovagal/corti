@@ -1,0 +1,323 @@
+//! The pipeline worker: the single thread that owns the durable [`Queue`] and pushes every recording
+//! through `enqueue → transcribe → file → Done`, resuming crashed jobs on startup (guardrail 7).
+//!
+//! Why one thread: rusqlite's `Connection` is `Send` but not `Sync`, so the `Queue` has exactly one owner
+//! here and is never shared. Transcription blocks (the backend runs its own runtime), so doing it on this
+//! dedicated thread keeps it off the Tauri UI loop (guardrail 9). Jobs run serially — fine, since
+//! transcription is inherently sequential and a second call simply waits in the channel.
+//!
+//! ## Crash recovery shape (maps 1:1 to `JobStatus`)
+//! - `PendingTranscription` / `Transcribing` → (re)transcribe; the stable AWS job name re-attaches.
+//! - `PendingNote` → re-file from the persisted transcript **sidecar** (or mark Done if already filed).
+//! - `Recording` → an orphaned capture; no recorder survives a crash, so fail it.
+//!
+//! The **sidecar** (`<recording>.transcript.json`) is corti's own durability detail: we persist the parsed
+//! transcript the moment it's ready, so a crash between "transcript ready" and "note filed" can re-file
+//! without re-transcribing — the AWS-staged result may already have been deleted.
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+
+use anyhow::{Context, Result};
+use corti_core::{DiarizedTranscript, JobStatus, RecordingMeta};
+use corti_queue::{Job, JobUpdate, Queue};
+use corti_vagus::Vagus;
+use tauri::AppHandle;
+
+use crate::config::AppConfig;
+use crate::transcribe::Backend;
+use crate::tray;
+
+/// How long a `Done` recording (and its WAV) is kept before [`Queue::prune_done`] reclaims it.
+const RETENTION_DAYS: i64 = 30;
+
+/// Work for the pipeline worker. (One variant today; an enum leaves room for prune/shutdown signals.)
+pub enum PipelineMsg {
+    /// A finished recording to push through transcribe → file → Done.
+    Process {
+        meta: RecordingMeta,
+        audio_path: PathBuf,
+    },
+}
+
+/// Everything the worker owns. Built once on the worker thread; never shared.
+struct Ctx {
+    queue: Queue,
+    /// Discovered once. `Err` (stringified) when `vagus` isn't installed — we still record + transcribe,
+    /// then fail filing with a clear message rather than blocking the whole pipeline at startup.
+    vagus: Result<Vagus, String>,
+    backend: Backend,
+    app: AppHandle,
+}
+
+/// Worker entry point. Opens the queue, recovers/prunes, then drains the channel until the app exits.
+pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
+    let queue = match Queue::open() {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[corti] cannot open job queue: {e:#}");
+            tray::set_status(&app, format!("⚠ queue unavailable: {e}"));
+            return;
+        }
+    };
+
+    let vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
+    if let Err(e) = &vagus {
+        eprintln!("[corti] vagus not available — notes can't be filed: {e}");
+    }
+
+    let ctx = Ctx {
+        queue,
+        vagus,
+        backend: Backend::init(cfg),
+        app,
+    };
+
+    recover(&ctx);
+    prune(&ctx);
+    tray::set_status(&ctx.app, "Idle — waiting for a call".to_string());
+
+    for msg in rx {
+        match msg {
+            PipelineMsg::Process { meta, audio_path } => match ctx.queue.enqueue(&meta) {
+                Ok(id) => transcribe_and_file(&ctx, &id, &meta, &audio_path),
+                Err(e) => {
+                    eprintln!("[corti] enqueue failed for {}: {e:#}", audio_path.display());
+                    tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
+                }
+            },
+        }
+    }
+}
+
+/// Resume every non-terminal job left by a previous run.
+fn recover(ctx: &Ctx) {
+    let jobs = match ctx.queue.resumable() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[corti] could not read resumable jobs: {e:#}");
+            return;
+        }
+    };
+    if jobs.is_empty() {
+        return;
+    }
+    eprintln!("[corti] resuming {} unfinished job(s)", jobs.len());
+    tray::set_status(
+        &ctx.app,
+        format!("Resuming {} unfinished job(s)…", jobs.len()),
+    );
+    for job in jobs {
+        resume(ctx, job);
+    }
+}
+
+fn resume(ctx: &Ctx, job: Job) {
+    let meta = job.meta();
+    match job.status {
+        JobStatus::Recording => {
+            // A capture orphaned by the crash; no recorder survives (no partial WAV). Nothing to salvage.
+            let _ = ctx.queue.fail(&job.id, "recording interrupted by shutdown");
+        }
+        JobStatus::PendingTranscription | JobStatus::Transcribing => {
+            transcribe_and_file(ctx, &job.id, &meta, &job.audio_path);
+        }
+        JobStatus::PendingNote => finish_note(ctx, &job, &meta),
+        // Terminal states are never returned by `resumable()`.
+        JobStatus::Done | JobStatus::Failed => {}
+    }
+}
+
+/// Transcribe `audio`, persist the transcript sidecar, then file it. Used for both fresh recordings and
+/// `PendingTranscription` / `Transcribing` resumes.
+fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) {
+    // Record the stable Transcribe job name + advance to Transcribing BEFORE transcribing, so a crash
+    // mid-transcribe re-attaches to the same (idempotent) AWS job on resume.
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            status: Some(JobStatus::Transcribing),
+            transcribe_job: Some(id.to_string()),
+            ..Default::default()
+        },
+    ) {
+        fail(
+            ctx,
+            id,
+            meta,
+            format!("queue update before transcribe: {e:#}"),
+        );
+        return;
+    }
+    tray::set_status(
+        &ctx.app,
+        format!("Transcribing — {}…", meta.owning_app.name),
+    );
+
+    let transcript = match ctx.backend.transcribe(id, audio, meta) {
+        Ok(t) => t,
+        Err(e) => {
+            fail(ctx, id, meta, format!("transcription failed: {e:#}"));
+            return;
+        }
+    };
+
+    // Persist the transcript next to the WAV so re-filing after a crash never needs to re-transcribe.
+    // Best-effort: even if this fails we still hold the transcript in memory for this run.
+    let sidecar = sidecar_path(audio);
+    if let Err(e) = write_sidecar(&sidecar, &transcript) {
+        eprintln!(
+            "[corti] could not persist transcript sidecar {}: {e:#}",
+            sidecar.display()
+        );
+    }
+
+    if let Err(e) = ctx.queue.set_status(id, JobStatus::PendingNote) {
+        fail(ctx, id, meta, format!("queue set PendingNote: {e:#}"));
+        return;
+    }
+    file_and_done(ctx, id, meta, &transcript, &sidecar);
+}
+
+/// Resume a `PendingNote` job: it's already transcribed, so just re-file (idempotently).
+fn finish_note(ctx: &Ctx, job: &Job, meta: &RecordingMeta) {
+    let sidecar = sidecar_path(&job.audio_path);
+
+    // Already filed once (note_path set): nothing to redo — just mark Done and clean up.
+    if job.note_path.is_some() {
+        let _ = ctx.queue.set_status(&job.id, JobStatus::Done);
+        let _ = std::fs::remove_file(&sidecar);
+        return;
+    }
+
+    match read_sidecar(&sidecar) {
+        Some(transcript) => file_and_done(ctx, &job.id, meta, &transcript, &sidecar),
+        // No sidecar (e.g. it failed to write): fall back to re-transcribing. The stable job name lets the
+        // AWS job re-attach if its staged output still exists.
+        None => transcribe_and_file(ctx, &job.id, meta, &job.audio_path),
+    }
+}
+
+/// File the transcript into vagus and mark the job `Done`.
+fn file_and_done(
+    ctx: &Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    transcript: &DiarizedTranscript,
+    sidecar: &Path,
+) {
+    let vagus = match &ctx.vagus {
+        Ok(v) => v,
+        Err(e) => {
+            fail(ctx, id, meta, format!("vagus unavailable: {e}"));
+            return;
+        }
+    };
+
+    let note = match vagus.file_recording(meta, transcript) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(ctx, id, meta, format!("filing note failed: {e:#}"));
+            return;
+        }
+    };
+
+    // Record the note path first (so a crash here doesn't re-file), then mark Done.
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            note_path: Some(note.clone()),
+            ..Default::default()
+        },
+    ) {
+        eprintln!("[corti] note filed but could not persist note_path for {id}: {e:#}");
+    }
+    let _ = ctx.queue.set_status(id, JobStatus::Done);
+    let _ = std::fs::remove_file(sidecar); // transcript is safely in the note now
+
+    let title = meta.note_title();
+    tray::push_recent(&ctx.app, title.clone(), note);
+    tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
+}
+
+/// Reclaim old `Done` recordings: delete their cached WAVs (and any leftover sidecar) on the retention
+/// policy. The queue deletes its own rows and hands back the WAV paths to unlink.
+fn prune(ctx: &Ctx) {
+    let cutoff = chrono::Local::now() - chrono::Duration::days(RETENTION_DAYS);
+    match ctx.queue.prune_done(cutoff) {
+        Ok(paths) => {
+            for p in &paths {
+                let _ = std::fs::remove_file(p);
+                let _ = std::fs::remove_file(sidecar_path(p));
+            }
+            if !paths.is_empty() {
+                eprintln!("[corti] pruned {} old recording(s)", paths.len());
+            }
+        }
+        Err(e) => eprintln!("[corti] prune failed: {e:#}"),
+    }
+}
+
+/// Fail a job and surface it in the tray.
+fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
+    eprintln!("[corti] job {id} failed: {msg}");
+    let _ = ctx.queue.fail(id, &msg);
+    tray::set_status(&ctx.app, format!("⚠ {} — {msg}", meta.owning_app.name));
+}
+
+/// `<recording>.wav` → `<recording>.transcript.json` (next to the WAV, in the recordings cache).
+fn sidecar_path(audio: &Path) -> PathBuf {
+    audio.with_extension("transcript.json")
+}
+
+fn write_sidecar(path: &Path, transcript: &DiarizedTranscript) -> Result<()> {
+    let file =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    serde_json::to_writer(std::io::BufWriter::new(file), transcript)
+        .context("serializing transcript sidecar")?;
+    Ok(())
+}
+
+fn read_sidecar(path: &Path) -> Option<DiarizedTranscript> {
+    let file = std::fs::File::open(path).ok()?;
+    serde_json::from_reader(std::io::BufReader::new(file)).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corti_core::{Speaker, TranscriptSegment};
+
+    #[test]
+    fn sidecar_sits_next_to_the_wav() {
+        assert_eq!(
+            sidecar_path(Path::new(
+                "/cache/corti/recordings/20260530-140500-zoom.wav"
+            )),
+            PathBuf::from("/cache/corti/recordings/20260530-140500-zoom.transcript.json")
+        );
+    }
+
+    #[test]
+    fn sidecar_round_trips_a_transcript() {
+        let dir = std::env::temp_dir().join("corti-app-sidecar-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = sidecar_path(&dir.join("rec.wav"));
+
+        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 0.0,
+            end: 1.5,
+            text: "hello".into(),
+        }]);
+        write_sidecar(&path, &transcript).unwrap();
+        assert_eq!(read_sidecar(&path), Some(transcript));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_sidecar_is_none_when_absent() {
+        assert!(read_sidecar(Path::new("/nope/does-not-exist.transcript.json")).is_none());
+    }
+}

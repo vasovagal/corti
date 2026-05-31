@@ -39,5 +39,8 @@ See [`design/`](./design/) for ADRs and guardrails.
 
 ## Status
 
-Early development. Current focus: the CoreAudio capture spike (mic + per-process tap → synchronized 2-track
-WAV) which is the go/no-go for the all-CoreAudio architecture.
+The full pipeline is built: the CoreAudio capture spike validated (mic + per-process tap → synchronized
+2-track WAV), every library crate is done + tested, and the `corti-app` Tauri menu-bar tray wires it all
+together (detect → capture → transcribe → vagus, crash-recoverable). The live join-call → note loop needs a
+signed `.app` to exercise the macOS audio-capture (TCC) grant. Remaining: offline AEC (`corti-aec`) and the
+local whisper backend. See [`design/STATUS.md`](./design/STATUS.md).
