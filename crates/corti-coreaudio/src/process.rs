@@ -40,6 +40,28 @@ pub fn mic_owner() -> MicOwner {
     MicOwner { app, pid: None }
 }
 
+/// Whether a meaningful mic owner *other than* `self_pid` currently holds input.
+///
+/// corti's own synchronized capture builds an aggregate device around the mic, which pins the
+/// device-level `kAudioDevicePropertyDeviceIsRunningSomewhere` signal true for as long as we record (the
+/// IO is "running" even before any audio flows / before the TCC grant). So the
+/// [`MicMonitor`](crate::MicMonitor) *falling* edge never fires while we're capturing. To detect that the
+/// *call* actually ended, poll this instead: it asks, at the process level, whether any app besides us
+/// (and besides `com.apple.*` audio helpers) still has mic input running. Mirrors the ranking in
+/// [`mic_owner`] — a process counts only if it has a bundle id and isn't a system helper.
+pub fn other_app_holds_input(self_pid: i32) -> bool {
+    let Ok(objects) = process_object_list() else {
+        // Best-effort: if we can't enumerate, report "no other owner" so a stuck recording can still
+        // wind down through the debounce window rather than recording forever.
+        return false;
+    };
+    objects.into_iter().any(|obj| {
+        is_running_input(obj)
+            && pid_of(obj) != Some(self_pid)
+            && bundle_id(obj).is_some_and(|b| !is_system_helper(&b))
+    })
+}
+
 /// Pick the most meaningful mic owner among all processes holding input, returning its bundle id and PID.
 ///
 /// Several processes can have input running simultaneously (a conferencing app *and* a system helper like

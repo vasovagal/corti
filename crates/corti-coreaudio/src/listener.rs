@@ -119,3 +119,78 @@ unsafe extern "C" fn trampoline(
     }
     0
 }
+
+struct DeviceState {
+    on_change: Box<dyn Fn() + Send>,
+}
+
+/// Watches for changes to the system **default input device** and invokes a callback on each change.
+///
+/// [`MicMonitor`] is bound to one device id, so when the user switches input mid-session (AirPods
+/// connect, headset unplugged) it stops seeing transitions on the device that's now active. `corti-detect`
+/// uses this monitor to drop and recreate its `MicMonitor` on the new default device.
+///
+/// Dropping it removes the HAL listener and frees the callback.
+pub struct DefaultInputDeviceMonitor {
+    addr: ca::AudioObjectPropertyAddress,
+    state: *mut DeviceState,
+}
+
+// As with `MicMonitor`, the raw `*mut DeviceState` makes this `!Send`; the boxed closure is `Send` and we
+// own the box for the monitor's whole lifetime, removing the listener before freeing it, so this is sound.
+unsafe impl Send for DefaultInputDeviceMonitor {}
+
+impl DefaultInputDeviceMonitor {
+    /// Start watching for default-input-device changes. `on_change()` fires whenever the system default
+    /// input device changes.
+    pub fn new(on_change: impl Fn() + Send + 'static) -> Result<Self> {
+        let addr = property::global(ca::kAudioHardwarePropertyDefaultInputDevice);
+        let state = Box::into_raw(Box::new(DeviceState {
+            on_change: Box::new(on_change),
+        }));
+        let st = unsafe {
+            ca::AudioObjectAddPropertyListener(
+                ca::kAudioObjectSystemObject,
+                &addr,
+                Some(device_trampoline),
+                state as *mut c_void,
+            )
+        };
+        if st != 0 {
+            drop(unsafe { Box::from_raw(state) });
+            bail!("AudioObjectAddPropertyListener(default input device) failed: OSStatus {st}");
+        }
+        Ok(Self { addr, state })
+    }
+}
+
+impl Drop for DefaultInputDeviceMonitor {
+    fn drop(&mut self) {
+        unsafe {
+            ca::AudioObjectRemovePropertyListener(
+                ca::kAudioObjectSystemObject,
+                &self.addr,
+                Some(device_trampoline),
+                self.state as *mut c_void,
+            );
+            // No callbacks can arrive after the remove above returns, so freeing is safe.
+            drop(Box::from_raw(self.state));
+        }
+    }
+}
+
+/// HAL listener proc for default-device changes: forward to the closure (the value is re-read by the
+/// caller after it rebinds, so the proc itself carries no payload).
+unsafe extern "C" fn device_trampoline(
+    _obj: ca::AudioObjectID,
+    _n: u32,
+    _addrs: *const ca::AudioObjectPropertyAddress,
+    client: *mut c_void,
+) -> ca::OSStatus {
+    if client.is_null() {
+        return 0;
+    }
+    let state = unsafe { &*(client as *const DeviceState) };
+    (state.on_change)();
+    0
+}
