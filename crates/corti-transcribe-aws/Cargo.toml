@@ -11,6 +11,19 @@ rust-version.workspace = true
 corti-core = { workspace = true }
 corti-transcribe = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
-# When implementing (see design/02-corti-transcribe.md), add:
-#   aws-config, aws-sdk-s3, aws-sdk-transcribe, tokio
+# AWS Transcribe batch flow: S3 stage + StartTranscriptionJob/poll. The SDK is async, so we run a private
+# tokio current-thread runtime inside the blocking `Transcriber::transcribe` (the trait is sync by design).
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-sdk-transcribe = "1"
+tokio = { version = "1", features = ["rt", "time", "net"] }
+
+# WAV re-encode: recordings are 32-bit float, AWS Transcribe wants 16-bit PCM.
+hound = "3.5"
+
+[dev-dependencies]
+# The example plays the app's role and builds a RecordingMeta, which carries chrono timestamps.
+chrono = { workspace = true }
