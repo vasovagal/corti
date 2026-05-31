@@ -7,3 +7,5 @@
 /recordings
 # bundled spike .app output
 dist/
+# tauri_build-generated ACL/capability schemas (regenerated each build)
+app/gen/
