@@ -47,6 +47,9 @@ mod imp {
     use std::sync::mpsc::Sender;
 
     use anyhow::{Context, Result};
+    use chrono::{DateTime, Local};
+    use corti_capture::Recorder;
+    use corti_core::{OwningApp, RecordingMeta};
     use corti_detect::{Detector, DetectorEvent};
     use tauri::Manager;
 
@@ -102,6 +105,34 @@ mod imp {
     /// (whose `Drop` stops the worker + removes HAL listeners).
     struct DetectorHandle(#[allow(dead_code)] Mutex<Detector>);
 
+    /// Manual "Webinar mode": a live tap-only [`Recorder`] driven by the tray toggle, plus a clone of the
+    /// channel to the pipeline worker so a finished webinar enters the same transcribe → file path as a
+    /// detected call. The `Mutex` makes the handle `Send + Sync` (both `Recorder` and `Sender` are `Send`
+    /// but not `Sync`).
+    struct Webinar(Mutex<WebinarState>);
+
+    struct WebinarState {
+        /// The in-flight tap-only recorder; `Some` while a webinar is being recorded.
+        recorder: Option<Recorder>,
+        /// When the in-flight recording started (for the filed note's `RecordingMeta`).
+        started_at: Option<DateTime<Local>>,
+        /// Hands a finished recording to the pipeline worker.
+        tx: Sender<PipelineMsg>,
+    }
+
+    impl Webinar {
+        fn new(tx: Sender<PipelineMsg>) -> Self {
+            Self(Mutex::new(WebinarState {
+                recorder: None,
+                started_at: None,
+                tx,
+            }))
+        }
+    }
+
+    /// Label/owner for a manual webinar recording. `bundle_id: None` ⇒ `note_title` omits " call".
+    const WEBINAR_NAME: &str = "Webinar";
+
     pub fn run_app() -> Result<()> {
         let cfg = AppConfig::load();
 
@@ -144,6 +175,10 @@ mod imp {
                 .spawn(move || pipeline::run(handle, cfg, pipe_rx))
                 .context("spawning pipeline worker")?;
         }
+
+        // Manual "Webinar mode" handle: owns the live tap-only recorder + a clone of the pipeline channel.
+        // Managed after the channel exists and before the detector closure consumes `pipe_tx`.
+        app.manage(Webinar::new(pipe_tx.clone()));
 
         // Detector: mic on/off → recordings. Its callback runs off the HAL thread (guardrail 9).
         let handle = app.handle().clone();
@@ -192,6 +227,129 @@ mod imp {
     fn set_recording(app: &tauri::AppHandle, on: bool) {
         if let Some(state) = app.try_state::<AppState>() {
             state.recording.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a manual webinar recording is currently in flight — drives the tray toggle's label.
+    pub fn webinar_active(app: &tauri::AppHandle) -> bool {
+        app.try_state::<Webinar>()
+            .map(|w| w.0.lock().unwrap().recorder.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Start or stop a manual tap-only "webinar" recording from the tray. Invoked on the main thread (the
+    /// menu-event handler); the CoreAudio start/stop is done under the `Webinar` lock, but the lock is
+    /// released before any tray update (`build_menu` re-locks `Webinar`; `std::sync::Mutex` is not
+    /// reentrant), and the WAV write on stop is moved to a worker thread so the menu bar never stalls.
+    pub fn toggle(app: &tauri::AppHandle) {
+        let Some(state) = app.try_state::<Webinar>() else {
+            return;
+        };
+
+        /// What `toggle` decided to do, computed under the lock and acted on after it's dropped.
+        enum Next {
+            Started,
+            Stopping {
+                recorder: Recorder,
+                started_at: DateTime<Local>,
+                tx: Sender<PipelineMsg>,
+            },
+            Busy,
+            StartFailed(String),
+        }
+
+        let next = {
+            let mut w = state.0.lock().unwrap();
+            if let Some(recorder) = w.recorder.take() {
+                // Stop: hand the recorder off to a worker thread (finish writes the whole WAV).
+                let started_at = w.started_at.take().unwrap_or_else(chrono::Local::now);
+                Next::Stopping {
+                    recorder,
+                    started_at,
+                    tx: w.tx.clone(),
+                }
+            } else if app
+                .try_state::<AppState>()
+                .map(|s| s.recording.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                // A detected call is already recording; refuse to double-capture.
+                Next::Busy
+            } else {
+                let owner = OwningApp {
+                    bundle_id: None,
+                    name: WEBINAR_NAME.to_string(),
+                };
+                match Recorder::start_tap_only(&owner, None) {
+                    Ok(recorder) => {
+                        w.recorder = Some(recorder);
+                        w.started_at = Some(chrono::Local::now());
+                        Next::Started
+                    }
+                    Err(e) => Next::StartFailed(format!("{e:#}")),
+                }
+            }
+        };
+
+        // Lock released. Tray updates (which rebuild the menu, re-reading `webinar_active`) happen here.
+        match next {
+            Next::Started => {
+                set_recording(app, true);
+                tray::set_status(app, format!("● Webinar recording — {WEBINAR_NAME}"));
+            }
+            Next::Stopping {
+                recorder,
+                started_at,
+                tx,
+            } => {
+                set_recording(app, false);
+                tray::set_status(app, format!("Transcribing — {WEBINAR_NAME}…"));
+                let app = app.clone();
+                std::thread::Builder::new()
+                    .name("corti-webinar-finish".to_string())
+                    .spawn(move || finish_webinar(&app, recorder, started_at, tx))
+                    .expect("spawning webinar-finish thread");
+            }
+            Next::Busy => tray::set_status(
+                app,
+                "Can't start webinar — a call is already recording".to_string(),
+            ),
+            Next::StartFailed(e) => {
+                eprintln!("[corti] webinar capture failed to start: {e}");
+                // Most often the missing audio-capture TCC grant (design/LESSONS §1).
+                tray::set_status(app, format!("⚠ webinar capture failed: {e}"));
+            }
+        }
+    }
+
+    /// Off-thread tail of a webinar stop: write the tap-only WAV, then hand it to the pipeline worker so it
+    /// runs the same enqueue → transcribe → file → Done path as a detected call.
+    fn finish_webinar(
+        app: &tauri::AppHandle,
+        recorder: Recorder,
+        started_at: DateTime<Local>,
+        tx: Sender<PipelineMsg>,
+    ) {
+        let audio_path = match recorder.finish_tap_only() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[corti] webinar capture produced no audio: {e:#}");
+                tray::set_status(app, format!("⚠ webinar capture failed: {e}"));
+                set_recording(app, false);
+                return;
+            }
+        };
+        let meta = RecordingMeta {
+            started_at,
+            ended_at: Some(chrono::Local::now()),
+            owning_app: OwningApp {
+                bundle_id: None,
+                name: WEBINAR_NAME.to_string(),
+            },
+            audio_path: audio_path.clone(),
+        };
+        if tx.send(PipelineMsg::Process { meta, audio_path }).is_err() {
+            eprintln!("[corti] pipeline worker gone; dropped a finished webinar recording");
         }
     }
 

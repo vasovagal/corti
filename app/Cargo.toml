@@ -20,6 +20,7 @@ tauri-build = { version = "2", features = [] }
 # Library crates (the whole pipeline). corti-aec is intentionally NOT wired for v1 (passthrough stub; see
 # design/04-corti-aec.md) — the raw 2-track WAV goes straight to the backend.
 corti-core = { workspace = true }
+corti-capture = { workspace = true }
 corti-detect = { workspace = true }
 corti-queue = { workspace = true }
 corti-transcribe = { workspace = true }

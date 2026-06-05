@@ -11,6 +11,7 @@ members = [
     "crates/corti-transcribe-whisper",
     "crates/corti-queue",
     "crates/corti-aec",
+    "crates/corti-tap",
     "app",
 ]
 

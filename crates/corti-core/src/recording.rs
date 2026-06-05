@@ -22,9 +22,16 @@ pub struct RecordingMeta {
 
 impl RecordingMeta {
     /// A default note title from the owning app and start time, e.g. `Zoom call — 2026-05-29 14:05`.
+    /// When the app has no bundle id (manual/force-tap recordings), "call" is omitted:
+    /// `System audio — 2026-05-29 14:05`.
     pub fn note_title(&self) -> String {
+        let suffix = if self.owning_app.bundle_id.is_some() {
+            " call"
+        } else {
+            ""
+        };
         format!(
-            "{} call — {}",
+            "{}{suffix} — {}",
             self.owning_app.name,
             self.started_at.format("%Y-%m-%d %H:%M")
         )
@@ -86,6 +93,13 @@ mod tests {
         let m = sample();
         assert_eq!(m.note_title(), "Zoom call — 2026-05-29 14:05");
         assert_eq!(m.source(), "Zoom · 2026-05-29 14:05");
+    }
+
+    #[test]
+    fn title_omits_call_when_no_bundle_id() {
+        let mut m = sample();
+        m.owning_app = OwningApp::unknown();
+        assert_eq!(m.note_title(), "Unknown app — 2026-05-29 14:05");
     }
 
     #[test]

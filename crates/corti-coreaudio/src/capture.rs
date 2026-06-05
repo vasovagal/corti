@@ -1,6 +1,7 @@
 //! Synchronized capture engine: a CoreAudio **process tap** (all system output, or one app's output)
 //! combined with the **microphone** in a single **aggregate device**, pulled through one IO proc so both
-//! ends share a clock.
+//! ends share a clock. [`CaptureSession::start_tap_only`] is the listen-only variant — the tap drives the
+//! clock by itself and the mic is never opened (no orange "mic in use" dot), used for webinars and talks.
 //!
 //! This is the reusable core proven by the spike (ADR 0002). The two pieces CoreAudio doesn't expose
 //! through `coreaudio-sys` — `AudioHardwareCreateProcessTap`/`Destroy` and the `CATapDescription`
@@ -113,6 +114,19 @@ unsafe impl Send for CaptureSession {}
 impl CaptureSession {
     /// Begin capturing `target` + the default mic. Returns once IO has started.
     pub fn start(target: TapTarget) -> Result<Self> {
+        Self::start_inner(target, true)
+    }
+
+    /// Begin capturing `target` **only** — the microphone is never opened. The aggregate wraps just the
+    /// process tap, which drives the clock, so there is no orange "mic in use" dot and no microphone TCC
+    /// prompt. The captured stream is all tap channels (`mic_channels == 0`).
+    pub fn start_tap_only(target: TapTarget) -> Result<Self> {
+        Self::start_inner(target, false)
+    }
+
+    /// Shared start path. `capture_mic` adds the default input device as the aggregate's clock-leading
+    /// main sub-device; when false the mic device is never touched (tap-only).
+    fn start_inner(target: TapTarget, capture_mic: bool) -> Result<Self> {
         // 1. Tap.
         let description = unsafe { make_tap_description(&target)? };
         let mut tap_id: ca::AudioObjectID = 0;
@@ -123,17 +137,23 @@ impl CaptureSession {
         }
         let tap_guard = TapGuard(tap_id);
 
-        // 2. UIDs for the aggregate.
+        // 2. UIDs for the aggregate. The mic device is opened (and read) only in mic+tap mode.
         let tap_uid = read_cfstring(tap_id, ca::kAudioTapPropertyUID)
             .context("reading tap UID")?
             .ok_or_else(|| anyhow!("tap has no UID"))?;
-        let mic = listener::default_input_device()?;
-        let mic_uid = read_cfstring(mic, ca::kAudioDevicePropertyDeviceUID)
-            .context("reading mic UID")?
-            .ok_or_else(|| anyhow!("mic has no UID"))?;
+        let mic_uid = if capture_mic {
+            let mic = listener::default_input_device()?;
+            Some(
+                read_cfstring(mic, ca::kAudioDevicePropertyDeviceUID)
+                    .context("reading mic UID")?
+                    .ok_or_else(|| anyhow!("mic has no UID"))?,
+            )
+        } else {
+            None
+        };
 
-        // 3. Aggregate (mic = clock-leading sub-device + the tap).
-        let agg_id = create_aggregate(&mic_uid, &tap_uid)?;
+        // 3. Aggregate: mic (clock-leading sub-device) + the tap, or tap-only when `capture_mic` is false.
+        let agg_id = create_aggregate(mic_uid.as_deref(), &tap_uid)?;
         let agg_guard = AggregateGuard(agg_id);
 
         let sample_rate = unsafe { aggregate_input_format(agg_id) }
@@ -146,6 +166,7 @@ impl CaptureSession {
             channels: AtomicU32::new(0),
             mic_channels: AtomicU32::new(0),
             callbacks: AtomicU32::new(0),
+            has_mic: capture_mic,
         }));
         let mut proc_id: ca::AudioDeviceIOProcID = None;
         let st = unsafe {
@@ -220,11 +241,15 @@ struct Cap {
     channels: AtomicU32,
     mic_channels: AtomicU32,
     callbacks: AtomicU32,
+    /// Whether the aggregate has a mic sub-device. Set once at construction, read-only in the proc. When
+    /// false (tap-only), buffer 0 is the tap — not the mic — so the mic-channel count is 0.
+    has_mic: bool,
 }
 
-/// IO proc: interleave every input buffer's channels into one frame-major float stream. The aggregate
-/// presents one buffer per sub-stream (buffer 0 = mic, the rest = tap), so the first buffer's channel count
-/// is the mic-channel count.
+/// IO proc: interleave every input buffer's channels into one frame-major float stream. In mic+tap mode the
+/// aggregate presents one buffer per sub-stream (buffer 0 = mic, the rest = tap), so the first buffer's
+/// channel count is the mic-channel count. In tap-only mode there is no mic sub-device, so the mic-channel
+/// count is 0 and every channel is tap.
 unsafe extern "C" fn io_proc(
     _device: ca::AudioObjectID,
     _now: *const ca::AudioTimeStamp,
@@ -248,8 +273,14 @@ unsafe extern "C" fn io_proc(
 
     let total_channels: u32 = buffers.iter().map(|b| b.mNumberChannels).sum();
     cap.channels.store(total_channels, Ordering::Relaxed);
-    cap.mic_channels
-        .store(buffers[0].mNumberChannels, Ordering::Relaxed);
+    cap.mic_channels.store(
+        if cap.has_mic {
+            buffers[0].mNumberChannels
+        } else {
+            0
+        },
+        Ordering::Relaxed,
+    );
 
     let ch0 = buffers[0].mNumberChannels.max(1) as usize;
     let frames = buffers[0].mDataByteSize as usize / (4 * ch0);
@@ -349,15 +380,18 @@ fn read_cfstring(obj: ca::AudioObjectID, selector: u32) -> Result<Option<String>
     ))
 }
 
+/// Hands out a unique suffix per aggregate created in this process.
+static AGG_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// Build the aggregate-device description dict and create the device.
-fn create_aggregate(mic_uid: &str, tap_uid: &str) -> Result<ca::AudioObjectID> {
-    let mic_uid = CFString::new(mic_uid);
+///
+/// `mic_uid = Some(uid)` adds the mic as the clock-leading main sub-device (mic + tap). `None` builds a
+/// **tap-only** aggregate: only the process tap is in the device, so it is the sole input stream and drives
+/// the clock — the mic is never opened (no orange "mic in use" dot, no microphone TCC prompt). The keys that
+/// pull in a sub-device (`MainSubDevice`/`SubDeviceList`) are simply omitted in that case.
+fn create_aggregate(mic_uid: Option<&str>, tap_uid: &str) -> Result<ca::AudioObjectID> {
     let tap_uid = CFString::new(tap_uid);
 
-    let sub_dev = CFDictionary::from_CFType_pairs(&[(
-        key(ca::kAudioSubDeviceUIDKey).as_CFType(),
-        mic_uid.as_CFType(),
-    )]);
     let tap_entry = CFDictionary::from_CFType_pairs(&[
         (key(ca::kAudioSubTapUIDKey).as_CFType(), tap_uid.as_CFType()),
         (
@@ -365,30 +399,29 @@ fn create_aggregate(mic_uid: &str, tap_uid: &str) -> Result<ca::AudioObjectID> {
             CFNumber::from(1i32).as_CFType(),
         ),
     ]);
-    let sub_list = CFArray::from_CFTypes(&[sub_dev]);
     let tap_list = CFArray::from_CFTypes(&[tap_entry]);
 
-    let desc = CFDictionary::from_CFType_pairs(&[
+    // A fresh UID per aggregate avoids colliding with a sibling (the detector and webinar capture share one
+    // process, so a bare PID would not be unique) or a stale aggregate left by a crashed run.
+    let uid = CFString::new(&format!(
+        "com.vasovagal.corti.agg.{}.{}",
+        std::process::id(),
+        AGG_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let name = CFString::new("corti-capture");
+
+    let mut pairs = vec![
         (
             key(ca::kAudioAggregateDeviceNameKey).as_CFType(),
-            CFString::new("corti-capture").as_CFType(),
+            name.as_CFType(),
         ),
         (
             key(ca::kAudioAggregateDeviceUIDKey).as_CFType(),
-            // A fresh UID per session avoids colliding with a stale aggregate from a crashed run.
-            CFString::new(&format!("com.vasovagal.corti.agg.{}", std::process::id())).as_CFType(),
+            uid.as_CFType(),
         ),
         (
             key(ca::kAudioAggregateDeviceIsPrivateKey).as_CFType(),
             CFNumber::from(1i32).as_CFType(),
-        ),
-        (
-            key(ca::kAudioAggregateDeviceMainSubDeviceKey).as_CFType(),
-            mic_uid.as_CFType(),
-        ),
-        (
-            key(ca::kAudioAggregateDeviceSubDeviceListKey).as_CFType(),
-            sub_list.as_CFType(),
         ),
         (
             key(ca::kAudioAggregateDeviceTapListKey).as_CFType(),
@@ -398,7 +431,28 @@ fn create_aggregate(mic_uid: &str, tap_uid: &str) -> Result<ca::AudioObjectID> {
             key(ca::kAudioAggregateDeviceTapAutoStartKey).as_CFType(),
             CFNumber::from(1i32).as_CFType(),
         ),
-    ]);
+    ];
+
+    // Mic+tap mode only: add the mic as the clock-leading main sub-device. (`as_CFType()` retains, so the
+    // CFString/CFArray locals may drop at the end of this block — the dict keeps its own references.)
+    let mic_uid = mic_uid.map(CFString::new);
+    if let Some(mic_uid) = &mic_uid {
+        let sub_dev = CFDictionary::from_CFType_pairs(&[(
+            key(ca::kAudioSubDeviceUIDKey).as_CFType(),
+            mic_uid.as_CFType(),
+        )]);
+        let sub_list = CFArray::from_CFTypes(&[sub_dev]);
+        pairs.push((
+            key(ca::kAudioAggregateDeviceMainSubDeviceKey).as_CFType(),
+            mic_uid.as_CFType(),
+        ));
+        pairs.push((
+            key(ca::kAudioAggregateDeviceSubDeviceListKey).as_CFType(),
+            sub_list.as_CFType(),
+        ));
+    }
+
+    let desc = CFDictionary::from_CFType_pairs(&pairs);
 
     let mut agg_id: ca::AudioObjectID = 0;
     let st = unsafe {
@@ -448,5 +502,47 @@ struct AggregateGuard(ca::AudioObjectID);
 impl Drop for AggregateGuard {
     fn drop(&mut self) {
         unsafe { ca::AudioHardwareDestroyAggregateDevice(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CapturedAudio;
+
+    /// A tap-only capture (no mic sub-device) reports `mic_channels == 0`, so the whole interleaved stream
+    /// is the tap: `mic_mono()` is empty and `tap_mono()` averages every channel. This is the split
+    /// `start_tap_only` + `write_tap_only_wav` rely on.
+    #[test]
+    fn tap_only_split_treats_all_channels_as_tap() {
+        // Two stereo-tap frames, no mic channel: [tapL, tapR] per frame. Values are exact in f32.
+        let audio = CapturedAudio {
+            samples: vec![0.25, 0.75, 0.5, 1.0],
+            mic_channels: 0,
+            tap_channels: 2,
+            sample_rate: 48_000,
+            callbacks: 1,
+        };
+        assert_eq!(audio.channels(), 2);
+        assert_eq!(audio.frames(), 2);
+        assert!(
+            audio.mic_mono().is_empty(),
+            "no mic channel → empty me track"
+        );
+        assert_eq!(audio.tap_mono(), vec![0.5, 0.75]);
+    }
+
+    /// The mic+tap split keeps "me" (leading mic channel) and "them" (trailing tap channels) separate.
+    #[test]
+    fn mic_plus_tap_split_keeps_me_and_them_separate() {
+        // Two frames of [mic, tapL, tapR].
+        let audio = CapturedAudio {
+            samples: vec![1.0, 0.25, 0.75, 0.0, 0.5, 1.0],
+            mic_channels: 1,
+            tap_channels: 2,
+            sample_rate: 48_000,
+            callbacks: 1,
+        };
+        assert_eq!(audio.mic_mono(), vec![1.0, 0.0]);
+        assert_eq!(audio.tap_mono(), vec![0.5, 0.75]);
     }
 }
