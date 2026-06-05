@@ -1,8 +1,10 @@
 //! AWS Transcribe (batch) backend for corti.
 //!
-//! Stages the recording in S3, runs a `StartTranscriptionJob` with **channel identification** (our WAV is
-//! ch0 = me / ch1 = them, so each channel transcribes separately and maps deterministically to a speaker),
-//! polls to completion, fetches the result JSON, and parses it into a [`DiarizedTranscript`]. See
+//! Stages the recording in S3, runs a `StartTranscriptionJob`, polls to completion, fetches the result
+//! JSON, and parses it into a [`DiarizedTranscript`]. A 2-channel mic+tap WAV (ch0 = me / ch1 = them) is
+//! transcribed with **channel identification** so each channel maps deterministically to a speaker; a
+//! 1-channel tap-only ("webinar") WAV is transcribed as a plain single-speaker job (everything is the
+//! far-end "Them") since AWS only accepts channel identification for multi-channel audio. See
 //! `design/02-corti-transcribe.md`.
 //!
 //! The [`Transcriber`] contract is synchronous, so [`AwsTranscriber::transcribe`] drives the async AWS SDK
@@ -95,8 +97,11 @@ impl AwsTranscriber {
             bail!("AwsOptions.bucket is empty — set the S3 bucket to stage audio in");
         }
 
-        // 1. Re-encode the 2-track float WAV to 16-bit PCM (what AWS Transcribe accepts).
-        let (pcm_path, sample_rate) = wav::to_pcm16_temp(audio)?;
+        // 1. Re-encode the float WAV to 16-bit PCM (what AWS Transcribe accepts). The channel count decides
+        //    whether we ask for channel identification: 2-track mic+tap ⇒ yes; 1-track tap-only ⇒ no
+        //    (AWS rejects channel identification on mono audio).
+        let (pcm_path, sample_rate, channels) = wav::to_pcm16_temp(audio)?;
+        let multichannel = channels >= 2;
 
         // 2. Job name + object keys. A caller-supplied `job_name` (the recording id) makes the job and its
         //    staged S3 keys STABLE so a resumed `Transcribing` job re-attaches to the same AWS job; without
@@ -117,10 +122,11 @@ impl AwsTranscriber {
         upload?;
 
         // 4. Start the job (idempotent on ConflictException).
-        self.start_job(&job, &in_key, &out_key, sample_rate).await?;
+        self.start_job(&job, &in_key, &out_key, sample_rate, multichannel)
+            .await?;
 
-        // 5. Poll, 6. fetch, 7. parse.
-        let result = self.await_result(&job, &out_key).await;
+        // 5. Poll, 6. fetch, 7. parse (channel-identified vs. single-speaker per `multichannel`).
+        let result = self.await_result(&job, &out_key, multichannel).await;
 
         // 8. Best-effort cleanup of staged objects.
         if self.opts.delete_after {
@@ -152,11 +158,12 @@ impl AwsTranscriber {
         in_key: &str,
         out_key: &str,
         sample_rate: u32,
+        multichannel: bool,
     ) -> Result<()> {
         let media = Media::builder()
             .media_file_uri(format!("s3://{}/{in_key}", self.opts.bucket))
             .build();
-        let started = self
+        let mut req = self
             .transcribe
             .start_transcription_job()
             .transcription_job_name(job)
@@ -165,10 +172,13 @@ impl AwsTranscriber {
             .media_sample_rate_hertz(sample_rate as i32)
             .media(media)
             .output_bucket_name(&self.opts.bucket)
-            .output_key(out_key)
-            .settings(Settings::builder().channel_identification(true).build())
-            .send()
-            .await;
+            .output_key(out_key);
+        // Channel identification requires ≥ 2 channels; a tap-only (mono) recording is a plain job that AWS
+        // returns as a single `results.items` stream (no `channel_labels`).
+        if multichannel {
+            req = req.settings(Settings::builder().channel_identification(true).build());
+        }
+        let started = req.send().await;
 
         if let Err(err) = started {
             // A pre-existing job with this name is fine — fall through to polling it.
@@ -183,7 +193,12 @@ impl AwsTranscriber {
         Ok(())
     }
 
-    async fn await_result(&self, job: &str, out_key: &str) -> Result<DiarizedTranscript> {
+    async fn await_result(
+        &self,
+        job: &str,
+        out_key: &str,
+        multichannel: bool,
+    ) -> Result<DiarizedTranscript> {
         let deadline = Instant::now() + self.opts.max_wait;
         loop {
             let resp = self
@@ -233,7 +248,11 @@ impl AwsTranscriber {
             .context("reading transcript body")?
             .into_bytes();
         let text = String::from_utf8_lossy(&bytes);
-        parse::parse_channel_transcript(&text)
+        if multichannel {
+            parse::parse_channel_transcript(&text)
+        } else {
+            parse::parse_single_channel_transcript(&text)
+        }
     }
 
     async fn delete(&self, key: &str) {

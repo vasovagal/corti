@@ -178,9 +178,14 @@ pub fn spawn_blink(app: AppHandle) {
             let mut shown: Option<bool> = None; // Some(true)=rec icon, Some(false)=idle icon
             loop {
                 std::thread::sleep(Duration::from_millis(500));
+                // Blink while EITHER capture source is live (detector call or manual webinar); they own
+                // independent flags so one ending never stops the blink for the other.
                 let recording = app
                     .try_state::<AppState>()
-                    .map(|s| s.recording.load(Ordering::Relaxed))
+                    .map(|s| {
+                        s.detector_recording.load(Ordering::Relaxed)
+                            || s.webinar_recording.load(Ordering::Relaxed)
+                    })
                     .unwrap_or(false);
                 let want = if recording {
                     phase = !phase;

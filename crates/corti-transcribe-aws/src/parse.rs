@@ -1,9 +1,15 @@
-//! Parse AWS Transcribe **channel-identification** output into a [`DiarizedTranscript`].
+//! Parse AWS Transcribe output into a [`DiarizedTranscript`].
 //!
-//! corti uploads a 2-channel WAV (ch0 = me/mic, ch1 = them/tap) with `ChannelIdentification` on, so AWS
-//! transcribes each channel separately and emits `results.channel_labels.channels[]`, each labelled
-//! `ch_0` / `ch_1` with its own word `items[]`. That maps deterministically to speakers — `ch_0` ⇒
-//! [`Speaker::Me`], anything else ⇒ [`Speaker::Other`]`("Them")` — with no energy-alignment heuristics.
+//! For a 2-channel mic+tap WAV (ch0 = me/mic, ch1 = them/tap) corti runs the job with
+//! `ChannelIdentification` on, so AWS transcribes each channel separately and emits
+//! `results.channel_labels.channels[]`, each labelled `ch_0` / `ch_1` with its own word `items[]`. That
+//! maps deterministically to speakers — `ch_0` ⇒ [`Speaker::Me`], anything else ⇒
+//! [`Speaker::Other`]`("Them")` — with no energy-alignment heuristics
+//! ([`parse_channel_transcript`]).
+//!
+//! For a 1-channel tap-only ("webinar") WAV, AWS can't do channel identification, so the job is plain and
+//! the result is a single flat `results.items[]` stream; every utterance is the far-end "Them"
+//! ([`parse_single_channel_transcript`]).
 //!
 //! This module is pure (no AWS, no IO) so the join logic is unit-tested against canned JSON.
 
@@ -24,8 +30,11 @@ struct Root {
 
 #[derive(Debug, Deserialize)]
 struct Results {
-    /// Present when the job ran with channel identification.
+    /// Present when the job ran with channel identification (2-track mic+tap).
     channel_labels: Option<ChannelLabels>,
+    /// The flat word-item stream of a plain (single-channel / tap-only) job.
+    #[serde(default)]
+    items: Vec<Item>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,9 +76,22 @@ pub fn parse_channel_transcript(json: &str) -> Result<DiarizedTranscript> {
 
     let mut segments: Vec<TranscriptSegment> = Vec::new();
     for channel in &channels {
-        segments.extend(segments_for_channel(channel));
+        segments.extend(items_to_segments(
+            &channel.items,
+            speaker_for(&channel.channel_label),
+        ));
     }
     // Interleave both channels into one timeline. `total_cmp` keeps it panic-free on any odd NaN.
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    Ok(DiarizedTranscript::new(segments))
+}
+
+/// Parse a plain (non-channel-identification) transcript JSON — a tap-only / mono recording — into a
+/// [`DiarizedTranscript`] with every utterance attributed to the far-end ("Them") track.
+pub fn parse_single_channel_transcript(json: &str) -> Result<DiarizedTranscript> {
+    let root: Root = serde_json::from_str(json).context("parsing AWS Transcribe result JSON")?;
+    let mut segments = items_to_segments(&root.results.items, Speaker::Other("Them".to_string()));
+    // Items are already time-ordered, but sort defensively to match the channel path.
     segments.sort_by(|a, b| a.start.total_cmp(&b.start));
     Ok(DiarizedTranscript::new(segments))
 }
@@ -83,14 +105,14 @@ fn speaker_for(channel_label: &str) -> Speaker {
     }
 }
 
-/// Group one channel's word items into segments, splitting on a pause longer than [`SEGMENT_GAP`].
-/// Punctuation items (no timestamps) glue onto the current word with no leading space.
-fn segments_for_channel(channel: &Channel) -> Vec<TranscriptSegment> {
-    let speaker = speaker_for(&channel.channel_label);
+/// Group a stream of word items into segments for one `speaker`, splitting on a pause longer than
+/// [`SEGMENT_GAP`]. Punctuation items (no timestamps) glue onto the current word with no leading space.
+/// Shared by the channel-identified path (one call per channel) and the single-channel path.
+fn items_to_segments(items: &[Item], speaker: Speaker) -> Vec<TranscriptSegment> {
     let mut out: Vec<TranscriptSegment> = Vec::new();
     let mut cur: Option<TranscriptSegment> = None;
 
-    for item in &channel.items {
+    for item in items {
         let content = match item.alternatives.first() {
             Some(a) if !a.content.is_empty() => a.content.as_str(),
             _ => continue,
@@ -241,5 +263,37 @@ mod tests {
         let t = parse_channel_transcript(json).unwrap();
         assert_eq!(t.segments.len(), 1);
         assert_eq!(t.segments[0].text, "Hi");
+    }
+
+    #[test]
+    fn single_channel_attributes_everything_to_them() {
+        // A plain (tap-only / mono) job: a flat results.items stream with a >1.5s gap splitting two
+        // segments and trailing punctuation glued on, every segment attributed to "Them".
+        let json = r#"{ "results": {
+            "transcripts": [{ "transcript": "ignored" }],
+            "items": [
+                { "start_time": "0.0", "end_time": "0.4", "type": "pronunciation",
+                  "alternatives": [{ "content": "Hello" }] },
+                { "start_time": "0.4", "end_time": "0.8", "type": "pronunciation",
+                  "alternatives": [{ "content": "world" }] },
+                { "type": "punctuation", "alternatives": [{ "content": "." }] },
+                { "start_time": "5.0", "end_time": "5.3", "type": "pronunciation",
+                  "alternatives": [{ "content": "Bye" }] }
+            ]
+        } }"#;
+        let t = parse_single_channel_transcript(json).unwrap();
+        assert_eq!(t.segments.len(), 2);
+        assert_eq!(t.segments[0].speaker, Speaker::Other("Them".into()));
+        assert_eq!(t.segments[0].text, "Hello world.");
+        assert_eq!(t.segments[1].speaker, Speaker::Other("Them".into()));
+        assert_eq!(t.segments[1].text, "Bye");
+        assert_eq!(t.segments[1].start, 5.0);
+    }
+
+    #[test]
+    fn single_channel_with_no_items_is_empty() {
+        // No `items` (and no `channel_labels`) → empty transcript, not an error.
+        let t = parse_single_channel_transcript(r#"{ "results": { "transcripts": [] } }"#).unwrap();
+        assert!(t.segments.is_empty());
     }
 }

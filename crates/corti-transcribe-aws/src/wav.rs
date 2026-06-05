@@ -1,17 +1,20 @@
 //! Re-encode a recording to the format AWS Transcribe accepts.
 //!
-//! corti's recordings are 2-channel **32-bit float** WAVs (ch0 = me, ch1 = them). AWS Transcribe's
-//! documented input is **16-bit PCM**, and channel identification needs the two channels preserved, so we
-//! transcode float → i16 PCM (same channel count + sample rate) into a temp file before upload. No
-//! resampling: AWS accepts up to 48 kHz, which is what we capture.
+//! corti's recordings are 2-channel **32-bit float** WAVs (ch0 = me, ch1 = them) for mic+tap calls, or
+//! 1-channel float for tap-only ("webinar") recordings. AWS Transcribe's documented input is **16-bit
+//! PCM**, and channel identification needs the channels preserved, so we transcode float → i16 PCM (same
+//! channel count + sample rate) into a temp file before upload. No resampling: AWS accepts up to 48 kHz,
+//! which is what we capture. The returned channel count lets the caller decide whether to ask for channel
+//! identification (≥ 2 channels) or a plain single-speaker transcript (mono).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 /// Read the float (or int) WAV at `input` and write a 16-bit PCM copy to a temp file, preserving channel
-/// count and sample rate. Returns the temp path and the sample rate. Caller deletes the temp file.
-pub fn to_pcm16_temp(input: &Path) -> Result<(PathBuf, u32)> {
+/// count and sample rate. Returns the temp path, the sample rate, and the channel count. Caller deletes the
+/// temp file.
+pub fn to_pcm16_temp(input: &Path) -> Result<(PathBuf, u32, u16)> {
     let mut reader = hound::WavReader::open(input)
         .with_context(|| format!("opening {} for re-encode", input.display()))?;
     let spec = reader.spec();
@@ -54,7 +57,7 @@ pub fn to_pcm16_temp(input: &Path) -> Result<(PathBuf, u32)> {
     }
     writer.finalize().context("finalizing pcm16 WAV")?;
 
-    Ok((out, spec.sample_rate))
+    Ok((out, spec.sample_rate, spec.channels))
 }
 
 #[cfg(test)]
@@ -80,8 +83,9 @@ mod tests {
             w.finalize().unwrap();
         }
 
-        let (out, rate) = to_pcm16_temp(&src).unwrap();
+        let (out, rate, channels) = to_pcm16_temp(&src).unwrap();
         assert_eq!(rate, 48_000);
+        assert_eq!(channels, 2);
 
         let mut r = hound::WavReader::open(&out).unwrap();
         let got = r.spec();
