@@ -25,6 +25,18 @@ pub fn default_input_device() -> Result<ca::AudioObjectID> {
     Ok(id)
 }
 
+/// The current default output device, or an error if there is none. Used as the clock anchor for a
+/// tap-only (no-mic) aggregate: an output device gives the aggregate a clock without opening any input, so
+/// there is no orange "mic in use" dot — unlike [`default_input_device`], which the mic+tap path uses.
+pub fn default_output_device() -> Result<ca::AudioObjectID> {
+    let addr = property::global(ca::kAudioHardwarePropertyDefaultOutputDevice);
+    let id: ca::AudioObjectID = unsafe { property::get(ca::kAudioObjectSystemObject, &addr)? };
+    if id == 0 {
+        bail!("no default output device");
+    }
+    Ok(id)
+}
+
 /// Whether `device` currently has input IO running somewhere on the system.
 pub fn is_running(device: ca::AudioObjectID) -> Result<bool> {
     let addr = property::global(ca::kAudioDevicePropertyDeviceIsRunningSomewhere);
