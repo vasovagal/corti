@@ -14,6 +14,22 @@
 fn main() -> anyhow::Result<()> {
     use corti_coreaudio::{MicMonitor, listener, process};
 
+    // Tap-only (webinar) clock selection — see issue #4. If the default output also has inputs (AirPods,
+    // USB interface), `tap_only_clock_device` falls back to an input-less output so no mic leaks in.
+    let default_output = listener::default_output_device()?;
+    match listener::tap_only_clock_device() {
+        Ok(clock) if clock == default_output => {
+            println!("tap-only clock: default output (id {clock}) — input-less, used directly");
+        }
+        Ok(clock) => {
+            println!(
+                "tap-only clock: default output (id {default_output}) has inputs → fell back to \
+                 input-less output id {clock}"
+            );
+        }
+        Err(e) => println!("tap-only clock: NONE available ({e})"),
+    }
+
     let device = listener::default_input_device()?;
     println!("corti probe — default input device id: {device}");
     println!("initial mic-in-use: {}", listener::is_running(device)?);
