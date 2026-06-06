@@ -8,7 +8,7 @@ members = [
     "crates/corti-detect",
     "crates/corti-transcribe",
     "crates/corti-transcribe-aws",
-    "crates/corti-transcribe-whisper",
+    "crates/corti-transcribe-local",
     "crates/corti-queue",
     "crates/corti-aec",
     "crates/corti-tap",
@@ -33,7 +33,7 @@ corti-capture = { path = "crates/corti-capture", version = "0.1.0" }
 corti-detect = { path = "crates/corti-detect", version = "0.1.0" }
 corti-transcribe = { path = "crates/corti-transcribe", version = "0.1.0" }
 corti-transcribe-aws = { path = "crates/corti-transcribe-aws", version = "0.1.0" }
-corti-transcribe-whisper = { path = "crates/corti-transcribe-whisper", version = "0.1.0" }
+corti-transcribe-local = { path = "crates/corti-transcribe-local", version = "0.1.0" }
 corti-queue = { path = "crates/corti-queue", version = "0.1.0" }
 corti-aec = { path = "crates/corti-aec", version = "0.1.0" }
 
@@ -46,4 +46,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 
 [profile.release]
 lto = "thin"
+codegen-units = 1 # single-unit codegen: best raw speed for the M1 Pro daily driver (ADR 0002/0003)
 strip = true

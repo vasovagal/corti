@@ -17,8 +17,8 @@ Exactly what this app does: audio → notes.
   process taps), corti ships its own thin safe bindings rather than risk a dead-end dependency.
 - **vagus stays lean.** corti is a separate project; it touches vagus *only* by shelling out to the `vagus`
   CLI (`vagus add-note … --print-path`). It never writes the vault or the index directly.
-- **Pluggable, feature-flavored backends** — `aws` (AWS Transcribe, default) and `whisper` (local, offline)
-  transcription; selected via Cargo features.
+- **Pluggable, runtime-selectable backends** — `aws` (AWS Transcribe) and `local` (offline, on-device
+  Parakeet-TDT via ONNX) compile together; pick one at runtime with `CORTI_TRANSCRIBE_BACKEND`.
 
 ## Workspace layout
 
@@ -30,7 +30,7 @@ Exactly what this app does: audio → notes.
 | `corti-capture` | Aggregate-device capture graph → multitrack WAV |
 | `corti-transcribe` | `Transcriber` trait + diarized-transcript Markdown renderer |
 | `corti-transcribe-aws` | AWS Transcribe batch backend (`aws` feature) |
-| `corti-transcribe-whisper` | Local whisper backend (`whisper` feature) |
+| `corti-transcribe-local` | Local offline backend — Parakeet-TDT via ONNX/sherpa-onnx (`local` feature) |
 | `corti-queue` | Durable job store + crash recovery |
 | `corti-vagus` | The `vagus` CLI shell-out (the only vagus touchpoint) |
 | `app/` | Tauri 2 tray binary |
@@ -41,6 +41,7 @@ See [`design/`](./design/) for ADRs and guardrails.
 
 The full pipeline is built: the CoreAudio capture spike validated (mic + per-process tap → synchronized
 2-track WAV), every library crate is done + tested, and the `corti-app` Tauri menu-bar tray wires it all
-together (detect → capture → transcribe → vagus, crash-recoverable). The live join-call → note loop needs a
-signed `.app` to exercise the macOS audio-capture (TCC) grant. Remaining: offline AEC (`corti-aec`) and the
-local whisper backend. See [`design/STATUS.md`](./design/STATUS.md).
+together (detect → capture → transcribe → vagus, crash-recoverable). Both transcription backends are built:
+AWS Transcribe and a fully-offline local backend (Parakeet-TDT-0.6B-v3 via ONNX/sherpa-onnx, with far-end
+speaker diarization). The live join-call → note loop needs a signed `.app` to exercise the macOS
+audio-capture (TCC) grant. Remaining: offline AEC (`corti-aec`). See [`design/STATUS.md`](./design/STATUS.md).

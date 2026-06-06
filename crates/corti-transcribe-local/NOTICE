@@ -1,0 +1,27 @@
+corti-transcribe-local — third-party model & runtime attributions
+==================================================================
+
+This crate runs pre-trained models through the ONNX Runtime via sherpa-onnx. The models are downloaded at
+setup time (see fetch-models.sh) and are not redistributed in this repository. Their licenses require the
+following attributions:
+
+- NVIDIA Parakeet-TDT-0.6B-v3 (speech recognition)
+  © NVIDIA. Licensed under CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).
+  https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+
+- pyannote speaker-segmentation 3.0 (far-end diarization, segmentation stage)
+  © Hervé Bredin / pyannote. Licensed under CC-BY-4.0.
+  https://huggingface.co/pyannote/segmentation-3.0
+
+- 3D-Speaker speaker-embedding model (far-end diarization, embedding stage)
+  © Alibaba DAMO Academy / 3D-Speaker. Licensed under Apache-2.0.
+
+- Silero VAD (voice-activity detection)
+  © Silero Team. Licensed under MIT.
+
+- sherpa-onnx (ONNX inference runtime + bindings)
+  © 2023-2026 Xiaomi Corporation (k2-fsa). Licensed under Apache-2.0.
+  https://github.com/k2-fsa/sherpa-onnx
+
+CC-BY-4.0 permits commercial use with attribution; this NOTICE satisfies that requirement. Verify the exact
+checkpoint license at integration time, as upstream terms can change.

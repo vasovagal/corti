@@ -1,0 +1,27 @@
+[package]
+name = "corti-transcribe-local"
+description = "Local on-device backend for corti: fully offline, Apple-Silicon transcription (Parakeet-TDT via ONNX)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-core = { workspace = true }
+corti-transcribe = { workspace = true }
+anyhow = { workspace = true }
+
+# ONNX runtime + models: ASR (Parakeet-TDT transducer), Silero VAD, pyannote speaker diarization — all
+# ONNX, one runtime. `static` (default) downloads a prebuilt osx-arm64 lib at first build; set
+# SHERPA_ONNX_LIB_DIR for hermetic/offline builds. See design/adr/0003-local-asr-sherpa-onnx.md.
+sherpa-onnx = "1.13"
+
+# Read the 2-track float WAV (ch0 = mic, ch1 = system tap) that corti-capture writes.
+hound = "3.5"
+# Default model cache under ~/Library/Caches/corti/models/ (guardrail #5: outside any vault).
+dirs = "6"
+
+[dev-dependencies]
+# The transcribe_file example builds a RecordingMeta, which carries chrono timestamps.
+chrono = { workspace = true }

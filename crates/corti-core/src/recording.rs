@@ -56,7 +56,7 @@ pub enum JobStatus {
     Recording,
     /// Capture finished; audio on disk, not yet handed to a transcription backend.
     PendingTranscription,
-    /// Transcription backend is working (e.g. AWS job running, or local whisper in progress).
+    /// Transcription backend is working (e.g. AWS job running, or local Parakeet/ONNX in progress).
     Transcribing,
     /// Transcript ready; about to be filed into vagus.
     PendingNote,
