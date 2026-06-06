@@ -38,6 +38,77 @@ pub fn recording_stem(app: &corti_core::OwningApp, now: chrono::DateTime<chrono:
     format!("{}-{slug}", now.format("%Y%m%d-%H%M%S"))
 }
 
+/// The cleaned-recording sibling of a raw recording: `<dir>/<stem>.wav` → `<dir>/<stem>-clean.wav`.
+/// Shared by [`write_clean_wav`] and the pipeline's prune step so both agree on the path.
+pub fn clean_wav_path(raw: &Path) -> PathBuf {
+    let stem = raw
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".to_string());
+    raw.with_file_name(format!("{stem}-clean.wav"))
+}
+
+/// Read the raw 2-track recording, cancel speaker bleed on ch0 (mic) using ch1 (far-end tap) as the
+/// reference, and write the cleaned 2-track WAV (ch0 = cleaned mic, ch1 = **raw** tap, preserved). Returns
+/// the clean path.
+///
+/// Errors if the input isn't 2-channel (e.g. a tap-only/listen-only recording has nothing to cancel) — the
+/// caller is expected to fall back to the raw recording. The raw file is only read, never modified, so the
+/// originals are always preserved (design/04-corti-aec.md invariant).
+pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<PathBuf> {
+    let mut reader = hound::WavReader::open(raw_2track_wav)
+        .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
+    let spec = reader.spec();
+    if spec.channels != 2 {
+        anyhow::bail!(
+            "expected a 2-channel recording for AEC, got {} channel(s)",
+            spec.channels
+        );
+    }
+
+    // Read interleaved samples as f32, tolerating Float and Int (mirrors corti-transcribe-aws::wav).
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .context("reading float samples")?,
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<Result<_, _>>()
+                .context("reading int samples")?
+        }
+    };
+    let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
+    let tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+
+    let clean = corti_aec::cancel(
+        &mic,
+        &tap,
+        spec.sample_rate,
+        &corti_aec::AecConfig::default(),
+    );
+
+    let out = clean_wav_path(raw_2track_wav);
+    let out_spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&out, out_spec)
+        .with_context(|| format!("creating {}", out.display()))?;
+    let frames = mic.len().max(tap.len());
+    for i in 0..frames {
+        w.write_sample(clean.get(i).copied().unwrap_or(0.0))?; // ch0 = cleaned mic
+        w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = raw tap (preserved)
+    }
+    w.finalize()?;
+    Ok(out)
+}
+
 #[cfg(target_os = "macos")]
 pub use platform::{Recorder, write_two_track_wav};
 
@@ -148,5 +219,60 @@ mod tests {
             PathBuf::from("/tmp/corti-test-recordings")
         );
         unsafe { std::env::remove_var("CORTI_RECORDINGS_DIR") };
+    }
+
+    #[test]
+    fn clean_wav_path_is_a_clean_sibling() {
+        assert_eq!(
+            clean_wav_path(Path::new(
+                "/cache/corti/recordings/20260605-140500-zoom.wav"
+            )),
+            PathBuf::from("/cache/corti/recordings/20260605-140500-zoom-clean.wav")
+        );
+    }
+
+    #[test]
+    fn write_clean_wav_preserves_tap_and_layout() {
+        let dir = std::env::temp_dir().join("corti-clean-wav-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("rec.wav");
+
+        // Synthetic 2-track float WAV: ch0 = mic, ch1 = tap. A few hundred frames so the (single-block)
+        // AEC has something to chew on; exact values don't matter — we assert structure + tap preservation.
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let frames = 512usize;
+        let tap_in: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let mic_in: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.02).cos() * 0.2).collect();
+        {
+            let mut w = hound::WavWriter::create(&raw, spec).unwrap();
+            for i in 0..frames {
+                w.write_sample(mic_in[i]).unwrap(); // ch0 = me
+                w.write_sample(tap_in[i]).unwrap(); // ch1 = them
+            }
+            w.finalize().unwrap();
+        }
+
+        let clean_path = write_clean_wav(&raw).unwrap();
+        assert_eq!(clean_path, clean_wav_path(&raw));
+
+        let mut r = hound::WavReader::open(&clean_path).unwrap();
+        let got = r.spec();
+        assert_eq!(got.channels, 2);
+        assert_eq!(got.sample_rate, 48_000);
+        assert_eq!(got.bits_per_sample, 32);
+        assert_eq!(got.sample_format, hound::SampleFormat::Float);
+
+        let out: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(out.len(), frames * 2, "same frame count, 2 channels");
+        // ch1 (the tap) must be bit-identical to the input tap — AEC never touches the far-end track.
+        let tap_out: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(tap_out, tap_in, "raw far-end tap must be preserved exactly");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

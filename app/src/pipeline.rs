@@ -47,6 +47,8 @@ struct Ctx {
     /// then fail filing with a clear message rather than blocking the whole pipeline at startup.
     vagus: Result<Vagus, String>,
     backend: Backend,
+    /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
+    aec_enabled: bool,
     app: AppHandle,
 }
 
@@ -66,10 +68,13 @@ pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
         eprintln!("[corti] vagus not available — notes can't be filed: {e}");
     }
 
+    // Capture the AEC toggle before `Backend::init` consumes `cfg`.
+    let aec_enabled = cfg.aec_enabled;
     let ctx = Ctx {
         queue,
         vagus,
         backend: Backend::init(cfg),
+        aec_enabled,
         app,
     };
 
@@ -154,7 +159,22 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
         format!("Transcribing — {}…", meta.owning_app.name),
     );
 
-    let transcript = match ctx.backend.transcribe(id, audio, meta) {
+    // Clean speaker bleed on disk before transcription (backend-agnostic). The raw 2-track WAV is never
+    // touched; on any AEC error (e.g. a tap-only recording) we fall back to the raw mic so the pipeline
+    // never stalls. Regenerating the clean WAV on resume is an idempotent, cheap overwrite.
+    let input: PathBuf = if ctx.aec_enabled {
+        match corti_capture::write_clean_wav(audio) {
+            Ok(clean) => clean,
+            Err(e) => {
+                eprintln!("[corti] AEC skipped ({e:#}); using raw mic");
+                audio.to_path_buf()
+            }
+        }
+    } else {
+        audio.to_path_buf()
+    };
+
+    let transcript = match ctx.backend.transcribe(id, &input, meta) {
         Ok(t) => t,
         Err(e) => {
             fail(ctx, id, meta, format!("transcription failed: {e:#}"));
@@ -249,6 +269,7 @@ fn prune(ctx: &Ctx) {
             for p in &paths {
                 let _ = std::fs::remove_file(p);
                 let _ = std::fs::remove_file(sidecar_path(p));
+                let _ = std::fs::remove_file(corti_capture::clean_wav_path(p));
             }
             if !paths.is_empty() {
                 eprintln!("[corti] pruned {} old recording(s)", paths.len());
