@@ -11,8 +11,9 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
 4. **Capture is CoreAudio (process tap + aggregate device)**; ScreenCaptureKit is a fallback only. (ADR 0002)
 5. **Audio and other large/derived artifacts live outside any vault** — recordings under
    `~/Library/Caches/corti/`, job state under `~/.local/share/corti/`. Never in `~/brain`.
-6. **Transcription backends are pluggable and feature-gated** (`aws`, `whisper`) behind a single
-   `Transcriber` trait, so the rest of the pipeline is backend-agnostic.
+6. **Transcription backends are pluggable** behind a single `Transcriber` trait, so the rest of the
+   pipeline is backend-agnostic. The `aws` and `local` features compile independently (both can be on at
+   once) and the active backend is chosen at **runtime** (`CORTI_TRANSCRIBE_BACKEND`). (ADR 0003)
 7. **The pipeline is crash-recoverable.** A recording's progress is persisted (`corti-queue`) so a crash
    mid-upload/transcribe/file resumes rather than loses the note.
 8. **Attribution is best-effort and must never block capture.** Prefer a known conferencing app; skip

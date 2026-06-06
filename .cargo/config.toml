@@ -1,0 +1,11 @@
+# Apple Silicon only, tuned for the author's M1 Pro daily driver (ADR 0002 policy, ADR 0003 build knobs).
+#
+# `target-cpu=apple-m1` is the forward-compatible baseline: M2/M3/M4 are supersets, so the binary still
+# runs on any Apple Silicon while getting native NEON/AMX-class codegen and best battery/speed. This is the
+# single knob to relax if non-M-series Macs ever matter (use `native` for personal dev-only builds).
+
+[build]
+target = "aarch64-apple-darwin"
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]

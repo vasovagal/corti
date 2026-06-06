@@ -27,8 +27,9 @@ bottom for what shipped, how to run, and how to bundle. The live join-call → n
 
 ## Crate
 Binary crate at `app/` (new workspace member; add to root `Cargo.toml` `members`, set `publish = false`).
-Heavy deps (tauri, the aws/whisper backends) live here, keeping the library crates lean. Apple-Silicon +
-latest-macOS only. Backend chosen by Cargo features: `default = ["aws"]`, `whisper` opt-in.
+Heavy deps (tauri, the aws/local backends) live here, keeping the library crates lean. Apple-Silicon +
+latest-macOS only. `aws` + `local` features compile together (shipped `--features aws,local`); the active
+backend is chosen at **runtime** via `CORTI_TRANSCRIBE_BACKEND` (default `aws`). See ADR 0003.
 
 ## Depends on
 All library crates: corti-core, corti-coreaudio, corti-capture, corti-detect, corti-transcribe(+backend),
@@ -172,9 +173,10 @@ Crate `app/` = package `corti-app`, binary `corti` (`publish = false`). Layout:
 - `src/pipeline.rs` — the single `Queue`-owning worker: crash recovery (`resumable()`) + `prune_done`, then
   serial `enqueue → store stable transcribe_job + Transcribing → transcribe (blocking) → write transcript
   sidecar → set PendingNote → file via vagus → note_path → Done`. Errors → `queue.fail` + tray status.
-- `src/transcribe.rs` — feature-flavored backend (`Backend::transcribe`); AWS builds `SdkConfig` once and
-  passes the recording id as the stable `AwsOptions.job_name`.
-- `src/config.rs` — env config (`CORTI_AWS_BUCKET`, `CORTI_LANGUAGE`, `CORTI_WHISPER_MODEL`).
+- `src/transcribe.rs` — runtime backend dispatch (`Backend::transcribe` matches a `BackendKind`); AWS
+  builds `SdkConfig` once and passes the recording id as the stable `AwsOptions.job_name`.
+- `src/config.rs` — env config (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`, `CORTI_LANGUAGE`,
+  `CORTI_LOCAL_MODEL_DIR`, `CORTI_LOCAL_PROVIDER`, `CORTI_LOCAL_THREADS`).
 - `src/permissions.rs` — startup mic check via `tauri-plugin-macos-permissions` (host-side, no JS); only
   *requests* when running bundled (calling `request_microphone_permission` unbundled crashes — no plist).
 - `Info.plist` (auto-merged: `LSUIElement`, `NSAudioCaptureUsageDescription`, `NSMicrophoneUsageDescription`),

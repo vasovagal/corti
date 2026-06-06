@@ -43,10 +43,12 @@ corti-transcribe-aws = { workspace = true, optional = true }
 aws-config = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
 
-# Local whisper backend (opt-in; the crate is a stub today — see design/02-corti-transcribe.md).
-corti-transcribe-whisper = { workspace = true, optional = true }
+# Local on-device backend (opt-in). Parakeet-TDT via sherpa-onnx — see design/02-corti-transcribe.md and
+# design/adr/0003-local-asr-sherpa-onnx.md. Independent of `aws`: both can be compiled in and the active
+# backend is chosen at runtime (CORTI_TRANSCRIBE_BACKEND).
+corti-transcribe-local = { workspace = true, optional = true }
 
 [features]
 default = ["aws"]
 aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
-whisper = ["dep:corti-transcribe-whisper"]
+local = ["dep:corti-transcribe-local"]

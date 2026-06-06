@@ -73,14 +73,33 @@ match.
 **Cost + privacy:** audio leaves the device; `delete_after` defaults on (staged `.wav` + `.json` removed
 when the job completes). A bucket lifecycle TTL on the `corti/` prefix is a sensible backstop.
 
-## corti-transcribe-whisper (feature `whisper`, offline flavor)
-Local `whisper-rs`. Fully offline — matches vagus's ethos and avoids per-minute cost. Weak/no diarization,
-so lean on the 2-track split (transcribe ch0 and ch1 separately, then interleave segments by time). Model
-file cached under `~/Library/Caches/corti/models/`.
+## corti-transcribe-local (feature `local`, offline flavor)
+Fully offline, on-device, Apple-Silicon transcription. Fully offline — matches vagus's ethos and avoids
+per-minute cost + PHI egress. Engine: **NVIDIA Parakeet-TDT-0.6B-v3** (ONNX) via the official
+`sherpa-onnx` Rust crate (CPU provider by default; `coreml` opt-in). A transducer, so far less
+hallucination-prone than Whisper. See `design/adr/0003-local-asr-sherpa-onnx.md`.
+
+Pipeline (`crates/corti-transcribe-local/`): read the 2-track float WAV (`audio.rs`) → per channel,
+resample to 16 kHz and run **Silero VAD** to chunk into speech regions (also sidesteps Parakeet's ~30 s
+offline clip limit), decode each region with Parakeet, and reassemble token timestamps into words
+(`engine.rs`). ch0 (mic) → `Speaker::Me`. ch1 (system tap) is additionally **diarized**
+(pyannote-segmentation-3.0 + 3D-Speaker embedding, ONNX) so far-end words are attributed to
+`Them 1/2/…`. All shaping (pause-split grouping, speaker merge, diarization attribution) is the shared
+`corti_transcribe::segment` module — the same helpers the AWS parser uses. Models cache under
+`~/Library/Caches/corti/models/` (fetch once with `crates/corti-transcribe-local/fetch-models.sh`); a
+missing model fails the job with a clear, actionable error.
+
+Out of scope here (tracked as `Feature` issues): echo/cross-talk cancellation (assume headphones), live
+streaming, validating the `coreml` provider, in-app model download, English speaker-embedding tuning.
 
 ## Feature wiring (in the app)
-`default = ["aws"]`; `whisper` opt-in. The app picks an impl at startup based on enabled features / config.
+`default = ["aws"]`; the shipped app builds `--features aws,local`. Both backends compile in and the
+active one is chosen **at runtime** (`CORTI_TRANSCRIBE_BACKEND` = `aws` | `local`, default `aws`) behind
+the single `Transcriber` trait — `app/src/transcribe.rs` dispatches on a runtime `BackendKind` (no
+compile-time exclusivity). The local backend reads `CORTI_LOCAL_MODEL_DIR` / `CORTI_LOCAL_PROVIDER` /
+`CORTI_LOCAL_THREADS`. A Tauri settings screen to toggle this live is a planned `Feature`.
 
 ## Depends on
-`corti-core` (DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment). The renderer is already in
-core; backends only produce the struct.
+`corti-core` (DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment) and
+`corti-transcribe::segment` (shared word→segment helpers). The renderer is already in core; backends only
+produce the struct.

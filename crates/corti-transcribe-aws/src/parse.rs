@@ -14,12 +14,9 @@
 //! This module is pure (no AWS, no IO) so the join logic is unit-tested against canned JSON.
 
 use anyhow::{Context, Result};
-use corti_core::{DiarizedTranscript, Speaker, TranscriptSegment};
+use corti_core::{DiarizedTranscript, Speaker};
+use corti_transcribe::segment::{SEGMENT_GAP, Word, merge_by_time, words_to_segments};
 use serde::Deserialize;
-
-/// Start a new segment when the gap between consecutive words in a channel exceeds this (seconds), so a
-/// channel's stream is broken into readable utterances rather than one run-on blob.
-const SEGMENT_GAP: f64 = 1.5;
 
 // ---- AWS Transcribe result JSON (only the fields we use) ----
 
@@ -74,26 +71,27 @@ pub fn parse_channel_transcript(json: &str) -> Result<DiarizedTranscript> {
         .context("transcript JSON has no channel_labels (was channel identification enabled?)")?
         .channels;
 
-    let mut segments: Vec<TranscriptSegment> = Vec::new();
+    let mut segments = Vec::new();
     for channel in &channels {
-        segments.extend(items_to_segments(
-            &channel.items,
+        let words = items_to_words(&channel.items);
+        segments.extend(words_to_segments(
+            &words,
             speaker_for(&channel.channel_label),
+            SEGMENT_GAP,
         ));
     }
-    // Interleave both channels into one timeline. `total_cmp` keeps it panic-free on any odd NaN.
-    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-    Ok(DiarizedTranscript::new(segments))
+    // Interleave both channels into one timeline.
+    Ok(DiarizedTranscript::new(merge_by_time(segments)))
 }
 
 /// Parse a plain (non-channel-identification) transcript JSON — a tap-only / mono recording — into a
 /// [`DiarizedTranscript`] with every utterance attributed to the far-end ("Them") track.
 pub fn parse_single_channel_transcript(json: &str) -> Result<DiarizedTranscript> {
     let root: Root = serde_json::from_str(json).context("parsing AWS Transcribe result JSON")?;
-    let mut segments = items_to_segments(&root.results.items, Speaker::Other("Them".to_string()));
+    let words = items_to_words(&root.results.items);
+    let segments = words_to_segments(&words, Speaker::Other("Them".to_string()), SEGMENT_GAP);
     // Items are already time-ordered, but sort defensively to match the channel path.
-    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-    Ok(DiarizedTranscript::new(segments))
+    Ok(DiarizedTranscript::new(merge_by_time(segments)))
 }
 
 /// Map a channel label to its speaker: `ch_0` is the near-end mic (me); any other channel is the far end.
@@ -105,12 +103,12 @@ fn speaker_for(channel_label: &str) -> Speaker {
     }
 }
 
-/// Group a stream of word items into segments for one `speaker`, splitting on a pause longer than
-/// [`SEGMENT_GAP`]. Punctuation items (no timestamps) glue onto the current word with no leading space.
-/// Shared by the channel-identified path (one call per channel) and the single-channel path.
-fn items_to_segments(items: &[Item], speaker: Speaker) -> Vec<TranscriptSegment> {
-    let mut out: Vec<TranscriptSegment> = Vec::new();
-    let mut cur: Option<TranscriptSegment> = None;
+/// Convert a channel's word/punctuation items into timestamped [`Word`]s. Punctuation items (no
+/// timestamps) glue onto the preceding word with no leading space; a leading punctuation with no word to
+/// attach to is dropped; pronunciation items without timestamps are skipped. The shared
+/// [`words_to_segments`] then groups these into pause-split segments (keeping the historical behaviour).
+fn items_to_words(items: &[Item]) -> Vec<Word> {
+    let mut out: Vec<Word> = Vec::new();
 
     for item in items {
         let content = match item.alternatives.first() {
@@ -119,9 +117,9 @@ fn items_to_segments(items: &[Item], speaker: Speaker) -> Vec<TranscriptSegment>
         };
 
         if item.kind == "punctuation" {
-            // Attach to the current segment; drop a leading punctuation with no word to attach to.
-            if let Some(seg) = cur.as_mut() {
-                seg.text.push_str(content);
+            // Attach to the current word; drop a leading punctuation with no word to attach to.
+            if let Some(w) = out.last_mut() {
+                w.text.push_str(content);
             }
             continue;
         }
@@ -135,27 +133,11 @@ fn items_to_segments(items: &[Item], speaker: Speaker) -> Vec<TranscriptSegment>
             _ => continue,
         };
 
-        match cur.as_mut() {
-            Some(seg) if start - seg.end <= SEGMENT_GAP => {
-                seg.text.push(' ');
-                seg.text.push_str(content);
-                seg.end = end;
-            }
-            _ => {
-                if let Some(seg) = cur.take() {
-                    out.push(seg);
-                }
-                cur = Some(TranscriptSegment {
-                    speaker: speaker.clone(),
-                    start,
-                    end,
-                    text: content.to_string(),
-                });
-            }
-        }
-    }
-    if let Some(seg) = cur.take() {
-        out.push(seg);
+        out.push(Word {
+            start,
+            end,
+            text: content.to_string(),
+        });
     }
     out
 }
