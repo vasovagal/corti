@@ -47,9 +47,11 @@ pub fn resolve_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
     Ok(cache.join("corti").join("models"))
 }
 
-/// Build the [`Models`] paths under `dir` and verify every file exists, with an actionable error naming
-/// the missing files and the fetch script if not.
-pub fn discover(dir: &Path) -> Result<Models> {
+/// Build the [`Models`] paths under `dir` and verify the required files exist, with an actionable error
+/// naming the missing files and the fetch script if not. The segmentation + embedding models are required
+/// only when `need_diarization` is set (far-end speaker splitting); the default path needs just Parakeet +
+/// VAD.
+pub fn discover(dir: &Path, need_diarization: bool) -> Result<Models> {
     let parakeet = dir.join(PARAKEET_DIR);
     let models = Models {
         parakeet_encoder: parakeet.join("encoder.int8.onnx"),
@@ -61,7 +63,11 @@ pub fn discover(dir: &Path) -> Result<Models> {
         vad: dir.join(VAD_FILE),
     };
 
-    let missing: Vec<&Path> = models.all().into_iter().filter(|p| !p.exists()).collect();
+    let missing: Vec<&Path> = models
+        .required(need_diarization)
+        .into_iter()
+        .filter(|p| !p.exists())
+        .collect();
     if !missing.is_empty() {
         let list = missing
             .iter()
@@ -80,15 +86,20 @@ pub fn discover(dir: &Path) -> Result<Models> {
 }
 
 impl Models {
-    fn all(&self) -> Vec<&Path> {
-        vec![
-            &self.parakeet_encoder,
-            &self.parakeet_decoder,
-            &self.parakeet_joiner,
-            &self.parakeet_tokens,
-            &self.segmentation,
-            &self.embedding,
-            &self.vad,
-        ]
+    /// The model files that must exist: always Parakeet + VAD; segmentation + embedding only when far-end
+    /// diarization is enabled.
+    fn required(&self, need_diarization: bool) -> Vec<&Path> {
+        let mut req = vec![
+            self.parakeet_encoder.as_path(),
+            self.parakeet_decoder.as_path(),
+            self.parakeet_joiner.as_path(),
+            self.parakeet_tokens.as_path(),
+            self.vad.as_path(),
+        ];
+        if need_diarization {
+            req.push(self.segmentation.as_path());
+            req.push(self.embedding.as_path());
+        }
+        req
     }
 }

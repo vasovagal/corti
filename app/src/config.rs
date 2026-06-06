@@ -32,6 +32,10 @@ pub struct AppConfig {
     /// ONNX intra-op thread count for the local backend (`CORTI_LOCAL_THREADS`, default 4).
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_threads: i32,
+    /// Split the far-end channel into per-speaker labels with the local backend (`CORTI_LOCAL_DIARIZE`,
+    /// default off — it over-clusters on English audio today; see issue #18). Off ⇒ ch1 → single `Them`.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    pub local_diarize_far_end: bool,
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
@@ -50,6 +54,7 @@ impl AppConfig {
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n > 0)
                 .unwrap_or(4),
+            local_diarize_far_end: env_bool("CORTI_LOCAL_DIARIZE", false),
             aec_enabled: env_bool("CORTI_AEC", true),
         }
     }

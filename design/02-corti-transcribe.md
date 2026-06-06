@@ -82,15 +82,18 @@ hallucination-prone than Whisper. See `design/adr/0003-local-asr-sherpa-onnx.md`
 Pipeline (`crates/corti-transcribe-local/`): read the 2-track float WAV (`audio.rs`) → per channel,
 resample to 16 kHz and run **Silero VAD** to chunk into speech regions (also sidesteps Parakeet's ~30 s
 offline clip limit), decode each region with Parakeet, and reassemble token timestamps into words
-(`engine.rs`). ch0 (mic) → `Speaker::Me`. ch1 (system tap) is additionally **diarized**
-(pyannote-segmentation-3.0 + 3D-Speaker embedding, ONNX) so far-end words are attributed to
-`Them 1/2/…`. All shaping (pause-split grouping, speaker merge, diarization attribution) is the shared
-`corti_transcribe::segment` module — the same helpers the AWS parser uses. Models cache under
-`~/Library/Caches/corti/models/` (fetch once with `crates/corti-transcribe-local/fetch-models.sh`); a
-missing model fails the job with a clear, actionable error.
+(`engine.rs`). ch0 (mic) → `Speaker::Me`; ch1 (system tap) → `Speaker::Other("Them")` by default. Far-end
+speaker splitting (`Them 1/2/…` via pyannote-segmentation-3.0 + 3D-Speaker embedding, ONNX) is **opt-in**
+(`CORTI_LOCAL_DIARIZE=1`) and **off by default** — it over-clusters on English audio today (issue #18); when
+off, the segmentation + embedding models aren't required. All shaping (pause-split grouping, speaker merge,
+diarization attribution) is the shared `corti_transcribe::segment` module — the same helpers the AWS parser
+uses. Models cache under `~/Library/Caches/corti/models/` (fetch once with
+`crates/corti-transcribe-local/fetch-models.sh`); a missing required model fails the job with a clear,
+actionable error.
 
-Out of scope here (tracked as `Feature` issues): echo/cross-talk cancellation (assume headphones), live
-streaming, validating the `coreml` provider, in-app model download, English speaker-embedding tuning.
+Out of scope here (tracked as `Feature`/`Bug Fix` issues): far-end diarization quality (#18, #14, #15),
+echo/cross-talk cancellation (the pipeline AEC-cleans upstream), live streaming, validating the `coreml`
+provider, in-app model download.
 
 ## Feature wiring (in the app)
 `default = ["aws"]`; the shipped app builds `--features aws,local`. Both backends compile in and the
