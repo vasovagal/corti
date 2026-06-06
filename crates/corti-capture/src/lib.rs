@@ -110,7 +110,7 @@ pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-pub use platform::{Recorder, write_two_track_wav};
+pub use platform::{Recorder, write_tap_only_wav, write_two_track_wav};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -143,6 +143,26 @@ mod platform {
             Ok(Self { session, out })
         }
 
+        /// Like [`start`], but **tap-only**: the microphone is never opened (no orange "mic in use" dot, no
+        /// microphone TCC prompt) — only the system-audio tap runs. Pair with [`finish_tap_only`] to write
+        /// the 1-channel WAV. This is the "webinar / listen-only" capture mode.
+        ///
+        /// [`start`]: Recorder::start
+        /// [`finish_tap_only`]: Recorder::finish_tap_only
+        pub fn start_tap_only(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
+            let dir = recordings_dir()?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let stem = recording_stem(app, chrono::Local::now());
+            let out = dir.join(format!("{stem}.wav"));
+            let target = match pid {
+                Some(pid) => TapTarget::Process(pid),
+                None => TapTarget::Global,
+            };
+            let session = CaptureSession::start_tap_only(target)
+                .with_context(|| format!("starting tap-only capture for {}", app.name))?;
+            Ok(Self { session, out })
+        }
+
         /// The path the recording will be written to.
         pub fn output_path(&self) -> &Path {
             &self.out
@@ -151,6 +171,24 @@ mod platform {
         /// Stop capture and write the 2-track WAV. Returns the written path. Errors if no audio was
         /// delivered (e.g. the TCC audio-capture permission is missing).
         pub fn finish(self) -> Result<PathBuf> {
+            let (out, audio) = self.stop_capture()?;
+            write_two_track_wav(&out, &audio)?;
+            Ok(out)
+        }
+
+        /// Stop capture and write a 1-channel WAV containing only the tap (far-end / system audio). Pair
+        /// with [`start_tap_only`] for a true no-mic recording; if paired with [`start`] the mic was opened
+        /// as the clock leader and is simply discarded here.
+        ///
+        /// [`start`]: Recorder::start
+        /// [`start_tap_only`]: Recorder::start_tap_only
+        pub fn finish_tap_only(self) -> Result<PathBuf> {
+            let (out, audio) = self.stop_capture()?;
+            write_tap_only_wav(&out, &audio)?;
+            Ok(out)
+        }
+
+        fn stop_capture(self) -> Result<(PathBuf, CapturedAudio)> {
             let audio = self.session.stop();
             if audio.callbacks == 0 {
                 anyhow::bail!(
@@ -158,9 +196,26 @@ mod platform {
                      is not granted to corti"
                 );
             }
-            write_two_track_wav(&self.out, &audio)?;
-            Ok(self.out)
+            Ok((self.out, audio))
         }
+    }
+
+    /// Write captured audio as a 1-channel float WAV: tap only (far-end / system audio, mono).
+    pub fn write_tap_only_wav(path: &Path, audio: &CapturedAudio) -> Result<()> {
+        let tap = audio.tap_mono();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: audio.sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec)
+            .with_context(|| format!("creating {}", path.display()))?;
+        for &s in &tap {
+            w.write_sample(s)?;
+        }
+        w.finalize()?;
+        Ok(())
     }
 
     /// Write captured audio as a 2-channel float WAV: ch0 = mic (mono), ch1 = far-end tap (mono).

@@ -1143,6 +1143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "corti-tap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aws-config",
+ "chrono",
+ "corti-capture",
+ "corti-core",
+ "corti-transcribe",
+ "corti-transcribe-aws",
+ "corti-vagus",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "corti-transcribe"
 version = "0.1.0"
 dependencies = [

@@ -54,6 +54,22 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )?));
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
 
+    // Manual "Webinar mode" toggle (tap-only, mic never opened). The label reflects whether a webinar is
+    // currently recording.
+    let webinar_label = if crate::imp::webinar_active(app) {
+        "■ Stop webinar recording"
+    } else {
+        "▶ Start webinar recording"
+    };
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        "webinar_toggle",
+        webinar_label,
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+
     // Recent notes (clickable → open in the default markdown app).
     {
         let recent = state.recent.lock().unwrap();
@@ -162,9 +178,14 @@ pub fn spawn_blink(app: AppHandle) {
             let mut shown: Option<bool> = None; // Some(true)=rec icon, Some(false)=idle icon
             loop {
                 std::thread::sleep(Duration::from_millis(500));
+                // Blink while EITHER capture source is live (detector call or manual webinar); they own
+                // independent flags so one ending never stops the blink for the other.
                 let recording = app
                     .try_state::<AppState>()
-                    .map(|s| s.recording.load(Ordering::Relaxed))
+                    .map(|s| {
+                        s.detector_recording.load(Ordering::Relaxed)
+                            || s.webinar_recording.load(Ordering::Relaxed)
+                    })
                     .unwrap_or(false);
                 let want = if recording {
                     phase = !phase;
@@ -193,6 +214,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     match id {
         "quit" => app.exit(0),
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
+        "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
         _ => {
             if let Some(path) = note_path_from_id(id) {
