@@ -10,7 +10,7 @@
 
 use std::os::raw::c_void;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use coreaudio_sys as ca;
 
 use crate::property;
@@ -25,9 +25,8 @@ pub fn default_input_device() -> Result<ca::AudioObjectID> {
     Ok(id)
 }
 
-/// The current default output device, or an error if there is none. Used as the clock anchor for a
-/// tap-only (no-mic) aggregate: an output device gives the aggregate a clock without opening any input, so
-/// there is no orange "mic in use" dot — unlike [`default_input_device`], which the mic+tap path uses.
+/// The current default output device, or an error if there is none. The starting point for
+/// [`tap_only_clock_device`], which the tap-only (no-mic) path uses as its aggregate clock anchor.
 pub fn default_output_device() -> Result<ca::AudioObjectID> {
     let addr = property::global(ca::kAudioHardwarePropertyDefaultOutputDevice);
     let id: ca::AudioObjectID = unsafe { property::get(ca::kAudioObjectSystemObject, &addr)? };
@@ -35,6 +34,73 @@ pub fn default_output_device() -> Result<ca::AudioObjectID> {
         bail!("no default output device");
     }
     Ok(id)
+}
+
+/// The clock anchor for a tap-only (no-mic) aggregate: an **output** device that exposes **no input
+/// streams**. Clocking the aggregate off such a device gives it a tick without ever opening an input — so
+/// no orange "mic in use" dot, no microphone TCC prompt, and no stray input channels folded into the tap.
+///
+/// The default output device is preferred when it is itself input-less (built-in speakers). When the default
+/// output *also* has inputs — AirPods, USB headsets/interfaces, BlackHole/Loopback are one device with both
+/// scopes — using it as the clock would pull its mic into the capture and may light the mic indicator (issue
+/// #4). In that case we fall back to another output-only device, preferring the built-in output.
+///
+/// Errors if no input-less output device exists at all, rather than silently clocking off an input-capable
+/// device: failing the capture is better than breaking the no-mic guarantee.
+pub fn tap_only_clock_device() -> Result<ca::AudioObjectID> {
+    let default_output = default_output_device()?;
+    // Treat an unreadable input scope as "has input" so we never risk an input-capable clock.
+    if !has_streams(default_output, ca::kAudioObjectPropertyScopeInput).unwrap_or(true) {
+        return Ok(default_output);
+    }
+
+    // Default output has inputs; find an output-only device instead, preferring the built-in output.
+    let mut fallback: Option<ca::AudioObjectID> = None;
+    for device in all_devices()? {
+        if device == default_output {
+            continue;
+        }
+        // Must be an output, must have no input.
+        if !has_streams(device, ca::kAudioObjectPropertyScopeOutput).unwrap_or(false) {
+            continue;
+        }
+        if has_streams(device, ca::kAudioObjectPropertyScopeInput).unwrap_or(true) {
+            continue;
+        }
+        if is_built_in(device).unwrap_or(false) {
+            return Ok(device); // built-in output is the safest, most stable clock
+        }
+        fallback.get_or_insert(device);
+    }
+    fallback.ok_or_else(|| {
+        anyhow!("no input-less output device available to clock a tap-only (no-mic) aggregate")
+    })
+}
+
+/// Whether `device` exposes any streams on `scope` (`kAudioObjectPropertyScopeInput` /
+/// `…Output`). An output-only device has zero input streams; AirPods/USB interfaces have both.
+fn has_streams(device: ca::AudioObjectID, scope: u32) -> Result<bool> {
+    let addr = property::address(
+        ca::kAudioDevicePropertyStreams,
+        scope,
+        ca::kAudioObjectPropertyElementMain,
+    );
+    let streams: Vec<ca::AudioObjectID> = unsafe { property::get_vec(device, &addr)? };
+    Ok(!streams.is_empty())
+}
+
+/// Whether `device`'s transport is the built-in audio (internal speakers/mic), as opposed to USB,
+/// Bluetooth, virtual, etc.
+fn is_built_in(device: ca::AudioObjectID) -> Result<bool> {
+    let addr = property::global(ca::kAudioDevicePropertyTransportType);
+    let transport: u32 = unsafe { property::get(device, &addr)? };
+    Ok(transport == ca::kAudioDeviceTransportTypeBuiltIn)
+}
+
+/// Every audio device known to the system.
+fn all_devices() -> Result<Vec<ca::AudioObjectID>> {
+    let addr = property::global(ca::kAudioHardwarePropertyDevices);
+    unsafe { property::get_vec(ca::kAudioObjectSystemObject, &addr) }
 }
 
 /// Whether `device` currently has input IO running somewhere on the system.
