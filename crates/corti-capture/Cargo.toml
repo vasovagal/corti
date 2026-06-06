@@ -9,10 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 corti-core = { workspace = true }
+corti-aec = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 dirs = "6"
+# Cross-platform: the raw 2-track writer (macOS) and the clean-WAV reader/writer both use hound.
+hound = "3.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 corti-coreaudio = { workspace = true }
-hound = "3.5"

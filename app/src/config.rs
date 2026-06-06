@@ -14,6 +14,9 @@ pub struct AppConfig {
     /// Local whisper model path for the `whisper` backend (`CORTI_WHISPER_MODEL`).
     #[cfg_attr(not(feature = "whisper"), allow(dead_code))]
     pub whisper_model: Option<PathBuf>,
+    /// Whether to run offline echo cancellation on speaker recordings before transcription
+    /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
+    pub aec_enabled: bool,
 }
 
 impl AppConfig {
@@ -22,6 +25,7 @@ impl AppConfig {
             aws_bucket: env_non_empty("CORTI_AWS_BUCKET"),
             language: env_non_empty("CORTI_LANGUAGE").unwrap_or_else(|| "en-US".to_string()),
             whisper_model: env_non_empty("CORTI_WHISPER_MODEL").map(PathBuf::from),
+            aec_enabled: env_bool("CORTI_AEC", true),
         }
     }
 
@@ -44,4 +48,16 @@ fn env_non_empty(key: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Read a boolean env var. Unset/empty ⇒ `default`; otherwise anything but `0`/`false`/`off`/`no`
+/// (case-insensitive) is treated as `true`.
+fn env_bool(key: &str, default: bool) -> bool {
+    match env_non_empty(key) {
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => default,
+    }
 }

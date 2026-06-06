@@ -8,6 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Frequency-domain block adaptive filter (overlap-save FDAF) — see design/04-corti-aec.md.
+rustfft = "6"
 
-# When implementing the frequency-domain variant (see design/04-corti-aec.md), optionally add:
-#   rustfft
+[dev-dependencies]
+# The `aec_file` audition example reads/writes WAVs; tests are pure DSP (std only).
+hound = "3.5"
