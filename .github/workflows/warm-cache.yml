@@ -1,0 +1,44 @@
+name: warm-cache
+
+# Seed the RELEASE-profile build cache on the DEFAULT BRANCH. GitHub scopes cache restore to a run's own
+# ref plus the default branch only — a release tag can't see another tag's cache. Without a main-side
+# rel-aarch64-apple-darwin cache, every release.yml tag build recompiles the dependency graph cold
+# (aws-sdk + tauri + webkit + LTO). rust-setup wires sccache, so this warms BOTH the sccache GHA object
+# cache and the rust-cache layer. It publishes nothing (LAWS §3). The paths: gate keeps docs-only pushes
+# from paying for a heavy build.
+#
+# COST NOTE: macOS minutes bill at 10x. This trades minutes on qualifying main pushes for (more) minutes
+# saved at each tag — a net win only if corti is tagged more than rarely. Revisit if release cadence drops.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "app/**"
+      - ".cargo/config.toml"
+      - ".github/actions/rust-setup/**"
+      - ".github/workflows/warm-cache.yml"
+
+concurrency:
+  group: warm-cache
+  cancel-in-progress: true # superseded by a newer main push; this is a cache warm, not a release
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    # Single macos-15 entry (LAWS §1: corti is single-arch). MUST mirror release.yml's build job: same image
+    # + same shared-key, so the cache the tag build restores was produced on an identical platform.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: rel-aarch64-apple-darwin # MUST match release.yml's build job exactly
+      # Warm with the same feature set the release ships (default = aws). A plain release build of the app
+      # crate populates the same target/sccache caches tauri-action's build will later restore.
+      - name: Warm the release build cache
+        run: cargo build --release --locked -p corti-app

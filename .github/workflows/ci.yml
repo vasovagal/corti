@@ -1,0 +1,62 @@
+name: ci
+
+# LAWS §3: the PR gate. Tests run on PRs (and main pushes); tags do NOT re-run this — a tag trusts the
+# green main it was cut from. macOS-only because corti links CoreAudio (corti-coreaudio's bindings don't
+# build elsewhere), so unlike vagus there is no cheap ubuntu lane.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Pin macos-15 (Sequoia, current GA), not macos-14 (deprecated, EOL Nov 2025) and not the moving
+    # macos-latest. The app's minimumSystemVersion 14.2 still builds fine against the 15 SDK.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          components: clippy rustfmt
+          cache-key: ci
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      # Build the frontend FIRST: the app crate's generate_context!() reads tauri.conf.json's frontendDist
+      # (ui/dist), so cargo won't compile the workspace until ui/dist exists. `npm run build` also runs
+      # `tsc --noEmit` (the typecheck); `npm test` runs vitest (app/ui/src/lib/consent.test.ts).
+      - name: Frontend install + build + test
+        working-directory: app/ui
+        run: |
+          npm ci
+          npm run build
+          npm test
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy (default features = aws)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: clippy (all features = aws + local, the dual-backend build)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (default features)
+        run: cargo test --locked
+
+      # The offline-only build path (no aws) must still compile.
+      - name: check (local only, no default features)
+        run: cargo check --locked --no-default-features --features local
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

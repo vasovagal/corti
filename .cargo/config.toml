@@ -6,9 +6,11 @@
 
 [build]
 target = "aarch64-apple-darwin"
-# Reuse cached dependency compiles across git worktrees, so a freshly created worktree doesn't
-# rebuild the ~14G target from scratch. Requires `brew install sccache`. Safe to commit here:
-# corti has no CI and this config is already machine-personal. Inspect with `sccache --show-stats`.
+# Reuse cached dependency compiles across git worktrees (and across CI runs), so a freshly created
+# worktree doesn't rebuild the ~14G target from scratch. Requires sccache on PATH: `brew install sccache`
+# locally; CI installs it via mozilla-actions/sccache-action (see .github/actions/rust-setup) and sets
+# SCCACHE_GHA_ENABLED=true + CARGO_INCREMENTAL=0 so this same wrapper works on the runners (LAWS §8).
+# Inspect with `sccache --show-stats`.
 rustc-wrapper = "sccache"
 
 [target.aarch64-apple-darwin]
