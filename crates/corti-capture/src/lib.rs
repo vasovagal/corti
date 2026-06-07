@@ -112,17 +112,19 @@ pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "macos")]
-pub use platform::{Recorder, write_tap_only_wav, write_two_track_wav};
+pub use platform::Recorder;
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use corti_coreaudio::{CaptureSession, CapturedAudio, TapTarget};
+    use corti_coreaudio::{CaptureSession, OutputLayout, TapTarget};
 
     /// An in-progress recording. Built from the owning app's PID (per-app tap, falling back to a global tap
-    /// inside the engine if the PID can't be resolved); call [`finish`] to stop and write the WAV.
+    /// inside the engine if the PID can't be resolved). The session streams the chosen layout straight to
+    /// disk; call [`finish`] to stop and finalize, or [`discard`] to stop and delete the partial file.
     ///
     /// [`finish`]: Recorder::finish
+    /// [`discard`]: Recorder::discard
     pub struct Recorder {
         session: CaptureSession,
         out: PathBuf,
@@ -140,17 +142,17 @@ mod platform {
                 Some(pid) => TapTarget::Process(pid),
                 None => TapTarget::Global,
             };
-            let session = CaptureSession::start(target)
-                .with_context(|| format!("starting capture for {}", app.name))?;
+            let session =
+                CaptureSession::start_recording(target, out.clone(), OutputLayout::TwoTrack)
+                    .with_context(|| format!("starting capture for {}", app.name))?;
             Ok(Self { session, out })
         }
 
         /// Like [`start`], but **tap-only**: the microphone is never opened (no orange "mic in use" dot, no
-        /// microphone TCC prompt) — only the system-audio tap runs. Pair with [`finish_tap_only`] to write
-        /// the 1-channel WAV. This is the "webinar / listen-only" capture mode.
+        /// microphone TCC prompt) — only the system-audio tap runs, streamed as a 1-channel WAV. This is the
+        /// "webinar / listen-only" capture mode.
         ///
         /// [`start`]: Recorder::start
-        /// [`finish_tap_only`]: Recorder::finish_tap_only
         pub fn start_tap_only(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
             let dir = recordings_dir()?;
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -160,8 +162,9 @@ mod platform {
                 Some(pid) => TapTarget::Process(pid),
                 None => TapTarget::Global,
             };
-            let session = CaptureSession::start_tap_only(target)
-                .with_context(|| format!("starting tap-only capture for {}", app.name))?;
+            let session =
+                CaptureSession::start_tap_only_recording(target, out.clone(), OutputLayout::TapOnlyMono)
+                    .with_context(|| format!("starting tap-only capture for {}", app.name))?;
             Ok(Self { session, out })
         }
 
@@ -170,75 +173,56 @@ mod platform {
             &self.out
         }
 
-        /// Stop capture and write the 2-track WAV. Returns the written path. Errors if no audio was
-        /// delivered (e.g. the TCC audio-capture permission is missing).
-        pub fn finish(self) -> Result<PathBuf> {
-            let (out, audio) = self.stop_capture()?;
-            write_two_track_wav(&out, &audio)?;
-            Ok(out)
-        }
-
-        /// Stop capture and write a 1-channel WAV containing only the tap (far-end / system audio). Pair
-        /// with [`start_tap_only`] for a true no-mic recording; if paired with [`start`] the mic was opened
-        /// as the clock leader and is simply discarded here.
+        /// Stop capture and finalize the streamed WAV (2-track for [`start`], 1-track for
+        /// [`start_tap_only`] — the layout was fixed at start). Returns the written path. Errors if no audio
+        /// was delivered (e.g. the TCC audio-capture permission is missing).
         ///
         /// [`start`]: Recorder::start
         /// [`start_tap_only`]: Recorder::start_tap_only
-        pub fn finish_tap_only(self) -> Result<PathBuf> {
-            let (out, audio) = self.stop_capture()?;
-            write_tap_only_wav(&out, &audio)?;
-            Ok(out)
+        pub fn finish(self) -> Result<PathBuf> {
+            self.stop_capture()
         }
 
-        fn stop_capture(self) -> Result<(PathBuf, CapturedAudio)> {
-            let audio = self.session.stop();
-            if audio.callbacks == 0 {
+        /// Alias of [`finish`] retained for callers that paired it with [`start_tap_only`]; the on-disk
+        /// layout is fixed at start, so this finalizes whatever was being streamed.
+        ///
+        /// [`finish`]: Recorder::finish
+        /// [`start_tap_only`]: Recorder::start_tap_only
+        pub fn finish_tap_only(self) -> Result<PathBuf> {
+            self.stop_capture()
+        }
+
+        /// Stop capture and **delete** the streamed file — for a recording the user chose not to keep. The
+        /// writer has already streamed a partial WAV to disk, so unlike the old buffer-then-write model this
+        /// must remove it explicitly.
+        pub fn discard(self) {
+            let _ = self.session.stop(); // finalize the partial file (best-effort)
+            let _ = std::fs::remove_file(&self.out);
+        }
+
+        fn stop_capture(self) -> Result<PathBuf> {
+            let handle = self.session.stop()?;
+            if handle.callbacks == 0 {
+                let _ = std::fs::remove_file(&self.out); // no file should exist, but be tidy
                 anyhow::bail!(
                     "no audio captured (IO proc never fired) — likely the macOS audio-capture permission \
                      is not granted to corti"
                 );
             }
-            Ok((self.out, audio))
+            if handle.frames == 0 {
+                let _ = std::fs::remove_file(&self.out);
+                anyhow::bail!("IO proc fired but produced no audio frames (a format/layout issue)");
+            }
+            if handle.dropped_samples > 0 {
+                eprintln!(
+                    "[corti] WARNING: dropped {} samples during capture (disk too slow / ring overflow) — \
+                     {} may have gaps",
+                    handle.dropped_samples,
+                    self.out.display()
+                );
+            }
+            Ok(self.out)
         }
-    }
-
-    /// Write captured audio as a 1-channel float WAV: tap only (far-end / system audio, mono).
-    pub fn write_tap_only_wav(path: &Path, audio: &CapturedAudio) -> Result<()> {
-        let tap = audio.tap_mono();
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: audio.sample_rate,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut w = hound::WavWriter::create(path, spec)
-            .with_context(|| format!("creating {}", path.display()))?;
-        for &s in &tap {
-            w.write_sample(s)?;
-        }
-        w.finalize()?;
-        Ok(())
-    }
-
-    /// Write captured audio as a 2-channel float WAV: ch0 = mic (mono), ch1 = far-end tap (mono).
-    pub fn write_two_track_wav(path: &Path, audio: &CapturedAudio) -> Result<()> {
-        let mic = audio.mic_mono();
-        let tap = audio.tap_mono();
-        let frames = mic.len().max(tap.len());
-        let spec = hound::WavSpec {
-            channels: 2,
-            sample_rate: audio.sample_rate,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        };
-        let mut w = hound::WavWriter::create(path, spec)
-            .with_context(|| format!("creating {}", path.display()))?;
-        for i in 0..frames {
-            w.write_sample(mic.get(i).copied().unwrap_or(0.0))?; // ch0 = me
-            w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = them
-        }
-        w.finalize()?;
-        Ok(())
     }
 }
 
