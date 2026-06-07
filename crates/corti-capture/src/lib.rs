@@ -162,9 +162,12 @@ mod platform {
                 Some(pid) => TapTarget::Process(pid),
                 None => TapTarget::Global,
             };
-            let session =
-                CaptureSession::start_tap_only_recording(target, out.clone(), OutputLayout::TapOnlyMono)
-                    .with_context(|| format!("starting tap-only capture for {}", app.name))?;
+            let session = CaptureSession::start_tap_only_recording(
+                target,
+                out.clone(),
+                OutputLayout::TapOnlyMono,
+            )
+            .with_context(|| format!("starting tap-only capture for {}", app.name))?;
             Ok(Self { session, out })
         }
 

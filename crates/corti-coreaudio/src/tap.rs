@@ -54,8 +54,11 @@ pub fn run_spike(secs: u64, out: &Path) -> Result<PathBuf> {
 fn capture(secs: u64, out: &Path, log: &mut Log) -> Result<PathBuf> {
     // The spike keeps every captured channel (AllChannels) so each can be auditioned via `splitwav`; the
     // session streams it straight to disk.
-    let session =
-        CaptureSession::start_recording(TapTarget::Global, out.to_path_buf(), OutputLayout::AllChannels)?;
+    let session = CaptureSession::start_recording(
+        TapTarget::Global,
+        out.to_path_buf(),
+        OutputLayout::AllChannels,
+    )?;
     log.line("capture session started (global tap + mic)");
     std::thread::sleep(Duration::from_secs(secs));
     let handle = session.stop()?;

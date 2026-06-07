@@ -49,7 +49,7 @@ mod imp {
     use anyhow::{Context, Result};
     use chrono::{DateTime, Local};
     use corti_capture::Recorder;
-    use corti_core::{OwningApp, RecordingMeta};
+    use corti_core::{JobStatus, OwningApp, RecordingMeta};
     use corti_detect::{Detector, DetectorEvent};
     use tauri::Manager;
 
@@ -57,10 +57,26 @@ mod imp {
     use crate::pipeline::{self, PipelineMsg};
     use crate::{permissions, tray};
 
-    /// One filed note shown in the tray's "Recent notes" section.
-    pub struct RecentNote {
-        pub title: String,
-        pub path: PathBuf,
+    /// One recording shown in the tray's `History ▸` submenu. Unlike the old `Done`-only "Recent notes"
+    /// list this tracks a recording from the moment it starts (`Recording`) through every pipeline
+    /// transition, so in-flight and failed recordings appear too (issue #3). The pipeline worker is the
+    /// sole owner of the `Queue`, so the tray never queries it — the worker (and the capture-start sites)
+    /// push/update this snapshot via [`tray::push_history`]/[`tray::update_history`].
+    #[derive(Clone)]
+    pub struct HistoryEntry {
+        /// The queue job id (recording filename stem) — the key for [`tray::update_history`]. Computed at
+        /// capture start from the recorder's output path so it matches the id the queue assigns later.
+        pub id: String,
+        /// Display label (owning-app name / note title).
+        pub label: String,
+        pub started_at: DateTime<Local>,
+        /// `None` while still `Recording`; set once capture finishes.
+        pub ended_at: Option<DateTime<Local>>,
+        pub status: JobStatus,
+        /// Failure message, set alongside `JobStatus::Failed`.
+        pub error: Option<String>,
+        /// Path of the filed vagus note once `Done` — drives click-to-open.
+        pub note_path: Option<PathBuf>,
     }
 
     /// Shared app state (managed singleton). Everything here is read/written from background threads, so it
@@ -74,15 +90,17 @@ mod imp {
         pub webinar_recording: AtomicBool,
         /// The status line shown at the top of the tray menu.
         pub status: Mutex<String>,
-        /// Most-recent filed notes (front = newest), capped at [`RECENT_LIMIT`].
-        pub recent: Mutex<VecDeque<RecentNote>>,
+        /// The most-recent recordings (front = newest), capped at [`HISTORY_LIMIT`] — the `History ▸`
+        /// submenu's source of truth, covering in-flight, failed, and filed recordings (issue #3).
+        pub history: Mutex<VecDeque<HistoryEntry>>,
         /// Static "Backend: …" label.
         pub backend_label: String,
         /// Static "Bucket: …" label (empty when the backend has no bucket).
         pub bucket_label: String,
     }
 
-    pub const RECENT_LIMIT: usize = 5;
+    /// How many recordings the `History ▸` submenu shows (newest first).
+    pub const HISTORY_LIMIT: usize = 5;
 
     impl AppState {
         fn new(cfg: &AppConfig) -> Self {
@@ -98,7 +116,7 @@ mod imp {
                 detector_recording: AtomicBool::new(false),
                 webinar_recording: AtomicBool::new(false),
                 status: Mutex::new("Starting…".to_string()),
-                recent: Mutex::new(VecDeque::new()),
+                history: Mutex::new(VecDeque::new()),
                 backend_label: cfg.backend_name().to_string(),
                 bucket_label,
             }
@@ -215,6 +233,7 @@ mod imp {
         match event {
             DetectorEvent::RecordingStarted { meta } => {
                 set_detector_recording(app, true);
+                tray::push_history_recording(app, &meta);
                 tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
             }
             DetectorEvent::RecordingFinished { meta, audio_path } => {
@@ -331,11 +350,22 @@ mod imp {
                 };
                 match Recorder::start_tap_only(&owner, None) {
                     Ok(recorder) => {
+                        // A `Recording` history entry, keyed by the same id the queue will assign once the
+                        // finished webinar is enqueued (`job_id` = recorder output stem), so the worker's
+                        // later `update_history` calls land on this same row.
+                        let started_at = chrono::Local::now();
+                        let meta = RecordingMeta {
+                            started_at,
+                            ended_at: None,
+                            owning_app: owner.clone(),
+                            audio_path: recorder.output_path().to_path_buf(),
+                        };
                         {
                             let mut w = state.lock();
                             w.recorder = Some(recorder);
-                            w.started_at = Some(chrono::Local::now());
+                            w.started_at = Some(started_at);
                         }
+                        tray::push_history_recording(app, &meta);
                         set_webinar_recording(app, true);
                         tray::set_status(app, format!("● Webinar recording — {WEBINAR_NAME}"));
                     }
