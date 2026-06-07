@@ -27,10 +27,15 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Toolchain
+    - name: Toolchain (latest stable)
       shell: bash
       run: |
-        rustup show active-toolchain >/dev/null 2>&1 || rustup toolchain install stable --profile minimal
+        # corti's MSRV (Cargo.toml rust-version) tracks the latest stable, so CI must actually BE on the
+        # latest stable — NOT the runner image's baked-in (often weeks-old) stable. `rustup update stable`
+        # guarantees it; a bare `... || rustup toolchain install stable` would skip the update whenever the
+        # image already had an (older) stable active, which silently fails the MSRV check.
+        rustup update stable --no-self-update
+        rustup default stable
         rustup target add aarch64-apple-darwin
         if [ -n "${{ inputs.components }}" ]; then rustup component add ${{ inputs.components }}; fi
         rustc -V && cargo -V
