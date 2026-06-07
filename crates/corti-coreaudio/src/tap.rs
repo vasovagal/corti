@@ -1,16 +1,17 @@
 //! The capture **spike** binary's logic — the architecture go/no-go (ADR 0002), now a thin driver over the
 //! reusable [`crate::capture`] engine.
 //!
-//! `run_spike` captures all system output (a global tap) plus the default mic for a fixed window and writes
-//! a single multichannel float WAV: the mic channel(s) first, then the tap channel(s). Open it (or split it
-//! with the `splitwav` example) to confirm "me" and "them" land on separate channels and stay in sync.
+//! `run_spike` captures all system output (a global tap) plus the default mic for a fixed window and streams
+//! a single multichannel 16-bit WAV to disk: the mic channel(s) first, then the tap channel(s). Open it (or
+//! split it with the `splitwav` example) to confirm "me" and "them" land on separate channels and stay in
+//! sync.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 
-use crate::capture::{CaptureSession, CapturedAudio, TapTarget};
+use crate::capture::{CaptureSession, OutputLayout, TapTarget};
 
 /// Accumulates diagnostics to stdout AND a sibling `.log` file. The log file is essential because the spike
 /// is launched via `open` (LaunchServices) — the launch path that gives the bundle its own TCC identity —
@@ -51,48 +52,39 @@ pub fn run_spike(secs: u64, out: &Path) -> Result<PathBuf> {
 }
 
 fn capture(secs: u64, out: &Path, log: &mut Log) -> Result<PathBuf> {
-    let session = CaptureSession::start(TapTarget::Global)?;
+    // The spike keeps every captured channel (AllChannels) so each can be auditioned via `splitwav`; the
+    // session streams it straight to disk.
+    let session =
+        CaptureSession::start_recording(TapTarget::Global, out.to_path_buf(), OutputLayout::AllChannels)?;
     log.line("capture session started (global tap + mic)");
     std::thread::sleep(Duration::from_secs(secs));
-    let audio = session.stop();
+    let handle = session.stop()?;
 
     log.line(format!(
         "io proc fired {} times; mic {} ch + tap {} ch = {} ch @ {} Hz; {} frames",
-        audio.callbacks,
-        audio.mic_channels,
-        audio.tap_channels,
-        audio.channels(),
-        audio.sample_rate,
-        audio.frames()
+        handle.callbacks,
+        handle.mic_channels,
+        handle.tap_channels,
+        handle.channels(),
+        handle.sample_rate,
+        handle.frames
     ));
-    if audio.callbacks == 0 {
+    if handle.callbacks == 0 {
         bail!(
             "the IO proc never fired — likely the TCC audio-capture permission: launch the bundle via \
              LaunchServices (`open corti-spike.app --args …`), NOT a loose binary from a shell. See SPIKE.md."
         );
     }
-    if audio.channels() == 0 || audio.samples.is_empty() {
+    if handle.frames == 0 {
         bail!("IO proc fired but produced no samples — a format/layout issue");
     }
+    if handle.dropped_samples > 0 {
+        log.line(format!(
+            "WARNING: dropped {} samples (ring overflow — disk too slow)",
+            handle.dropped_samples
+        ));
+    }
 
-    write_wav(out, &audio)?;
     log.line(format!("wrote {}", out.display()));
     Ok(out.to_path_buf())
-}
-
-/// Write captured audio as an interleaved float WAV.
-pub fn write_wav(path: &Path, audio: &CapturedAudio) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: audio.channels() as u16,
-        sample_rate: audio.sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut w = hound::WavWriter::create(path, spec)
-        .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
-    for &s in &audio.samples {
-        w.write_sample(s)?;
-    }
-    w.finalize()?;
-    Ok(())
 }

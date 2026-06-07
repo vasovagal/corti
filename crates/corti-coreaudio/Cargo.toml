@@ -20,6 +20,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSRunningApplication", "NSWorkspace"] }
 hound = "3.5"
+# Wait-free SPSC ring: the IO proc (real-time HAL thread) pushes captured frames lock-free and
+# allocation-free; a writer thread drains it to disk (guardrail 9). Bounds capture RAM regardless of length.
+rtrb = "0.3"
 
 [dev-dependencies]
 cpal = "0.16"

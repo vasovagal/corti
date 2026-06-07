@@ -215,9 +215,9 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                     return;
                 };
                 if !keep {
-                    // Discard: `finish()` is never called, so no WAV is written. Dropping the recorder
-                    // tears the capture session down cleanly — nothing to clean up.
-                    drop(recorder);
+                    // Discard: the writer has already streamed a partial WAV to disk, so `discard()` stops
+                    // the session and deletes that file (a plain `drop` would leave the partial behind).
+                    recorder.discard();
                     return;
                 }
                 match recorder.finish() {
