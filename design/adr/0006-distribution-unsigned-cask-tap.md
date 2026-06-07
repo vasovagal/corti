@@ -54,9 +54,9 @@ Ship corti **unsigned (ad-hoc)** through a **private Homebrew cask tap** (`vasov
   not a bug.
 - **We deliberately bypass Gatekeeper** via the postflight quarantine strip. This is a real security
   tradeoff and is only acceptable for a tap the author controls.
-- **macOS floor is fuzzy at the Homebrew layer.** `depends_on macos: ">= :sonoma"` (14.x) is coarser than
-  the app's true 14.2 floor, which stays in `Info.plist` (`LSMinimumSystemVersion`); a 14.0/14.1 user could
-  `brew install` but the app would refuse to launch with a clear OS dialog. Benign on Apple Silicon.
+- **macOS floor (latest + one back).** Per ADR 0002 the support floor is `minimumSystemVersion = 15.0`
+  (Sequoia); the cask's per-major `depends_on macos: ">= :sequoia"` (15.x) lines up exactly, so there is no
+  install-vs-launch gap. Tightening to latest-only would be `15.0`→`26.0` and `:sequoia`→`:tahoe`.
 
 ## Upgrade trigger (when to notarize)
 

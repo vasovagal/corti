@@ -42,10 +42,10 @@ cask "corti" do
   desc "Menu-bar app that auto-records meetings and files transcript notes to vagus"
   homepage "https://github.com/${REPO}"
 
-  # Apple Silicon only, latest macOS only. The app's minimumSystemVersion is 14.2; Homebrew's macOS gate
-  # is per-major, so ">= :sonoma" (14.x) is the closest expressible floor — the real 14.2 floor stays in
-  # the bundle's LSMinimumSystemVersion (see the tap README / ADR 0006).
-  depends_on macos: ">= :sonoma"
+  # Apple Silicon only; support latest macOS + one back (ADR 0002). minimumSystemVersion is 15.0, so the
+  # per-major Homebrew gate ">= :sequoia" (15.x) lines up exactly with the bundle's LSMinimumSystemVersion
+  # (see the tap README / ADR 0006).
+  depends_on macos: ">= :sequoia"
   depends_on arch: :arm64
 
   app "Corti.app"
