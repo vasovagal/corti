@@ -38,7 +38,7 @@ runs:
     - name: Install sccache
       uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       with:
-        version: "v0.10.0"
+        version: "v0.15.0"
 
     - name: Enable sccache (GHA backend) for cargo
       shell: bash
