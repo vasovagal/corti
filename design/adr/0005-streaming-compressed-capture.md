@@ -1,4 +1,4 @@
-# ADR 0004 — Streaming compressed capture: bounded-RAM disk writer; keep AEC offline
+# ADR 0005 — Streaming compressed capture: bounded-RAM disk writer; keep AEC offline
 
 - **Status:** Proposed (2026-06-07)
 
