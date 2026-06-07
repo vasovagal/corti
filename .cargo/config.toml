@@ -6,6 +6,10 @@
 
 [build]
 target = "aarch64-apple-darwin"
+# Reuse cached dependency compiles across git worktrees, so a freshly created worktree doesn't
+# rebuild the ~14G target from scratch. Requires `brew install sccache`. Safe to commit here:
+# corti has no CI and this config is already machine-personal. Inspect with `sccache --show-stats`.
+rustc-wrapper = "sccache"
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1"]
