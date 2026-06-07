@@ -16,10 +16,13 @@ fn main() -> anyhow::Result<()> {
     let device = host
         .default_input_device()
         .ok_or_else(|| anyhow::anyhow!("no default input device"))?;
-    println!("opening mic: {}", device.name().unwrap_or_default());
+    // cpal 0.18 deprecated/removed `Device::name()`; `Device` now implements `Display`, so the
+    // human-readable device name is just its `{}` representation.
+    println!("opening mic: {device}");
     let config = device.default_input_config()?;
     let stream = device.build_input_stream_raw(
-        &config.config(),
+        // cpal 0.18: `build_*_stream` take `StreamConfig` by value (it is now `Copy`), not `&`.
+        config.config(),
         config.sample_format(),
         move |_data, _info: &cpal::InputCallbackInfo| {},
         move |err| eprintln!("stream error: {err}"),
