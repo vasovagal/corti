@@ -276,8 +276,9 @@ CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
 ";
 
 /// The job id for a recording: its filename stem (already unique + stable), falling back to the start
-/// time if the path somehow has no stem.
-fn job_id(meta: &RecordingMeta) -> String {
+/// time if the path somehow has no stem. Public so callers (the tray) can key a pre-enqueue history
+/// entry by the same id the queue will assign on [`enqueue`](Queue::enqueue).
+pub fn job_id(meta: &RecordingMeta) -> String {
     meta.audio_path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())

@@ -25,6 +25,7 @@ use corti_vagus::Vagus;
 use tauri::AppHandle;
 
 use crate::config::AppConfig;
+use crate::imp::{HISTORY_LIMIT, HistoryEntry};
 use crate::transcribe::Backend;
 use crate::tray;
 
@@ -78,6 +79,7 @@ pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
         app,
     };
 
+    seed_history(&ctx);
     recover(&ctx);
     prune(&ctx);
     tray::set_status(&ctx.app, "Idle — waiting for a call".to_string());
@@ -85,13 +87,58 @@ pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
     for msg in rx {
         match msg {
             PipelineMsg::Process { meta, audio_path } => match ctx.queue.enqueue(&meta) {
-                Ok(id) => transcribe_and_file(&ctx, &id, &meta, &audio_path),
+                Ok(id) => {
+                    // The capture-start site already pushed a `Recording` entry (keyed by this same id);
+                    // advance it to `Queued` and stamp the now-known end time before transcribing.
+                    tray::update_history(
+                        &ctx.app,
+                        &id,
+                        JobStatus::PendingTranscription,
+                        meta.ended_at,
+                        None,
+                        None,
+                    );
+                    transcribe_and_file(&ctx, &id, &meta, &audio_path);
+                }
                 Err(e) => {
                     eprintln!("[corti] enqueue failed for {}: {e:#}", audio_path.display());
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
         }
+    }
+}
+
+/// Seed the tray's `History ▸` submenu with the most recent recordings from the durable queue, so the
+/// history survives a restart (issue #3). Best-effort: a read failure just leaves the history empty until
+/// the next live recording. Runs on the worker thread (the sole `Queue` owner), never the UI loop.
+fn seed_history(ctx: &Ctx) {
+    let jobs = match ctx.queue.all() {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[corti] could not read recordings for tray history: {e:#}");
+            return;
+        }
+    };
+    // `all()` is oldest-first; take the newest HISTORY_LIMIT and push oldest→newest so the front ends up
+    // being the most recent (push_history prepends).
+    for job in jobs.iter().rev().take(HISTORY_LIMIT).rev() {
+        tray::push_history(&ctx.app, history_entry_from_job(job));
+    }
+}
+
+/// Build a tray [`HistoryEntry`] from a durable [`Job`] row (for startup seeding / resume). The capture
+/// mode is re-derived from the persisted owning-app signals via `meta()` — no new column (issue #28).
+fn history_entry_from_job(job: &Job) -> HistoryEntry {
+    HistoryEntry {
+        id: job.id.clone(),
+        label: job.owning_app.clone(),
+        started_at: job.started_at,
+        ended_at: job.ended_at,
+        status: job.status,
+        mode: job.meta().mode(),
+        error: job.error.clone(),
+        note_path: job.note_path.clone(),
     }
 }
 
@@ -122,7 +169,16 @@ fn resume(ctx: &Ctx, job: Job) {
     match job.status {
         JobStatus::Recording => {
             // A capture orphaned by the crash; no recorder survives (no partial WAV). Nothing to salvage.
-            let _ = ctx.queue.fail(&job.id, "recording interrupted by shutdown");
+            let msg = "recording interrupted by shutdown";
+            let _ = ctx.queue.fail(&job.id, msg);
+            tray::update_history(
+                &ctx.app,
+                &job.id,
+                JobStatus::Failed,
+                None,
+                Some(msg.to_string()),
+                None,
+            );
         }
         JobStatus::PendingTranscription | JobStatus::Transcribing => {
             transcribe_and_file(ctx, &job.id, &meta, &job.audio_path);
@@ -158,6 +214,7 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
         &ctx.app,
         format!("Transcribing — {}…", meta.owning_app.name),
     );
+    tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
     // Clean speaker bleed on disk before transcription (backend-agnostic). The raw recording is never
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
@@ -202,6 +259,7 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
         fail(ctx, id, meta, format!("queue set PendingNote: {e:#}"));
         return;
     }
+    tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
     file_and_done(ctx, id, meta, &transcript, &sidecar);
 }
 
@@ -262,7 +320,14 @@ fn file_and_done(
     let _ = std::fs::remove_file(sidecar); // transcript is safely in the note now
 
     let title = meta.note_title();
-    tray::push_recent(&ctx.app, title.clone(), note);
+    tray::update_history(
+        &ctx.app,
+        id,
+        JobStatus::Done,
+        None,
+        None,
+        Some(note.clone()),
+    );
     tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
 }
 
@@ -285,10 +350,18 @@ fn prune(ctx: &Ctx) {
     }
 }
 
-/// Fail a job and surface it in the tray.
+/// Fail a job and surface it in the tray (both the status line and its history entry).
 fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
     eprintln!("[corti] job {id} failed: {msg}");
     let _ = ctx.queue.fail(id, &msg);
+    tray::update_history(
+        &ctx.app,
+        id,
+        JobStatus::Failed,
+        None,
+        Some(msg.clone()),
+        None,
+    );
     tray::set_status(&ctx.app, format!("⚠ {} — {msg}", meta.owning_app.name));
 }
 

@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::OwningApp;
 
+/// The friendly app name a manual "webinar" (tap-only, listen-only) capture is recorded under. The tray
+/// toggle sets `OwningApp { bundle_id: None, name: WEBINAR_NAME }`, which is the signal [`RecordingMode`]
+/// derives from — no new persisted state. Kept here (not in the app) so both the producer and the
+/// mode-deriving consumer agree on the exact string.
+pub const WEBINAR_NAME: &str = "Webinar";
+
+/// How a recording was captured. Derived from signals already on [`RecordingMeta`] (no new persisted
+/// state — see issue #28): the manual webinar path records under [`WEBINAR_NAME`] with no bundle id, while
+/// every detector-triggered (mic-in-use) capture and every two-way tap carries a real owning app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingMode {
+    /// A two-way call: the detector saw the mic go live for a real app (mic + tap captured).
+    Call,
+    /// A listen-only "webinar": the manual tap-only path (no mic opened).
+    Webinar,
+}
+
 /// Metadata for one recording, captured by the detector and carried through the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingMeta {
@@ -21,14 +39,26 @@ pub struct RecordingMeta {
 }
 
 impl RecordingMeta {
-    /// A default note title from the owning app and start time, e.g. `Zoom call — 2026-05-29 14:05`.
-    /// When the app has no bundle id (manual/force-tap recordings), "call" is omitted:
-    /// `System audio — 2026-05-29 14:05`.
-    pub fn note_title(&self) -> String {
-        let suffix = if self.owning_app.bundle_id.is_some() {
-            " call"
+    /// The capture mode, derived from existing signals (no new persisted state; see issue #28). A manual
+    /// webinar is recorded under [`WEBINAR_NAME`] with no bundle id; everything else (detector calls, taps
+    /// attributed to a real app, even "Unknown app") is a two-way [`Call`](RecordingMode::Call).
+    pub fn mode(&self) -> RecordingMode {
+        if self.owning_app.bundle_id.is_none() && self.owning_app.name == WEBINAR_NAME {
+            RecordingMode::Webinar
         } else {
-            ""
+            RecordingMode::Call
+        }
+    }
+
+    /// A default note title from the owning app and start time, styled by [`mode`](RecordingMeta::mode):
+    /// a call reads `Zoom call — 2026-05-29 14:05`; a listen-only capture reads `Webinar — 2026-05-29 14:05`
+    /// (no " call" suffix). An attributed-but-unknown app keeps its name without the suffix too.
+    pub fn note_title(&self) -> String {
+        let suffix = match self.mode() {
+            // A real, recognized conferencing app reads best as "<App> call"; anonymous/unknown captures
+            // (no bundle id) drop the suffix so we never write "Unknown app call" / "Webinar call".
+            RecordingMode::Call if self.owning_app.bundle_id.is_some() => " call",
+            RecordingMode::Call | RecordingMode::Webinar => "",
         };
         format!(
             "{}{suffix} — {}",
@@ -100,6 +130,29 @@ mod tests {
         let mut m = sample();
         m.owning_app = OwningApp::unknown();
         assert_eq!(m.note_title(), "Unknown app — 2026-05-29 14:05");
+    }
+
+    #[test]
+    fn mode_is_call_for_attributed_recordings() {
+        // A detected call (real bundle id).
+        assert_eq!(sample().mode(), RecordingMode::Call);
+        // Attribution failed but it's still a mic-triggered call, not a webinar.
+        let mut unknown = sample();
+        unknown.owning_app = OwningApp::unknown();
+        assert_eq!(unknown.mode(), RecordingMode::Call);
+    }
+
+    #[test]
+    fn mode_is_webinar_for_the_tap_only_path() {
+        let mut m = sample();
+        m.owning_app = OwningApp {
+            bundle_id: None,
+            name: WEBINAR_NAME.to_string(),
+        };
+        assert_eq!(m.mode(), RecordingMode::Webinar);
+        // A webinar's title drops the " call" suffix and keeps the WEBINAR_NAME.
+        assert_eq!(m.note_title(), "Webinar — 2026-05-29 14:05");
+        assert_eq!(m.source(), "Webinar · 2026-05-29 14:05");
     }
 
     #[test]

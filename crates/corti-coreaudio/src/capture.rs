@@ -141,7 +141,7 @@ impl CapturedAudio {
     /// Frame count (samples / channels), 0 if no channels.
     pub fn frames(&self) -> usize {
         let ch = self.channels() as usize;
-        if ch == 0 { 0 } else { self.samples.len() / ch }
+        self.samples.len().checked_div(ch).unwrap_or(0)
     }
     /// The mic channels mixed down to mono (averaged).
     pub fn mic_mono(&self) -> Vec<f32> {
@@ -492,7 +492,9 @@ unsafe extern "C" fn io_proc(
             unsafe { chunk.commit_all() };
         }
         Err(_) => {
-            cap.shared.dropped.fetch_add(needed as u64, Ordering::Relaxed);
+            cap.shared
+                .dropped
+                .fetch_add(needed as u64, Ordering::Relaxed);
         }
     }
     0
@@ -853,7 +855,14 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("two-track.wav");
-        let n = run_writer(consumer, shared, out.clone(), OutputLayout::TwoTrack, 48_000).unwrap();
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+        )
+        .unwrap();
         assert_eq!(n, 3, "three output frames");
 
         let mut r = hound::WavReader::open(&out).unwrap();
@@ -899,8 +908,14 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-tap-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("tap.wav");
-        let n =
-            run_writer(consumer, shared, out.clone(), OutputLayout::TapOnlyMono, 48_000).unwrap();
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TapOnlyMono,
+            48_000,
+        )
+        .unwrap();
         assert_eq!(n, 2);
 
         let mut r = hound::WavReader::open(&out).unwrap();
@@ -927,7 +942,14 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-empty-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("none.wav");
-        let n = run_writer(consumer, shared, out.clone(), OutputLayout::TwoTrack, 48_000).unwrap();
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+        )
+        .unwrap();
         assert_eq!(n, 0);
         assert!(!out.exists(), "no audio ⇒ no file");
 
