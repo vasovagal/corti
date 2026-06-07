@@ -18,7 +18,7 @@ inputs:
   cache-key:
     description: >
       Stable cache segment, passed to rust-cache as shared-key (not key). rust-cache's default key embeds
-      ${{ github.job }}; using shared-key drops that segment so any job with the same value restores one
+      github.job; using shared-key drops that segment so any job with the same value restores one
       shared cache — that's how warm-cache (on main) and the release build job share a single
       rel-aarch64-apple-darwin cache. Use the same value everywhere they must collide.
     required: false
