@@ -8,7 +8,7 @@
 //! through `coreaudio-sys` — `AudioHardwareCreateProcessTap`/`Destroy` and the `CATapDescription`
 //! Objective-C class — are declared here directly.
 //!
-//! **Streaming, bounded-RAM capture (ADR 0004).** The IO proc never accumulates the recording in memory: it
+//! **Streaming, bounded-RAM capture (ADR 0005).** The IO proc never accumulates the recording in memory: it
 //! pushes interleaved frames into a pre-allocated, wait-free SPSC ring (lock-free, allocation-free — what
 //! guardrail 9 requires), and a dedicated writer thread drains the ring and encodes the WAV **incrementally**
 //! to disk. Peak RAM is `O(ring capacity)`, independent of call length, so an all-day recording no longer
