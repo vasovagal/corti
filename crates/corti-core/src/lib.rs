@@ -9,5 +9,5 @@ mod recording;
 mod transcript;
 
 pub use app::{OwningApp, is_known_conferencing_app};
-pub use recording::{JobStatus, RecordingMeta};
+pub use recording::{JobStatus, RecordingMeta, RecordingMode, WEBINAR_NAME};
 pub use transcript::{DiarizedTranscript, Speaker, TranscriptSegment};

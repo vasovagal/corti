@@ -49,7 +49,7 @@ mod imp {
     use anyhow::{Context, Result};
     use chrono::{DateTime, Local};
     use corti_capture::Recorder;
-    use corti_core::{JobStatus, OwningApp, RecordingMeta};
+    use corti_core::{JobStatus, OwningApp, RecordingMeta, RecordingMode, WEBINAR_NAME};
     use corti_detect::{Detector, DetectorEvent};
     use tauri::Manager;
 
@@ -73,6 +73,9 @@ mod imp {
         /// `None` while still `Recording`; set once capture finishes.
         pub ended_at: Option<DateTime<Local>>,
         pub status: JobStatus,
+        /// How the recording was captured (call vs. webinar), derived from existing signals (issue #28).
+        /// Surfaced as a compact tag on the history line.
+        pub mode: RecordingMode,
         /// Failure message, set alongside `JobStatus::Failed`.
         pub error: Option<String>,
         /// Path of the filed vagus note once `Done` — drives click-to-open.
@@ -160,8 +163,8 @@ mod imp {
         }
     }
 
-    /// Label/owner for a manual webinar recording. `bundle_id: None` ⇒ `note_title` omits " call".
-    const WEBINAR_NAME: &str = "Webinar";
+    // The manual webinar's owning-app name (`corti_core::WEBINAR_NAME`) is the single signal `RecordingMeta::mode`
+    // derives the webinar/call distinction from — kept in corti-core so the producer here and the consumer agree.
 
     pub fn run_app() -> Result<()> {
         let cfg = AppConfig::load();

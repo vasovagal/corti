@@ -127,7 +127,8 @@ fn seed_history(ctx: &Ctx) {
     }
 }
 
-/// Build a tray [`HistoryEntry`] from a durable [`Job`] row (for startup seeding / resume).
+/// Build a tray [`HistoryEntry`] from a durable [`Job`] row (for startup seeding / resume). The capture
+/// mode is re-derived from the persisted owning-app signals via `meta()` — no new column (issue #28).
 fn history_entry_from_job(job: &Job) -> HistoryEntry {
     HistoryEntry {
         id: job.id.clone(),
@@ -135,6 +136,7 @@ fn history_entry_from_job(job: &Job) -> HistoryEntry {
         started_at: job.started_at,
         ended_at: job.ended_at,
         status: job.status,
+        mode: job.meta().mode(),
         error: job.error.clone(),
         note_path: job.note_path.clone(),
     }

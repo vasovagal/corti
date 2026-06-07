@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{DateTime, Local};
-use corti_core::JobStatus;
+use corti_core::{JobStatus, RecordingMode};
 use tauri::image::Image;
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
@@ -164,6 +164,7 @@ pub fn push_history_recording(app: &AppHandle, meta: &corti_core::RecordingMeta)
         started_at: meta.started_at,
         ended_at: meta.ended_at,
         status: JobStatus::Recording,
+        mode: meta.mode(),
         error: None,
         note_path: None,
     };
@@ -340,15 +341,27 @@ fn revert_activation_policy_if_no_windows(app: &AppHandle) {
     });
 }
 
-/// One compact `History ▸` line: `<app> · <relative time> · <HH:MM:SS> · <state>` (issue #3).
+/// One compact `History ▸` line: `<app><mode tag> · <relative time> · <HH:MM:SS> · <state>`. The mode tag
+/// marks listen-only "webinar" captures so they're distinguishable from two-way calls at a glance, without
+/// reading logs (issue #28). Calls carry no tag (the common case stays uncluttered).
 fn history_entry_label(entry: &HistoryEntry, now: DateTime<Local>) -> String {
     format!(
-        "{} · {} · {} · {}",
+        "{}{} · {} · {} · {}",
         entry.label,
+        mode_tag(entry.mode),
         relative_time(entry, now),
         format_duration(entry, now),
         status_label(entry),
     )
+}
+
+/// A compact tag appended to a history line's app name to mark the capture mode. A two-way call is the
+/// default and shows nothing; a listen-only webinar gets a `🎧 webinar` marker (issue #28).
+fn mode_tag(mode: RecordingMode) -> &'static str {
+    match mode {
+        RecordingMode::Call => "",
+        RecordingMode::Webinar => " 🎧 webinar",
+    }
 }
 
 /// How long ago a recording happened, relative to `now`: `recording now` while live, then
@@ -435,12 +448,12 @@ fn open_url(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTE_PREFIX, format_duration, history_entry_label, note_menu_id, note_path_from_id,
-        relative_time, status_label,
+        NOTE_PREFIX, format_duration, history_entry_label, mode_tag, note_menu_id,
+        note_path_from_id, relative_time, status_label,
     };
     use crate::imp::HistoryEntry;
     use chrono::{DateTime, Duration, Local, TimeZone};
-    use corti_core::JobStatus;
+    use corti_core::{JobStatus, RecordingMode};
     use std::path::Path;
 
     #[test]
@@ -477,6 +490,7 @@ mod tests {
             started_at: now() - started_ago,
             ended_at: ended_ago.map(|d| now() - d),
             status,
+            mode: RecordingMode::Call,
             error: None,
             note_path: None,
         }
@@ -575,6 +589,24 @@ mod tests {
         assert_eq!(
             history_entry_label(&e, now()),
             "Zoom · 5 min ago · 00:30:00 · Transcribed"
+        );
+    }
+
+    #[test]
+    fn webinar_mode_tags_the_label_while_calls_stay_bare() {
+        assert_eq!(mode_tag(RecordingMode::Call), "");
+        assert_eq!(mode_tag(RecordingMode::Webinar), " 🎧 webinar");
+
+        // A webinar capture gets the tag between the app name and the relative time (issue #28).
+        let mut w = entry(
+            JobStatus::Done,
+            Duration::minutes(35),
+            Some(Duration::minutes(5)),
+        );
+        w.mode = RecordingMode::Webinar;
+        assert_eq!(
+            history_entry_label(&w, now()),
+            "Zoom 🎧 webinar · 5 min ago · 00:30:00 · Transcribed"
         );
     }
 }
