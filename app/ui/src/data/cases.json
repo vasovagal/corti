@@ -1,0 +1,62 @@
+[
+  {
+    "id": "katz",
+    "shortName": "Katz v. United States",
+    "citation": "389 U.S. 347 (1967)",
+    "year": 1967,
+    "court": "U.S. Supreme Court",
+    "holding": "The Fourth Amendment protects people, not places: a person has a 'reasonable expectation of privacy' even in a public phone booth.",
+    "whyItMatters": "Created the reasonable-expectation-of-privacy test that underlies which conversations count as 'private' (and thus protected) in most all-party recording statutes.",
+    "doctrineTags": ["reasonable expectation of privacy", "Fourth Amendment"]
+  },
+  {
+    "id": "smith",
+    "shortName": "Smith v. Maryland",
+    "citation": "442 U.S. 735 (1979)",
+    "year": 1979,
+    "court": "U.S. Supreme Court",
+    "holding": "No reasonable expectation of privacy in information voluntarily shared with a third party (the numbers you dial), so a pen register was not a 'search'.",
+    "whyItMatters": "The 'third-party doctrine' — once you share information with someone, your privacy interest weakens. Relevant to how courts treat metadata and shared communications.",
+    "doctrineTags": ["third-party doctrine", "Fourth Amendment"]
+  },
+  {
+    "id": "bartnicki",
+    "shortName": "Bartnicki v. Vopper",
+    "citation": "532 U.S. 514 (2001)",
+    "year": 2001,
+    "court": "U.S. Supreme Court",
+    "holding": "The First Amendment protects publishing a recording of a matter of public concern even when someone else illegally intercepted it, where the publisher was not involved in the illegal recording.",
+    "whyItMatters": "Distinguishes the act of recording (which can be illegal) from publishing its contents (which can be protected) — a key line for journalists and leakers, not a license to record.",
+    "doctrineTags": ["First Amendment", "publication"]
+  },
+  {
+    "id": "glik",
+    "shortName": "Glik v. Cunniffe",
+    "citation": "655 F.3d 78 (1st Cir. 2011)",
+    "year": 2011,
+    "court": "U.S. Court of Appeals (1st Cir.)",
+    "holding": "Citizens have a First Amendment right to openly record police officers performing their duties in public.",
+    "whyItMatters": "Carves out a narrow public-interest exception: recording public officials in public is generally protected — but this does not extend to private meetings or calls.",
+    "doctrineTags": ["First Amendment", "right to record police"]
+  },
+  {
+    "id": "carpenter",
+    "shortName": "Carpenter v. United States",
+    "citation": "585 U.S. ___ (2018)",
+    "year": 2018,
+    "court": "U.S. Supreme Court",
+    "holding": "Accessing historical cell-site location information is a Fourth Amendment search requiring a warrant, limiting the third-party doctrine for sensitive digital data.",
+    "whyItMatters": "Signals that courts are reining in the third-party doctrine as technology makes pervasive tracking and aggregation possible — the backdrop for modern always-on recording tools.",
+    "doctrineTags": ["Fourth Amendment", "digital privacy", "location data"]
+  },
+  {
+    "id": "kearney",
+    "shortName": "Kearney v. Salomon Smith Barney",
+    "citation": "39 Cal. 4th 95 (2006)",
+    "year": 2006,
+    "court": "California Supreme Court",
+    "holding": "California's all-party consent law can apply to protect a California resident even when the recording party is in a one-party-consent state (Georgia).",
+    "whyItMatters": "The leading reason a cross-state recorder cannot rely on their own state's one-party rule: a stricter state's law may apply to protect its resident. Default to all-party on interstate calls.",
+    "doctrineTags": ["conflict of laws", "all-party consent", "cross-border"]
+  }
+]

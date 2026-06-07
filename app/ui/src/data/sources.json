@@ -1,0 +1,86 @@
+[
+  {
+    "id": "rcfp",
+    "title": "Reporters Committee for Freedom of the Press — Reporter's Recording Guide (50-state)",
+    "url": "https://www.rcfp.org/reporters-recording-guide/",
+    "category": "US law"
+  },
+  {
+    "id": "justia-50",
+    "title": "Justia — Recording Phone Calls and Conversations 50-State Survey",
+    "url": "https://www.justia.com/50-state-surveys/recording-phone-calls-and-conversations/",
+    "category": "US law"
+  },
+  {
+    "id": "mwl",
+    "title": "Matthiesen, Wickert & Lehrer — Recording Conversations in All 50 States (chart)",
+    "url": "https://www.mwl-law.com/wp-content/uploads/2018/02/RECORDING-CONVERSATIONS-CHART.pdf",
+    "category": "US law"
+  },
+  {
+    "id": "dmlp",
+    "title": "Digital Media Law Project — Recording Phone Calls and Conversations",
+    "url": "https://www.dmlp.org/legal-guide/recording-phone-calls-and-conversations",
+    "category": "US law"
+  },
+  {
+    "id": "ecpa",
+    "title": "18 U.S.C. § 2511 — Wiretap Act (ECPA)",
+    "url": "https://www.law.cornell.edu/uscode/text/18/2511",
+    "category": "US law"
+  },
+  {
+    "id": "oyez",
+    "title": "Oyez — U.S. Supreme Court case summaries (Katz, Smith, Bartnicki, Carpenter)",
+    "url": "https://www.oyez.org/",
+    "category": "US law"
+  },
+  {
+    "id": "gdpr",
+    "title": "GDPR — Regulation (EU) 2016/679 (full text)",
+    "url": "https://gdpr-info.eu/",
+    "category": "International"
+  },
+  {
+    "id": "cnil",
+    "title": "CNIL — France's data protection authority (guidance)",
+    "url": "https://www.cnil.fr/en",
+    "category": "International"
+  },
+  {
+    "id": "ico",
+    "title": "ICO — UK Information Commissioner's Office (guidance)",
+    "url": "https://ico.org.uk/",
+    "category": "International"
+  },
+  {
+    "id": "dlapiper",
+    "title": "DLA Piper — Data Protection Laws of the World",
+    "url": "https://www.dlapiperdataprotection.com/",
+    "category": "International"
+  },
+  {
+    "id": "bipa",
+    "title": "Illinois Biometric Information Privacy Act — 740 ILCS 14",
+    "url": "https://www.ilga.gov/legislation/ilcs/ilcs3.asp?ActID=3004",
+    "category": "Biometrics"
+  },
+  {
+    "id": "whitman",
+    "title": "James Q. Whitman — The Two Western Cultures of Privacy (Yale Law Journal)",
+    "url": "https://www.yalelawjournal.org/article/the-two-western-cultures-of-privacy-dignity-versus-liberty",
+    "category": "Culture"
+  },
+  {
+    "id": "nissenbaum",
+    "title": "Helen Nissenbaum — Privacy as Contextual Integrity",
+    "url": "https://nissenbaum.tech.cornell.edu/papers/washingtonlawreview.pdf",
+    "category": "Ethics"
+  },
+  {
+    "id": "pew",
+    "title": "Pew Research Center — Americans and Privacy / Attitudes",
+    "url": "https://www.pewresearch.org/internet/2019/11/15/americans-and-privacy-concerned-confused-and-feeling-lack-of-control-over-their-personal-information/",
+    "category": "Culture"
+  }
+]

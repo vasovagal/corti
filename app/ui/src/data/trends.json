@@ -1,0 +1,29 @@
+[
+  {
+    "id": "ai-assistants",
+    "name": "Always-on AI meeting assistants & 'consent-by-bot'",
+    "category": "AI transcription",
+    "summary": "Notetaker bots and built-in meeting AI now join calls and transcribe by default. A bot announcing itself, or a meeting platform's 'recording' banner, is increasingly treated as the consent mechanism — but whether that satisfies all-party consent (especially for participants who never affirmatively agreed) is unsettled.",
+    "examples": ["Otter.ai", "Zoom AI Companion", "Recall.ai bots", "Google Meet / Teams transcription"],
+    "governingTheories": ["Federal Wiretap Act § 2511", "state all-party consent", "CIPA § 631/632"],
+    "status": "active"
+  },
+  {
+    "id": "cipa-wave",
+    "name": "CIPA § 631 session-replay & chatbot wiretap class actions",
+    "category": "Session replay / chatbot",
+    "summary": "A large wave of California class actions argues that website session-replay scripts and third-party chatbot vendors 'wiretap' visitors in real time without consent under the California Invasion of Privacy Act. Courts are split on motions to dismiss, and the theory keeps extending to new technologies.",
+    "examples": ["Session-replay analytics scripts", "Third-party customer-service chatbots", "Embedded marketing trackers"],
+    "governingTheories": ["CIPA § 631", "CIPA § 632.7", "CIPA § 638.51 (pen register)"],
+    "status": "split"
+  },
+  {
+    "id": "right-to-record",
+    "name": "Body cameras & the right to record",
+    "category": "Right to record",
+    "summary": "Body-worn cameras are now standard for police, and courts broadly recognize a First Amendment right to openly record officers in public. This sits in tension with all-party consent statutes, several of which have been held unconstitutional as applied to recording public officials.",
+    "examples": ["Police body cameras", "Bystander phone recording of officers", "Bodycam public-records disputes"],
+    "governingTheories": ["First Amendment", "state all-party consent (as-applied limits)"],
+    "status": "active"
+  }
+]

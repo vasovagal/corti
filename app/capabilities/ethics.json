@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ethics-window",
+  "description": "Static informational Ethics & Legality guide window. No custom commands; core defaults only.",
+  "platforms": ["macOS"],
+  "windows": ["ethics"],
+  "permissions": ["core:default"]
+}

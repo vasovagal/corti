@@ -181,8 +181,13 @@ Crate `app/` = package `corti-app`, binary `corti` (`publish = false`). Layout:
   *requests* when running bundled (calling `request_microphone_permission` unbundled crashes — no plist).
 - `Info.plist` (auto-merged: `LSUIElement`, `NSAudioCaptureUsageDescription`, `NSMicrophoneUsageDescription`),
   `Entitlements.plist` (`device.audio-input` + `device.microphone`), `icons/` (tray + bundle set,
-  regenerable via `icons/generate-icons.py` + `cargo tauri icon`), `tauri.conf.json` (windowless: no
-  `frontendDist`, `app.windows: []`).
+  regenerable via `icons/generate-icons.py` + `cargo tauri icon`), `tauri.conf.json`.
+  - **Windowless at startup, but no longer windowless-only (ADR 0004).** The tray/pipeline still launch
+    with `app.windows: []` and `ActivationPolicy::Accessory` (no Dock icon). On-demand *informational*
+    webview windows are now permitted: the tray's "Ethics & Legality Guide…" creates a `WebviewWindow` at
+    runtime (React/Vite frontend under `app/ui/`, wired via `frontendDist`/`devUrl`), flipping to
+    `ActivationPolicy::Regular` while open and back to `Accessory` once the last window closes. A frontend
+    toolchain (Node/Vite) is therefore now a build dependency — see ADR 0004.
 
 Deliberate v1 choices:
 - **AEC skipped** (the §"AEC" note's "skip for v1" branch): the raw 2-track WAV goes straight to the backend.
