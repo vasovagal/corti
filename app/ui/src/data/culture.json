@@ -1,0 +1,40 @@
+{
+  "corePrinciple": "Consent is not comfort. People can legally agree to be recorded and still feel exposed, guarded, or disrespected. Norms about recording differ sharply by country, relationship, and setting — and they often run stricter than the law.",
+  "chillingEffect": "Being recorded changes behavior. People hedge, perform, or fall silent when they know their words are being captured — the 'chilling effect'. A recorder that makes a conversation safer to remember can also make it less honest. Weigh that cost, especially in candid or creative settings.",
+  "profiles": [
+    {
+      "id": "us",
+      "region": "United States",
+      "orientation": "Liberty-based",
+      "comfortDelta": "medium",
+      "summary": "Americans generally accept recording when told, framing privacy as freedom from government and corporate intrusion. Yet surveys (e.g. Pew Research) show widespread unease and a sense that surveillance is inescapable — permission is given but comfort lags.",
+      "keyConcepts": ["notice and choice", "surveillance fatigue", "freedom from intrusion"],
+      "drivers": "A constitutional, liberty-centric tradition: privacy as protection against the state, less as a dignity interest between private parties."
+    },
+    {
+      "id": "europe",
+      "region": "Europe",
+      "orientation": "Dignity-based",
+      "comfortDelta": "high",
+      "summary": "Europeans treat privacy as a matter of personal dignity and informational self-determination, not just freedom from the state. Recording someone without clear consent feels like a dignity violation, and people expect transparency and control over their data.",
+      "keyConcepts": ["dignity", "informational self-determination", "Datenschutz", "data protection"],
+      "drivers": "Historical memory of state surveillance (Gestapo, Stasi) and a rights tradition that, per James Q. Whitman's 'The Two Western Cultures of Privacy', centers dignity rather than liberty."
+    },
+    {
+      "id": "japan-east-asia",
+      "region": "Japan & East Asia",
+      "orientation": "Harmony / contextual",
+      "comfortDelta": "high",
+      "summary": "Even where secret recording is legal (as in Japan), strong norms of group harmony and not causing 'meiwaku' (trouble for others) make overt recording socially fraught. Privacy is contextual and relational; reticence is the default.",
+      "keyConcepts": ["wa (harmony)", "meiwaku (avoiding nuisance)", "contextual reticence", "face"],
+      "drivers": "Collectivist, harmony-oriented social norms where the group's comfort and saving face outweigh an individual's legal right to record."
+    }
+  ],
+  "etiquette": [
+    "Announce the recording out loud at the start — don't rely on a buried banner or an assumption.",
+    "State the purpose and who will see the transcript; let people opt out without friction.",
+    "Be more cautious cross-culturally: when in doubt, follow the stricter norm, not the local legal minimum.",
+    "Mind hierarchy: a subordinate, patient, or guest may feel unable to object — make declining genuinely safe.",
+    "Re-confirm if anything sensitive comes up, and offer to pause or delete; comfort can change mid-conversation."
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "systems": [
+    {
+      "name": "Legality",
+      "definition": "What the law permits or forbids. Set by statutes, regulations, and courts; varies by jurisdiction and is enforced by the state. The floor, not the ceiling."
+    },
+    {
+      "name": "Ethics",
+      "definition": "Agreed, often professional, norms of right conduct — what a thoughtful community expects of you (e.g. a clinician's duty of confidentiality). Broader than law and frequently stricter."
+    },
+    {
+      "name": "Morality",
+      "definition": "Your own and society's sense of right and wrong — conscience, fairness, respect for others. The deepest layer; it asks not 'can I?' but 'should I?'."
+    }
+  ],
+  "coreMessage": "Legal does not mean ethical. A recording can be perfectly lawful and still be a betrayal of someone's trust. Before you record, ask whether the people speaking would feel respected — not just whether a statute allows it.",
+  "lenses": [
+    {
+      "id": "consequentialism",
+      "name": "Consequentialism",
+      "question": "Do the outcomes of recording do more good than harm, for everyone affected?",
+      "appliedToRecording": "Weigh the benefit (a faithful record, accessibility, accountability) against harms (chilled candor, leaked sensitive content, broken trust). If the likely harm outweighs the benefit, reconsider."
+    },
+    {
+      "id": "deontology",
+      "name": "Deontology (duties & rights)",
+      "question": "Are you respecting people's rights and your duties, regardless of outcome?",
+      "appliedToRecording": "People have a right to know they are being recorded and to decline. Recording someone secretly treats them as a means, not an end — even if the result is useful."
+    },
+    {
+      "id": "virtue",
+      "name": "Virtue ethics",
+      "question": "Would an honest, trustworthy person record this, this way?",
+      "appliedToRecording": "Ask what recording says about your character. Openness and candor build trust; covert capture, even when legal, erodes it."
+    },
+    {
+      "id": "contextual-integrity",
+      "name": "Contextual integrity (Nissenbaum)",
+      "question": "Does this recording fit the information norms of the context it happens in?",
+      "appliedToRecording": "Privacy is appropriate information flow. Words shared in confidence in therapy, a support group, or among friends carry an expectation that they stay there. Capturing or repurposing them violates the context even if no law is broken."
+    }
+  ],
+  "contextualIntegrity": "Helen Nissenbaum's framework treats privacy not as secrecy but as the appropriate flow of information within a context. Every setting — a doctor's office, a team standup, a kitchen-table chat — has entrenched norms about who hears what, and on what terms (in confidence, off the record, just between us). A recording can be legal yet still breach those norms by widening the audience, making the ephemeral permanent, or shifting words from 'in confidence' to 'shareable'. Use it as a practical test: would this recording, and what you plan to do with it, surprise or dismay the people who spoke?",
+  "scenarios": [
+    {
+      "id": "therapy",
+      "title": "Secretly recording a therapy or medical conversation",
+      "legalStatus": "depends",
+      "ethicalStatus": "inappropriate",
+      "whyLegal": "In a one-party-consent state, a patient recording their own session may be lawful.",
+      "whyEthicalProblem": "Health and recovery settings carry the strongest expectation of confidentiality. Covert recording betrays a therapeutic relationship and can deter honest disclosure.",
+      "sensitiveContext": true
+    },
+    {
+      "id": "aa",
+      "title": "Recording a support group (e.g. AA) confession",
+      "legalStatus": "depends",
+      "ethicalStatus": "inappropriate",
+      "whyLegal": "If you are a participant in a one-party state, recording may be legal.",
+      "whyEthicalProblem": "Anonymity and confidentiality are the entire point of the setting. Recording — and the mere risk of it — destroys the safety the group depends on.",
+      "sensitiveContext": true
+    },
+    {
+      "id": "friend-confession",
+      "title": "Recording a friend's vulnerable confession, then sharing it",
+      "legalStatus": "depends",
+      "ethicalStatus": "inappropriate",
+      "whyLegal": "Capturing your own conversation can be lawful; the ethical breach is the use, not just the capture.",
+      "whyEthicalProblem": "The words were shared in confidence between friends. Widening the audience is a contextual-integrity violation and a betrayal of trust, regardless of legality.",
+      "sensitiveContext": true
+    },
+    {
+      "id": "covert-employee",
+      "title": "Covertly recording employees",
+      "legalStatus": "depends",
+      "ethicalStatus": "questionable",
+      "whyLegal": "Some one-party states permit it; many all-party states do not, and labor law may add constraints.",
+      "whyEthicalProblem": "A power imbalance plus secrecy undermines trust and autonomy. Even where legal, covert workplace recording is corrosive; disclosure and policy are the ethical path.",
+      "sensitiveContext": false
+    },
+    {
+      "id": "forum-shopping",
+      "title": "Recording from a one-party state to dodge another party's all-party expectation",
+      "legalStatus": "depends",
+      "ethicalStatus": "questionable",
+      "whyLegal": "You may sit in a one-party state — but the other party's state law (and Kearney-style reasoning) can still apply.",
+      "whyEthicalProblem": "Deliberately exploiting a jurisdictional gap to avoid someone's reasonable expectation of consent is ethically evasive even if it survives a legal challenge.",
+      "sensitiveContext": false
+    },
+    {
+      "id": "secondary-use",
+      "title": "Reusing transcripts for purposes the speaker never imagined",
+      "legalStatus": "likely_legal",
+      "ethicalStatus": "questionable",
+      "whyLegal": "Once lawfully recorded, further use is rarely separately regulated (outside data-protection regimes).",
+      "whyEthicalProblem": "Feeding a candid conversation into AI training, performance reviews, or analytics is a 'secondary use' the speaker never agreed to — a contextual-integrity violation distinct from the recording itself.",
+      "sensitiveContext": false
+    }
+  ],
+  "guidance": [
+    "Default to disclosure: tell people you are recording, and why, at the start.",
+    "Treat sensitive contexts (health, recovery, confession, intimacy, legal jeopardy) as do-not-record-covertly, regardless of the law.",
+    "Separate capture from use: get agreement for both recording AND what you will do with the transcript.",
+    "If someone seems hesitant, offer an unrecorded alternative — consent under pressure is not real consent.",
+    "Ask the contextual-integrity question: would this recording, and your plans for it, surprise the people who spoke?"
+  ]
+}

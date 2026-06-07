@@ -11,7 +11,9 @@ use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{
+    ActivationPolicy, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+};
 
 use crate::imp::{AppState, RECENT_LIMIT, RecentNote};
 use crate::permissions::PRIVACY_SCREEN_CAPTURE;
@@ -114,6 +116,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     }
     items.push(Box::new(MenuItem::with_id(
         app,
+        "ethics_guide",
+        "Ethics & Legality Guide…",
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
         "open_privacy",
         "Open Privacy Settings…",
         true,
@@ -214,6 +223,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     match id {
         "quit" => app.exit(0),
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
+        "ethics_guide" => open_ethics_window(app),
         "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
         _ => {
@@ -222,6 +232,59 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
             }
         }
     }
+}
+
+/// Open (or focus, if already open) the in-app "Ethics & Legality Guide" webview window. This is the
+/// app's only window — the tray/pipeline stay windowless (ADR 0004). Window + AppKit work must run on
+/// the main thread, like every other tray mutation here.
+fn open_ethics_window(app: &AppHandle) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        // Singleton: focus the existing window instead of spawning a second.
+        if let Some(win) = app.get_webview_window("ethics") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+
+        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
+        let _ = app.set_activation_policy(ActivationPolicy::Regular);
+
+        match WebviewWindowBuilder::new(&app, "ethics", WebviewUrl::App("index.html".into()))
+            .title("Ethics & Legality Guide")
+            .inner_size(900.0, 700.0)
+            .min_inner_size(640.0, 480.0)
+            .resizable(true)
+            .build()
+        {
+            Ok(win) => {
+                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
+                let app_for_evt = app.clone();
+                win.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Destroyed) {
+                        revert_activation_policy_if_no_windows(&app_for_evt);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[corti] opening ethics window failed: {e}");
+                // Don't leave a dangling Regular policy with no window.
+                revert_activation_policy_if_no_windows(&app);
+            }
+        }
+    });
+}
+
+/// Return to `Accessory` (menu-bar-only) once no webview windows remain — future-proof against more
+/// informational windows being added later.
+fn revert_activation_policy_if_no_windows(app: &AppHandle) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        if app.webview_windows().is_empty() {
+            let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+        }
+    });
 }
 
 /// The menu id that encodes a recent note's path (`note::/path/to/note.md`).

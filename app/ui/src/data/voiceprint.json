@@ -1,0 +1,44 @@
+{
+  "whatItIs": "A voiceprint is a biometric template — a mathematical model of the unique characteristics of someone's voice that can identify them across recordings. It is fundamentally different from an audio file or a transcript: it identifies WHO is speaking, not just WHAT was said.",
+  "distinction": "Recording and transcribing answer 'may I capture and convert what is said?' Voiceprinting answers 'may I derive a biometric identifier for who is speaking?' The second pulls in dedicated biometric-privacy laws with notice, written-consent, retention, no-sale, and security duties that ordinary recording-consent does not impose. Keep the two concerns separate.",
+  "laws": [
+    {
+      "id": "bipa",
+      "jurisdiction": "Illinois",
+      "law": "Biometric Information Privacy Act (BIPA), 740 ILCS 14",
+      "requirements": "Written notice, a specific purpose and retention term, and a written release BEFORE collecting a voiceprint; a published retention/destruction policy; no sale of biometric data.",
+      "enforcement": "Private right of action with statutory damages ($1,000 negligent / $5,000 reckless per violation). Note the 2024 SB 2979 amendment adopting a single-violation rule.",
+      "notes": "The highest-risk US biometric regime because individuals can sue directly. Drove major voiceprint litigation against drive-thru, banking voice-auth, and call-center systems."
+    },
+    {
+      "id": "cubi",
+      "jurisdiction": "Texas",
+      "law": "Capture or Use of Biometric Identifier Act (CUBI)",
+      "requirements": "Notice and consent before capturing a biometric identifier; retention/destruction duties.",
+      "enforcement": "Attorney General only (no private right of action); civil penalties up to $25,000 per violation.",
+      "notes": "Includes an exemption that has helped financial institutions using voice authentication."
+    },
+    {
+      "id": "wa",
+      "jurisdiction": "Washington",
+      "law": "Wash. Rev. Code 19.375 (biometric identifiers)",
+      "requirements": "Notice/consent or another lawful mechanism before enrolling a biometric identifier in a database for a commercial purpose.",
+      "enforcement": "Attorney General only.",
+      "notes": "Applies primarily when a voiceprint is enrolled into a database, not to mere ephemeral processing."
+    },
+    {
+      "id": "gdpr-art9",
+      "jurisdiction": "EU / UK",
+      "law": "GDPR Article 9 (and Art. 4(14)) — special-category biometric data",
+      "requirements": "A voiceprint used to uniquely identify someone is special-category data: it needs explicit consent or another Article 9 condition, plus an Article 6 basis; a DPIA is expected for large-scale processing.",
+      "enforcement": "Data Protection Authorities (e.g. CNIL, ICO); fines up to €20m or 4% of global turnover.",
+      "notes": "Among the strictest regimes — explicit consent is effectively the practical bar for voice biometrics."
+    }
+  ],
+  "ethics": [
+    "Covertly building a voiceprint is worse than covert recording: it creates a durable identifier that can re-identify someone far beyond the original conversation.",
+    "Function creep: a voiceprint captured for one purpose (say, speaker labels) can quietly be reused for authentication, search, or surveillance.",
+    "Even where legal, enrolling people into a voice database without their understanding violates their reasonable expectations and autonomy."
+  ],
+  "cortiFlag": "Corti today RECORDS and TRANSCRIBES — that does not by itself create voiceprints. Its optional local diarization (CORTI_LOCAL_DIARIZE) is EPHEMERAL and per-session — it labels 'Speaker 1' vs 'Speaker 2' within a single recording without persisting a reusable template — which is generally NOT biometric processing. Corti would cross into biometric territory only if it ever persisted a speaker model or matched speakers ACROSS recordings, or added voice authentication. Design guardrails: keep embeddings ephemeral/per-session by default; gate any persistent speaker model behind a default-OFF flag and a separate biometric-consent/retention path; and keep this voiceprint concern in its own section, never folded into recording consent."
+}

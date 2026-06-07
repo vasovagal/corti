@@ -3,7 +3,12 @@
   "productName": "Corti",
   "version": "0.1.0",
   "identifier": "com.vasovagal.corti",
-  "build": {},
+  "build": {
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "ui" },
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "ui" },
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "ui/dist"
+  },
   "app": {
     "windows": []
   },
