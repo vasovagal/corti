@@ -1,7 +1,8 @@
 name: release
 
 # LAWS §3: a tag is a vote of confidence — this workflow does ONLY tag-specific work (build, bundle,
-# publish, bump the tap). It never re-runs the PR matrix. §18: one workflow per release event, fanned by
+# publish). It never re-runs the PR matrix. The Homebrew cask is updated MANUALLY post-release (see the
+# NOTE at the bottom — CI never writes the tap). §18: one workflow per release event, fanned by
 # `needs:` only on real dependencies. §19: re-run-safe at every step. Distribution is UNSIGNED: no Apple
 # secrets in the env, so tauri-action uses Tauri's default ad-hoc signing.
 on:
@@ -111,37 +112,6 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           gh release upload "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
 
-  update-cask:
-    needs: [check, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout corti (for scripts/render-cask.sh)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Checkout the tap repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: vasovagal/homebrew-corti
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }} # PAT with contents:write on the tap repo
-          path: tap
-
-      - name: Render Casks/corti.rb from the published dmg (computes sha256 from the public asset)
-        env:
-          VERSION: ${{ needs.check.outputs.version }}
-          REPO: ${{ github.repository }}
-          GH_TOKEN: ${{ github.token }} # for the render script's gh fallback asset lookup
-        run: |
-          set -euo pipefail
-          mkdir -p tap/Casks
-          VERSION="$VERSION" REPO="$REPO" ./scripts/render-cask.sh > tap/Casks/corti.rb
-          cat tap/Casks/corti.rb
-
-      - name: Commit + push the cask bump (idempotent; no-op if unchanged — §19)
-        working-directory: tap
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Casks/corti.rb; then echo "cask unchanged"; exit 0; fi
-          git add Casks/corti.rb
-          git commit -m "corti ${{ needs.check.outputs.version }} [skip ci]"
-          git push
+# NOTE: the Homebrew cask is NOT updated by CI. After a release publishes, a human regenerates
+# Casks/corti.rb via scripts/render-cask.sh and commits it to the shared tap vasovagal/homebrew-tap
+# (no PAT, no cross-repo push). See design/adr/0006 + the breadcrumb in CLAUDE.md.
