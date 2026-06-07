@@ -26,6 +26,7 @@ fetch_tar() { # url — download a .tar.bz2 and extract it here
 }
 
 fetch_file() { # url — download a bare file here
+  local url="$1"
   echo "→ $(basename "$url")"
   curl -fL --retry 3 -O "$url"
 }
