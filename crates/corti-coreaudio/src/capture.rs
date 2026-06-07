@@ -141,7 +141,7 @@ impl CapturedAudio {
     /// Frame count (samples / channels), 0 if no channels.
     pub fn frames(&self) -> usize {
         let ch = self.channels() as usize;
-        if ch == 0 { 0 } else { self.samples.len() / ch }
+        self.samples.len().checked_div(ch).unwrap_or(0)
     }
     /// The mic channels mixed down to mono (averaged).
     pub fn mic_mono(&self) -> Vec<f32> {
