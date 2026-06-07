@@ -159,14 +159,20 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
         format!("Transcribing — {}…", meta.owning_app.name),
     );
 
-    // Clean speaker bleed on disk before transcription (backend-agnostic). The raw 2-track WAV is never
-    // touched; on any AEC error (e.g. a tap-only recording) we fall back to the raw mic so the pipeline
-    // never stalls. Regenerating the clean WAV on resume is an idempotent, cheap overwrite.
+    // Clean speaker bleed on disk before transcription (backend-agnostic). The raw recording is never
+    // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
+    // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
+    // Regenerating the clean WAV on resume is an idempotent, cheap overwrite.
     let input: PathBuf = if ctx.aec_enabled {
         match corti_capture::write_clean_wav(audio) {
-            Ok(clean) => clean,
+            Ok(Some(clean)) => clean,
+            Ok(None) => {
+                // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
+                eprintln!("[corti] tap-only recording — no mic track to clean; skipping AEC");
+                audio.to_path_buf()
+            }
             Err(e) => {
-                eprintln!("[corti] AEC skipped ({e:#}); using raw mic");
+                eprintln!("[corti] AEC failed ({e:#}); using the raw recording");
                 audio.to_path_buf()
             }
         }
