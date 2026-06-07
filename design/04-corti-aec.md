@@ -30,6 +30,9 @@ simple energy-ratio detector (near vs far) gates the `w` update. Tune `μ` (~0.1
 ## Invariants
 - **Always preserve the raw mic + far-end tracks** — AEC produces an *additional* cleaned mic track and
   never overwrites the originals. If AEC underperforms, the pipeline falls back to the raw mic.
+- **Tap-only recordings skip AEC cleanly** — a 1-channel ("webinar" / listen-only) capture has no mic
+  track, so there is no speaker bleed to cancel. `write_clean_wav` returns `Ok(None)` and the pipeline
+  transcribes the raw tap directly. This is an expected outcome, **not** an error/fallback.
 - **Headphones remain the cleanest path** — AEC is the speaker-user safety net, documented as such, not a
   substitute for headphones.
 - Hand-rolled (own the stack); NLMS is well-understood DSP with no dead-end dependency. Optional: pull in a

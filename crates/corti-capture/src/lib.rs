@@ -50,20 +50,22 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
 
 /// Read the raw 2-track recording, cancel speaker bleed on ch0 (mic) using ch1 (far-end tap) as the
 /// reference, and write the cleaned 2-track WAV (ch0 = cleaned mic, ch1 = **raw** tap, preserved). Returns
-/// the clean path.
+/// the clean path wrapped in `Some`.
 ///
-/// Errors if the input isn't 2-channel (e.g. a tap-only/listen-only recording has nothing to cancel) — the
-/// caller is expected to fall back to the raw recording. The raw file is only read, never modified, so the
-/// originals are always preserved (design/04-corti-aec.md invariant).
-pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<PathBuf> {
+/// Returns `Ok(None)` for a **1-channel** input: a tap-only / listen-only ("webinar") recording has no mic
+/// track, so there is nothing to cancel — the caller transcribes the raw tap directly. This is an expected
+/// outcome, not an error. Any other channel count (0, or 3+) is a genuine error. The raw file is only read,
+/// never modified, so the originals are always preserved (design/04-corti-aec.md invariant).
+pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<Option<PathBuf>> {
     let mut reader = hound::WavReader::open(raw_2track_wav)
         .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
     let spec = reader.spec();
-    if spec.channels != 2 {
-        anyhow::bail!(
-            "expected a 2-channel recording for AEC, got {} channel(s)",
-            spec.channels
-        );
+    match spec.channels {
+        // Tap-only / listen-only ("webinar") recording: no mic track, nothing to cancel. Only the header
+        // has been read at this point (never the samples), so the raw file is left untouched.
+        1 => return Ok(None),
+        2 => {}
+        n => anyhow::bail!("expected a 1- or 2-channel recording for AEC, got {n} channel(s)"),
     }
 
     // Read interleaved samples as f32, tolerating Float and Int (mirrors corti-transcribe-aws::wav).
@@ -106,7 +108,7 @@ pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<PathBuf> {
         w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = raw tap (preserved)
     }
     w.finalize()?;
-    Ok(out)
+    Ok(Some(out))
 }
 
 #[cfg(target_os = "macos")]
@@ -312,7 +314,9 @@ mod tests {
             w.finalize().unwrap();
         }
 
-        let clean_path = write_clean_wav(&raw).unwrap();
+        let clean_path = write_clean_wav(&raw)
+            .unwrap()
+            .expect("a 2-channel input produces a cleaned WAV");
         assert_eq!(clean_path, clean_wav_path(&raw));
 
         let mut r = hound::WavReader::open(&clean_path).unwrap();
@@ -327,6 +331,42 @@ mod tests {
         // ch1 (the tap) must be bit-identical to the input tap — AEC never touches the far-end track.
         let tap_out: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
         assert_eq!(tap_out, tap_in, "raw far-end tap must be preserved exactly");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_clean_wav_skips_tap_only_mono() {
+        let dir = std::env::temp_dir().join("corti-clean-wav-taponly-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("rec.wav");
+
+        // A 1-channel float WAV is a tap-only ("webinar"/listen-only) recording: no mic track, nothing to
+        // cancel. `write_clean_wav` must report this as `Ok(None)` (an expected skip, not an error) and must
+        // not create a `-clean.wav` sibling.
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        {
+            let mut w = hound::WavWriter::create(&raw, spec).unwrap();
+            for i in 0..256usize {
+                w.write_sample((i as f32 * 0.01).sin() * 0.3).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        assert_eq!(
+            write_clean_wav(&raw).unwrap(),
+            None,
+            "a tap-only (1-channel) recording skips AEC cleanly"
+        );
+        assert!(
+            !clean_wav_path(&raw).exists(),
+            "skipping AEC must not write a -clean.wav sibling"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
