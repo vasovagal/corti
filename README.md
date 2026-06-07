@@ -31,6 +31,8 @@ Exactly what this app does: audio → notes.
 | `corti-transcribe` | `Transcriber` trait + diarized-transcript Markdown renderer |
 | `corti-transcribe-aws` | AWS Transcribe batch backend (`aws` feature) |
 | `corti-transcribe-local` | Local offline backend — Parakeet-TDT via ONNX/sherpa-onnx (`local` feature) |
+| `corti-aec` | Offline NLMS/FDAF echo canceller — removes speaker bleed from the mic track |
+| `corti-tap` | Standalone CLI: force-tap system audio to a WAV on demand (`--inbox` to file a note) |
 | `corti-queue` | Durable job store + crash recovery |
 | `corti-vagus` | The `vagus` CLI shell-out (the only vagus touchpoint) |
 | `app/` | Tauri 2 tray binary |
@@ -43,5 +45,6 @@ The full pipeline is built: the CoreAudio capture spike validated (mic + per-pro
 2-track WAV), every library crate is done + tested, and the `corti-app` Tauri menu-bar tray wires it all
 together (detect → capture → transcribe → vagus, crash-recoverable). Both transcription backends are built:
 AWS Transcribe and a fully-offline local backend (Parakeet-TDT-0.6B-v3 via ONNX/sherpa-onnx, with far-end
-speaker diarization). The live join-call → note loop needs a signed `.app` to exercise the macOS
-audio-capture (TCC) grant. Remaining: offline AEC (`corti-aec`). See [`design/STATUS.md`](./design/STATUS.md).
+speaker diarization). Offline AEC (`corti-aec`) is implemented and wired into the pipeline (speaker-bleed
+removal; raw tracks preserved). The live join-call → note loop needs a signed `.app` to exercise the macOS
+audio-capture (TCC) grant. See [`design/STATUS.md`](./design/STATUS.md).

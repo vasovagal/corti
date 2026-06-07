@@ -47,11 +47,15 @@ Snapshot of what's built, what's stubbed, and the order to tackle the rest. Pair
   diarized (pyannote-segmentation-3.0 + 3D-Speaker) into `Them 1/2/…`, reconciled by the shared
   `corti_transcribe::segment` helpers (also used by the AWS parser). Models via `fetch-models.sh`;
   `clippy -D warnings`/`fmt`/unit tests clean. See [`adr/0003-local-asr-sherpa-onnx.md`](adr/0003-local-asr-sherpa-onnx.md).
-  Headphones assumed (AEC out of scope); live/streaming, CoreML validation, in-app download are `Feature` follow-ups.
+  Headphones assumed (this backend ignores AEC); live/streaming, CoreML validation, in-app download are `Feature` follow-ups.
+- **corti-aec** → [`04-corti-aec.md`](04-corti-aec.md) — offline NLMS/FDAF echo canceller (speaker-bleed
+  removal): overlap-save frequency-domain block adaptive filter with bin-wise NLMS, double-talk gating, and a
+  2-pass sweep so the call opening is cleaned too. Wired into the pipeline via
+  `corti-capture::write_clean_wav` (raw originals preserved; tap-only mono recordings skipped). Unit-tested
+  (synthetic-echo ERLE, near-end preservation, length invariants). Delivered by PRs #6/#30.
 
 ## Stubbed (compiling shells, ready to implement) 🚧
-Each has a design doc and a `lib.rs` that compiles with the intended public API + `todo!`/`bail!` bodies.
-- **corti-aec** → [`04-corti-aec.md`](04-corti-aec.md) — offline NLMS echo canceller (speaker-bleed removal).
+_None — every crate is implemented._
 
 ## Recommended build order when you resume
 1. ~~**corti-detect**~~ — **done** (pure logic; first real "join huddle → 2-track WAV appears" loop).
@@ -63,7 +67,8 @@ Each has a design doc and a `lib.rs` that compiles with the intended public API 
    instead of re-submitting (the parse/poll path was already idempotent).
 4. ~~**app/**~~ — **done** (the Tauri tray; `enqueue` → transcribe → corti-vagus → `Done`, resuming
    `resumable()` rows on startup). Live capture loop pending a signed bundle (TCC; LESSONS §1).
-5. **corti-aec** — quality polish for speaker users.
+5. ~~**corti-aec**~~ — **done** (quality polish for speaker users; offline NLMS/FDAF canceller wired via
+   `corti-capture::write_clean_wav`, raw tracks preserved; PRs #6/#30).
 6. ~~**corti-transcribe-local**~~ — **done** (offline Parakeet-TDT via sherpa-onnx/ONNX; runtime-selectable
    with AWS; ch1 far-end diarization). Live check:
    `cargo run -p corti-transcribe-local --example transcribe_file -- <wav>` (after `fetch-models.sh`).
