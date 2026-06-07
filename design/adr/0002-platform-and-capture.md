@@ -13,7 +13,10 @@ tap fed into an aggregate device alongside the mic (one synchronized graph).
 ## Decision
 
 - **Target `aarch64-apple-darwin` only, latest macOS only** (M1 Pro onward). No Intel, no universal
-  binaries, no support for >1 release back. Newest APIs are fair game (process taps need only 14.2+).
+  binaries, no support for >1 release back. The deployment floor tracks **latest-minus-one** —
+  `minimumSystemVersion = 15.0` (Sequoia) as of 2026-06, set in `app/tauri.conf.json` and mirrored by the
+  Homebrew cask's `depends_on macos: ">= :sequoia"`. (The process-tap API itself only needs 14.2; the 15.0
+  floor is a support policy, not an API limit — tighten to `26.0`/`:tahoe` for latest-only.)
 - **Capture via CoreAudio** — `AudioHardwareCreateProcessTap` on the owning app's output + an aggregate
   device combining it with the default mic → one clock-synchronized multichannel stream. This avoids
   screen-recording permission, needs no virtual audio device, and removes the two-stream alignment

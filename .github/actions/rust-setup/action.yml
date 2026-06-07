@@ -1,0 +1,64 @@
+name: rust-setup
+description: >
+  Install the Rust toolchain (aarch64-apple-darwin) and wire the build caches, configured identically
+  across CI and release (LAWS §8). Two complementary layers, no real overlap:
+    - sccache (mozilla-actions/sccache-action, GitHub Actions cache backend) caches rustc invocations.
+      The repo's .cargo/config.toml already sets `rustc-wrapper = "sccache"`; this action installs sccache
+      on the runner and enables the GHA backend so that wrapper works here exactly as it does locally.
+    - Swatinem/rust-cache caches the cargo home (registry index + crate sources) AND dependency
+      build-script outputs (target/.../build/*) — which is what covers corti-transcribe-local's
+      sherpa-onnx-sys prebuilt download (fetched via ureq into its OUT_DIR; sccache does not cache that).
+  No `ort` cache step (unlike vagus): corti has no `ort`.
+
+inputs:
+  components:
+    description: "Extra rustup components, space-separated (e.g. 'clippy rustfmt')."
+    required: false
+    default: ""
+  cache-key:
+    description: >
+      Stable cache segment, passed to rust-cache as shared-key (not key). rust-cache's default key embeds
+      github.job; using shared-key drops that segment so any job with the same value restores one
+      shared cache — that's how warm-cache (on main) and the release build job share a single
+      rel-aarch64-apple-darwin cache. Use the same value everywhere they must collide.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Toolchain (latest stable)
+      shell: bash
+      run: |
+        # corti's MSRV (Cargo.toml rust-version) tracks the latest stable, so CI must actually BE on the
+        # latest stable — NOT the runner image's baked-in (often weeks-old) stable. `rustup update stable`
+        # guarantees it; a bare `... || rustup toolchain install stable` would skip the update whenever the
+        # image already had an (older) stable active, which silently fails the MSRV check.
+        rustup update stable --no-self-update
+        rustup default stable
+        rustup target add aarch64-apple-darwin
+        if [ -n "${{ inputs.components }}" ]; then rustup component add ${{ inputs.components }}; fi
+        rustc -V && cargo -V
+
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      with:
+        version: "v0.15.0"
+
+    - name: Enable sccache (GHA backend) for cargo
+      shell: bash
+      run: |
+        # SCCACHE_GHA_ENABLED routes sccache's store to the GitHub Actions cache (not ephemeral local disk).
+        # RUSTC_WRAPPER is redundant with .cargo/config.toml's `rustc-wrapper = "sccache"` but set explicitly
+        # so the wrapper is unambiguous in CI. CARGO_INCREMENTAL=0 because sccache cannot cache incremental
+        # builds and silently bypasses otherwise.
+        {
+          echo "SCCACHE_GHA_ENABLED=true"
+          echo "RUSTC_WRAPPER=sccache"
+          echo "CARGO_INCREMENTAL=0"
+        } >> "$GITHUB_ENV"
+
+    - name: Rust cache (cargo home + dependency build-script outputs; covers the sherpa-onnx prebuilt)
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: ${{ inputs.cache-key }}

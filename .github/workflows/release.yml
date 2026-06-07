@@ -1,0 +1,147 @@
+name: release
+
+# LAWS §3: a tag is a vote of confidence — this workflow does ONLY tag-specific work (build, bundle,
+# publish, bump the tap). It never re-runs the PR matrix. §18: one workflow per release event, fanned by
+# `needs:` only on real dependencies. §19: re-run-safe at every step. Distribution is UNSIGNED: no Apple
+# secrets in the env, so tauri-action uses Tauri's default ad-hoc signing.
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # §19: never cancel a half-finished release
+
+permissions:
+  contents: write # create the release + upload assets in THIS repo (GITHUB_TOKEN)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT" # §7: version lives in the tag
+
+      # §7: the tag is the single source of truth. Fail the release unless all three mirrors agree.
+      - name: Version-sync gate (tag == Cargo.toml == tauri.conf.json == app/ui/package.json)
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          fail=0
+          cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          tauri_v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' app/tauri.conf.json | head -1)
+          ui_v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' app/ui/package.json | head -1)
+          for pair in "Cargo.toml:$cargo_v" "tauri.conf.json:$tauri_v" "package.json:$ui_v"; do
+            name=${pair%%:*}; val=${pair#*:}
+            if [ "$val" != "$VERSION" ]; then
+              echo "::error::$name version '$val' != tag '$VERSION'"; fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] && echo "all versions == $VERSION"
+          exit "$fail"
+
+  create-release:
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.rel.outputs.id }}
+    steps:
+      - name: Create release if absent (idempotent; §19), capture its numeric id for tauri-action
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                 --title "$GITHUB_REF_NAME" --generate-notes
+          id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [check, create-release]
+    # LAWS §1: corti is single-arch (aarch64-apple-darwin) → ONE macOS runner, no build matrix, no manifest
+    # fan-in. macos-26 mirrors ci.yml + warm-cache.yml so the shared build cache was produced identically.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          # MUST equal warm-cache.yml's shared-key so the main-seeded cache restores here.
+          cache-key: rel-aarch64-apple-darwin
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/ui/package-lock.json
+
+      # Install the frontend deps so tauri-action's beforeBuildCommand (`npm run build` in ui) can run.
+      - name: Frontend deps
+        working-directory: app/ui
+        run: npm ci
+
+      # Build + bundle the .app and .dmg and upload the .dmg to the release create-release made. tauri-action
+      # runs beforeBuildCommand itself. UNSIGNED: no APPLE_* secrets in env → Tauri's default ad-hoc signing.
+      # No `args: --target …` — .cargo/config.toml already pins aarch64-apple-darwin.
+      - name: Build + bundle (ad-hoc signed) and upload to the release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          projectPath: app
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      # Second asset: a zipped .app (the dmg is the primary). ditto preserves bundle symlinks + xattrs. The
+      # bundle is under the triple subdir because .cargo/config.toml sets [build] target = aarch64-apple-darwin.
+      - name: Zip the .app and upload (re-run safe)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          APP="target/aarch64-apple-darwin/release/bundle/macos/Corti.app"
+          ZIP="Corti_${VERSION}_aarch64.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          gh release upload "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+
+  update-cask:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout corti (for scripts/render-cask.sh)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Checkout the tap repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: vasovagal/homebrew-corti
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }} # PAT with contents:write on the tap repo
+          path: tap
+
+      - name: Render Casks/corti.rb from the published dmg (computes sha256 from the public asset)
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }} # for the render script's gh fallback asset lookup
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Casks
+          VERSION="$VERSION" REPO="$REPO" ./scripts/render-cask.sh > tap/Casks/corti.rb
+          cat tap/Casks/corti.rb
+
+      - name: Commit + push the cask bump (idempotent; no-op if unchanged — §19)
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Casks/corti.rb; then echo "cask unchanged"; exit 0; fi
+          git add Casks/corti.rb
+          git commit -m "corti ${{ needs.check.outputs.version }} [skip ci]"
+          git push

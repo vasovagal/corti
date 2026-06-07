@@ -14,4 +14,4 @@ chrono = { workspace = true }
 # JobStatus' snake_case wire form is the source of truth for the `status` column (no drift).
 serde_json = { workspace = true }
 # Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency.
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }

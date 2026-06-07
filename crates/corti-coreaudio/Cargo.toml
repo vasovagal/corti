@@ -25,4 +25,4 @@ hound = "3.5"
 rtrb = "0.3"
 
 [dev-dependencies]
-cpal = "0.16"
+cpal = "0.18"
