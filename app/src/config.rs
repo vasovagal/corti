@@ -224,7 +224,10 @@ fn env_non_empty(key: &str) -> Option<String> {
 /// (case-insensitive) is treated as `true`.
 fn env_bool(key: &str, default: bool) -> bool {
     match env_non_empty(key) {
-        Some(v) => !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         None => default,
     }
 }

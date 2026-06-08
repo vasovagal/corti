@@ -67,7 +67,10 @@ impl From<&AppConfig> for SettingsDto {
             language: cfg.language.clone(),
             aws_profile: cfg.aws_profile.clone(),
             aws_region: cfg.aws_region.clone(),
-            local_model_dir: cfg.local_model_dir.as_ref().map(|p| p.display().to_string()),
+            local_model_dir: cfg
+                .local_model_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
             local_threads: cfg.local_threads,
             local_diarize_far_end: cfg.local_diarize_far_end,
             aec_enabled: cfg.aec_enabled,
@@ -153,13 +156,20 @@ pub fn set_config(
         to_save.aec_enabled = dto.aec_enabled;
     }
 
-    to_save.save().map_err(|e| format!("saving config: {e:#}"))?;
+    to_save
+        .save()
+        .map_err(|e| format!("saving config: {e:#}"))?;
 
     // Recompute the resolved runtime config (file + env layering) and publish it for the worker + tray.
     *state.config.lock().unwrap() = AppConfig::load();
 
     // Nudge the worker to rebuild its backend on its next turn (immediate when idle).
-    if let Err(e) = state.reload_tx.lock().unwrap().send(PipelineMsg::ReloadConfig) {
+    if let Err(e) = state
+        .reload_tx
+        .lock()
+        .unwrap()
+        .send(PipelineMsg::ReloadConfig)
+    {
         eprintln!("[corti] could not signal pipeline reload (worker gone?): {e}");
     }
 
@@ -293,7 +303,11 @@ fn vault_ancestor(path: &Path) -> Option<PathBuf> {
 /// Set the local models directory (persisted to config), rejecting a location inside a notes vault
 /// (guardrail #5). Re-applies on the next recording.
 #[tauri::command]
-pub fn set_models_dir(dir: String, state: State<'_, ConfigState>, app: AppHandle) -> Result<(), String> {
+pub fn set_models_dir(
+    dir: String,
+    state: State<'_, ConfigState>,
+    app: AppHandle,
+) -> Result<(), String> {
     #[cfg(not(feature = "local"))]
     {
         let _ = (dir, state, app);
@@ -305,7 +319,10 @@ pub fn set_models_dir(dir: String, state: State<'_, ConfigState>, app: AppHandle
         if trimmed.is_empty() {
             return Err("models directory path is empty".to_string());
         }
-        if config::env_managed_fields().iter().any(|f| f == "local_model_dir") {
+        if config::env_managed_fields()
+            .iter()
+            .any(|f| f == "local_model_dir")
+        {
             return Err(
                 "the models directory is pinned by CORTI_LOCAL_MODEL_DIR; unset it to edit here"
                     .to_string(),
@@ -321,9 +338,16 @@ pub fn set_models_dir(dir: String, state: State<'_, ConfigState>, app: AppHandle
 
         let mut to_save = AppConfig::load_file().unwrap_or_default();
         to_save.local_model_dir = Some(path);
-        to_save.save().map_err(|e| format!("saving config: {e:#}"))?;
+        to_save
+            .save()
+            .map_err(|e| format!("saving config: {e:#}"))?;
         *state.config.lock().unwrap() = AppConfig::load();
-        if let Err(e) = state.reload_tx.lock().unwrap().send(PipelineMsg::ReloadConfig) {
+        if let Err(e) = state
+            .reload_tx
+            .lock()
+            .unwrap()
+            .send(PipelineMsg::ReloadConfig)
+        {
             eprintln!("[corti] could not signal pipeline reload (worker gone?): {e}");
         }
         crate::tray::refresh_menu(&app);
@@ -693,7 +717,11 @@ pub async fn verify_aws(state: State<'_, ConfigState>) -> Result<AwsIdentity, St
     // STS is global; ensure the probe always has an endpoint even when no region is configured/env-set.
     if !(crate::transcribe::env_present("AWS_REGION")
         || crate::transcribe::env_present("AWS_DEFAULT_REGION"))
-        && cfg.aws_region.as_deref().filter(|s| !s.is_empty()).is_none()
+        && cfg
+            .aws_region
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
     {
         loader = loader.region(Region::new("us-east-1"));
     }
@@ -738,7 +766,8 @@ mod tests {
     #[test]
     fn parse_profile_names_handles_both_files() {
         // credentials-style: bare [name] headers; comments + key=value ignored; whitespace trimmed.
-        let creds = "# creds\n[default]\naws_access_key_id = AKIA\n\n[work]\n; note\n[ personal ]\n";
+        let creds =
+            "# creds\n[default]\naws_access_key_id = AKIA\n\n[work]\n; note\n[ personal ]\n";
         assert_eq!(
             parse_profile_names(creds, false),
             vec!["default", "work", "personal"]
