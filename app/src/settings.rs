@@ -35,6 +35,8 @@ pub struct SettingsDto {
     pub transcribe_backend: String,
     pub aws_bucket: Option<String>,
     pub language: String,
+    pub aws_profile: Option<String>,
+    pub aws_region: Option<String>,
     pub local_model_dir: Option<String>,
     pub local_provider: String,
     pub local_threads: i32,
@@ -64,6 +66,8 @@ impl From<&AppConfig> for SettingsDto {
             transcribe_backend: backend_id(cfg.transcribe_backend).to_string(),
             aws_bucket: cfg.aws_bucket.clone(),
             language: cfg.language.clone(),
+            aws_profile: cfg.aws_profile.clone(),
+            aws_region: cfg.aws_region.clone(),
             local_model_dir: cfg.local_model_dir.as_ref().map(|p| p.display().to_string()),
             local_provider: cfg.local_provider.clone(),
             local_threads: cfg.local_threads,
@@ -133,6 +137,9 @@ pub fn set_config(
     {
         to_save.language = lang;
     }
+    // AWS profile/region aren't CORTI_*-pinned (their override is the AWS-native chain), so persist directly.
+    to_save.aws_profile = non_empty(dto.aws_profile);
+    to_save.aws_region = non_empty(dto.aws_region);
     if !pinned("local_model_dir") {
         to_save.local_model_dir = non_empty(dto.local_model_dir).map(PathBuf::from);
     }
@@ -519,6 +526,202 @@ fn download_and_install(
     Ok(())
 }
 
+// ----- AWS credential-chain status + verification (issue #24 follow-up) -----
+
+/// AWS credential-chain status for the Settings UI: drives the profile dropdown, the region/profile lock
+/// state, and the "what is the app actually using" banner. NEVER carries the secret access key or session
+/// token — only booleans for their presence; only the access key id is echoed.
+#[derive(Debug, Clone, Serialize)]
+pub struct AwsStatus {
+    /// Named profiles, union of ~/.aws/credentials + ~/.aws/config, deduped + sorted.
+    pub profiles: Vec<String>,
+    /// Profile the chain will effectively key on: AWS_PROFILE, else saved aws_profile, else None.
+    pub selected_profile: Option<String>,
+    /// Saved aws_region, for prefilling the selector.
+    pub configured_region: Option<String>,
+    /// Profile dropdown disabled (AWS_PROFILE or env static creds present).
+    pub profile_locked: bool,
+    /// Region selector disabled (AWS_REGION / AWS_DEFAULT_REGION present).
+    pub region_locked: bool,
+    /// Echoed AWS_ACCESS_KEY_ID (explicitly requested). None when unset.
+    pub env_access_key_id: Option<String>,
+    /// Whether AWS_SECRET_ACCESS_KEY is set — boolean ONLY, never the value.
+    pub env_has_secret: bool,
+    /// Whether AWS_SESSION_TOKEN is set — boolean ONLY, never the value.
+    pub env_session_token: bool,
+    /// Reflected AWS_PROFILE (just a name — safe to echo).
+    pub env_profile: Option<String>,
+    /// Reflected AWS_REGION / AWS_DEFAULT_REGION (safe to echo).
+    pub env_region: Option<String>,
+    /// Human-readable summary of the resolved source (drives the banner).
+    pub source: String,
+}
+
+/// Result of a live STS GetCallerIdentity — proof the resolved chain authenticates.
+#[derive(Debug, Clone, Serialize)]
+pub struct AwsIdentity {
+    pub account: Option<String>,
+    pub arn: Option<String>,
+    pub user_id: Option<String>,
+}
+
+/// Read an env var, trimmed; empty ⇒ None.
+#[cfg(feature = "aws")]
+fn aws_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse INI section headers from one ~/.aws file body. credentials uses `[name]`; config uses
+/// `[profile name]` (and a bare `[default]`). Returns names with the `profile ` prefix stripped. Tolerant of
+/// comments (`#`/`;`), blank lines, surrounding whitespace, and `key = value` lines (ignored).
+#[cfg(feature = "aws")]
+fn parse_profile_names(body: &str, is_config_file: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+            continue; // key = value or junk — not a section header
+        };
+        let name = inner.trim();
+        let name = if is_config_file {
+            name.strip_prefix("profile ").map(str::trim).unwrap_or(name)
+        } else {
+            name
+        };
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Path to a `~/.aws` file, honoring the AWS env overrides (`AWS_SHARED_CREDENTIALS_FILE`/`AWS_CONFIG_FILE`).
+#[cfg(feature = "aws")]
+fn aws_file(env_override: &str, default_leaf: &str) -> Option<PathBuf> {
+    if let Some(p) = aws_env(env_override) {
+        return Some(PathBuf::from(p));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aws").join(default_leaf))
+}
+
+/// Profile names across ~/.aws/credentials + ~/.aws/config, unioned, deduped, and sorted. Missing files are
+/// skipped. Includes SSO-only profiles (they appear as `[profile x]` in config).
+#[cfg(feature = "aws")]
+fn list_aws_profiles() -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(p) = aws_file("AWS_SHARED_CREDENTIALS_FILE", "credentials")
+        && let Ok(body) = std::fs::read_to_string(&p)
+    {
+        names.extend(parse_profile_names(&body, false));
+    }
+    if let Some(p) = aws_file("AWS_CONFIG_FILE", "config")
+        && let Ok(body) = std::fs::read_to_string(&p)
+    {
+        names.extend(parse_profile_names(&body, true));
+    }
+    names.into_iter().collect()
+}
+
+/// AWS credential-chain status for the Settings UI.
+#[tauri::command]
+pub fn get_aws_status(state: State<'_, ConfigState>) -> Result<AwsStatus, String> {
+    #[cfg(not(feature = "aws"))]
+    {
+        let _ = &state;
+        Err("AWS transcription backend is not compiled into this build".to_string())
+    }
+    #[cfg(feature = "aws")]
+    {
+        let (cfg_profile, cfg_region) = {
+            let cfg = state.config.lock().unwrap();
+            (cfg.aws_profile.clone(), cfg.aws_region.clone())
+        };
+
+        let env_access_key_id = aws_env("AWS_ACCESS_KEY_ID");
+        let env_profile = aws_env("AWS_PROFILE");
+        let env_region = aws_env("AWS_REGION").or_else(|| aws_env("AWS_DEFAULT_REGION"));
+
+        let profile_locked = env_access_key_id.is_some() || env_profile.is_some();
+        let region_locked = env_region.is_some();
+
+        // Match the credential-chain precedence build_sdk_config enforces, so the banner never lies.
+        let selected_profile = if env_profile.is_some() {
+            env_profile.clone()
+        } else if env_access_key_id.is_some() {
+            None // static env creds: the profile is irrelevant
+        } else {
+            cfg_profile.clone()
+        };
+
+        let source = if env_access_key_id.is_some() {
+            "Using credentials from the environment (AWS_ACCESS_KEY_ID)".to_string()
+        } else if let Some(p) = &env_profile {
+            format!("Using AWS_PROFILE = {p}")
+        } else if let Some(p) = &cfg_profile {
+            format!("Using profile: {p}")
+        } else {
+            "Using the default AWS credential chain".to_string()
+        };
+
+        Ok(AwsStatus {
+            profiles: list_aws_profiles(),
+            selected_profile,
+            configured_region: cfg_region,
+            profile_locked,
+            region_locked,
+            env_access_key_id,
+            env_has_secret: crate::transcribe::env_present("AWS_SECRET_ACCESS_KEY"),
+            env_session_token: crate::transcribe::env_present("AWS_SESSION_TOKEN"),
+            env_profile,
+            env_region,
+            source,
+        })
+    }
+}
+
+/// Verify the resolved AWS credential chain via STS GetCallerIdentity (account + ARN).
+#[cfg(feature = "aws")]
+#[tauri::command]
+pub async fn verify_aws(state: State<'_, ConfigState>) -> Result<AwsIdentity, String> {
+    use aws_config::Region;
+
+    // Snapshot + drop the lock BEFORE awaiting (MutexGuard is !Send across .await).
+    let cfg = { state.config.lock().unwrap().clone() };
+
+    let mut loader = crate::transcribe::configure_loader(&cfg);
+    // STS is global; ensure the probe always has an endpoint even when no region is configured/env-set.
+    if !(crate::transcribe::env_present("AWS_REGION")
+        || crate::transcribe::env_present("AWS_DEFAULT_REGION"))
+        && cfg.aws_region.as_deref().filter(|s| !s.is_empty()).is_none()
+    {
+        loader = loader.region(Region::new("us-east-1"));
+    }
+
+    let sdk = loader.load().await;
+    let out = aws_sdk_sts::Client::new(&sdk)
+        .get_caller_identity()
+        .send()
+        .await
+        .map_err(|e| format!("AWS credential check failed: {e}"))?;
+    Ok(AwsIdentity {
+        account: out.account().map(str::to_string),
+        arn: out.arn().map(str::to_string),
+        user_id: out.user_id().map(str::to_string),
+    })
+}
+
+#[cfg(not(feature = "aws"))]
+#[tauri::command]
+pub async fn verify_aws() -> Result<AwsIdentity, String> {
+    Err("AWS transcription backend is not compiled into this build".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +737,27 @@ mod tests {
         assert_eq!(path_size(&dir.join("a.bin")), 100);
         assert_eq!(path_size(&dir.join("missing")), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn parse_profile_names_handles_both_files() {
+        // credentials-style: bare [name] headers; comments + key=value ignored; whitespace trimmed.
+        let creds = "# creds\n[default]\naws_access_key_id = AKIA\n\n[work]\n; note\n[ personal ]\n";
+        assert_eq!(
+            parse_profile_names(creds, false),
+            vec!["default", "work", "personal"]
+        );
+
+        // config-style: [profile name] + bare [default]; the `profile ` prefix is stripped.
+        let config = "[default]\nregion = us-east-1\n[profile work]\n[profile sso-admin]\nsso_start_url = https://x\n";
+        assert_eq!(
+            parse_profile_names(config, true),
+            vec!["default", "work", "sso-admin"]
+        );
+
+        // Junk / blank / key=value with no section ⇒ nothing.
+        assert!(parse_profile_names("\n  \nnot a header\nkey = val\n", false).is_empty());
     }
 
     #[cfg(feature = "local")]

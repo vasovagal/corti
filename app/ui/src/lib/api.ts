@@ -8,6 +8,8 @@ export interface SettingsDto {
   transcribe_backend: string; // "aws" | "local"
   aws_bucket: string | null;
   language: string;
+  aws_profile: string | null;
+  aws_region: string | null;
   local_model_dir: string | null;
   local_provider: string; // "cpu" | "coreml"
   local_threads: number;
@@ -28,6 +30,34 @@ export const getConfig = (): Promise<SettingsDto> => invoke<SettingsDto>("get_co
 export const getBackends = (): Promise<BackendInfo[]> => invoke<BackendInfo[]>("get_backends");
 
 export const setConfig = (dto: SettingsDto): Promise<void> => invoke<void>("set_config", { dto });
+
+// ----- AWS credential-chain status + verification -----
+
+/** Mirror of Rust `settings::AwsStatus`. Never carries the secret/session-token values — booleans only. */
+export interface AwsStatus {
+  profiles: string[];
+  selected_profile: string | null;
+  configured_region: string | null;
+  profile_locked: boolean;
+  region_locked: boolean;
+  env_access_key_id: string | null;
+  env_has_secret: boolean;
+  env_session_token: boolean;
+  env_profile: string | null;
+  env_region: string | null;
+  source: string;
+}
+
+/** Mirror of Rust `settings::AwsIdentity` (STS GetCallerIdentity). */
+export interface AwsIdentity {
+  account: string | null;
+  arn: string | null;
+  user_id: string | null;
+}
+
+export const getAwsStatus = (): Promise<AwsStatus> => invoke<AwsStatus>("get_aws_status");
+
+export const verifyAws = (): Promise<AwsIdentity> => invoke<AwsIdentity>("verify_aws");
 
 // ----- Path + Model sections -----
 

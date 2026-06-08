@@ -35,6 +35,17 @@ pub struct AppConfig {
     /// BCP-47 language passed to the AWS backend (`CORTI_LANGUAGE`, default `en-US`).
     #[cfg_attr(not(feature = "aws"), allow(dead_code))]
     pub language: String,
+    /// AWS named profile to resolve credentials/region from (like `aws --profile`). Applied as a
+    /// **fallback** only when the environment doesn't already pin creds (`AWS_ACCESS_KEY_ID`/`AWS_PROFILE`);
+    /// the Settings screen surfaces and edits it.
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_profile: Option<String>,
+    /// AWS region for Transcribe/S3. Applied as a **fallback** only when `AWS_REGION`/`AWS_DEFAULT_REGION`
+    /// are unset. Must match the bucket's region (Transcribe is regional).
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aws_region: Option<String>,
     /// Model directory for the local backend (`CORTI_LOCAL_MODEL_DIR`); `None` ⇒ default cache
     /// (`~/Library/Caches/corti/models/`), resolved inside the backend.
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
@@ -61,6 +72,8 @@ impl Default for AppConfig {
             transcribe_backend: default_backend(),
             aws_bucket: None,
             language: "en-US".to_string(),
+            aws_profile: None,
+            aws_region: None,
             local_model_dir: None,
             local_provider: "cpu".to_string(),
             local_threads: 4,
@@ -253,6 +266,8 @@ mod tests {
             transcribe_backend: BackendChoice::Local,
             aws_bucket: Some("my-bucket".into()),
             language: "fr-FR".into(),
+            aws_profile: Some("scientist".into()),
+            aws_region: Some("us-west-2".into()),
             local_model_dir: Some(PathBuf::from("/tmp/models")),
             local_provider: "coreml".into(),
             local_threads: 8,

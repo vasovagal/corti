@@ -168,6 +168,8 @@ mod imp {
                 crate::settings::get_config,
                 crate::settings::set_config,
                 crate::settings::get_backends,
+                crate::settings::get_aws_status,
+                crate::settings::verify_aws,
                 crate::settings::get_paths,
                 crate::settings::reveal_path,
                 crate::settings::set_models_dir,

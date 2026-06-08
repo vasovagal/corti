@@ -44,6 +44,9 @@ tauri-plugin-macos-permissions = "2.3.0"
 # to drive that one async `load()` at worker startup (the backend spins its own runtime internally).
 corti-transcribe-aws = { workspace = true, optional = true }
 aws-config = { version = "1", optional = true }
+# STS GetCallerIdentity powers the Settings "Test credentials" button. Already resolved transitively via
+# aws-config; declared direct here so the app can call it.
+aws-sdk-sts = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
 
 # Local on-device backend (opt-in). Parakeet-TDT via sherpa-onnx — see design/02-corti-transcribe.md and
@@ -61,5 +64,5 @@ ureq = { version = "2", optional = true }
 # possible (and CI exercises it), but it is on by default — Parakeet is always available.
 [features]
 default = ["aws", "local"]
-aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
+aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:tokio"]
 local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
