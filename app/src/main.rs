@@ -20,6 +20,8 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod settings;
+#[cfg(target_os = "macos")]
 mod transcribe;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -42,9 +44,9 @@ fn main() {
 mod imp {
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Sender;
+    use std::sync::{Arc, Mutex};
 
     use anyhow::{Context, Result};
     use chrono::{DateTime, Local};
@@ -96,32 +98,20 @@ mod imp {
         /// The most-recent recordings (front = newest), capped at [`HISTORY_LIMIT`] — the `History ▸`
         /// submenu's source of truth, covering in-flight, failed, and filed recordings (issue #3).
         pub history: Mutex<VecDeque<HistoryEntry>>,
-        /// Static "Backend: …" label.
-        pub backend_label: String,
-        /// Static "Bucket: …" label (empty when the backend has no bucket).
-        pub bucket_label: String,
     }
 
     /// How many recordings the `History ▸` submenu shows (newest first).
     pub const HISTORY_LIMIT: usize = 5;
 
     impl AppState {
-        fn new(cfg: &AppConfig) -> Self {
-            #[cfg(feature = "aws")]
-            let bucket_label = cfg
-                .aws_bucket
-                .clone()
-                .unwrap_or_else(|| "(unset — export CORTI_AWS_BUCKET)".to_string());
-            #[cfg(not(feature = "aws"))]
-            let bucket_label = String::new();
-
+        // The tray's Backend:/Bucket: summary is derived live from `settings::ConfigState` in `build_menu`,
+        // so it stays in sync with edits saved in the Settings window (no static labels here).
+        fn new() -> Self {
             Self {
                 detector_recording: AtomicBool::new(false),
                 webinar_recording: AtomicBool::new(false),
                 status: Mutex::new("Starting…".to_string()),
                 history: Mutex::new(VecDeque::new()),
-                backend_label: cfg.backend_name().to_string(),
-                bucket_label,
             }
         }
     }
@@ -172,6 +162,20 @@ mod imp {
         let app = tauri::Builder::default()
             // Global menu handler: catches events from the dynamically-rebuilt tray menu.
             .on_menu_event(|app, event| tray::handle_menu_event(app, &event))
+            // Commands the Settings webview calls (own app commands; scoped to the settings window via
+            // `app/capabilities/settings.json`).
+            .invoke_handler(tauri::generate_handler![
+                crate::settings::get_config,
+                crate::settings::set_config,
+                crate::settings::get_backends,
+                crate::settings::get_aws_status,
+                crate::settings::verify_aws,
+                crate::settings::get_paths,
+                crate::settings::reveal_path,
+                crate::settings::set_models_dir,
+                crate::settings::get_models_status,
+                crate::settings::download_model,
+            ])
             .setup(move |app| {
                 setup(app, &cfg).map_err(|e| {
                     Box::new(SetupError(format!("{e:#}"))) as Box<dyn std::error::Error>
@@ -192,20 +196,29 @@ mod imp {
         app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
         // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
-        app.manage(AppState::new(cfg));
+        app.manage(AppState::new());
+
+        // Pipeline channel + shared runtime config. Both are created before the tray (its menu summary reads
+        // the config via `ConfigState`) and before the worker (which holds the shared config to rebuild its
+        // backend when the Settings screen saves).
+        let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<PipelineMsg>();
+        let shared_cfg: crate::settings::SharedConfig = Arc::new(Mutex::new(cfg.clone()));
+        app.manage(crate::settings::ConfigState {
+            config: shared_cfg.clone(),
+            reload_tx: Mutex::new(pipe_tx.clone()),
+        });
 
         // Tray + blink (icons swap on the main thread).
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
         // Pipeline worker (sole Queue owner). It resumes crashed jobs, then drains the channel serially.
-        let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<PipelineMsg>();
         {
             let handle = app.handle().clone();
-            let cfg = cfg.clone();
+            let shared_cfg = shared_cfg.clone();
             std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
-                .spawn(move || pipeline::run(handle, cfg, pipe_rx))
+                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx))
                 .context("spawning pipeline worker")?;
         }
 

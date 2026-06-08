@@ -22,7 +22,7 @@ use corti_transcribe::segment::{SEGMENT_GAP, diarize_words, merge_by_time, words
 
 mod audio;
 mod engine;
-mod models;
+pub mod models;
 
 /// Where the ONNX models live and how to run them. Built by the app from its config.
 #[derive(Debug, Clone)]

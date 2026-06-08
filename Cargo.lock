@@ -1091,6 +1091,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-sdk-sts",
  "chrono",
  "corti-capture",
  "corti-core",
@@ -1100,11 +1101,15 @@ dependencies = [
  "corti-transcribe-aws",
  "corti-transcribe-local",
  "corti-vagus",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-macos-permissions",
  "tokio",
+ "toml 0.8.2",
+ "ureq",
 ]
 
 [[package]]

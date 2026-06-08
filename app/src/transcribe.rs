@@ -36,7 +36,7 @@ impl Backend {
     pub fn init(cfg: AppConfig) -> Self {
         let kind = match cfg.transcribe_backend {
             #[cfg(feature = "aws")]
-            BackendChoice::Aws => BackendKind::Aws(build_sdk_config().map(Box::new)),
+            BackendChoice::Aws => BackendKind::Aws(build_sdk_config(&cfg).map(Box::new)),
             #[cfg(feature = "local")]
             BackendChoice::Local => BackendKind::Local,
             #[allow(unreachable_patterns)]
@@ -112,16 +112,52 @@ impl Backend {
     }
 }
 
-/// Resolve the AWS credential chain once, on a throwaway current-thread runtime. The backend itself spins
-/// its own runtime for the actual S3/Transcribe calls; this only builds the shared `SdkConfig`.
+/// Whether an env var is set and non-empty (after trim) — the conventional "this is configured" test, and
+/// the signal that an AWS-native env var should take precedence over our saved config.
 #[cfg(feature = "aws")]
-fn build_sdk_config() -> Option<aws_config::SdkConfig> {
-    use aws_config::BehaviorVersion;
+pub(crate) fn env_present(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| !v.trim().is_empty())
+}
 
+/// Build a `ConfigLoader` that applies the app's saved profile/region as **fallbacks behind** the AWS
+/// environment, matching standard CLI/SDK precedence. Sync + IO-free: the credential-resolving `.load()` is
+/// driven by the caller on whatever runtime it has.
+#[cfg(feature = "aws")]
+pub(crate) fn configure_loader(cfg: &AppConfig) -> aws_config::ConfigLoader {
+    use aws_config::{BehaviorVersion, Region};
+
+    let mut loader = aws_config::defaults(BehaviorVersion::latest());
+
+    // Region: our value only when the environment doesn't set one.
+    if !(env_present("AWS_REGION") || env_present("AWS_DEFAULT_REGION"))
+        && let Some(region) = cfg.aws_region.as_deref().filter(|s| !s.is_empty())
+    {
+        loader = loader.region(Region::new(region.to_string()));
+    }
+
+    // Profile: our value only when neither env static creds nor AWS_PROFILE are present (either would win in
+    // the credential chain regardless).
+    if !env_present("AWS_ACCESS_KEY_ID")
+        && !env_present("AWS_PROFILE")
+        && let Some(profile) = cfg.aws_profile.as_deref().filter(|s| !s.is_empty())
+    {
+        loader = loader.profile_name(profile.to_string());
+    }
+
+    loader
+}
+
+/// Resolve the AWS credential chain once at startup, on a throwaway current-thread runtime. The backend
+/// itself spins its own runtime for the actual S3/Transcribe calls; this only builds the shared `SdkConfig`.
+///
+/// Do NOT call this from inside an existing tokio runtime (e.g. the async `verify_aws` command) — the inner
+/// `block_on` panics there. Async callers await `configure_loader(cfg).load()` directly instead.
+#[cfg(feature = "aws")]
+fn build_sdk_config(cfg: &AppConfig) -> Option<aws_config::SdkConfig> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| eprintln!("[corti] could not build tokio runtime for AWS config: {e}"))
         .ok()?;
-    Some(rt.block_on(async { aws_config::defaults(BehaviorVersion::latest()).load().await }))
+    Some(rt.block_on(configure_loader(cfg).load()))
 }

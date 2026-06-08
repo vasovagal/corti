@@ -29,7 +29,10 @@ corti-vagus = { workspace = true }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# Persisted, hand-editable config file (`~/.local/share/corti/config.toml`). Flat scalar struct only.
+toml = "0.8"
 
 # Tray + menu live in core tauri behind the `tray-icon` feature. No `image-*` feature needed: tray icons
 # are embedded at build time via `include_image!` (raw RGBA, not feature-gated).
@@ -41,14 +44,25 @@ tauri-plugin-macos-permissions = "2.3.0"
 # to drive that one async `load()` at worker startup (the backend spins its own runtime internally).
 corti-transcribe-aws = { workspace = true, optional = true }
 aws-config = { version = "1", optional = true }
+# STS GetCallerIdentity powers the Settings "Test credentials" button. Already resolved transitively via
+# aws-config; declared direct here so the app can call it.
+aws-sdk-sts = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
 
 # Local on-device backend (opt-in). Parakeet-TDT via sherpa-onnx — see design/02-corti-transcribe.md and
 # design/adr/0003-local-asr-sherpa-onnx.md. Independent of `aws`: both can be compiled in and the active
 # backend is chosen at runtime (CORTI_TRANSCRIBE_BACKEND).
 corti-transcribe-local = { workspace = true, optional = true }
+# In-app model downloader (Settings → Models), part of the `local` feature: a tiny blocking HTTP client and
+# SHA-256 verification of the downloaded artifacts (tarballs extracted via the system `tar`, like
+# fetch-models.sh). Pulled in only when the local backend is compiled.
+sha2 = { version = "0.10", optional = true }
+ureq = { version = "2", optional = true }
 
+# Both backends ship in every build (dev + the default-feature release bundle): the active one is chosen at
+# runtime in Settings. `local` stays a named feature so a minimal `--no-default-features` build is still
+# possible (and CI exercises it), but it is on by default — Parakeet is always available.
 [features]
-default = ["aws"]
-aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
-local = ["dep:corti-transcribe-local"]
+default = ["aws", "local"]
+aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:tokio"]
+local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]

@@ -24,21 +24,25 @@ use corti_queue::{Job, JobUpdate, Queue};
 use corti_vagus::Vagus;
 use tauri::AppHandle;
 
-use crate::config::AppConfig;
 use crate::imp::{HISTORY_LIMIT, HistoryEntry};
+use crate::settings::SharedConfig;
 use crate::transcribe::Backend;
 use crate::tray;
 
 /// How long a `Done` recording (and its WAV) is kept before [`Queue::prune_done`] reclaims it.
 const RETENTION_DAYS: i64 = 30;
 
-/// Work for the pipeline worker. (One variant today; an enum leaves room for prune/shutdown signals.)
+/// Work for the pipeline worker.
 pub enum PipelineMsg {
     /// A finished recording to push through transcribe → file → Done.
     Process {
         meta: RecordingMeta,
         audio_path: PathBuf,
     },
+    /// Re-read the shared config and rebuild the backend + AEC toggle. Sent by the Settings screen on save;
+    /// handled between jobs (the worker is serial) so it applies to the next recording — or immediately when
+    /// the worker is idle and blocked waiting for one.
+    ReloadConfig,
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -53,8 +57,9 @@ struct Ctx {
     app: AppHandle,
 }
 
-/// Worker entry point. Opens the queue, recovers/prunes, then drains the channel until the app exits.
-pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
+/// Worker entry point. Opens the queue, recovers/prunes, then drains the channel until the app exits. Holds
+/// the [`SharedConfig`] so a Settings save (`PipelineMsg::ReloadConfig`) can rebuild the backend live.
+pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
     let queue = match Queue::open() {
         Ok(q) => q,
         Err(e) => {
@@ -69,9 +74,11 @@ pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
         eprintln!("[corti] vagus not available — notes can't be filed: {e}");
     }
 
-    // Capture the AEC toggle before `Backend::init` consumes `cfg`.
+    // Snapshot the shared config to build the initial backend. Capture the AEC toggle before `Backend::init`
+    // consumes the snapshot.
+    let cfg = config.lock().unwrap().clone();
     let aec_enabled = cfg.aec_enabled;
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         queue,
         vagus,
         backend: Backend::init(cfg),
@@ -105,8 +112,23 @@ pub fn run(app: AppHandle, cfg: AppConfig, rx: Receiver<PipelineMsg>) {
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
+            PipelineMsg::ReloadConfig => reload_config(&mut ctx, &config),
         }
     }
+}
+
+/// Apply a saved config change: re-read the shared runtime config and rebuild the backend + AEC toggle. A
+/// job already transcribing finishes on the old backend (the worker is serial), so this is exactly "takes
+/// effect on the next recording".
+fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
+    let cfg = config.lock().unwrap().clone();
+    let backend_name = cfg.backend_name();
+    ctx.aec_enabled = cfg.aec_enabled;
+    ctx.backend = Backend::init(cfg);
+    eprintln!(
+        "[corti] settings saved — backend now {backend_name}; AEC {}",
+        if ctx.aec_enabled { "on" } else { "off" }
+    );
 }
 
 /// Seed the tray's `History ▸` submenu with the most recent recordings from the durable queue, so the
