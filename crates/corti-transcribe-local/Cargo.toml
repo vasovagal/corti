@@ -23,6 +23,15 @@ hound = "3.5"
 # Default model cache under ~/Library/Caches/corti/models/ (guardrail #5: outside any vault).
 dirs = "6"
 
+[features]
+# Signals that this build links a *CoreML-enabled* sherpa-onnx static lib (which you must supply via
+# SHERPA_ONNX_LIB_DIR / SHERPA_ONNX_ARCHIVE_DIR — the crates.io prebuilt has no CoreML execution provider).
+# Two effects: (1) `build.rs` adds `framework=CoreML` to the link line, which a CoreML-enabled
+# libonnxruntime.a/libsherpa-onnx-core.a requires; (2) the backend passes a `coreml` provider straight
+# through instead of mapping it to `cpu`. OFF by default → CPU-only build, byte-for-byte unchanged.
+# See design/adr/0003-local-asr-sherpa-onnx.md.
+coreml-lib = []
+
 [dev-dependencies]
 # The transcribe_file example builds a RecordingMeta, which carries chrono timestamps.
 chrono = { workspace = true }
