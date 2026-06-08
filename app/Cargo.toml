@@ -56,7 +56,10 @@ corti-transcribe-local = { workspace = true, optional = true }
 sha2 = { version = "0.10", optional = true }
 ureq = { version = "2", optional = true }
 
+# Both backends ship in every build (dev + the default-feature release bundle): the active one is chosen at
+# runtime in Settings. `local` stays a named feature so a minimal `--no-default-features` build is still
+# possible (and CI exercises it), but it is on by default — Parakeet is always available.
 [features]
-default = ["aws"]
+default = ["aws", "local"]
 aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
 local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
