@@ -11,7 +11,6 @@ export interface SettingsDto {
   aws_profile: string | null;
   aws_region: string | null;
   local_model_dir: string | null;
-  local_provider: string; // "cpu" | "coreml"
   local_threads: number;
   local_diarize_far_end: boolean;
   aec_enabled: boolean;

@@ -38,7 +38,6 @@ pub struct SettingsDto {
     pub aws_profile: Option<String>,
     pub aws_region: Option<String>,
     pub local_model_dir: Option<String>,
-    pub local_provider: String,
     pub local_threads: i32,
     pub local_diarize_far_end: bool,
     pub aec_enabled: bool,
@@ -69,7 +68,6 @@ impl From<&AppConfig> for SettingsDto {
             aws_profile: cfg.aws_profile.clone(),
             aws_region: cfg.aws_region.clone(),
             local_model_dir: cfg.local_model_dir.as_ref().map(|p| p.display().to_string()),
-            local_provider: cfg.local_provider.clone(),
             local_threads: cfg.local_threads,
             local_diarize_far_end: cfg.local_diarize_far_end,
             aec_enabled: cfg.aec_enabled,
@@ -143,11 +141,8 @@ pub fn set_config(
     if !pinned("local_model_dir") {
         to_save.local_model_dir = non_empty(dto.local_model_dir).map(PathBuf::from);
     }
-    if !pinned("local_provider")
-        && let Some(p) = non_empty(Some(dto.local_provider))
-    {
-        to_save.local_provider = p;
-    }
+    // `local_provider` is no longer a webview setting (CPU is the only shipping provider — see ADR 0003); it
+    // stays on the file baseline `to_save` started from, settable only via `CORTI_LOCAL_PROVIDER`.
     if !pinned("local_threads") {
         to_save.local_threads = dto.local_threads;
     }

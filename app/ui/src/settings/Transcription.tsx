@@ -202,18 +202,9 @@ export function Transcription({ cfg, backends, onChange }: Props) {
 
       {cfg.transcribe_backend === "local" && (
         <>
-          <div className="settings-field">
-            <label>Compute provider{envBadge("local_provider")}</label>
-            <select
-              className="jselect"
-              value={cfg.local_provider}
-              disabled={isEnv("local_provider")}
-              onChange={(e) => set("local_provider", e.target.value)}
-            >
-              <option value="cpu">CPU</option>
-              <option value="coreml">CoreML / ANE (validating)</option>
-            </select>
-          </div>
+          <p className="callout">
+            On-device engine: NVIDIA Parakeet-TDT — runs fully offline; nothing leaves your Mac.
+          </p>
           <div className="settings-field">
             <label>ONNX threads{envBadge("local_threads")}</label>
             <input
