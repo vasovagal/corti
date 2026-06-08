@@ -17,7 +17,8 @@ anyhow = { workspace = true }
 # SHERPA_ONNX_LIB_DIR for hermetic/offline builds. See design/adr/0003-local-asr-sherpa-onnx.md.
 sherpa-onnx = "1.13"
 
-# Read the 2-track float WAV (ch0 = mic, ch1 = system tap) that corti-capture writes.
+# Read the 2-track WAV (ch0 = mic, ch1 = system tap) that corti-capture writes: 16-bit int raw, or 32-bit
+# float once AEC-cleaned.
 hound = "3.5"
 # Default model cache under ~/Library/Caches/corti/models/ (guardrail #5: outside any vault).
 dirs = "6"
