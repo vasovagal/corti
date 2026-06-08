@@ -69,7 +69,7 @@ impl Transcriber for LocalTranscriber {
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
         let m = models::discover(&dir, self.cfg.diarize_far_end)?;
         let track = audio::read_two_track(audio)?;
-        let provider = self.cfg.provider.as_str();
+        let provider = resolve_provider(self.cfg.provider.as_str());
         let threads = self.cfg.num_threads;
 
         // One recognizer load per job, shared across both channels.
@@ -102,5 +102,48 @@ impl Transcriber for LocalTranscriber {
         }
 
         Ok(DiarizedTranscript::new(merge_by_time(segments)))
+    }
+}
+
+/// Resolve the requested ONNX execution provider against what this build can actually honor.
+///
+/// A `coreml` request only works when the crate is compiled with the `coreml-lib` feature, which links a
+/// CoreML-enabled sherpa-onnx (see `build.rs`). The default crates.io prebuilt has **no** CoreML execution
+/// provider, so sherpa-onnx would silently fall back to CPU while printing a misleading
+/// `"CoreML is for Apple only since onnxruntime>=1.15. Fallback to cpu!"` line for *every* ONNX session
+/// (3 ASR + 2 VAD = 5 lines for a typical job) — which reads like platform misdetection on an Apple-Silicon
+/// Mac. When CoreML can't be honored, map the request to `cpu` ourselves and say so once, clearly.
+fn resolve_provider(requested: &str) -> &str {
+    if requested != "cpu" && !cfg!(feature = "coreml-lib") {
+        eprintln!(
+            "[corti] provider {requested:?} unavailable in this build — running on CPU \
+             (build with the `coreml-lib` feature + a CoreML-enabled sherpa-onnx lib to enable it)"
+        );
+        return "cpu";
+    }
+    requested
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_provider;
+
+    #[test]
+    fn cpu_passes_through() {
+        assert_eq!(resolve_provider("cpu"), "cpu");
+    }
+
+    #[test]
+    #[cfg(not(feature = "coreml-lib"))]
+    fn coreml_falls_back_to_cpu_without_the_feature() {
+        // Default build links a sherpa-onnx with no CoreML EP, so we map it to cpu rather than let
+        // sherpa-onnx emit its misleading per-session fallback log.
+        assert_eq!(resolve_provider("coreml"), "cpu");
+    }
+
+    #[test]
+    #[cfg(feature = "coreml-lib")]
+    fn coreml_passes_through_with_the_feature() {
+        assert_eq!(resolve_provider("coreml"), "coreml");
     }
 }
