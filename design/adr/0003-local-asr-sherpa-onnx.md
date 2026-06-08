@@ -74,18 +74,26 @@ exact prebuilt the build links:
   `libonnxruntime.1.24.4.dylib` (real CoreML EP — defines `OrtSessionOptionsAppendExecutionProvider_CoreML`,
   links `CoreML.framework`) and `libsherpa-onnx-c-api.dylib` compiled with the CoreML branch in.
 
-We measured the payoff against that shared lib (fresh process per run = one real corti job; output **identical**
-to CPU in every case):
+We measured the payoff against that shared lib (fresh process per run = one real corti job), across short
+clips **and a long recording** (a 1-hour call is the real target, so the short-clip numbers alone would have
+been misleading):
 
-| Audio  | CPU (median) | CoreML (median) | Result          |
-|--------|--------------|-----------------|-----------------|
-| 11.1 s | 1.73 s       | 19.22 s         | ~11× **slower** |
-| 44.5 s | 5.53 s       | 25.23 s         | ~4.6× **slower**|
+| Audio  | CPU    | CoreML | Ratio        |
+|--------|--------|--------|--------------|
+| 11.1 s | 1.73 s | 19.22 s| 11× slower   |
+| 44.5 s | 5.53 s | 25.23 s| 4.6× slower  |
+| 12 min | 107 s  | 296 s  | 2.76× slower |
 
-The CoreML penalty is a near-constant ~18–20 s independent of audio length — the per-session CoreML
-**model-compilation** cost (encoder/decoder/joiner → `.mlmodelc`), paid every job because corti builds
-sessions per job. sherpa 1.13.2 calls the EP with flags `0` and wires no model cache, so it never amortizes,
-and the int8 transducer ops largely fall back to CPU anyway. **Net: slower, with no accuracy gain.**
+The ratio shrinks with length as the per-session model-compilation cost (encoder/decoder/joiner →
+`.mlmodelc`, paid once per job) amortizes — but it converges to **~2.7×, not toward 1×**. Steady-state
+throughput is the real problem: CoreML sustains ~0.40 s per audio-second (**~2.5× realtime**) vs CPU's
+~0.15 s (**~6.7× realtime**) — a per-VAD-segment deficit that persists at any length (sherpa 1.13.2 calls the
+EP with flags `0` and wires no model cache; the int8 transducer ops largely partition back onto CPU).
+**Extrapolated to a 1-hour call: ~24 min on CoreML vs ~9 min on CPU.** This directly tested the "the compile
+cost amortizes over a long call" hypothesis — it does amortize, but CoreML still loses on raw throughput.
+The output isn't free either: at 12 min the CoreML transcript **diverges** from CPU (46 line-diffs — its
+fp16 ANE/GPU kernels accumulate enough numeric drift to change token decisions), where short clips were
+identical. **Net: slower at every realistic length, and not bit-identical.**
 
 **Decision:** keep CPU the default and do **not** ship CoreML. Instead of letting sherpa emit its misleading
 fallback, the backend now maps a `coreml` request to `cpu` itself and logs one honest line
