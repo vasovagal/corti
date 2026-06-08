@@ -238,45 +238,28 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
     );
     tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
-    // Clean speaker bleed on disk before transcription (backend-agnostic). The raw recording is never
-    // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
-    // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
-    // Regenerating the clean WAV on resume is an idempotent, cheap overwrite.
-    let input: PathBuf = if ctx.aec_enabled {
-        match corti_capture::write_clean_wav(audio) {
-            Ok(Some(clean)) => clean,
-            Ok(None) => {
-                // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
-                eprintln!("[corti] tap-only recording — no mic track to clean; skipping AEC");
-                audio.to_path_buf()
-            }
-            Err(e) => {
-                eprintln!("[corti] AEC failed ({e:#}); using the raw recording");
-                audio.to_path_buf()
-            }
-        }
-    } else {
-        audio.to_path_buf()
-    };
-
-    let transcript = match ctx.backend.transcribe(id, &input, meta) {
-        Ok(t) => t,
+    // Run the shared transcription core: offline AEC (regenerating the clean WAV on resume is an
+    // idempotent, cheap overwrite) → backend → persist the transcript sidecar next to the WAV. The
+    // pipeline's input is always the raw 2-track recording, so `skip_aec` is false; a tap-only recording
+    // is handled inside (`Ok(None)`). Only a real transcription failure returns `Err` here.
+    let transcript = match crate::transcribe::transcribe_recording(
+        &ctx.backend,
+        ctx.aec_enabled,
+        false,
+        id,
+        meta,
+        audio,
+    ) {
+        Ok((transcript, _input)) => transcript,
         Err(e) => {
             fail(ctx, id, meta, format!("transcription failed: {e:#}"));
             return;
         }
     };
 
-    // Persist the transcript next to the WAV so re-filing after a crash never needs to re-transcribe.
-    // Best-effort: even if this fails we still hold the transcript in memory for this run.
+    // `transcribe_recording` already wrote the sidecar next to the raw WAV; recompute its path so
+    // `file_and_done` can remove it once the note is filed.
     let sidecar = sidecar_path(audio);
-    if let Err(e) = write_sidecar(&sidecar, &transcript) {
-        eprintln!(
-            "[corti] could not persist transcript sidecar {}: {e:#}",
-            sidecar.display()
-        );
-    }
-
     if let Err(e) = ctx.queue.set_status(id, JobStatus::PendingNote) {
         fail(ctx, id, meta, format!("queue set PendingNote: {e:#}"));
         return;
@@ -388,11 +371,13 @@ fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
 }
 
 /// `<recording>.wav` → `<recording>.transcript.json` (next to the WAV, in the recordings cache).
-fn sidecar_path(audio: &Path) -> PathBuf {
+/// `pub(crate)` so the shared transcription core ([`crate::transcribe::transcribe_recording`]) writes the
+/// sidecar to the same location the pipeline reads it from on resume.
+pub(crate) fn sidecar_path(audio: &Path) -> PathBuf {
     audio.with_extension("transcript.json")
 }
 
-fn write_sidecar(path: &Path, transcript: &DiarizedTranscript) -> Result<()> {
+pub(crate) fn write_sidecar(path: &Path, transcript: &DiarizedTranscript) -> Result<()> {
     let file =
         std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     serde_json::to_writer(std::io::BufWriter::new(file), transcript)
