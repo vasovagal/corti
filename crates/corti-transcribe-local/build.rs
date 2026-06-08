@@ -31,7 +31,7 @@ fn main() {
             "cargo:warning=corti-transcribe-local: the `coreml-lib` feature is on but neither \
              SHERPA_ONNX_LIB_DIR nor SHERPA_ONNX_ARCHIVE_DIR is set. The default sherpa-onnx prebuilt has \
              no CoreML execution provider, so `coreml` will still run on CPU. Point one of these at a \
-             CoreML-enabled sherpa-onnx static lib (see scripts/build-sherpa-coreml.sh)."
+             CoreML-enabled sherpa-onnx static lib (see design/adr/0003-local-asr-sherpa-onnx.md)."
         );
     }
 }

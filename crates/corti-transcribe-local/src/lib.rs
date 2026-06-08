@@ -30,7 +30,10 @@ pub struct LocalConfig {
     /// Directory holding the model files (Parakeet, pyannote segmentation, embedding, VAD).
     /// `None` ⇒ the default cache (`~/Library/Caches/corti/models/`), resolved by the backend.
     pub model_dir: Option<PathBuf>,
-    /// ONNX Runtime execution provider: `"cpu"` (default, reliable) or `"coreml"` (opt-in, experimental).
+    /// ONNX Runtime execution provider. `"cpu"` (default) is the only one that ships: the prebuilt
+    /// sherpa-onnx static lib has no CoreML execution provider, and CoreML measured 4.6–11× *slower* on the
+    /// int8 transducer anyway (see [`resolve_provider`] and design/adr/0003). A non-`cpu` value is honored
+    /// only in a build with the `coreml-lib` feature + a CoreML-enabled lib; otherwise it maps to `"cpu"`.
     pub provider: String,
     /// ONNX intra-op threads. Small by default (a short batch job → favours battery on the M1 Pro).
     pub num_threads: i32,

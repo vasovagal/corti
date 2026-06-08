@@ -56,3 +56,48 @@ A mid-2026 research sweep (and direct verification) settled the engine choice:
 - **Relaxation point:** the `target-cpu=apple-m1` pin in `.cargo/config.toml` is the single knob to relax if
   non-M-series ever matters; the Apple-Silicon-only *policy* remains ADR 0002.
 - Transcription reads a WAV and never captures audio, so it needs no new TCC identity (guardrail #10).
+
+## Addendum (2026-06-08): CoreML measured — not viable for the int8 transducer
+
+The `coreml` provider knob looked broken: on an Apple-Silicon Mac it printed
+`CoreML is for Apple only since onnxruntime>=1.15. Fallback to cpu!` once per ONNX session (3 ASR + 2 VAD =
+5 lines) and ran on CPU — reading like platform misdetection. It is not. Confirmed by `nm`/`strings` on the
+exact prebuilt the build links:
+
+- The crates.io `sherpa-onnx-sys` **static** path links `csukuangfj/onnxruntime-libs`'
+  `onnxruntime-osx-arm64-static_lib`, which is **CPU-only**. sherpa's own
+  `cmake/onnxruntime-osx-arm64-static.cmake` hard-codes `add_definitions(-DSHERPA_ONNX_DISABLE_COREML)`
+  "when using static onnxruntime lib", so `session.cc`'s CoreML branch
+  (`#if defined(__APPLE__) && (ORT_API_VERSION>=15) && !defined(SHERPA_ONNX_DISABLE_COREML)`) is compiled
+  out and the `coreml` request hits the `#else` fallback. **CoreML is impossible with the static lib.**
+- CoreML is only present on the **shared** path: the upstream `…-osx-arm64-shared-lib` ships Microsoft's
+  `libonnxruntime.1.24.4.dylib` (real CoreML EP — defines `OrtSessionOptionsAppendExecutionProvider_CoreML`,
+  links `CoreML.framework`) and `libsherpa-onnx-c-api.dylib` compiled with the CoreML branch in.
+
+We measured the payoff against that shared lib (fresh process per run = one real corti job; output **identical**
+to CPU in every case):
+
+| Audio  | CPU (median) | CoreML (median) | Result          |
+|--------|--------------|-----------------|-----------------|
+| 11.1 s | 1.73 s       | 19.22 s         | ~11× **slower** |
+| 44.5 s | 5.53 s       | 25.23 s         | ~4.6× **slower**|
+
+The CoreML penalty is a near-constant ~18–20 s independent of audio length — the per-session CoreML
+**model-compilation** cost (encoder/decoder/joiner → `.mlmodelc`), paid every job because corti builds
+sessions per job. sherpa 1.13.2 calls the EP with flags `0` and wires no model cache, so it never amortizes,
+and the int8 transducer ops largely fall back to CPU anyway. **Net: slower, with no accuracy gain.**
+
+**Decision:** keep CPU the default and do **not** ship CoreML. Instead of letting sherpa emit its misleading
+fallback, the backend now maps a `coreml` request to `cpu` itself and logs one honest line
+(`crates/corti-transcribe-local/src/lib.rs::resolve_provider`), unless the crate is built with the
+`coreml-lib` feature. That feature is a **documented escape hatch** for re-evaluation, not a shipping path:
+it needs a CoreML-capable sherpa-onnx lib, which the static model cannot provide. Re-enabling would require
+either (a) **shared** linking + bundling `libonnxruntime.dylib`/`libsherpa-onnx-c-api.dylib` into the `.app`
+(+ rpath from the app build script, + ad-hoc signing the dylibs), or (b) a **custom static** `libonnxruntime.a`
+built from ONNX Runtime source with `--use_coreml` (then point sherpa at it via `SHERPA_ONNXRUNTIME_LIB_DIR`,
+which skips the `DISABLE_COREML` define). Both are real work to make corti *slower* today; revisit only if a
+future ORT/model or a persistent CoreML model cache changes the math.
+
+To re-measure: build a CoreML-capable lib, then
+`SHERPA_ONNX_LIB_DIR=<lib> cargo run -p corti-transcribe-local --features coreml-lib --example transcribe_file -- <recording.wav>`
+with `CORTI_LOCAL_PROVIDER=coreml` vs `=cpu`.
