@@ -102,23 +102,32 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         }
     }
 
-    // Settings section.
+    // Settings section. The Backend:/Bucket: lines are a read-only summary derived live from the current
+    // config (so they reflect edits saved in the Settings window); the window itself is the editor.
+    let (backend_label, bucket_label) = settings_summary(app);
     items.push(Box::new(MenuItem::with_id(
         app,
         "backend",
-        format!("Backend: {}", state.backend_label),
+        format!("Backend: {backend_label}"),
         false,
         None::<&str>,
     )?));
-    if !state.bucket_label.is_empty() {
+    if let Some(bucket) = bucket_label {
         items.push(Box::new(MenuItem::with_id(
             app,
             "bucket",
-            format!("Bucket: {}", state.bucket_label),
+            format!("Bucket: {bucket}"),
             false,
             None::<&str>,
         )?));
     }
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        "open_settings",
+        "Settings…",
+        true,
+        None::<&str>,
+    )?));
     items.push(Box::new(MenuItem::with_id(
         app,
         "ethics_guide",
@@ -215,8 +224,28 @@ pub fn update_history(
     refresh_menu(app);
 }
 
-/// Rebuild the menu from state and swap it in (marshalled to the main thread).
-fn refresh_menu(app: &AppHandle) {
+/// The read-only Settings-summary labels for the tray, derived live from the current config so they reflect
+/// edits saved in the Settings window. `None` bucket ⇒ no "Bucket:" line.
+fn settings_summary(app: &AppHandle) -> (String, Option<String>) {
+    let Some(state) = app.try_state::<crate::settings::ConfigState>() else {
+        return ("…".to_string(), None);
+    };
+    let cfg = state.config.lock().unwrap();
+    let backend = cfg.backend_name().to_string();
+    #[cfg(feature = "aws")]
+    let bucket = (cfg.transcribe_backend == crate::config::BackendChoice::Aws).then(|| {
+        cfg.aws_bucket
+            .clone()
+            .unwrap_or_else(|| "(unset — set in Settings…)".to_string())
+    });
+    #[cfg(not(feature = "aws"))]
+    let bucket = None::<String>;
+    (backend, bucket)
+}
+
+/// Rebuild the menu from state and swap it in (marshalled to the main thread). `pub(crate)` so the Settings
+/// `set_config` command can refresh the read-only summary after a save.
+pub(crate) fn refresh_menu(app: &AppHandle) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -277,6 +306,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     match id {
         "quit" => app.exit(0),
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
+        "open_settings" => open_settings_window(app),
         "ethics_guide" => open_ethics_window(app),
         "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
@@ -323,6 +353,53 @@ fn open_ethics_window(app: &AppHandle) {
             }
             Err(e) => {
                 eprintln!("[corti] opening ethics window failed: {e}");
+                // Don't leave a dangling Regular policy with no window.
+                revert_activation_policy_if_no_windows(&app);
+            }
+        }
+    });
+}
+
+/// Open (or focus, if already open) the in-app Settings window. Created on demand like the Ethics window
+/// (ADR 0004): flips the app to `Regular` while it lives and reverts to menu-bar-only `Accessory` once it
+/// (and any other window) closes. It loads the same SPA bundle as the Ethics window, selecting the settings
+/// view via the `?view=settings` query. Window + AppKit work runs on the main thread.
+fn open_settings_window(app: &AppHandle) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        // Singleton: focus the existing window instead of spawning a second.
+        if let Some(win) = app.get_webview_window("settings") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+
+        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
+        let _ = app.set_activation_policy(ActivationPolicy::Regular);
+
+        match WebviewWindowBuilder::new(
+            &app,
+            "settings",
+            WebviewUrl::App("index.html?view=settings".into()),
+        )
+        .title("Settings")
+        .inner_size(720.0, 640.0)
+        .min_inner_size(560.0, 420.0)
+        .resizable(true)
+        .build()
+        {
+            Ok(win) => {
+                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
+                let app_for_evt = app.clone();
+                win.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Destroyed) {
+                        revert_activation_policy_if_no_windows(&app_for_evt);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[corti] opening settings window failed: {e}");
                 // Don't leave a dangling Regular policy with no window.
                 revert_activation_policy_if_no_windows(&app);
             }

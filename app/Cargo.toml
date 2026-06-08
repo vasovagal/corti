@@ -29,7 +29,10 @@ corti-vagus = { workspace = true }
 
 anyhow = { workspace = true }
 chrono = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+# Persisted, hand-editable config file (`~/.local/share/corti/config.toml`). Flat scalar struct only.
+toml = "0.8"
 
 # Tray + menu live in core tauri behind the `tray-icon` feature. No `image-*` feature needed: tray icons
 # are embedded at build time via `include_image!` (raw RGBA, not feature-gated).
@@ -47,8 +50,13 @@ tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
 # design/adr/0003-local-asr-sherpa-onnx.md. Independent of `aws`: both can be compiled in and the active
 # backend is chosen at runtime (CORTI_TRANSCRIBE_BACKEND).
 corti-transcribe-local = { workspace = true, optional = true }
+# In-app model downloader (Settings → Models), part of the `local` feature: a tiny blocking HTTP client and
+# SHA-256 verification of the downloaded artifacts (tarballs extracted via the system `tar`, like
+# fetch-models.sh). Pulled in only when the local backend is compiled.
+sha2 = { version = "0.10", optional = true }
+ureq = { version = "2", optional = true }
 
 [features]
 default = ["aws"]
 aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
-local = ["dep:corti-transcribe-local"]
+local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
