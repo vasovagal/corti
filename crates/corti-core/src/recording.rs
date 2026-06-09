@@ -67,13 +67,48 @@ impl RecordingMeta {
         )
     }
 
-    /// The `--source` value for `vagus add-note`: app name plus start time.
+    /// The `--source` value for `vagus add-note`: app name plus start time. The app-name half is run through
+    /// [`yaml_safe`] because `vagus` writes `--source` verbatim and unquoted into the note's YAML frontmatter,
+    /// and the name can be an arbitrary macOS bundle id or the user's `corti-tap --label`.
     pub fn source(&self) -> String {
         format!(
             "{} · {}",
-            self.owning_app.name,
+            yaml_safe(&self.owning_app.name),
             self.started_at.format("%Y-%m-%d %H:%M")
         )
+    }
+}
+
+/// Make `name` safe to embed in `vagus`'s single-line YAML `source:` frontmatter. vagus writes `--source`
+/// verbatim and unquoted, so a value with a newline, a `": "` mapping marker, a leading YAML indicator
+/// (`#`, `&`, `*`, `!`, …), a `" #"` comment, or a quote would corrupt the note's frontmatter (invalid YAML
+/// the vault indexer then skips or mis-parses). The recording-time half of `source()` is known-safe
+/// (`HH:MM`'s colon isn't followed by a space), so only the app-name half needs this.
+fn yaml_safe(name: &str) -> String {
+    // Collapse all whitespace (incl. newlines/tabs) to single spaces — this alone defeats newline injection.
+    let collapsed = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(collapsed.len());
+    let mut chars = collapsed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // `": "` (or a trailing colon) opens a nested mapping in a plain scalar — neutralize to a dash.
+            ':' if chars.peek().is_none_or(|n| *n == ' ') => out.push('-'),
+            // `" #"` starts a YAML comment; drop the marker so the rest of the name survives.
+            '#' if out.ends_with(' ') => {}
+            // A bare quote/backtick can flip the value into a quoted scalar; drop it.
+            '"' | '\'' | '`' => {}
+            other => out.push(other),
+        }
+    }
+    // Strip any leading YAML indicator so the value is always parsed as a plain scalar.
+    let cleaned = out
+        .trim()
+        .trim_start_matches(|c: char| "#&*!|>%@,-?:[]{}".contains(c))
+        .trim();
+    if cleaned.is_empty() {
+        "Unknown app".to_string()
+    } else {
+        cleaned.to_string()
     }
 }
 
@@ -153,6 +188,35 @@ mod tests {
         // A webinar's title drops the " call" suffix and keeps the WEBINAR_NAME.
         assert_eq!(m.note_title(), "Webinar — 2026-05-29 14:05");
         assert_eq!(m.source(), "Webinar · 2026-05-29 14:05");
+    }
+
+    #[test]
+    fn source_is_yaml_frontmatter_safe() {
+        let at = Local.with_ymd_and_hms(2026, 5, 29, 14, 5, 0).unwrap();
+        let src = |name: &str| {
+            RecordingMeta {
+                started_at: at,
+                ended_at: None,
+                owning_app: OwningApp {
+                    bundle_id: None,
+                    name: name.to_string(),
+                },
+                audio_path: PathBuf::from("/tmp/x.wav"),
+            }
+            .source()
+        };
+        // A `": "` mapping marker (reachable via `corti-tap --label`) is neutralized, not left to break YAML.
+        assert_eq!(src("My Call: part 2"), "My Call- part 2 · 2026-05-29 14:05");
+        // A newline can't inject a second frontmatter line.
+        assert_eq!(
+            src("evil\ninjected: true"),
+            "evil injected- true · 2026-05-29 14:05"
+        );
+        // Leading indicators and quotes are stripped so the value stays a plain scalar.
+        assert_eq!(src("#tag"), "tag · 2026-05-29 14:05");
+        assert_eq!(src("\"quoted\""), "quoted · 2026-05-29 14:05");
+        // An all-hostile name degrades to a placeholder rather than an empty value.
+        assert_eq!(src("###"), "Unknown app · 2026-05-29 14:05");
     }
 
     #[test]
