@@ -47,8 +47,9 @@ pub fn mic_owner() -> MicOwner {
 /// IO is "running" even before any audio flows / before the TCC grant). So the
 /// [`MicMonitor`](crate::MicMonitor) *falling* edge never fires while we're capturing. To detect that the
 /// *call* actually ended, poll this instead: it asks, at the process level, whether any app besides us
-/// (and besides `com.apple.*` audio helpers) still has mic input running. Mirrors the ranking in
-/// [`mic_owner`] — a process counts only if it has a bundle id and isn't a system helper.
+/// still has mic input running. Mirrors [`best_running_input_app`]'s ranking via [`counts_as_call_owner`]:
+/// a recognized conferencing app counts even when it's an Apple app (FaceTime, Safari are `com.apple.*`),
+/// as does any non-Apple app with a bundle id — but not an unrecognized `com.apple.*` audio helper.
 pub fn other_app_holds_input(self_pid: i32) -> bool {
     let Ok(objects) = process_object_list() else {
         // Best-effort: if we can't enumerate, report "no other owner" so a stuck recording can still
@@ -58,7 +59,7 @@ pub fn other_app_holds_input(self_pid: i32) -> bool {
     objects.into_iter().any(|obj| {
         is_running_input(obj)
             && pid_of(obj) != Some(self_pid)
-            && bundle_id(obj).is_some_and(|b| !is_system_helper(&b))
+            && bundle_id(obj).is_some_and(|b| counts_as_call_owner(&b))
     })
 }
 
@@ -99,6 +100,16 @@ fn is_system_helper(bundle_id: &str) -> bool {
     bundle_id.starts_with("com.apple.")
 }
 
+/// Whether an input-holding process (other than us) should keep a recording alive in the end-of-call poll.
+/// A recognized conferencing app counts **even when it's an Apple app** — FaceTime and Safari are
+/// `com.apple.*` yet are real call apps (without this they were dropped as "system helpers", so their calls
+/// were cut off after the first poll). Any non-Apple app with a bundle id also counts; an unrecognized
+/// `com.apple.*` audio helper (CoreSpeech, controlcenter, …) does not. Symmetric with the start trigger, so a
+/// call that can *start* can also be *kept alive*.
+fn counts_as_call_owner(bundle_id: &str) -> bool {
+    is_known_conferencing_app(bundle_id) || !is_system_helper(bundle_id)
+}
+
 /// All HAL process objects.
 fn process_object_list() -> Result<Vec<ca::AudioObjectID>> {
     let addr = property::global(ca::kAudioHardwarePropertyProcessObjectList);
@@ -133,4 +144,34 @@ fn frontmost_app_bundle_id() -> Option<String> {
     let app = workspace.frontmostApplication()?;
     let bundle_id = app.bundleIdentifier()?;
     Some(bundle_id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counts_as_call_owner;
+
+    #[test]
+    fn apple_conferencing_apps_keep_a_recording_alive() {
+        // Regression: FaceTime/Safari are `com.apple.*` but ARE conferencing apps. They used to be filtered
+        // out as "system helpers", so their calls were force-stopped ~1-3 s in and discarded.
+        assert!(counts_as_call_owner("com.apple.FaceTime"));
+        assert!(counts_as_call_owner("com.apple.Safari"));
+        assert!(counts_as_call_owner("com.apple.Safari.WebApp")); // a Safari helper (prefix-matched)
+    }
+
+    #[test]
+    fn non_apple_apps_keep_a_recording_alive() {
+        assert!(counts_as_call_owner("us.zoom.xos"));
+        assert!(counts_as_call_owner("com.tinyspeck.slackmacgap.helper"));
+        assert!(counts_as_call_owner("com.some.random.app"));
+    }
+
+    #[test]
+    fn unrecognized_apple_helpers_do_not() {
+        assert!(!counts_as_call_owner("com.apple.CoreSpeech"));
+        assert!(!counts_as_call_owner("com.apple.controlcenter"));
+        assert!(!counts_as_call_owner(
+            "com.apple.audio.AudioComponentRegistrar"
+        ));
+    }
 }
