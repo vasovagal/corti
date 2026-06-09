@@ -10,7 +10,6 @@ export interface SettingsDto {
   language: string;
   aws_profile: string | null;
   aws_region: string | null;
-  local_model_dir: string | null;
   local_threads: number;
   local_diarize_far_end: boolean;
   aec_enabled: boolean;
