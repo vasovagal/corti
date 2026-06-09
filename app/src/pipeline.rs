@@ -48,8 +48,10 @@ pub enum PipelineMsg {
 /// Everything the worker owns. Built once on the worker thread; never shared.
 struct Ctx {
     queue: Queue,
-    /// Discovered once. `Err` (stringified) when `vagus` isn't installed — we still record + transcribe,
-    /// then fail filing with a clear message rather than blocking the whole pipeline at startup.
+    /// Discovered at startup; if that failed, re-probed on each filing attempt (see [`file_and_done`])
+    /// so installing vagus mid-session works without a relaunch. `Err` is the stringified, user-facing
+    /// reason shown when filing fails — we still record + transcribe rather than blocking the whole
+    /// pipeline at startup.
     vagus: Result<Vagus, String>,
     backend: Backend,
     /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
@@ -87,7 +89,7 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
     };
 
     seed_history(&ctx);
-    recover(&ctx);
+    recover(&mut ctx);
     prune(&ctx);
     tray::set_status(&ctx.app, "Idle — waiting for a call".to_string());
 
@@ -105,7 +107,7 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
                         None,
                         None,
                     );
-                    transcribe_and_file(&ctx, &id, &meta, &audio_path);
+                    transcribe_and_file(&mut ctx, &id, &meta, &audio_path);
                 }
                 Err(e) => {
                     eprintln!("[corti] enqueue failed for {}: {e:#}", audio_path.display());
@@ -165,7 +167,7 @@ fn history_entry_from_job(job: &Job) -> HistoryEntry {
 }
 
 /// Resume every non-terminal job left by a previous run.
-fn recover(ctx: &Ctx) {
+fn recover(ctx: &mut Ctx) {
     let jobs = match ctx.queue.resumable() {
         Ok(j) => j,
         Err(e) => {
@@ -186,7 +188,7 @@ fn recover(ctx: &Ctx) {
     }
 }
 
-fn resume(ctx: &Ctx, job: Job) {
+fn resume(ctx: &mut Ctx, job: Job) {
     let meta = job.meta();
     match job.status {
         JobStatus::Recording => {
@@ -213,7 +215,7 @@ fn resume(ctx: &Ctx, job: Job) {
 
 /// Transcribe `audio`, persist the transcript sidecar, then file it. Used for both fresh recordings and
 /// `PendingTranscription` / `Transcribing` resumes.
-fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) {
+fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Path) {
     // Record the stable Transcribe job name + advance to Transcribing BEFORE transcribing, so a crash
     // mid-transcribe re-attaches to the same (idempotent) AWS job on resume.
     if let Err(e) = ctx.queue.update(
@@ -277,7 +279,7 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
 }
 
 /// Resume a `PendingNote` job: it's already transcribed, so just re-file (idempotently).
-fn finish_note(ctx: &Ctx, job: &Job, meta: &RecordingMeta) {
+fn finish_note(ctx: &mut Ctx, job: &Job, meta: &RecordingMeta) {
     let sidecar = sidecar_path(&job.audio_path);
 
     // Already filed once (note_path set): nothing to redo — just mark Done and clean up.
@@ -297,12 +299,26 @@ fn finish_note(ctx: &Ctx, job: &Job, meta: &RecordingMeta) {
 
 /// File the transcript into vagus and mark the job `Done`.
 fn file_and_done(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     id: &str,
     meta: &RecordingMeta,
     transcript: &DiarizedTranscript,
     sidecar: &Path,
 ) {
+    // Startup discovery may have failed only because vagus wasn't installed yet — `brew install vagus`
+    // mid-session is the expected fix, and a tray app shouldn't need a relaunch to notice. Retry once
+    // per filing attempt: one `vagus --version` spawn, only on the filing path of a concluded recording,
+    // so effectively free. A fresh failure replaces the cached error so the tray always reports current
+    // reality, not the state at app launch.
+    if ctx.vagus.is_err() {
+        ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
+        if let Ok(v) = &ctx.vagus {
+            eprintln!(
+                "[corti] vagus now available at `{}` — filing enabled",
+                v.bin().display()
+            );
+        }
+    }
     let vagus = match &ctx.vagus {
         Ok(v) => v,
         Err(e) => {
