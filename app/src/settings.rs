@@ -37,7 +37,6 @@ pub struct SettingsDto {
     pub language: String,
     pub aws_profile: Option<String>,
     pub aws_region: Option<String>,
-    pub local_model_dir: Option<String>,
     pub local_threads: i32,
     pub local_diarize_far_end: bool,
     pub aec_enabled: bool,
@@ -67,10 +66,6 @@ impl From<&AppConfig> for SettingsDto {
             language: cfg.language.clone(),
             aws_profile: cfg.aws_profile.clone(),
             aws_region: cfg.aws_region.clone(),
-            local_model_dir: cfg
-                .local_model_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
             local_threads: cfg.local_threads,
             local_diarize_far_end: cfg.local_diarize_far_end,
             aec_enabled: cfg.aec_enabled,
@@ -141,9 +136,11 @@ pub fn set_config(
     // AWS profile/region aren't CORTI_*-pinned (their override is the AWS-native chain), so persist directly.
     to_save.aws_profile = non_empty(dto.aws_profile);
     to_save.aws_region = non_empty(dto.aws_region);
-    if !pinned("local_model_dir") {
-        to_save.local_model_dir = non_empty(dto.local_model_dir).map(PathBuf::from);
-    }
+    // `local_model_dir` is intentionally NOT taken from the DTO — it's owned solely by the Storage section's
+    // `set_models_dir` command. The webview loads the config once at mount, so a `dto.local_model_dir` here
+    // would be a stale snapshot that this Save would write back, silently reverting a models dir just set via
+    // the Storage section. `to_save` already carries the persisted value from `load_file()`, so leaving it
+    // untouched preserves it.
     // `local_provider` is no longer a webview setting (CPU is the only shipping provider — see ADR 0003); it
     // stays on the file baseline `to_save` started from, settable only via `CORTI_LOCAL_PROVIDER`.
     if !pinned("local_threads") {
