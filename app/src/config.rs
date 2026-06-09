@@ -201,14 +201,17 @@ fn parse_backend(s: Option<String>) -> BackendChoice {
     }
 }
 
-/// Default backend for this build: prefer `aws` (the historical default), else `local`.
+/// Default backend for this build: prefer the on-device `local` backend so a fresh install transcribes out
+/// of the box with no cloud setup (and nothing leaves the Mac — matching the README's offline-by-default
+/// framing). Fall back to `aws` only when `local` isn't compiled in. `CORTI_TRANSCRIBE_BACKEND` and the
+/// Settings screen override this.
 fn default_backend() -> BackendChoice {
-    if cfg!(feature = "aws") {
-        BackendChoice::Aws
-    } else if cfg!(feature = "local") {
+    if cfg!(feature = "local") {
         BackendChoice::Local
-    } else {
+    } else if cfg!(feature = "aws") {
         BackendChoice::Aws
+    } else {
+        BackendChoice::Local
     }
 }
 
