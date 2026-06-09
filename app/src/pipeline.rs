@@ -257,9 +257,17 @@ fn transcribe_and_file(ctx: &Ctx, id: &str, meta: &RecordingMeta, audio: &Path) 
         }
     };
 
-    // `transcribe_recording` already wrote the sidecar next to the raw WAV; recompute its path so
-    // `file_and_done` can remove it once the note is filed.
+    // Persist the transcript next to the WAV so re-filing after a crash never needs to re-transcribe.
+    // Best-effort: even if this fails we still hold the transcript in memory for this run. (The shared
+    // `transcribe_recording` no longer does this — it's a pipeline/crash-recovery concern, not the CLI's.)
     let sidecar = sidecar_path(audio);
+    if let Err(e) = write_sidecar(&sidecar, &transcript) {
+        eprintln!(
+            "[corti] could not persist transcript sidecar {}: {e:#}",
+            sidecar.display()
+        );
+    }
+
     if let Err(e) = ctx.queue.set_status(id, JobStatus::PendingNote) {
         fail(ctx, id, meta, format!("queue set PendingNote: {e:#}"));
         return;
@@ -371,13 +379,11 @@ fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
 }
 
 /// `<recording>.wav` → `<recording>.transcript.json` (next to the WAV, in the recordings cache).
-/// `pub(crate)` so the shared transcription core ([`crate::transcribe::transcribe_recording`]) writes the
-/// sidecar to the same location the pipeline reads it from on resume.
-pub(crate) fn sidecar_path(audio: &Path) -> PathBuf {
+fn sidecar_path(audio: &Path) -> PathBuf {
     audio.with_extension("transcript.json")
 }
 
-pub(crate) fn write_sidecar(path: &Path, transcript: &DiarizedTranscript) -> Result<()> {
+fn write_sidecar(path: &Path, transcript: &DiarizedTranscript) -> Result<()> {
     let file =
         std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     serde_json::to_writer(std::io::BufWriter::new(file), transcript)

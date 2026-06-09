@@ -112,17 +112,18 @@ impl Backend {
     }
 }
 
-/// Run offline AEC (unless `skip_aec`), transcribe with the runtime-selected `backend`, then persist the
-/// `<recording>.transcript.json` sidecar next to `raw_audio`. This is the tray-free, queue-free
-/// transcription core shared by the pipeline worker ([`crate::pipeline::transcribe_and_file`]) and the
-/// `--redo` CLI ([`crate::cli`]). Returns the transcript plus the audio path actually fed to the backend
-/// (the cleaned WAV when AEC ran, else the raw input) for logging.
+/// Run offline AEC (unless `skip_aec`), then transcribe with the runtime-selected `backend`. This is the
+/// tray-free, queue-free transcription core shared by the pipeline worker
+/// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
+/// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
+/// input) for logging. Persisting the transcript sidecar is the pipeline's concern (crash recovery), not
+/// this primitive's — callers that want it write it themselves.
 ///
 /// `skip_aec` is set by the CLI when the input is already a `*-clean.wav` (a 2-channel AEC *output*):
 /// running AEC again would cancel a second time. The pipeline always passes `skip_aec = false` — its input
 /// is the raw 2-track recording, and a tap-only (mono) recording is handled inside `write_clean_wav`
-/// (`Ok(None)`). Only a genuine backend transcription failure is returned as `Err`; AEC failures fall back
-/// to the raw recording and a sidecar-write failure is logged but swallowed, so neither stalls the pipeline.
+/// (`Ok(None)`). Only a genuine backend transcription failure is returned as `Err`; an AEC failure falls
+/// back to the raw recording so it never stalls the caller.
 pub fn transcribe_recording(
     backend: &Backend,
     aec_enabled: bool,
@@ -152,17 +153,6 @@ pub fn transcribe_recording(
     };
 
     let transcript = backend.transcribe(id, &input, meta)?;
-
-    // Persist the transcript next to the WAV so re-filing after a crash never needs to re-transcribe.
-    // Best-effort: even if this fails we still hold the transcript in memory for this run.
-    let sidecar = crate::pipeline::sidecar_path(raw_audio);
-    if let Err(e) = crate::pipeline::write_sidecar(&sidecar, &transcript) {
-        eprintln!(
-            "[corti] could not persist transcript sidecar {}: {e:#}",
-            sidecar.display()
-        );
-    }
-
     Ok((transcript, input))
 }
 

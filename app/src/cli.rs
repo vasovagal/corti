@@ -38,32 +38,46 @@ corti — menu-bar call recorder + transcriber
 
 USAGE:
     corti                                  launch the menu-bar tray app (default)
-    corti --redo <recording> [options]     re-transcribe a recording and file a fresh note
+    corti --input <wav> [options]          transcribe a WAV to a note at a path you choose (primitive)
+    corti --redo <recording> [options]     re-transcribe a tracked recording and file via vagus
     corti --list                           list tracked recordings and their pipeline status
     corti --help | -h                      show this help
     corti --version | -V                   show the version
 
-REDO OPTIONS:
+INPUT OPTIONS (--input):
+    -o, --output <path>      write the rendered note here (default: stdout)
+    --title <text>           note title (default: derived from the input filename)
+    --source <text>          note `source` frontmatter (default: derived from the input filename)
+    --backend <aws|local>    backend to use (default: the configured backend)
+    --local | --aws          shorthand for --backend local|aws
+    --no-aec                 transcribe the input as-is (skip offline echo cancellation)
+
+REDO OPTIONS (--redo):
     --backend <aws|local>    backend to use for this run (default: the configured backend)
-    --local                  shorthand for --backend local (on-device Parakeet)
-    --aws                    shorthand for --backend aws
+    --local | --aws          shorthand for --backend local|aws
     --print                  print the transcript to stdout; do NOT file a note or touch the queue
 
-<recording> may be a recordings-cache filename (e.g. 20260608-160056-slack.wav), a path to a .wav, a
-*-clean.wav, or a bare stem (20260608-160056-slack). Bare names resolve under the recordings cache
-(~/Library/Caches/corti/recordings, or $CORTI_RECORDINGS_DIR).";
+--input is the plain primitive: you give it an exact WAV and an exact --output path, it transcribes and
+writes a note (frontmatter + title + transcript) — no cache/queue/vagus, nothing is filed or indexed. AEC
+runs automatically on a 2-channel (mic+tap) WAV and is skipped on a mono or *-clean.wav input. A 2-channel
+input writes a sibling <name>-clean.wav. To index a note written into the vault, run `vagus index`.
+
+--redo is the convenience path: <recording> may be a recordings-cache filename, a path, a *-clean.wav, or
+a bare stem (bare names resolve under ~/Library/Caches/corti/recordings, or $CORTI_RECORDINGS_DIR); it
+files through vagus and reflects the new note in the queue/tray history.";
 
 /// A parsed command line. `Run` is the default (no/blank args) and launches the tray.
 #[derive(Debug, PartialEq)]
 pub enum Cli {
     Run,
     Redo(RedoArgs),
+    Transcribe(TranscribeArgs),
     List,
     Help,
     Version,
 }
 
-/// Options for `--redo`.
+/// Options for `--redo`: corti resolves the recording (cache dir + queue) and files through vagus.
 #[derive(Debug, PartialEq)]
 pub struct RedoArgs {
     /// The recording as typed (filename, path, `-clean.wav`, or bare stem).
@@ -72,6 +86,24 @@ pub struct RedoArgs {
     pub backend: Option<BackendChoice>,
     /// `--print`: dump the transcript to stdout instead of filing a note.
     pub print_only: bool,
+}
+
+/// Options for `--input`: the low-level primitive — caller supplies exact paths, corti transcribes and
+/// renders a note. No cache/queue/vagus resolution; nothing is filed or indexed.
+#[derive(Debug, PartialEq)]
+pub struct TranscribeArgs {
+    /// Exact path to the input WAV.
+    pub input: String,
+    /// Where to write the rendered note; `None` ⇒ stdout.
+    pub output: Option<String>,
+    /// Note title override; `None` ⇒ derived from the input filename.
+    pub title: Option<String>,
+    /// Note `source` (frontmatter) override; `None` ⇒ derived from the input filename.
+    pub source: Option<String>,
+    /// Backend override for this run; `None` ⇒ the configured/env backend.
+    pub backend: Option<BackendChoice>,
+    /// `--no-aec`: transcribe the input as-is (skip offline echo cancellation).
+    pub no_aec: bool,
 }
 
 /// Parse the process arguments, exiting with usage on error. Thin wrapper over [`parse_from`] (which is the
@@ -123,6 +155,43 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Cli, String> {
                 print_only,
             }))
         }
+        "--input" => {
+            let input = args
+                .next()
+                .ok_or("--input requires a path to a .wav file")?;
+            let mut output = None;
+            let mut title = None;
+            let mut source = None;
+            let mut backend = None;
+            let mut no_aec = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--output" | "-o" => {
+                        output = Some(args.next().ok_or("--output requires a path")?);
+                    }
+                    "--title" => title = Some(args.next().ok_or("--title requires a value")?),
+                    "--source" => source = Some(args.next().ok_or("--source requires a value")?),
+                    "--backend" => {
+                        let v = args
+                            .next()
+                            .ok_or("--backend requires a value (aws|local)")?;
+                        backend = Some(parse_backend_flag(&v)?);
+                    }
+                    "--local" => backend = Some(BackendChoice::Local),
+                    "--aws" => backend = Some(BackendChoice::Aws),
+                    "--no-aec" => no_aec = true,
+                    other => return Err(format!("unknown option to --input: `{other}`")),
+                }
+            }
+            Ok(Cli::Transcribe(TranscribeArgs {
+                input,
+                output,
+                title,
+                source,
+                backend,
+                no_aec,
+            }))
+        }
         other => Err(format!("unknown argument: `{other}`")),
     }
 }
@@ -150,6 +219,7 @@ pub fn dispatch(cli: Cli) -> i32 {
         }
         Cli::List => run_list(),
         Cli::Redo(args) => run_redo(args),
+        Cli::Transcribe(args) => run_transcribe(args),
     };
     match result {
         Ok(()) => 0,
@@ -289,6 +359,93 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `--input`: the low-level primitive. Transcribe an explicit WAV and render a note to `--output` (or
+/// stdout). No cache/queue/vagus resolution — the caller owns the paths and any filing/indexing.
+fn run_transcribe(args: TranscribeArgs) -> Result<()> {
+    let mut cfg = AppConfig::load();
+    if let Some(choice) = args.backend {
+        cfg.transcribe_backend = choice;
+    }
+    let backend_label = cfg.backend_name();
+    if backend_label == "none" {
+        bail!(
+            "the requested transcription backend is not compiled into this build (have: {})",
+            compiled_backends()
+        );
+    }
+
+    let input = Path::new(&args.input);
+    if !input.exists() {
+        bail!("no such file: {}", input.display());
+    }
+    let name = input
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem_from_name(&name);
+    // AEC runs by default; --no-aec forces it off, and an already-`-clean.wav` is never re-cancelled
+    // (write_clean_wav itself reports "nothing to do" for a mono/tap-only WAV via Ok(None)).
+    let aec_enabled = !args.no_aec;
+    let skip_aec = name.ends_with("-clean.wav");
+    let job_id = if stem.is_empty() {
+        "input".to_string()
+    } else {
+        stem.clone()
+    };
+    let meta = derive_meta_from_stem(&stem, input);
+
+    eprintln!(
+        "[corti] transcribing {} with {backend_label}; AEC {}",
+        input.display(),
+        if aec_enabled && !skip_aec {
+            "on"
+        } else {
+            "off"
+        },
+    );
+    let backend = Backend::init(cfg);
+    let (transcript, used) = crate::transcribe::transcribe_recording(
+        &backend,
+        aec_enabled,
+        skip_aec,
+        &job_id,
+        &meta,
+        input,
+    )
+    .context("transcription failed")?;
+    eprintln!(
+        "[corti] transcribed {} segment(s) from {}",
+        transcript.segments.len(),
+        used.display(),
+    );
+
+    let title = args.title.unwrap_or_else(|| meta.note_title());
+    let source = args.source.unwrap_or_else(|| meta.source());
+    let body = corti_vagus::recording_body(&meta, &transcript);
+    let note = render_note(&title, &source, &body, Local::now());
+
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &note).with_context(|| format!("writing note to {path}"))?;
+            println!("wrote note: {path}");
+        }
+        None => print!("{note}"),
+    }
+    Ok(())
+}
+
+/// Render a standalone note — YAML frontmatter + an H1 title + `body` — mirroring what `vagus add-note`
+/// produces, so a note written by `--input --output` matches one filed by `--redo`/vagus. corti renders
+/// this itself on purpose: the `vagus` CLI can only file into its own inbox with its own generated
+/// filename, and `--input` exists precisely to let the caller choose the path. This duplicates vagus's
+/// frontmatter shape (`created`/`status`/`source`); keep it in sync if vagus's note format changes.
+fn render_note(title: &str, source: &str, body: &str, created: chrono::DateTime<Local>) -> String {
+    format!(
+        "---\ncreated: {}\nstatus: inbox\nsource: {source}\n---\n\n# {title}\n\n{body}",
+        created.format("%Y-%m-%dT%H:%M"),
+    )
 }
 
 /// A recording resolved for re-transcription: which audio file to feed the backend, the metadata for the
@@ -432,11 +589,17 @@ fn parse_stem_timestamp(stem: &str) -> Option<chrono::DateTime<Local>> {
     Local.from_local_datetime(&naive).single()
 }
 
-/// The [`OwningApp`] from a recording stem's trailing slug. `20260608-160056-microsoft-teams` →
-/// `Microsoft Teams`; an empty/odd slug falls back to [`OwningApp::unknown`].
+/// The [`OwningApp`] from a recording stem. For a corti stem (timestamp prefix) the app is the trailing
+/// slug: `20260608-160056-microsoft-teams` → `Microsoft Teams`. For an arbitrary `--input` filename with no
+/// timestamp, the whole stem is humanized (`team-standup` → `Team Standup`). An empty slug falls back to
+/// [`OwningApp::unknown`].
 fn owning_app_from_stem(stem: &str) -> OwningApp {
-    // Everything after the 16-char `YYYYMMDD-HHMMSS-` prefix is the slug.
-    let slug = stem.get(16..).unwrap_or("").trim_matches('-');
+    let slug = if parse_stem_timestamp(stem).is_some() {
+        stem.get(16..).unwrap_or("") // after the 16-char `YYYYMMDD-HHMMSS-` prefix
+    } else {
+        stem
+    }
+    .trim_matches('-');
     if slug.is_empty() {
         OwningApp::unknown()
     } else {
@@ -545,6 +708,80 @@ mod tests {
     }
 
     #[test]
+    fn parses_input_with_options() {
+        assert_eq!(
+            p(&["--input", "rec.wav"]),
+            Ok(Cli::Transcribe(TranscribeArgs {
+                input: "rec.wav".into(),
+                output: None,
+                title: None,
+                source: None,
+                backend: None,
+                no_aec: false,
+            }))
+        );
+        assert_eq!(
+            p(&[
+                "--input",
+                "/a/b.wav",
+                "-o",
+                "/out/note.md",
+                "--title",
+                "My Call",
+                "--source",
+                "Slack",
+                "--local",
+                "--no-aec",
+            ]),
+            Ok(Cli::Transcribe(TranscribeArgs {
+                input: "/a/b.wav".into(),
+                output: Some("/out/note.md".into()),
+                title: Some("My Call".into()),
+                source: Some("Slack".into()),
+                backend: Some(BackendChoice::Local),
+                no_aec: true,
+            }))
+        );
+        // `--output` long form.
+        assert_eq!(
+            p(&["--input", "x.wav", "--output", "y.md"]),
+            Ok(Cli::Transcribe(TranscribeArgs {
+                input: "x.wav".into(),
+                output: Some("y.md".into()),
+                title: None,
+                source: None,
+                backend: None,
+                no_aec: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn input_error_cases() {
+        assert!(p(&["--input"]).is_err()); // missing input path
+        assert!(p(&["--input", "x.wav", "--output"]).is_err()); // --output needs a value
+        assert!(p(&["--input", "x.wav", "--title"]).is_err()); // --title needs a value
+        assert!(p(&["--input", "x.wav", "--backend", "xx"]).is_err()); // bad backend
+        assert!(p(&["--input", "x.wav", "--nope"]).is_err()); // unknown option
+    }
+
+    #[test]
+    fn renders_note_like_vagus() {
+        let created = Local.with_ymd_and_hms(2026, 6, 8, 16, 0, 56).unwrap();
+        let note = render_note(
+            "Slack call — 2026-06-08 16:00",
+            "Slack · 2026-06-08 16:00",
+            "> Auto-captured by corti from Slack.\n\n## Transcript\n\n**[00:00] Me:** hi\n",
+            created,
+        );
+        assert!(note.starts_with(
+            "---\ncreated: 2026-06-08T16:00\nstatus: inbox\nsource: Slack · 2026-06-08 16:00\n---\n"
+        ));
+        assert!(note.contains("\n# Slack call — 2026-06-08 16:00\n"));
+        assert!(note.contains("## Transcript\n\n**[00:00] Me:** hi\n"));
+    }
+
+    #[test]
     fn stem_strips_clean_and_wav() {
         assert_eq!(
             stem_from_name("20260608-160056-slack.wav"),
@@ -589,6 +826,9 @@ mod tests {
         );
         // Empty slug ⇒ Unknown app.
         assert_eq!(owning_app_from_stem("20260608-160056-").name, "Unknown app");
+        // Arbitrary `--input` filename (no timestamp prefix): humanize the whole stem.
+        assert_eq!(owning_app_from_stem("team-standup").name, "Team Standup");
+        assert_eq!(owning_app_from_stem("meeting").name, "Meeting");
     }
 
     #[test]
