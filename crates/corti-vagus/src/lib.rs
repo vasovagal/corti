@@ -98,8 +98,10 @@ impl Vagus {
     }
 }
 
-/// Compose the note body: a short auto-capture context line, then the diarized transcript.
-fn recording_body(meta: &RecordingMeta, transcript: &DiarizedTranscript) -> String {
+/// Compose the note body: a short auto-capture context line, then the diarized transcript. `pub` so the app
+/// can render the same body when it writes a note to an explicit path (the `corti --input --output` CLI)
+/// instead of filing through `vagus add-note`.
+pub fn recording_body(meta: &RecordingMeta, transcript: &DiarizedTranscript) -> String {
     let mut body = format!(
         "> Auto-captured by corti from {}.\n\n",
         meta.owning_app.name

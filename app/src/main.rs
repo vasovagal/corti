@@ -14,6 +14,8 @@
 
 // macOS-only by design — like the rest of the workspace, this compiles to a stub elsewhere.
 #[cfg(target_os = "macos")]
+mod cli;
+#[cfg(target_os = "macos")]
 mod config;
 #[cfg(target_os = "macos")]
 mod permissions;
@@ -28,9 +30,16 @@ mod tray;
 
 #[cfg(target_os = "macos")]
 fn main() {
-    if let Err(e) = imp::run_app() {
-        eprintln!("[corti] fatal: {e:#}");
-        std::process::exit(1);
+    // Parse argv first: with no/blank args this is `Cli::Run` and falls through to the tray (unchanged);
+    // every other command runs headlessly and exits before the Tauri event loop ever starts.
+    match cli::parse() {
+        cli::Cli::Run => {
+            if let Err(e) = imp::run_app() {
+                eprintln!("[corti] fatal: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        other => std::process::exit(cli::dispatch(other)),
     }
 }
 
