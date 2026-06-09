@@ -100,7 +100,7 @@ impl AwsOptions { pub fn new(bucket: impl Into<String>) -> Self; } // Default: c
 **corti-vagus** (`crates/corti-vagus/src/lib.rs`) — the only vagus touchpoint:
 ```rust
 impl Vagus {
-    pub fn discover() -> Result<Self>;  // finds `vagus` on PATH ($VAGUS_BIN override), checks --version
+    pub fn discover() -> Result<Self>;  // $VAGUS_BIN override (no fallback), else PATH, else /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin; checks --version
     pub fn file_recording(&self, meta: &RecordingMeta, transcript: &DiarizedTranscript) -> Result<PathBuf>; // note path
 }
 ```
@@ -147,7 +147,9 @@ via `queue.update(id, { transcribe_job: Some(name) })` **before** calling transc
   credential chain) and pass to `AwsTranscriber::new`; log clearly if it fails. Bucket from app
   config/`CORTI_AWS_BUCKET`. Min IAM policy is in `02-corti-transcribe.md` (principal creds, no
   DataAccessRoleArn).
-- **vagus:** `Vagus::discover()` at startup; surface a clear error if `vagus` isn't installed.
+- **vagus:** `Vagus::discover()` at startup; surface a clear error if `vagus` isn't installed (re-probed
+  at filing time if startup discovery failed, so a mid-session `brew install vagus` works without a
+  relaunch).
 - **AEC:** `corti-aec` is a passthrough stub today — wire it as a no-op between capture and transcribe, or
   skip for v1 (note it; real NLMS is design 04).
 
