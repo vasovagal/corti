@@ -13,10 +13,13 @@
 //! runs. Revisit before any real release.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use corti_core::{DiarizedTranscript, JobStatus, RecordingMeta};
+use corti_jobs::{Backoff, ClaimedJob, FailOutcome};
 use corti_queue::{Job, JobUpdate, Queue};
 use corti_vagus::Vagus;
 use tauri::AppHandle;
@@ -26,6 +29,16 @@ use crate::imp::{HISTORY_LIMIT, HistoryEntry};
 use crate::settings::SharedConfig;
 use crate::transcribe::Backend;
 use crate::tray;
+
+/// Backoff for one-shot background jobs: 1 m, 2 m, 4 m, … capped at 1 h.
+const JOB_BACKOFF: Backoff = Backoff {
+    base: Duration::from_secs(60),
+    cap: Duration::from_secs(3600),
+};
+
+/// Longest the worker blocks on the channel before re-checking the jobs table — bounds how late a
+/// periodic job can fire when no message wakes the loop sooner.
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
 /// Work for the pipeline worker.
 pub enum PipelineMsg {
@@ -100,11 +113,19 @@ pub fn run(
     };
 
     seed_history(&ctx);
+    match ctx.queue.jobs().recover_running() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
+        Err(e) => eprintln!("[corti] cannot recover background jobs: {e:#}"),
+    }
     tray::set_status(&ctx.app, "Idle — waiting for a call".to_string());
 
-    for msg in rx {
-        match msg {
-            PipelineMsg::Process { meta, audio_path } => match ctx.queue.enqueue(&meta) {
+    // Messages take priority (they're user-facing); due background jobs drain after each wake, so a
+    // recording never queues behind a backlog of background work. Everything stays serial on this one
+    // thread — a job mid-run delays the next message exactly like a long transcription always has.
+    loop {
+        match rx.recv_timeout(next_wake(&ctx)) {
+            Ok(PipelineMsg::Process { meta, audio_path }) => match ctx.queue.enqueue(&meta) {
                 Ok(id) => {
                     info!(
                         target: "corti::pipeline",
@@ -135,7 +156,81 @@ pub fn run(
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
-            PipelineMsg::ReloadConfig => reload_config(&mut ctx, &config),
+            Ok(PipelineMsg::ReloadConfig) => reload_config(&mut ctx, &config),
+            // Nothing arrived before the next background job came due — fall through to the drain.
+            Err(RecvTimeoutError::Timeout) => {}
+            // Every sender is gone: the app is shutting down.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        drain_due_jobs(&mut ctx);
+    }
+}
+
+/// How long to block on the channel: until the next pending background job is due, clamped to
+/// `[0, MAX_IDLE_WAIT]`. No pending jobs (or a read error) ⇒ the max — the drain re-checks anyway.
+fn next_wake(ctx: &Ctx) -> Duration {
+    match ctx.queue.jobs().next_due_at() {
+        Ok(Some(due)) => (due - Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(MAX_IDLE_WAIT),
+        Ok(None) => MAX_IDLE_WAIT,
+        Err(e) => {
+            eprintln!("[corti] cannot read next job due time: {e:#}");
+            MAX_IDLE_WAIT
+        }
+    }
+}
+
+/// Claim and run every due background job, oldest due first.
+fn drain_due_jobs(ctx: &mut Ctx) {
+    loop {
+        let job = match ctx.queue.jobs().claim_due(Utc::now()) {
+            Ok(Some(j)) => j,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("[corti] cannot claim background job: {e:#}");
+                return;
+            }
+        };
+        let result = run_job(ctx, &job);
+        finish_job(ctx, &job, result);
+    }
+}
+
+/// Dispatch one claimed job by kind. Kinds register here as features land (transcription retry, the
+/// retention sweep, legacy compression); an unrecognized kind fails with backoff so version skew
+/// surfaces in the jobs table instead of crash-looping or silently vanishing.
+fn run_job(_ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
+    anyhow::bail!("unknown job kind {:?}", job.kind)
+}
+
+/// Settle a finished job: completed ⇒ delete (or re-arm a periodic); failed ⇒ backoff or park.
+fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
+    match result {
+        Ok(()) => {
+            if let Err(e) = ctx.queue.jobs().complete(job) {
+                eprintln!(
+                    "[corti] cannot complete job {} ({}): {e:#}",
+                    job.id, job.kind
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("[corti] job {} ({}) failed: {err:#}", job.id, job.kind);
+            match ctx
+                .queue
+                .jobs()
+                .fail(job, &format!("{err:#}"), &JOB_BACKOFF)
+            {
+                Ok(FailOutcome::Rescheduled { next_run_at }) => {
+                    eprintln!("[corti]   will retry at {next_run_at}");
+                }
+                Ok(FailOutcome::Exhausted) => {
+                    eprintln!("[corti]   out of attempts — parked as failed");
+                }
+                Err(e) => eprintln!("[corti] cannot record job failure: {e:#}"),
+            }
         }
     }
 }

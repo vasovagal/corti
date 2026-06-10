@@ -1392,6 +1392,7 @@ dependencies = [
  "corti-capture",
  "corti-core",
  "corti-detect",
+ "corti-jobs",
  "corti-queue",
  "corti-transcribe",
  "corti-transcribe-aws",
@@ -1486,12 +1487,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "corti-jobs"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
 name = "corti-queue"
 version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
  "corti-core",
+ "corti-jobs",
  "rusqlite",
  "serde_json",
  "tracing",

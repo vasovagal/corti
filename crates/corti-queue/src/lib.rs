@@ -116,9 +116,16 @@ impl Queue {
             .context("enabling WAL")?;
         migrate(&mut conn).context("migrating queue schema")?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        corti_jobs::Jobs::ensure_schema(&conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)
             .context("stamping user_version")?;
         Ok(Self { conn })
+    }
+
+    /// Borrow the embedded background-jobs store. Same connection, same single owner thread — the
+    /// returned view must not outlive this `Queue` (the borrow enforces it).
+    pub fn jobs(&self) -> corti_jobs::Jobs<'_> {
+        corti_jobs::Jobs::new(&self.conn)
     }
 
     /// Enqueue a finished recording for transcription, returning its job id. **Idempotent**: if this
@@ -485,6 +492,7 @@ mod tests {
         fn memory() -> Self {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(SCHEMA).unwrap();
+            corti_jobs::Jobs::ensure_schema(&conn).unwrap();
             Self { conn }
         }
     }

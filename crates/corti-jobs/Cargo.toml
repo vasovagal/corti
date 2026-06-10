@@ -1,0 +1,16 @@
+[package]
+name = "corti-jobs"
+description = "Small durable background-job layer for corti: one-shot retries with backoff and periodic schedules, persisted in queue.db."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+# Payloads are JSON strings; serde_json's default (sorted-key) Map makes equal payloads byte-equal,
+# which the active-job dedupe index relies on.
+serde_json = { workspace = true }
+rusqlite = { workspace = true }

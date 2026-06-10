@@ -10,6 +10,7 @@ members = [
     "crates/corti-transcribe-aws",
     "crates/corti-transcribe-local",
     "crates/corti-queue",
+    "crates/corti-jobs",
     "crates/corti-aec",
     "crates/corti-tap",
     "crates/corti-bench",
@@ -36,6 +37,7 @@ corti-transcribe = { path = "crates/corti-transcribe", version = "0.8.0" }
 corti-transcribe-aws = { path = "crates/corti-transcribe-aws", version = "0.8.0" }
 corti-transcribe-local = { path = "crates/corti-transcribe-local", version = "0.8.0" }
 corti-queue = { path = "crates/corti-queue", version = "0.8.0" }
+corti-jobs = { path = "crates/corti-jobs", version = "0.8.0" }
 corti-aec = { path = "crates/corti-aec", version = "0.8.0" }
 
 # Shared third-party deps, pinned once here.
@@ -44,6 +46,9 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency. One pin
+# shared by corti-queue and corti-jobs — they borrow the same live Connection, so the types must match.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Structured logging / diagnostics console (issue #76). Pinned once here so future per-crate
 # instrumentation passes share one tracing version across the workspace.
