@@ -271,6 +271,18 @@ impl<'c> Jobs<'c> {
         next.as_deref().map(parse_utc).transpose()
     }
 
+    /// Drop any parked `failed` row for this exact `(kind, payload)`. The dedupe index only covers
+    /// active rows, so failed debris would otherwise sit next to a fresh enqueue of the same work —
+    /// call this when something (e.g. a manual retry) supersedes the old failure. Returns how many.
+    pub fn delete_failed(&self, kind: &str, payload: &serde_json::Value) -> Result<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM jobs WHERE kind = ?1 AND payload = ?2 AND state = 'failed'",
+                params![kind, payload.to_string()],
+            )
+            .context("deleting failed job row")
+    }
+
     /// GC `failed` rows older than `cutoff`. Returns how many were deleted.
     pub fn delete_terminal_older_than(&self, cutoff: DateTime<Utc>) -> Result<usize> {
         self.conn
@@ -533,6 +545,32 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn delete_failed_clears_exact_match_only() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        jobs.enqueue("retry", &json!({"id": "x"}), 1, Utc::now())
+            .unwrap();
+        let j = jobs.claim_due(Utc::now()).unwrap().unwrap();
+        assert_eq!(
+            jobs.fail(&j, "x", &BACKOFF).unwrap(),
+            FailOutcome::Exhausted
+        );
+
+        assert_eq!(
+            jobs.delete_failed("retry", &json!({"id": "other"}))
+                .unwrap(),
+            0
+        );
+        assert_eq!(jobs.delete_failed("retry", &json!({"id": "x"})).unwrap(), 1);
+        // Slate is clean: the same work can be enqueued fresh.
+        assert!(
+            jobs.enqueue("retry", &json!({"id": "x"}), 1, Utc::now())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

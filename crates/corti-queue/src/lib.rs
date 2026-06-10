@@ -228,6 +228,29 @@ impl Queue {
         Ok(())
     }
 
+    /// Reset a `Failed` recording for a (manual) retry: status back to `PendingTranscription` with the
+    /// error **cleared** — the COALESCE-based [`update`](Queue::update) can't NULL a field, hence the
+    /// dedicated method. Errors if the row isn't currently `Failed` (the UI races the pipeline).
+    pub fn retry_reset(&self, id: &str) -> Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE recordings SET status = ?2, error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = ?4",
+                params![
+                    id,
+                    status_to_string(JobStatus::PendingTranscription),
+                    fmt_dt(Local::now()),
+                    status_to_string(JobStatus::Failed),
+                ],
+            )
+            .context("resetting failed recording")?;
+        if n == 0 {
+            bail!("no Failed recording with id {id}");
+        }
+        Ok(())
+    }
+
     /// Mark a job `Failed` with an error message (convenience over [`update`](Queue::update)).
     pub fn fail(&self, id: &str, error: &str) -> Result<()> {
         tracing::warn!(target: "corti::queue", job_id = %id, error, "job failed");
@@ -748,6 +771,20 @@ CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
         assert!(s.ends_with('Z'), "expected Z suffix: {s}");
         assert_eq!(s.len(), "2026-05-30T21:05:00.000Z".len());
         assert_eq!(parse_dt(&s).unwrap(), dt); // round-trips through the canonical form
+    }
+
+    #[test]
+    fn retry_reset_requires_failed_and_clears_error() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
+        // Not Failed yet ⇒ refuses (the UI can race the pipeline).
+        assert!(q.retry_reset(&id).is_err());
+
+        q.fail(&id, "boom").unwrap();
+        q.retry_reset(&id).unwrap();
+        let job = q.get(&id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::PendingTranscription);
+        assert_eq!(job.error, None);
     }
 
     #[test]

@@ -20,6 +20,8 @@ mod config;
 #[cfg(target_os = "macos")]
 mod console;
 #[cfg(target_os = "macos")]
+mod jobs;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
