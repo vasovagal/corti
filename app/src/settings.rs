@@ -41,6 +41,7 @@ pub struct SettingsDto {
     pub local_diarize_far_end: bool,
     pub local_embedding_model: String,
     pub aec_enabled: bool,
+    pub retention_days: u32,
     pub env_managed: Vec<String>,
 }
 
@@ -71,6 +72,7 @@ impl From<&AppConfig> for SettingsDto {
             local_diarize_far_end: cfg.local_diarize_far_end,
             local_embedding_model: cfg.local_embedding_model.clone(),
             aec_enabled: cfg.aec_enabled,
+            retention_days: cfg.retention_days,
             env_managed: config::env_managed_fields(),
         }
     }
@@ -116,6 +118,9 @@ pub fn set_config(
     };
     if dto.local_threads <= 0 {
         return Err("local thread count must be greater than zero".to_string());
+    }
+    if !(1..=365).contains(&dto.retention_days) {
+        return Err("retention must be between 1 and 365 days".to_string());
     }
 
     // Seed from the FILE baseline (not the env-overridden runtime config) and apply only the edits to fields
@@ -165,6 +170,9 @@ pub fn set_config(
     }
     if !pinned("aec_enabled") {
         to_save.aec_enabled = dto.aec_enabled;
+    }
+    if !pinned("retention_days") {
+        to_save.retention_days = dto.retention_days;
     }
 
     to_save

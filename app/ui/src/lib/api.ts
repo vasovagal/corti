@@ -14,6 +14,7 @@ export interface SettingsDto {
   local_diarize_far_end: boolean;
   local_embedding_model: string; // a corti-transcribe-local EMBEDDING_IDS id, e.g. "titanet"
   aec_enabled: boolean;
+  retention_days: number;
   env_managed: string[];
 }
 

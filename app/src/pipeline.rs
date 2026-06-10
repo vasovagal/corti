@@ -73,6 +73,9 @@ pub(crate) struct Ctx {
     stats: crate::stats::StatsBuffer,
     /// Low-cardinality backend label for stage samples; refreshed on a live backend switch.
     backend_label: &'static str,
+    /// The live runtime config — the retention sweep reads `retention_days` from here on every run, so
+    /// a Settings change applies to the next sweep without any reload plumbing.
+    pub(crate) config: SharedConfig,
 }
 
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
@@ -113,6 +116,7 @@ pub fn run(
         app,
         stats,
         backend_label,
+        config: config.clone(),
     };
 
     seed_history(&ctx);
@@ -120,6 +124,14 @@ pub fn run(
         Ok(0) => {}
         Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
         Err(e) => eprintln!("[corti] cannot recover background jobs: {e:#}"),
+    }
+    // The retention sweep runs hourly AND right now (enqueue_periodic arms it due immediately).
+    if let Err(e) = ctx
+        .queue
+        .jobs()
+        .enqueue_periodic(crate::jobs::SWEEP_EXPIRED, crate::jobs::SWEEP_PERIOD)
+    {
+        eprintln!("[corti] cannot schedule the retention sweep: {e:#}");
     }
     tray::set_status(&ctx.app, "Idle — waiting for a call".to_string());
 
@@ -249,7 +261,7 @@ fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error)
     );
     let enqueue = ctx.queue.jobs().enqueue(
         crate::jobs::RETRY_TRANSCRIPTION,
-        &crate::jobs::retry_payload(id),
+        &crate::jobs::id_payload(id),
         crate::jobs::RETRY_MAX_ATTEMPTS,
         Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
     );

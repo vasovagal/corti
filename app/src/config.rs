@@ -97,6 +97,10 @@ pub struct AppConfig {
     /// Set 0 to disable. Higher values suppress more aggressively.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aec_suppress_residual: Option<f32>,
+    /// How many days a recording's **audio** is kept before the hourly sweep deletes it
+    /// (`CORTI_RETENTION_DAYS`, default 7, clamped to 1–365). Notes and transcripts are never touched,
+    /// and the queue row outlives the audio so history stays visible in the Recording Queue window.
+    pub retention_days: u32,
 }
 
 impl Default for AppConfig {
@@ -120,6 +124,7 @@ impl Default for AppConfig {
             aec_power_smoothing: None,
             aec_double_talk_ratio: None,
             aec_suppress_residual: None,
+            retention_days: 7,
         }
     }
 }
@@ -203,6 +208,12 @@ impl AppConfig {
         }
         if let Some(v) = env_non_empty("CORTI_AEC_SUPPRESS_RESIDUAL").and_then(|s| s.parse().ok()) {
             cfg.aec_suppress_residual = Some(v);
+        }
+        if let Some(d) = env_non_empty("CORTI_RETENTION_DAYS")
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|d| (1..=365).contains(d))
+        {
+            cfg.retention_days = d;
         }
 
         cfg
@@ -301,6 +312,7 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_LOCAL_EMBEDDING", "local_embedding_model"),
         ("CORTI_LOCAL_DIARIZE_THRESHOLD", "local_diarize_threshold"),
         ("CORTI_AEC", "aec_enabled"),
+        ("CORTI_RETENTION_DAYS", "retention_days"),
     ]
     .into_iter()
     .filter(|(var, _)| env_non_empty(var).is_some())
@@ -420,6 +432,7 @@ mod tests {
             aec_power_smoothing: Some(0.95),
             aec_double_talk_ratio: Some(1.5),
             aec_suppress_residual: Some(3.0),
+            retention_days: 14,
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);

@@ -82,6 +82,8 @@ pub struct JobUpdate {
     pub note_path: Option<PathBuf>,
     pub error: Option<String>,
     pub transcribe_secs: Option<f64>,
+    /// Re-point the row at a different audio file (the legacy-WAV backfill swaps `.wav` → `.ogg`).
+    pub audio_path: Option<PathBuf>,
 }
 
 /// The durable job store. Open with [`Queue::open`] (or [`Queue::open_at`] for an explicit path).
@@ -201,7 +203,8 @@ impl Queue {
                    note_path       = COALESCE(?5, note_path),
                    error           = COALESCE(?6, error),
                    transcribe_secs = COALESCE(?7, transcribe_secs),
-                   updated_at      = ?8
+                   audio_path      = COALESCE(?8, audio_path),
+                   updated_at      = ?9
                  WHERE id = ?1",
                 params![
                     id,
@@ -211,6 +214,7 @@ impl Queue {
                     note_path,
                     fields.error,
                     fields.transcribe_secs,
+                    fields.audio_path.map(|p| p.to_string_lossy().into_owned()),
                     fmt_dt(Local::now()),
                 ],
             )
@@ -288,29 +292,42 @@ impl Queue {
         raws.into_iter().map(raw_to_job).collect()
     }
 
-    /// Delete `Done` rows last updated before `older_than`, returning the audio paths of the pruned
-    /// recordings so the caller can delete the cached WAVs (this method touches only the DB). Lets the
-    /// recordings cache be reclaimed on a retention policy, e.g. `Local::now() - Duration::days(30)`.
-    pub fn prune_done(&self, older_than: DateTime<Local>) -> Result<Vec<PathBuf>> {
-        let done = status_to_string(JobStatus::Done);
-        let cutoff = fmt_dt(older_than);
-        let paths: Vec<PathBuf> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT audio_path FROM recordings WHERE status = ?1 AND updated_at < ?2",
-            )?;
-            stmt.query_map(params![done, cutoff], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect()
-        };
+    /// Terminal (`Done` | `Failed`) rows last updated before `older_than` — the retention sweep's
+    /// audio-deletion candidates, oldest first. **Read-only**: rows now outlive their audio, so the
+    /// Recording Queue window keeps showing history ("Filed in brain") after the files are reclaimed.
+    pub fn expired(&self, older_than: DateTime<Local>) -> Result<Vec<Job>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM recordings
+             WHERE status IN (?1, ?2) AND updated_at < ?3 ORDER BY started_at"
+        ))?;
+        let raws = stmt
+            .query_map(
+                params![
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                    fmt_dt(older_than),
+                ],
+                read_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        raws.into_iter().map(raw_to_job).collect()
+    }
+
+    /// Row GC: delete terminal (`Done` | `Failed`) rows last updated before `older_than`. Bounds
+    /// queue.db and the Recording Queue's history list on a much longer horizon than the audio
+    /// retention (90 days vs ~7), so "Filed in brain" history stays useful for a quarter. Returns how
+    /// many rows went; non-terminal rows are never touched.
+    pub fn delete_terminal_older_than(&self, older_than: DateTime<Local>) -> Result<usize> {
         self.conn
             .execute(
-                "DELETE FROM recordings WHERE status = ?1 AND updated_at < ?2",
-                params![done, cutoff],
+                "DELETE FROM recordings WHERE status IN (?1, ?2) AND updated_at < ?3",
+                params![
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                    fmt_dt(older_than),
+                ],
             )
-            .context("pruning done rows")?;
-        Ok(paths)
+            .context("deleting expired terminal rows")
     }
 }
 
@@ -631,30 +648,56 @@ mod tests {
     }
 
     #[test]
-    fn prune_done_removes_old_done_rows_and_returns_paths() {
+    fn expired_lists_terminal_rows_read_only() {
         let q = Queue::memory();
-        let a = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
-        let b = q.enqueue(&meta("/cache/b.wav", "us.zoom.xos")).unwrap();
+        let a = q.enqueue(&meta("/cache/a.ogg", "us.zoom.xos")).unwrap();
+        let b = q.enqueue(&meta("/cache/b.ogg", "us.zoom.xos")).unwrap();
+        let c = q.enqueue(&meta("/cache/c.ogg", "us.zoom.xos")).unwrap();
         q.set_status(&a, JobStatus::Done).unwrap();
-        // b stays PendingTranscription.
+        q.fail(&b, "boom").unwrap();
+        // c stays PendingTranscription.
 
-        // Cutoff in the future ⇒ the Done row counts as old and is pruned.
-        let removed = q
-            .prune_done(Local::now() + chrono::Duration::seconds(60))
-            .unwrap();
-        assert_eq!(removed, vec![PathBuf::from("/cache/a.wav")]);
-        assert!(q.get(&a).unwrap().is_none());
-        assert!(q.get(&b).unwrap().is_some()); // non-terminal never pruned
+        // Future cutoff ⇒ both terminal rows are sweep candidates; the pending one never is.
+        let future = Local::now() + chrono::Duration::seconds(60);
+        let ids: Vec<String> = q
+            .expired(future)
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(ids, vec![a.clone(), b.clone()]);
+        // Read-only: every row (and its status) survives the query.
+        assert_eq!(q.get(&a).unwrap().unwrap().status, JobStatus::Done);
+        assert_eq!(q.get(&b).unwrap().unwrap().status, JobStatus::Failed);
+        let _ = c;
 
-        // A past cutoff prunes nothing (the just-marked Done row is newer than it).
-        let a2 = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
-        q.set_status(&a2, JobStatus::Done).unwrap();
+        // A past cutoff matches nothing (the rows were just touched).
         assert!(
-            q.prune_done(Local::now() - chrono::Duration::hours(1))
+            q.expired(Local::now() - chrono::Duration::hours(1))
                 .unwrap()
                 .is_empty()
         );
-        assert!(q.get(&a2).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_terminal_older_than_spares_non_terminal() {
+        let q = Queue::memory();
+        let a = q.enqueue(&meta("/cache/a.ogg", "us.zoom.xos")).unwrap();
+        let b = q.enqueue(&meta("/cache/b.ogg", "us.zoom.xos")).unwrap();
+        let c = q.enqueue(&meta("/cache/c.ogg", "us.zoom.xos")).unwrap();
+        q.set_status(&a, JobStatus::Done).unwrap();
+        q.fail(&b, "boom").unwrap();
+
+        let n = q
+            .delete_terminal_older_than(Local::now() + chrono::Duration::seconds(60))
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(q.get(&a).unwrap().is_none());
+        assert!(q.get(&b).unwrap().is_none());
+        assert!(
+            q.get(&c).unwrap().is_some(),
+            "non-terminal rows are never GC'd"
+        );
     }
 
     #[test]
