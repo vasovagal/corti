@@ -130,6 +130,22 @@ impl Queue {
         corti_jobs::Jobs::new(&self.conn)
     }
 
+    /// Open the queue **read-only** — for UI command threads that must never become a second writer
+    /// (the pipeline thread stays the sole one; WAL supports concurrent readers beside it). Skips the
+    /// migration (read-only can't run it; the pipeline's open already has). Errors if the DB doesn't
+    /// exist yet, and any accidental write fails loudly at the SQLite layer.
+    pub fn open_read_only() -> Result<Self> {
+        let path = data_dir()?.join("queue.db");
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
+        Ok(Self { conn })
+    }
+
     /// Enqueue a finished recording for transcription, returning its job id. **Idempotent**: if this
     /// recording (same id) is already tracked, the existing row is left untouched (its progress is
     /// preserved) and its id is returned.

@@ -162,3 +162,38 @@ export interface StatsReport {
 
 /** One coherent snapshot of the stats buffer: memory/thread history + global stage timings. */
 export const getStats = (): Promise<StatsReport> => invoke<StatsReport>("get_stats");
+
+// ----- Recording Queue window -----
+
+/** Mirror of Rust `queue_ui::RecordingDto`. */
+export interface RecordingDto {
+  id: string;
+  app: string;
+  mode: string; // "call" | "webinar"
+  started_at: string;
+  ended_at: string | null;
+  duration_secs: number | null;
+  status: string; // JobStatus wire form: "recording" | "pending_transcription" | ... | "done" | "failed"
+  error: string | null;
+  transcribe_secs: number | null;
+  note_path: string | null;
+  note_exists: boolean;
+  audio_exists: boolean;
+  audio_bytes: number | null;
+  retry_pending: boolean;
+  retry_attempts: number | null;
+}
+
+export const listRecordings = (): Promise<RecordingDto[]> =>
+  invoke<RecordingDto[]>("list_recordings");
+
+export const retryRecording = (id: string): Promise<void> =>
+  invoke<void>("retry_recording", { id });
+
+export const openNote = (path: string): Promise<void> => invoke<void>("open_note", { path });
+
+export const revealAudio = (id: string): Promise<void> => invoke<void>("reveal_audio", { id });
+
+/** Subscribe to the pipeline's coarse "something changed" signal; returns the unlisten fn. */
+export const onQueueChanged = (handler: () => void): Promise<UnlistenFn> =>
+  listen("queue-changed", handler);

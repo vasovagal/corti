@@ -50,6 +50,9 @@ pub enum PipelineMsg {
         meta: RecordingMeta,
         audio_path: PathBuf,
     },
+    /// The Recording Queue window's Retry button: reset a `Failed` recording and re-run it with a
+    /// fresh attempt budget (a deliberate user action earns one).
+    Retry { id: String },
     /// Re-read the shared config and rebuild the backend + AEC toggle. Sent by the Settings screen on save;
     /// handled between jobs (the worker is serial) so it applies to the next recording — or immediately when
     /// the worker is idle and blocked waiting for one.
@@ -68,7 +71,7 @@ pub(crate) struct Ctx {
     /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
     aec_enabled: bool,
     aec_config: corti_aec::AecConfig,
-    app: AppHandle,
+    pub(crate) app: AppHandle,
     /// Clone of the managed stats buffer; the worker records coarse stage wall-clock here.
     stats: crate::stats::StatsBuffer,
     /// Low-cardinality backend label for stage samples; refreshed on a live backend switch.
@@ -173,6 +176,7 @@ pub fn run(
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
+            Ok(PipelineMsg::Retry { id }) => manual_retry(&mut ctx, &id),
             Ok(PipelineMsg::ReloadConfig) => reload_config(&mut ctx, &config),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
@@ -242,6 +246,61 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
             }
         }
     }
+}
+
+/// The Queue window's Retry button. Only a `Failed` recording with its audio still on disk qualifies
+/// (the UI greys the button out otherwise, but it can race the pipeline/sweep — re-check here, on the
+/// thread that owns the truth). Old failed-job debris is cleared so the fresh enqueue gets a clean
+/// slate and a full attempt budget; the loop drains due jobs right after this message, so the retry
+/// starts immediately.
+fn manual_retry(ctx: &mut Ctx, id: &str) {
+    let row = match ctx.queue.get(id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tray::set_status(&ctx.app, format!("⚠ recording {id} no longer exists"));
+            return;
+        }
+        Err(e) => {
+            eprintln!("[corti] retry lookup for {id} failed: {e:#}");
+            return;
+        }
+    };
+    if row.status != JobStatus::Failed {
+        return; // already moving again (raced a resume/retry) — nothing to do
+    }
+    if !row.audio_path.exists() {
+        tray::set_status(
+            &ctx.app,
+            "⚠ can't retry — the audio has already expired".to_string(),
+        );
+        return;
+    }
+    let _ = ctx.queue.jobs().delete_failed(
+        crate::jobs::RETRY_TRANSCRIPTION,
+        &crate::jobs::id_payload(id),
+    );
+    if let Err(e) = ctx.queue.retry_reset(id) {
+        eprintln!("[corti] cannot reset {id} for retry: {e:#}");
+        return;
+    }
+    if let Err(e) = ctx.queue.jobs().enqueue(
+        crate::jobs::RETRY_TRANSCRIPTION,
+        &crate::jobs::id_payload(id),
+        crate::jobs::RETRY_MAX_ATTEMPTS,
+        Utc::now(),
+    ) {
+        eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
+        return;
+    }
+    tray::update_history(
+        &ctx.app,
+        id,
+        JobStatus::PendingTranscription,
+        None,
+        None,
+        None,
+    );
+    tray::set_status(&ctx.app, format!("Retrying — {}…", row.owning_app));
 }
 
 /// A transcribe/file failure on the live path: don't terminal-fail — record the error, keep the row at

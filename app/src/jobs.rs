@@ -130,6 +130,7 @@ fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
             "[corti] sweep: deleted {files} expired audio file(s), {rows} ancient row(s), \
              {job_rows} stale job row(s)"
         );
+        crate::tray::emit_queue_changed(&ctx.app, "sweep");
     }
     Ok(())
 }
