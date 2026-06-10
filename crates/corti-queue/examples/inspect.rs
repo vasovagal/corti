@@ -30,6 +30,9 @@ fn main() -> Result<()> {
         if let Some(err) = &job.error {
             println!("      error: {err}");
         }
+        if let Some(secs) = job.transcribe_secs {
+            println!("      transcribed in {secs:.1}s");
+        }
     }
 
     let resumable = queue.resumable()?;

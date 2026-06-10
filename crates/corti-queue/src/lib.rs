@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 use corti_core::{JobStatus, OwningApp, RecordingMeta};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -31,7 +31,8 @@ pub fn data_dir() -> Result<PathBuf> {
 
 /// One tracked recording and where it is in the pipeline. Returned by [`Queue::get`],
 /// [`Queue::resumable`], and [`Queue::all`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `transcribe_secs` is an `f64` (only `PartialEq`), same situation as `AppConfig`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     /// Stable id (the recording's filename stem, e.g. `20260530-135756-slack`).
     pub id: String,
@@ -50,6 +51,9 @@ pub struct Job {
     pub note_path: Option<PathBuf>,
     /// Last error (set alongside `Failed`).
     pub error: Option<String>,
+    /// Wall-clock seconds the (successful) transcription took, for the Queue UI's
+    /// "transcribed 55 min in 30 s" line.
+    pub transcribe_secs: Option<f64>,
     pub updated_at: DateTime<Local>,
 }
 
@@ -77,6 +81,7 @@ pub struct JobUpdate {
     pub transcribe_job: Option<String>,
     pub note_path: Option<PathBuf>,
     pub error: Option<String>,
+    pub transcribe_secs: Option<f64>,
 }
 
 /// The durable job store. Open with [`Queue::open`] (or [`Queue::open_at`] for an explicit path).
@@ -100,7 +105,8 @@ impl Queue {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn =
+            Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
         // WAL keeps readers and the writer from blocking each other and survives crashes cleanly.
@@ -108,7 +114,10 @@ impl Queue {
         let _: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .context("enabling WAL")?;
+        migrate(&mut conn).context("migrating queue schema")?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .context("stamping user_version")?;
         Ok(Self { conn })
     }
 
@@ -179,12 +188,13 @@ impl Queue {
             .conn
             .execute(
                 "UPDATE recordings SET
-                   status         = COALESCE(?2, status),
-                   s3_uri         = COALESCE(?3, s3_uri),
-                   transcribe_job = COALESCE(?4, transcribe_job),
-                   note_path      = COALESCE(?5, note_path),
-                   error          = COALESCE(?6, error),
-                   updated_at     = ?7
+                   status          = COALESCE(?2, status),
+                   s3_uri          = COALESCE(?3, s3_uri),
+                   transcribe_job  = COALESCE(?4, transcribe_job),
+                   note_path       = COALESCE(?5, note_path),
+                   error           = COALESCE(?6, error),
+                   transcribe_secs = COALESCE(?7, transcribe_secs),
+                   updated_at      = ?8
                  WHERE id = ?1",
                 params![
                     id,
@@ -193,6 +203,7 @@ impl Queue {
                     fields.transcribe_job,
                     note_path,
                     fields.error,
+                    fields.transcribe_secs,
                     fmt_dt(Local::now()),
                 ],
             )
@@ -273,27 +284,103 @@ impl Queue {
     }
 }
 
-/// Columns in storage order; shared by every `SELECT` so [`read_row`] indices stay aligned.
+/// Columns in a fixed order shared by every `SELECT` so [`read_row`] indices stay aligned.
 const COLS: &str = "id, started_at, ended_at, owning_app, bundle_id, audio_path, \
-                    status, s3_uri, transcribe_job, note_path, error, updated_at";
+                    status, s3_uri, transcribe_job, note_path, error, updated_at, \
+                    transcribe_secs";
+
+/// Bumped whenever [`migrate`] gains a step; stamped into `PRAGMA user_version` on every open.
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS recordings(
-  id             TEXT PRIMARY KEY,
-  started_at     TEXT NOT NULL,
-  ended_at       TEXT,
-  owning_app     TEXT NOT NULL,
-  bundle_id      TEXT,
-  audio_path     TEXT NOT NULL,
-  status         TEXT NOT NULL,
-  s3_uri         TEXT,
-  transcribe_job TEXT,
-  note_path      TEXT,
-  error          TEXT,
-  updated_at     TEXT NOT NULL
+  id              TEXT PRIMARY KEY,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  owning_app      TEXT NOT NULL,
+  bundle_id       TEXT,
+  audio_path      TEXT NOT NULL,
+  status          TEXT NOT NULL,
+  s3_uri          TEXT,
+  transcribe_job  TEXT,
+  note_path       TEXT,
+  error           TEXT,
+  updated_at      TEXT NOT NULL,
+  transcribe_secs REAL
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
 ";
+
+/// Bring a pre-existing DB up to [`SCHEMA_VERSION`]. Runs before `execute_batch(SCHEMA)`, so a fresh DB
+/// (no `recordings` table yet) skips straight through and is created in the current shape. Every step is
+/// safe to re-run: a crash between a step committing and the `user_version` stamp just replays it.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("reading user_version")?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='recordings')",
+            [],
+            |r| r.get(0),
+        )
+        .context("probing for recordings table")?;
+    if version < 1 && has_table {
+        migrate_v0_to_v1(conn).context("migrating queue schema v0 → v1")?;
+    }
+    Ok(())
+}
+
+/// v0 → v1: add `transcribe_secs`, and rewrite every stored timestamp to the fixed-width UTC `…Z` form
+/// [`fmt_dt`] now writes. v0 stored `DateTime<Local>::to_rfc3339()` — local-*offset* strings whose lexical
+/// order diverges from chronological order the moment two rows carry different offsets (DST transition,
+/// timezone travel), corrupting `ORDER BY started_at` and every `updated_at < cutoff` retention check.
+fn migrate_v0_to_v1(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction().context("starting migration tx")?;
+    // Replayed after a crash mid-migration, the column may already be there; the rewrite below is
+    // idempotent (re-formatting a `…Z` string is a no-op).
+    let has_col: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recordings') WHERE name='transcribe_secs')",
+            [],
+            |r| r.get(0),
+        )
+        .context("probing for transcribe_secs column")?;
+    if !has_col {
+        tx.execute("ALTER TABLE recordings ADD COLUMN transcribe_secs REAL", [])
+            .context("adding transcribe_secs column")?;
+    }
+    let rows: Vec<(String, String, Option<String>, String)> = {
+        let mut stmt = tx.prepare("SELECT id, started_at, ended_at, updated_at FROM recordings")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .context("reading rows for timestamp rewrite")?
+    };
+    {
+        let mut write = tx.prepare(
+            "UPDATE recordings SET started_at = ?2, ended_at = ?3, updated_at = ?4 WHERE id = ?1",
+        )?;
+        for (id, started, ended, updated) in rows {
+            write
+                .execute(params![
+                    id,
+                    reformat_utc(&started)?,
+                    ended.as_deref().map(reformat_utc).transpose()?,
+                    reformat_utc(&updated)?,
+                ])
+                .with_context(|| format!("rewriting timestamps for {id}"))?;
+        }
+    }
+    tx.commit().context("committing v0 → v1 migration")
+}
+
+/// Any-offset RFC3339 → the canonical UTC `…Z` form (what [`fmt_dt`] writes).
+fn reformat_utc(s: &str) -> Result<String> {
+    Ok(fmt_dt(parse_dt(s)?))
+}
 
 /// The job id for a recording: its filename stem (already unique + stable), falling back to the start
 /// time if the path somehow has no stem. Public so callers (the tray) can key a pre-enqueue history
@@ -321,6 +408,7 @@ struct RawRow {
     note_path: Option<String>,
     error: Option<String>,
     updated_at: String,
+    transcribe_secs: Option<f64>,
 }
 
 fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -337,6 +425,7 @@ fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         note_path: row.get(9)?,
         error: row.get(10)?,
         updated_at: row.get(11)?,
+        transcribe_secs: row.get(12)?,
     })
 }
 
@@ -353,12 +442,17 @@ fn raw_to_job(r: RawRow) -> Result<Job> {
         transcribe_job: r.transcribe_job,
         note_path: r.note_path.map(PathBuf::from),
         error: r.error,
+        transcribe_secs: r.transcribe_secs,
         updated_at: parse_dt(&r.updated_at)?,
     })
 }
 
+/// The canonical stored form: UTC, millisecond precision, `Z` suffix — fixed-width, so lexical order
+/// (which SQLite's TEXT comparisons use) equals chronological order. Never store a local offset here;
+/// that's the v0 bug [`migrate_v0_to_v1`] cleans up.
 fn fmt_dt(dt: DateTime<Local>) -> String {
-    dt.to_rfc3339()
+    dt.with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Local>> {
@@ -549,6 +643,120 @@ mod tests {
             "pending_transcription"
         );
         assert!(status_from_str("not_a_status").is_err());
+    }
+
+    /// The v0 schema verbatim (pre-`user_version`, pre-`transcribe_secs`, local-offset timestamps), for
+    /// migration tests. Keep frozen — this is what shipped DBs look like.
+    const V0_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS recordings(
+  id             TEXT PRIMARY KEY,
+  started_at     TEXT NOT NULL,
+  ended_at       TEXT,
+  owning_app     TEXT NOT NULL,
+  bundle_id      TEXT,
+  audio_path     TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  s3_uri         TEXT,
+  transcribe_job TEXT,
+  note_path      TEXT,
+  error          TEXT,
+  updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
+";
+
+    #[test]
+    fn migrates_v0_db_to_utc_and_adds_transcribe_secs() {
+        let dir = std::env::temp_dir().join("corti-queue-test-migrate-v0");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.db");
+
+        // Build a v0 DB whose lexical timestamp order CONTRADICTS chronological order:
+        // `earlier` = 23:30+12:00 = 11:30Z, `later` = 08:00-07:00 = 15:00Z — yet "08:…" < "23:…".
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V0_SCHEMA).unwrap();
+            for (id, ts) in [
+                ("later", "2026-03-08T08:00:00-07:00"),
+                ("earlier", "2026-03-08T23:30:00+12:00"),
+            ] {
+                conn.execute(
+                    "INSERT INTO recordings (id, started_at, owning_app, audio_path, status, updated_at)
+                     VALUES (?1, ?2, 'Zoom', '/cache/x.wav', 'done', ?2)",
+                    params![id, ts],
+                )
+                .unwrap();
+            }
+            // v0 lexical ordering really is wrong — the precondition this migration exists for.
+            let first: String = conn
+                .query_row(
+                    "SELECT id FROM recordings ORDER BY started_at LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(first, "later");
+        }
+
+        let q = Queue::open_at(&path).unwrap();
+        let version: i64 = q
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Chronological order restored, timestamps canonicalized, new column readable as NULL.
+        let jobs = q.all().unwrap();
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+        for job in &jobs {
+            assert_eq!(job.transcribe_secs, None);
+            let raw: String = q
+                .conn
+                .query_row(
+                    "SELECT started_at FROM recordings WHERE id = ?1",
+                    params![&job.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(raw.ends_with('Z'), "expected UTC Z form, got {raw}");
+        }
+
+        // Reopening (already at v1) is a clean no-op.
+        drop(q);
+        let q = Queue::open_at(&path).unwrap();
+        assert_eq!(q.all().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fmt_dt_is_fixed_width_sortable_utc() {
+        let dt = Local.with_ymd_and_hms(2026, 5, 30, 14, 5, 0).unwrap();
+        let s = fmt_dt(dt);
+        assert!(s.ends_with('Z'), "expected Z suffix: {s}");
+        assert_eq!(s.len(), "2026-05-30T21:05:00.000Z".len());
+        assert_eq!(parse_dt(&s).unwrap(), dt); // round-trips through the canonical form
+    }
+
+    #[test]
+    fn update_records_transcribe_secs() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
+        q.update(
+            &id,
+            JobUpdate {
+                transcribe_secs: Some(30.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let job = q.get(&id).unwrap().unwrap();
+        assert_eq!(job.transcribe_secs, Some(30.5));
+        assert_eq!(job.status, JobStatus::PendingTranscription); // untouched
     }
 
     #[test]
