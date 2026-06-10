@@ -44,7 +44,8 @@ Snapshot of what's built, what's stubbed, and the order to tackle the rest. Pair
   `Entitlements.plist`).
 - **corti-transcribe-local** — local offline backend (NVIDIA Parakeet-TDT-0.6B-v3 via `sherpa-onnx`/ONNX,
   CPU provider): per channel, resample → Silero-VAD-chunked ASR (ch0 → `Me`); the far-end channel (ch1) is
-  diarized (pyannote-segmentation-3.0 + 3D-Speaker) into `Them 1/2/…`, reconciled by the shared
+  diarized (pyannote-segmentation-3.0 + a selectable English speaker-embedding model, default TitaNet-Large)
+  into `Them 1/2/…`, reconciled by the shared
   `corti_transcribe::segment` helpers (also used by the AWS parser). Models via `fetch-models.sh`;
   `clippy -D warnings`/`fmt`/unit tests clean. See [`adr/0003-local-asr-sherpa-onnx.md`](adr/0003-local-asr-sherpa-onnx.md).
   Headphones assumed (this backend ignores AEC); live/streaming, CoreML validation, in-app download are `Feature` follow-ups.

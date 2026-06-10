@@ -23,7 +23,9 @@ pub enum BackendChoice {
 /// `config.toml`: a flat document of scalars, so TOML field-ordering rules never bite. `#[serde(default)]`
 /// on the container means a partial or older file deserializes cleanly, with every missing key filled from
 /// [`AppConfig::default`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: `local_diarize_threshold` is an `f32` (which is only `PartialEq`). `PartialEq` is all the tests
+// (and any config comparison) need.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     /// Which backend to use at runtime (`CORTI_TRANSCRIBE_BACKEND` = `aws` | `local`).
@@ -58,9 +60,21 @@ pub struct AppConfig {
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_threads: i32,
     /// Split the far-end channel into per-speaker labels with the local backend (`CORTI_LOCAL_DIARIZE`,
-    /// default off — it over-clusters on English audio today; see issue #18). Off ⇒ ch1 → single `Them`.
+    /// default off). Uses the selected English embedding model; tune `CORTI_LOCAL_DIARIZE_THRESHOLD` if it
+    /// over-clusters (issue #18). Off ⇒ ch1 → single `Them`.
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_diarize_far_end: bool,
+    /// Which English speaker-embedding model far-end diarization uses (`CORTI_LOCAL_EMBEDDING`; one of
+    /// `corti_transcribe_local::models::EMBEDDING_IDS`, default `titanet`). Surfaced in the Settings UI; an
+    /// unknown/empty value falls back to the default inside the backend.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    #[serde(default = "default_embedding_model")]
+    pub local_embedding_model: String,
+    /// Diarization clustering threshold (`CORTI_LOCAL_DIARIZE_THRESHOLD`, 0.0–1.0, default 0.5) — higher
+    /// merges more speakers, lower splits more. An env-only knob to tune far-end over-clustering (#18); not
+    /// surfaced in the webview.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    pub local_diarize_threshold: f32,
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
@@ -78,6 +92,8 @@ impl Default for AppConfig {
             local_provider: "cpu".to_string(),
             local_threads: 4,
             local_diarize_far_end: false,
+            local_embedding_model: default_embedding_model(),
+            local_diarize_threshold: 0.5,
             aec_enabled: true,
         }
     }
@@ -113,6 +129,15 @@ impl AppConfig {
         }
         if env_non_empty("CORTI_LOCAL_DIARIZE").is_some() {
             cfg.local_diarize_far_end = env_bool("CORTI_LOCAL_DIARIZE", cfg.local_diarize_far_end);
+        }
+        if let Some(v) = env_non_empty("CORTI_LOCAL_EMBEDDING") {
+            cfg.local_embedding_model = v;
+        }
+        if let Some(t) = env_non_empty("CORTI_LOCAL_DIARIZE_THRESHOLD")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|t| (0.0..=1.0).contains(t))
+        {
+            cfg.local_diarize_threshold = t;
         }
         if env_non_empty("CORTI_AEC").is_some() {
             cfg.aec_enabled = env_bool("CORTI_AEC", cfg.aec_enabled);
@@ -180,6 +205,8 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_LOCAL_PROVIDER", "local_provider"),
         ("CORTI_LOCAL_THREADS", "local_threads"),
         ("CORTI_LOCAL_DIARIZE", "local_diarize_far_end"),
+        ("CORTI_LOCAL_EMBEDDING", "local_embedding_model"),
+        ("CORTI_LOCAL_DIARIZE_THRESHOLD", "local_diarize_threshold"),
         ("CORTI_AEC", "aec_enabled"),
     ]
     .into_iter()
@@ -199,6 +226,13 @@ fn parse_backend(s: Option<String>) -> BackendChoice {
         }
         None => default_backend(),
     }
+}
+
+/// Default speaker-embedding model id for far-end diarization. A literal (not the cross-crate
+/// `corti_transcribe_local::models::DEFAULT_EMBEDDING_ID`) so this file compiles without the `local` feature;
+/// keep the two in lock-step.
+fn default_embedding_model() -> String {
+    "titanet".to_string()
 }
 
 /// Default backend for this build: prefer the on-device `local` backend so a fresh install transcribes out
@@ -253,6 +287,8 @@ mod tests {
             "CORTI_LOCAL_PROVIDER",
             "CORTI_LOCAL_THREADS",
             "CORTI_LOCAL_DIARIZE",
+            "CORTI_LOCAL_EMBEDDING",
+            "CORTI_LOCAL_DIARIZE_THRESHOLD",
             "CORTI_AEC",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
@@ -278,6 +314,8 @@ mod tests {
             local_provider: "coreml".into(),
             local_threads: 8,
             local_diarize_far_end: true,
+            local_embedding_model: "wespeaker-resnet34".into(),
+            local_diarize_threshold: 0.7,
             aec_enabled: false,
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();

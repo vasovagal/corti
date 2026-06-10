@@ -13,8 +13,13 @@ following attributions:
   © Hervé Bredin / pyannote. Licensed under CC-BY-4.0.
   https://huggingface.co/pyannote/segmentation-3.0
 
-- 3D-Speaker speaker-embedding model (far-end diarization, embedding stage)
-  © Alibaba DAMO Academy / 3D-Speaker. Licensed under Apache-2.0.
+- Speaker-embedding models (far-end diarization, embedding stage) — one of these is selected at runtime:
+  - NVIDIA NeMo TitaNet-Large (English). © NVIDIA. Licensed under CC-BY-4.0.
+    https://huggingface.co/nvidia/speakerverification_en_titanet_large
+  - WeSpeaker VoxCeleb ResNet34-LM (English). © WeSpeaker authors. Licensed under Apache-2.0.
+    https://github.com/wenet-e2e/wespeaker
+  - 3D-Speaker CAM++ (English, VoxCeleb). © Alibaba DAMO Academy / 3D-Speaker. Licensed under Apache-2.0.
+    https://github.com/modelscope/3D-Speaker
 
 - Silero VAD (voice-activity detection)
   © Silero Team. Licensed under MIT.

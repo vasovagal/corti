@@ -39,6 +39,7 @@ pub struct SettingsDto {
     pub aws_region: Option<String>,
     pub local_threads: i32,
     pub local_diarize_far_end: bool,
+    pub local_embedding_model: String,
     pub aec_enabled: bool,
     pub env_managed: Vec<String>,
 }
@@ -68,6 +69,7 @@ impl From<&AppConfig> for SettingsDto {
             aws_region: cfg.aws_region.clone(),
             local_threads: cfg.local_threads,
             local_diarize_far_end: cfg.local_diarize_far_end,
+            local_embedding_model: cfg.local_embedding_model.clone(),
             aec_enabled: cfg.aec_enabled,
             env_managed: config::env_managed_fields(),
         }
@@ -148,6 +150,18 @@ pub fn set_config(
     }
     if !pinned("local_diarize_far_end") {
         to_save.local_diarize_far_end = dto.local_diarize_far_end;
+    }
+    if !pinned("local_embedding_model") {
+        let emb = dto.local_embedding_model.trim();
+        // Reject an unknown embedding id (validated only when the local backend — and its catalog — is in
+        // this build); an empty value leaves the file baseline so the backend's default applies.
+        #[cfg(feature = "local")]
+        if !emb.is_empty() && !corti_transcribe_local::models::is_embedding(emb) {
+            return Err(format!("unknown speaker-embedding model {emb:?}"));
+        }
+        if !emb.is_empty() {
+            to_save.local_embedding_model = emb.to_string();
+        }
     }
     if !pinned("aec_enabled") {
         to_save.aec_enabled = dto.aec_enabled;
@@ -352,7 +366,27 @@ pub fn set_models_dir(
     }
 }
 
-/// Install state of every local model (Settings → Models). Errors when the local backend isn't compiled in.
+/// Build a [`ModelStatus`] for one catalog spec, reading its install state under `dir`.
+#[cfg(feature = "local")]
+fn model_status(dir: &Path, spec: &corti_transcribe_local::models::ModelSpec) -> ModelStatus {
+    let present = dir.join(spec.present_rel).exists();
+    ModelStatus {
+        id: spec.id.to_string(),
+        label: spec.label.to_string(),
+        present,
+        on_disk_bytes: if present {
+            path_size(&dir.join(spec.install_rel))
+        } else {
+            0
+        },
+        download_bytes: spec.download_bytes,
+        diarize_only: spec.diarize_only,
+    }
+}
+
+/// Install state of the local models needed for the **current** config (Settings → Models): the core models
+/// plus only the *selected* speaker-embedding model (the other embedding options live behind the
+/// Transcription dropdown via [`get_embedding_models`]). Errors when the local backend isn't compiled in.
 #[tauri::command]
 pub fn get_models_status(state: State<'_, ConfigState>) -> Result<Vec<ModelStatus>, String> {
     #[cfg(not(feature = "local"))]
@@ -362,28 +396,37 @@ pub fn get_models_status(state: State<'_, ConfigState>) -> Result<Vec<ModelStatu
     }
     #[cfg(feature = "local")]
     {
+        use corti_transcribe_local::models;
         let dir = models_dir_or_err(&state)?;
-        let statuses = corti_transcribe_local::models::model_catalog()
+        let selected = state.config.lock().unwrap().local_embedding_model.clone();
+        let selected_id = models::embedding_spec(&selected).id;
+        let statuses = models::model_catalog()
             .into_iter()
-            .map(|spec| {
-                let present = dir.join(spec.present_rel).exists();
-                let on_disk_bytes = if present {
-                    path_size(&dir.join(spec.install_rel))
-                } else {
-                    0
-                };
-                ModelStatus {
-                    id: spec.id.to_string(),
-                    label: spec.label.to_string(),
-                    present,
-                    on_disk_bytes,
-                    download_bytes: spec.download_bytes,
-                    diarize_only: spec.diarize_only,
-                }
-            })
+            .filter(|spec| !models::is_embedding(spec.id) || spec.id == selected_id)
+            .map(|spec| model_status(&dir, &spec))
             .collect();
         Ok(statuses)
     }
+}
+
+/// Install state of every selectable English speaker-embedding model (the Transcription dropdown). Errors
+/// when the local backend isn't compiled in.
+#[cfg(feature = "local")]
+#[tauri::command]
+pub fn get_embedding_models(state: State<'_, ConfigState>) -> Result<Vec<ModelStatus>, String> {
+    use corti_transcribe_local::models;
+    let dir = models_dir_or_err(&state)?;
+    let statuses = models::EMBEDDING_IDS
+        .iter()
+        .map(|id| model_status(&dir, &models::embedding_spec(id)))
+        .collect();
+    Ok(statuses)
+}
+
+#[cfg(not(feature = "local"))]
+#[tauri::command]
+pub fn get_embedding_models() -> Result<Vec<ModelStatus>, String> {
+    Err("local transcription backend is not compiled into this build".to_string())
 }
 
 #[cfg(feature = "local")]

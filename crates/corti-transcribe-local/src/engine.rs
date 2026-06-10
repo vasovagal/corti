@@ -78,11 +78,15 @@ pub fn build_vad(m: &Models, provider: &str) -> Result<VoiceActivityDetector> {
         .context("failed to create the Silero VAD (check model file)")
 }
 
-/// Build the pyannote-segmentation + 3D-Speaker-embedding diarizer (for splitting the far-end channel).
+/// Build the pyannote-segmentation + speaker-embedding diarizer (for splitting the far-end channel). The
+/// embedding model is whichever English model `m.embedding` resolved to (see `models::EMBEDDING_IDS`).
+/// `threshold` is the clustering cutoff that estimates the speaker count — higher merges more (fewer
+/// speakers), lower splits more; tunable via `CORTI_LOCAL_DIARIZE_THRESHOLD` to address over-clustering (#18).
 pub fn build_diarizer(
     m: &Models,
     provider: &str,
     num_threads: i32,
+    threshold: f32,
 ) -> Result<OfflineSpeakerDiarization> {
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
@@ -102,7 +106,7 @@ pub fn build_diarizer(
         // Unknown number of far-end speakers → estimate via the clustering threshold (num_clusters < 0).
         clustering: FastClusteringConfig {
             num_clusters: -1,
-            threshold: 0.5,
+            threshold,
         },
         min_duration_on: 0.3,
         min_duration_off: 0.5,
@@ -233,6 +237,58 @@ mod tests {
 
     fn toks(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Proves sherpa-onnx loads **every** selectable English embedding model through the same diarizer —
+    /// i.e. the framework (NeMo / WeSpeaker / 3D-Speaker) is auto-detected from the `.onnx`, with no
+    /// per-model wiring. Ignored: needs the real segmentation + embedding files on disk. Run it with a model
+    /// dir that holds `sherpa-onnx-pyannote-segmentation-3-0/model.onnx` + the embedding `.onnx` files:
+    ///   CORTI_VERIFY_MODEL_DIR=/path/to/models \
+    ///     cargo test -p corti-transcribe-local build_diarizer_loads_every_embedding -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the real ONNX model files; set CORTI_VERIFY_MODEL_DIR"]
+    fn build_diarizer_loads_every_embedding() {
+        use crate::models::{self, Models};
+        use std::path::PathBuf;
+
+        let dir =
+            PathBuf::from(std::env::var("CORTI_VERIFY_MODEL_DIR").expect(
+                "set CORTI_VERIFY_MODEL_DIR to a dir with the segmentation + embedding files",
+            ));
+        let segmentation = dir.join(models::SEGMENTATION_DIR).join("model.onnx");
+        assert!(
+            segmentation.exists(),
+            "missing segmentation model at {}",
+            segmentation.display()
+        );
+
+        for id in models::EMBEDDING_IDS {
+            let spec = models::embedding_spec(id);
+            let embedding = dir.join(spec.install_rel);
+            assert!(
+                embedding.exists(),
+                "missing {id} embedding at {}",
+                embedding.display()
+            );
+            // build_diarizer only reads `segmentation` + `embedding`; the rest can be empty.
+            let m = Models {
+                parakeet_encoder: PathBuf::new(),
+                parakeet_decoder: PathBuf::new(),
+                parakeet_joiner: PathBuf::new(),
+                parakeet_tokens: PathBuf::new(),
+                segmentation: segmentation.clone(),
+                embedding,
+                vad: PathBuf::new(),
+            };
+            let diar = build_diarizer(&m, "cpu", 1, 0.5);
+            assert!(
+                diar.is_ok(),
+                "embedding {id} ({}) failed to load: {:?}",
+                spec.install_rel,
+                diar.err()
+            );
+            eprintln!("✓ {id} ({}) loaded OK", spec.install_rel);
+        }
     }
 
     #[test]

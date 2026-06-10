@@ -107,6 +107,8 @@ impl Backend {
             provider: self.cfg.local_provider.clone(),
             num_threads: self.cfg.local_threads,
             diarize_far_end: self.cfg.local_diarize_far_end,
+            embedding_model: self.cfg.local_embedding_model.clone(),
+            diarize_threshold: self.cfg.local_diarize_threshold,
         };
         LocalTranscriber::new(cfg).transcribe(audio, meta)
     }

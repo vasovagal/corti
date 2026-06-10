@@ -4,7 +4,7 @@
 //! ```text
 //! sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/{encoder,decoder,joiner}.int8.onnx, tokens.txt
 //! sherpa-onnx-pyannote-segmentation-3-0/model.onnx
-//! 3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+//! nemo_en_titanet_large.onnx           (the selected speaker-embedding model — see EMBEDDING_IDS)
 //! silero_vad.onnx
 //! ```
 //! Fetch them once with `crates/corti-transcribe-local/fetch-models.sh` (pinned to sherpa-onnx releases).
@@ -18,12 +18,37 @@ use anyhow::{Result, bail};
 pub const PARAKEET_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 /// pyannote speaker-segmentation 3.0 — directory name as extracted from the release archive.
 pub const SEGMENTATION_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
-/// 3D-Speaker speaker-embedding model (general, 16 kHz). NOTE: trained on zh-cn; speaker embeddings
-/// transfer across languages but an English/VoxCeleb model may separate far-end speakers better — tracked
-/// as a quality follow-up (`Feature`: evaluate English speaker-embedding model).
-pub const EMBEDDING_FILE: &str = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
 /// Silero VAD model.
 pub const VAD_FILE: &str = "silero_vad.onnx";
+
+/// The speaker-embedding model used by far-end diarization is **runtime-selectable** among these English
+/// (VoxCeleb-trained) models — the old zh-cn model was removed (it over-clustered on English; issue #18).
+/// Each id maps to a [`ModelSpec`] in [`model_catalog`] whose `install_rel` is the on-disk filename.
+/// sherpa-onnx auto-detects the framework (NeMo / WeSpeaker / 3D-Speaker) from the `.onnx` metadata, so all
+/// three load through the same diarizer with no per-model wiring (keep the official filenames intact).
+pub const EMBEDDING_IDS: [&str; 3] = ["titanet", "wespeaker-resnet34", "campplus-en"];
+/// Default speaker-embedding model id — NeMo TitaNet-Large, the strongest English option in the set.
+pub const DEFAULT_EMBEDDING_ID: &str = "titanet";
+
+/// Whether `id` names one of the selectable speaker-embedding models.
+pub fn is_embedding(id: &str) -> bool {
+    EMBEDDING_IDS.contains(&id)
+}
+
+/// The [`ModelSpec`] for the speaker-embedding model `id`, falling back to [`DEFAULT_EMBEDDING_ID`] when `id`
+/// is empty or unknown. This is the single fallback point before an embedding path is built, so a stray value
+/// from env, config, or the webview can never produce a bogus path.
+pub fn embedding_spec(id: &str) -> ModelSpec {
+    let want = if is_embedding(id) {
+        id
+    } else {
+        DEFAULT_EMBEDDING_ID
+    };
+    model_catalog()
+        .into_iter()
+        .find(|s| s.id == want)
+        .expect("embedding id must exist in the catalog")
+}
 
 /// Resolved, validated paths to every model file the backend loads.
 #[derive(Debug, Clone)]
@@ -50,8 +75,8 @@ pub fn resolve_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
 /// Build the [`Models`] paths under `dir` and verify the required files exist, with an actionable error
 /// naming the missing files and the fetch script if not. The segmentation + embedding models are required
 /// only when `need_diarization` is set (far-end speaker splitting); the default path needs just Parakeet +
-/// VAD.
-pub fn discover(dir: &Path, need_diarization: bool) -> Result<Models> {
+/// VAD. `embedding_id` selects which speaker-embedding model to expect (see [`EMBEDDING_IDS`]).
+pub fn discover(dir: &Path, need_diarization: bool, embedding_id: &str) -> Result<Models> {
     let parakeet = dir.join(PARAKEET_DIR);
     let models = Models {
         parakeet_encoder: parakeet.join("encoder.int8.onnx"),
@@ -59,7 +84,7 @@ pub fn discover(dir: &Path, need_diarization: bool) -> Result<Models> {
         parakeet_joiner: parakeet.join("joiner.int8.onnx"),
         parakeet_tokens: parakeet.join("tokens.txt"),
         segmentation: dir.join(SEGMENTATION_DIR).join("model.onnx"),
-        embedding: dir.join(EMBEDDING_FILE),
+        embedding: dir.join(embedding_spec(embedding_id).install_rel),
         vad: dir.join(VAD_FILE),
     };
 
@@ -181,16 +206,41 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             install_rel: SEGMENTATION_DIR,
             present_rel: "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
         },
+        // Speaker-embedding models for far-end diarization — runtime-selectable (see EMBEDDING_IDS); the
+        // user downloads + uses one. All English (VoxCeleb-trained); the framework is auto-detected from the
+        // .onnx, so they share one diarizer with no per-model wiring.
         ModelSpec {
-            id: "embedding",
-            label: "3D-Speaker embedding (16 kHz)",
-            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
-            sha256: "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
-            download_bytes: 39593761,
+            id: "titanet",
+            label: "NeMo TitaNet-Large embedding (English)",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_large.onnx",
+            sha256: "d51abcf31717ef28162f26acb9d44dd4127c3d44c9b8624f699f3425daca8e77",
+            download_bytes: 101405493,
             kind: ArtifactKind::File,
             diarize_only: true,
-            install_rel: EMBEDDING_FILE,
-            present_rel: EMBEDDING_FILE,
+            install_rel: "nemo_en_titanet_large.onnx",
+            present_rel: "nemo_en_titanet_large.onnx",
+        },
+        ModelSpec {
+            id: "wespeaker-resnet34",
+            label: "WeSpeaker ResNet34-LM embedding (English)",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx",
+            sha256: "e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012",
+            download_bytes: 26530550,
+            kind: ArtifactKind::File,
+            diarize_only: true,
+            install_rel: "wespeaker_en_voxceleb_resnet34_LM.onnx",
+            present_rel: "wespeaker_en_voxceleb_resnet34_LM.onnx",
+        },
+        ModelSpec {
+            id: "campplus-en",
+            label: "3D-Speaker CAM++ embedding (English)",
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+            sha256: "357a834f702b80161e5b981182c038e18553c1f2ca752ed6cec2052365d4129b",
+            download_bytes: 29596978,
+            kind: ArtifactKind::File,
+            diarize_only: true,
+            install_rel: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+            present_rel: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
         },
     ]
 }

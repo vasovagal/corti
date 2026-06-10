@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import {
   getAwsStatus,
+  getEmbeddingModels,
   verifyAws,
   type AwsStatus,
   type BackendInfo,
+  type ModelStatus,
   type SettingsDto,
 } from "../lib/api";
 
@@ -49,10 +51,17 @@ export function Transcription({ cfg, backends, onChange }: Props) {
   const [verifying, setVerifying] = useState(false);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
 
+  // The selectable English speaker-embedding models for the far-end-diarization dropdown (with their
+  // installed/size state). Empty on a build without the local backend — the dropdown then renders nothing.
+  const [embeddingModels, setEmbeddingModels] = useState<ModelStatus[]>([]);
+
   useEffect(() => {
     getAwsStatus()
       .then(setAws)
       .catch(() => setAws(null));
+    getEmbeddingModels()
+      .then(setEmbeddingModels)
+      .catch(() => setEmbeddingModels([]));
   }, []);
 
   async function testCredentials() {
@@ -226,8 +235,30 @@ export function Transcription({ cfg, backends, onChange }: Props) {
             {envBadge("local_diarize_far_end")}
           </label>
           <p className="muted small">
-            Off by default — far-end diarization over-clusters on English audio today (issue #18).
+            Off by default. Splits the far end using the English embedding model below.
           </p>
+
+          {embeddingModels.length > 0 && (
+            <div className="settings-field">
+              <label>Far-end embedding model{envBadge("local_embedding_model")}</label>
+              <select
+                className="jselect"
+                value={cfg.local_embedding_model}
+                disabled={!cfg.local_diarize_far_end || isEnv("local_embedding_model")}
+                onChange={(e) => set("local_embedding_model", e.target.value)}
+              >
+                {embeddingModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label} {m.present ? "· installed" : `· ~${Math.round(m.download_bytes / 1_000_000)} MB`}
+                  </option>
+                ))}
+              </select>
+              <p className="muted small">
+                English (VoxCeleb-trained) model that separates far-end speakers. Download the selected one in
+                Settings → Models. If it over-clusters, lower <code>CORTI_LOCAL_DIARIZE_THRESHOLD</code> (issue #18).
+              </p>
+            </div>
+          )}
         </>
       )}
 

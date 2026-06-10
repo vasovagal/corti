@@ -52,7 +52,8 @@ The app's transcription features are `aws` (default) and `local`; ship builds us
 ### Local backend models
 
 The offline backend needs its ONNX models (Parakeet-TDT, Silero VAD, and — for opt-in
-far-end diarization — pyannote-segmentation + 3D-Speaker; ~0.7 GB total, cached under
+far-end diarization — pyannote-segmentation + an English speaker-embedding model, default
+NeMo TitaNet-Large; ~0.7 GB total, cached under
 `~/Library/Caches/corti/models/`). Fetch them up front:
 
 ```sh

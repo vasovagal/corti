@@ -25,15 +25,17 @@ A mid-2026 research sweep (and direct verification) settled the engine choice:
   CPU is the default and CoreML is an opt-in knob only.
 - corti already records ch0=mic / ch1=system-tap, so **channel = speaker** solves me-vs-them with no
   diarizer. The far-end channel (ch1) is optionally split into `Them 1/2/…` with sherpa-onnx's
-  **pyannote-segmentation-3.0 + 3D-Speaker embedding** ONNX models (community-1's embedding does not export
-  to ONNX, so we use segmentation-3.0).
+  **pyannote-segmentation-3.0 + a speaker-embedding model** ONNX models. The embedding model is
+  runtime-selectable among English (VoxCeleb-trained) models — default **NeMo TitaNet-Large** — replacing the
+  original zh-cn 3D-Speaker model, which over-clustered on English audio (issue #18).
 
 ## Decision
 
 - **Adopt `sherpa-onnx` (ONNX Runtime) as corti's local ASR + VAD + diarization runtime**, in a new
   `corti-transcribe-local` crate behind the `Transcriber` trait. Models: Parakeet-TDT-0.6B-v3 (int8),
-  Silero VAD, pyannote-segmentation-3.0, a 3D-Speaker embedding. Default execution provider **`cpu`**;
-  `coreml` is an opt-in config knob (not validated/hardened here).
+  Silero VAD, pyannote-segmentation-3.0, and a runtime-selectable English speaker-embedding model (default
+  NeMo TitaNet-Large). Default execution provider **`cpu`**; `coreml` is an opt-in config knob (not
+  validated/hardened here).
 - **Feature-gated and runtime-selectable.** The crate is the `local` cargo feature, independent of `aws`;
   both compile together and the active backend is chosen **at runtime** (`CORTI_TRANSCRIBE_BACKEND`), so
   the default `aws` build is unaffected and neither dep is forced on the other (extends guardrail #6).

@@ -12,6 +12,7 @@ export interface SettingsDto {
   aws_region: string | null;
   local_threads: number;
   local_diarize_far_end: boolean;
+  local_embedding_model: string; // a corti-transcribe-local EMBEDDING_IDS id, e.g. "titanet"
   aec_enabled: boolean;
   env_managed: string[];
 }
@@ -86,6 +87,10 @@ export const setModelsDir = (dir: string): Promise<void> => invoke<void>("set_mo
 
 export const getModelsStatus = (): Promise<ModelStatus[]> =>
   invoke<ModelStatus[]>("get_models_status");
+
+/** Install state of the selectable English speaker-embedding models (the Transcription dropdown). */
+export const getEmbeddingModels = (): Promise<ModelStatus[]> =>
+  invoke<ModelStatus[]>("get_embedding_models");
 
 export const downloadModel = (id: string): Promise<void> => invoke<void>("download_model", { id });
 

@@ -83,9 +83,13 @@ Pipeline (`crates/corti-transcribe-local/`): read the 2-track float WAV (`audio.
 resample to 16 kHz and run **Silero VAD** to chunk into speech regions (also sidesteps Parakeet's ~30 s
 offline clip limit), decode each region with Parakeet, and reassemble token timestamps into words
 (`engine.rs`). ch0 (mic) → `Speaker::Me`; ch1 (system tap) → `Speaker::Other("Them")` by default. Far-end
-speaker splitting (`Them 1/2/…` via pyannote-segmentation-3.0 + 3D-Speaker embedding, ONNX) is **opt-in**
-(`CORTI_LOCAL_DIARIZE=1`) and **off by default** — it over-clusters on English audio today (issue #18); when
-off, the segmentation + embedding models aren't required. All shaping (pause-split grouping, speaker merge,
+speaker splitting (`Them 1/2/…` via pyannote-segmentation-3.0 + a speaker-embedding model, ONNX) is **opt-in**
+(`CORTI_LOCAL_DIARIZE=1`) and **off by default**; when off, the segmentation + embedding models aren't
+required. The embedding stage is **runtime-selectable** among three English (VoxCeleb-trained) models — NeMo
+TitaNet-Large (default), WeSpeaker ResNet34-LM, 3D-Speaker CAM++ — chosen in Settings → Transcription or via
+`CORTI_LOCAL_EMBEDDING` (the old zh-cn model was removed; sherpa-onnx auto-detects each model's framework from
+its ONNX metadata, so all three share one diarizer). Tune `CORTI_LOCAL_DIARIZE_THRESHOLD` (default 0.5) to
+curb over-clustering (issue #18). All shaping (pause-split grouping, speaker merge,
 diarization attribution) is the shared `corti_transcribe::segment` module — the same helpers the AWS parser
 uses. Models cache under `~/Library/Caches/corti/models/` (fetch once with
 `crates/corti-transcribe-local/fetch-models.sh`); a missing required model fails the job with a clear,

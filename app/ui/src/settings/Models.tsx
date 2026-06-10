@@ -70,7 +70,7 @@ export function Models() {
       <h2>Models</h2>
       <p className="muted small">
         Local transcription models (sherpa-onnx). Diarization models are only needed when far-end
-        diarization is on.
+        diarization is on; the embedding model shown is the one selected in Transcription settings.
       </p>
       <table className="jtable">
         <tbody>

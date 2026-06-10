@@ -183,6 +183,7 @@ mod imp {
                 crate::settings::reveal_path,
                 crate::settings::set_models_dir,
                 crate::settings::get_models_status,
+                crate::settings::get_embedding_models,
                 crate::settings::download_model,
             ])
             .setup(move |app| {
