@@ -130,6 +130,7 @@ pub fn transcribe_recording(
     backend: &Backend,
     aec_enabled: bool,
     skip_aec: bool,
+    aec_cfg: &corti_aec::AecConfig,
     id: &str,
     meta: &RecordingMeta,
     raw_audio: &Path,
@@ -138,7 +139,7 @@ pub fn transcribe_recording(
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
     let input: PathBuf = if aec_enabled && !skip_aec {
-        match corti_capture::write_clean_wav(raw_audio) {
+        match corti_capture::write_clean_wav(raw_audio, aec_cfg) {
             Ok(Some(clean)) => clean,
             Ok(None) => {
                 // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.

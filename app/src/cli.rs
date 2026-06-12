@@ -40,6 +40,7 @@ USAGE:
     corti                                  launch the menu-bar tray app (default)
     corti --input <wav> [options]          transcribe a WAV to a note at a path you choose (primitive)
     corti --redo <recording> [options]     re-transcribe a tracked recording and file via vagus
+    corti --calibrate-aec [wav...]         tune AEC parameters against recent recordings
     corti --list                           list tracked recordings and their pipeline status
     corti --help | -h                      show this help
     corti --version | -V                   show the version
@@ -57,6 +58,10 @@ REDO OPTIONS (--redo):
     --local | --aws          shorthand for --backend local|aws
     --print                  print the transcript to stdout; do NOT file a note or touch the queue
 
+CALIBRATE-AEC OPTIONS:
+    [wav...]                 explicit WAV files to calibrate against (default: 3 most recent 2-channel)
+    --dry-run                print results but don't save to config.toml
+
 --input is the plain primitive: you give it an exact WAV and an exact --output path, it transcribes and
 writes a note (frontmatter + title + transcript) — no cache/queue/vagus, nothing is filed or indexed. AEC
 runs automatically on a 2-channel (mic+tap) WAV and is skipped on a mono or *-clean.wav input. A 2-channel
@@ -64,7 +69,12 @@ input writes a sibling <name>-clean.wav. To index a note written into the vault,
 
 --redo is the convenience path: <recording> may be a recordings-cache filename, a path, a *-clean.wav, or
 a bare stem (bare names resolve under ~/Library/Caches/corti/recordings, or $CORTI_RECORDINGS_DIR); it
-files through vagus and reflects the new note in the queue/tray history.";
+files through vagus and reflects the new note in the queue/tray history.
+
+--calibrate-aec sweeps AEC parameters (filter length, step size, double-talk ratio, power smoothing) in
+parallel against the given recordings (or the 3 most recent 2-channel recordings from the cache) and saves
+the winning configuration to config.toml. The residual echo suppressor (CORTI_AEC_SUPPRESS_RESIDUAL, default
+2.5) runs after the adaptive filter to eliminate faint echo ghosts; set 0 to disable.";
 
 /// A parsed command line. `Run` is the default (no/blank args) and launches the tray.
 #[derive(Debug, PartialEq)]
@@ -72,6 +82,7 @@ pub enum Cli {
     Run,
     Redo(RedoArgs),
     Transcribe(TranscribeArgs),
+    CalibrateAec(CalibrateArgs),
     List,
     Help,
     Version,
@@ -104,6 +115,15 @@ pub struct TranscribeArgs {
     pub backend: Option<BackendChoice>,
     /// `--no-aec`: transcribe the input as-is (skip offline echo cancellation).
     pub no_aec: bool,
+}
+
+/// Options for `--calibrate-aec`: sweep AEC parameters against recordings and save the winners.
+#[derive(Debug, PartialEq)]
+pub struct CalibrateArgs {
+    /// Explicit WAV files to calibrate against; empty ⇒ auto-pick the 3 most recent 2-channel recordings.
+    pub files: Vec<String>,
+    /// `--dry-run`: print results but don't save to `config.toml`.
+    pub dry_run: bool,
 }
 
 /// Parse the process arguments, exiting with usage on error. Thin wrapper over [`parse_from`] (which is the
@@ -154,6 +174,20 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Cli, String> {
                 backend,
                 print_only,
             }))
+        }
+        "--calibrate-aec" => {
+            let mut files = Vec::new();
+            let mut dry_run = false;
+            for arg in args {
+                match arg.as_str() {
+                    "--dry-run" => dry_run = true,
+                    other if other.starts_with("--") => {
+                        return Err(format!("unknown option to --calibrate-aec: `{other}`"));
+                    }
+                    _ => files.push(arg),
+                }
+            }
+            Ok(Cli::CalibrateAec(CalibrateArgs { files, dry_run }))
         }
         "--input" => {
             let input = args
@@ -220,6 +254,7 @@ pub fn dispatch(cli: Cli) -> i32 {
         Cli::List => run_list(),
         Cli::Redo(args) => run_redo(args),
         Cli::Transcribe(args) => run_transcribe(args),
+        Cli::CalibrateAec(args) => run_calibrate_aec(args),
     };
     match result {
         Ok(()) => 0,
@@ -302,11 +337,13 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         if effective_aec { "on" } else { "off" },
     );
 
+    let aec_cfg = cfg.aec_config();
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
         aec_enabled,
         resolved.skip_aec,
+        &aec_cfg,
         &resolved.id,
         &resolved.meta,
         &resolved.audio,
@@ -405,11 +442,13 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
             "off"
         },
     );
+    let aec_cfg = cfg.aec_config();
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
         aec_enabled,
         skip_aec,
+        &aec_cfg,
         &job_id,
         &meta,
         input,
@@ -434,6 +473,196 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         None => print!("{note}"),
     }
     Ok(())
+}
+
+/// `--calibrate-aec`: sweep AEC parameters against recordings and save the best config.
+fn run_calibrate_aec(args: CalibrateArgs) -> Result<()> {
+    use corti_aec::tune::{default_grid, sweep};
+
+    let recordings = if args.files.is_empty() {
+        auto_pick_recordings(3)?
+    } else {
+        args.files
+            .iter()
+            .map(|f| load_recording(Path::new(f)))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    if recordings.is_empty() {
+        bail!("no 2-channel recordings found to calibrate against");
+    }
+
+    eprintln!(
+        "[corti] calibrating AEC against {} recording(s):",
+        recordings.len()
+    );
+    for r in &recordings {
+        let dur = r.mic.len() as f32 / r.sample_rate as f32;
+        eprintln!("  {}: {dur:.0}s", r.name);
+    }
+
+    let grid = default_grid();
+    eprintln!(
+        "[corti] sweeping {} parameter combos × {} files = {} AEC runs (parallel)…",
+        grid.len(),
+        recordings.len(),
+        grid.len() * recordings.len(),
+    );
+
+    let started = std::time::Instant::now();
+    let results = sweep(&recordings, &grid);
+    let elapsed = started.elapsed();
+
+    eprintln!("[corti] sweep completed in {:.1}s", elapsed.as_secs_f32());
+
+    // Print the current defaults' score for comparison.
+    let current = corti_aec::AecConfig::default();
+    let current_clean: Vec<Vec<f32>> = recordings
+        .iter()
+        .map(|r| corti_aec::cancel(&r.mic, &r.tap, r.sample_rate, &current))
+        .collect();
+    let current_scores: Vec<corti_aec::score::AecScore> = recordings
+        .iter()
+        .zip(current_clean.iter())
+        .map(|(r, c)| corti_aec::score::score(&r.mic, &r.tap, c, r.sample_rate))
+        .collect();
+    let current_mean = mean_aec_score(&current_scores);
+
+    println!();
+    println!("Current defaults:");
+    print_config_score(&current, &current_mean);
+    println!();
+    println!("Top 10 configurations:");
+    for (i, r) in results.iter().take(10).enumerate() {
+        print!("  #{:<2} ", i + 1);
+        print_config_score(&r.config, &r.mean);
+    }
+
+    if let Some(best) = results.first() {
+        let improvement = best.mean.combined - current_mean.combined;
+        println!();
+        if improvement > 0.01 {
+            println!(
+                "Best config improves combined score by {improvement:+.3} ({:.3} → {:.3})",
+                current_mean.combined, best.mean.combined
+            );
+        } else {
+            println!("Current defaults are already near-optimal (delta {improvement:+.3})");
+        }
+
+        if !args.dry_run {
+            let mut cfg = AppConfig::load();
+            cfg.aec_filter_len = Some(best.config.filter_len);
+            cfg.aec_mu = Some(best.config.mu);
+            cfg.aec_power_smoothing = Some(best.config.power_smoothing);
+            cfg.aec_double_talk_ratio = Some(best.config.double_talk_ratio);
+            cfg.save().context("saving calibrated AEC config")?;
+            println!("Saved to config.toml");
+        } else {
+            println!("(dry run — not saved)");
+        }
+    }
+    Ok(())
+}
+
+fn print_config_score(cfg: &corti_aec::AecConfig, s: &corti_aec::score::AecScore) {
+    println!(
+        "filter_len={:<5} mu={:.2} dt_ratio={:.1} power_smooth={:.2}  \
+         → echo_sup={:.3} near_pres={:.3} combined={:.3}",
+        cfg.filter_len,
+        cfg.mu,
+        cfg.double_talk_ratio,
+        cfg.power_smoothing,
+        s.echo_suppression,
+        s.near_end_preservation,
+        s.combined,
+    );
+}
+
+fn mean_aec_score(scores: &[corti_aec::score::AecScore]) -> corti_aec::score::AecScore {
+    let n = scores.len() as f32;
+    corti_aec::score::AecScore {
+        echo_suppression: scores.iter().map(|s| s.echo_suppression).sum::<f32>() / n,
+        near_end_preservation: scores.iter().map(|s| s.near_end_preservation).sum::<f32>() / n,
+        combined: scores.iter().map(|s| s.combined).sum::<f32>() / n,
+    }
+}
+
+/// Load a 2-channel recording, deinterleave, and truncate to 5 minutes for tuning speed.
+fn load_recording(path: &Path) -> Result<corti_aec::tune::Recording> {
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let spec = reader.spec();
+    if spec.channels != 2 {
+        bail!(
+            "{}: expected 2 channels, got {} (tap-only/mono recordings can't be calibrated)",
+            path.display(),
+            spec.channels
+        );
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<_, _>>()
+            .context("reading float samples")?,
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<Result<_, _>>()
+                .context("reading int samples")?
+        }
+    };
+    let mut mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
+    let mut tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+
+    // Truncate to 5 minutes for speed.
+    let max_samples = spec.sample_rate as usize * 300;
+    mic.truncate(max_samples);
+    tap.truncate(max_samples);
+
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".into());
+    Ok(corti_aec::tune::Recording {
+        name,
+        mic,
+        tap,
+        sample_rate: spec.sample_rate,
+    })
+}
+
+/// Auto-pick the `n` most recent 2-channel recordings from the cache.
+fn auto_pick_recordings(n: usize) -> Result<Vec<corti_aec::tune::Recording>> {
+    let dir = corti_capture::recordings_dir().context("resolving recordings directory")?;
+    if !dir.exists() {
+        bail!("recordings directory does not exist: {}", dir.display());
+    }
+    let mut wavs: Vec<_> = std::fs::read_dir(&dir)
+        .context("reading recordings directory")?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".wav") && !name.ends_with("-clean.wav")
+        })
+        .collect();
+    // Sort by name descending (names are timestamped YYYYMMDD-HHMMSS, so lexicographic = chronological).
+    wavs.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+
+    let mut recordings = Vec::new();
+    for entry in wavs {
+        if recordings.len() >= n {
+            break;
+        }
+        match load_recording(&entry.path()) {
+            Ok(r) => recordings.push(r),
+            Err(_) => continue, // skip mono/corrupt files
+        }
+    }
+    Ok(recordings)
 }
 
 /// Render a standalone note — YAML frontmatter + an H1 title + `body` — mirroring what `vagus add-note`

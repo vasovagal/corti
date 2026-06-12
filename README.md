@@ -20,8 +20,10 @@ signals. Exactly what this app does: audio → notes.
   2-track WAV through a single CoreAudio aggregate device — no virtual audio drivers, no
   ScreenCaptureKit.
 - **Knows who you were talking to.** Attributes each recording to the app that owned the call.
-- **Offline echo cancellation.** An NLMS/FDAF canceller strips speaker bleed from the mic
-  track when you're on speakers; the raw tracks are always preserved.
+- **Offline echo cancellation.** An FDAF adaptive filter strips speaker bleed from the mic
+  track when you're on speakers, plus a residual echo suppressor that eliminates the faint
+  ghosts the adaptive filter can't model — so the transcriber doesn't misattribute bleed as
+  "Me." The raw tracks are always preserved. Tune with `corti --calibrate-aec`.
 - **Diarized, timestamped transcripts.** Clean Markdown with word-level timestamps and
   **Me** / **Them** speaker labels, dropped right into your vagus vault.
 - **Crash-recoverable.** A durable job queue resumes interrupted transcriptions after a crash
@@ -57,6 +59,23 @@ download cached under `~/Library/Caches/corti/models/`; after that the local pat
 network calls** — audio and transcript never leave the device. Prefer cloud accuracy? Point
 `CORTI_TRANSCRIBE_BACKEND=aws` at AWS Transcribe instead. Either way, capture and
 transcription run in the background; the UI never blocks.
+
+## AEC tuning
+
+The echo canceller works out of the box for typical laptop-speaker setups. If your
+room/speakers produce unusual echo, `corti --calibrate-aec` sweeps 144 parameter combinations
+against your recent recordings and saves the best config:
+
+```sh
+corti --calibrate-aec                    # auto-picks 3 most recent 2-channel recordings
+corti --calibrate-aec ~/path/to/*.wav    # explicit recordings
+corti --calibrate-aec --dry-run          # print results without saving
+```
+
+Individual parameters can also be set via environment variables (`CORTI_AEC_FILTER_LEN`,
+`CORTI_AEC_MU`, `CORTI_AEC_POWER_SMOOTHING`, `CORTI_AEC_DOUBLE_TALK_RATIO`,
+`CORTI_AEC_SUPPRESS_RESIDUAL`) or persisted in `config.toml`. See
+[`design/04a-aec-calibration.md`](./design/04a-aec-calibration.md) for the full analysis.
 
 ## Status
 

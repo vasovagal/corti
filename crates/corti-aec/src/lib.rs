@@ -14,6 +14,9 @@
 //! Invariant: the raw mic + far-end tracks are always preserved upstream; this produces an *additional*
 //! cleaned track. Headphones remain the cleanest path; AEC is the speaker-user safety net.
 
+pub mod score;
+pub mod tune;
+
 use rustfft::Fft;
 use rustfft::num_complex::Complex;
 
@@ -29,6 +32,19 @@ pub struct AecConfig {
     pub mu: f32,
     /// Regularization to avoid divide-by-zero on quiet far-end (≈ 1e-6).
     pub eps: f32,
+    /// Far-end power-spectrum smoothing (γ) for the per-bin NLMS normalization (≈ 0.8–0.95).
+    pub power_smoothing: f32,
+    /// Double-talk gate: freeze adaptation when a block's mic energy exceeds this × the far-end energy (the
+    /// near-end is then dominating, and adapting would diverge the filter). Lower values freeze more
+    /// aggressively (≈ 1.0–3.0).
+    pub double_talk_ratio: f32,
+    /// Offline passes: 1 to converge `W`/`P`, 2 to re-filter from the start with the converged filter so
+    /// the call opening is cleaned rather than left under-cancelled.
+    pub passes: usize,
+    /// Residual echo suppression overestimation factor. After the FDAF removes the bulk echo, the post-filter
+    /// suppresses per-bin residual using a spectral-subtraction gain: G = max(1 − α·|Y|²/|E|², floor). Set 0
+    /// to disable. Typical range 1.5–4.0; higher → more aggressive (risks near-end distortion).
+    pub suppress_residual: f32,
 }
 
 impl Default for AecConfig {
@@ -37,43 +53,93 @@ impl Default for AecConfig {
             filter_len: 4096,
             mu: 0.3,
             eps: 1e-6,
+            power_smoothing: 0.9,
+            double_talk_ratio: 2.0,
+            passes: 2,
+            suppress_residual: 2.5,
         }
     }
 }
 
-/// Far-end power-spectrum smoothing (γ) for the per-bin NLMS normalization.
-const POWER_SMOOTHING: f32 = 0.9;
-/// Double-talk gate: freeze adaptation when a block's mic energy exceeds this × the far-end energy (the
-/// near-end is then dominating, and adapting would diverge the filter).
-const DOUBLE_TALK_RATIO: f32 = 2.0;
-/// Offline passes: 1 to converge `W`/`P`, 2 to re-filter from the start with the converged filter so the
-/// call opening is cleaned rather than left under-cancelled.
-const PASSES: usize = 2;
+/// Estimate the bulk acoustic delay (in samples) from speakers to mic via FFT-based cross-correlation.
+///
+/// Finds the lag in `[0, max_lag]` that maximizes the cross-correlation between `mic` and `far_end`. This
+/// is the room's acoustic propagation delay — typically 1–10 ms (48–480 samples at 48 kHz). Pre-shifting
+/// `far_end` by this amount lets the adaptive filter start aligned and converge faster.
+///
+/// Returns 0 when either signal is empty or when the best lag is negative (far_end leads mic, which
+/// shouldn't happen in a speaker→mic path but can occur with misaligned captures).
+fn estimate_delay(mic: &[f32], far_end: &[f32], max_lag: usize) -> usize {
+    let n = mic.len().min(far_end.len());
+    if n == 0 || max_lag == 0 {
+        return 0;
+    }
+    let fft_len = (2 * n).next_power_of_two();
+    let mut planner = rustfft::FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(fft_len);
+    let ifft = planner.plan_fft_inverse(fft_len);
+
+    let mut mic_spec: Vec<Cf> = mic.iter().map(|&v| Cf::new(v, 0.0)).collect();
+    mic_spec.resize(fft_len, Cf::new(0.0, 0.0));
+    let mut far_spec: Vec<Cf> = far_end.iter().map(|&v| Cf::new(v, 0.0)).collect();
+    far_spec.resize(fft_len, Cf::new(0.0, 0.0));
+
+    fft.process(&mut mic_spec);
+    fft.process(&mut far_spec);
+
+    // Cross-correlation: IFFT(conj(Far) ⊙ Mic). Positive lags = mic lags far_end (expected).
+    let mut xcorr: Vec<Cf> = mic_spec
+        .iter()
+        .zip(far_spec.iter())
+        .map(|(m, f)| f.conj() * m)
+        .collect();
+    ifft.process(&mut xcorr);
+
+    // Search positive lags [0, max_lag] for the peak.
+    let search = max_lag.min(fft_len);
+    let (best_lag, _) = xcorr[..search]
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.re.total_cmp(&b.re))
+        .unwrap_or((0, &Cf::new(0.0, 0.0)));
+    best_lag
+}
 
 /// Remove far-end echo from `mic`, returning the cleaned near-end signal (same length as `mic`).
 ///
 /// Uses `far_end` (the time-aligned tap of what the speakers played) as the echo reference. When `far_end`
 /// is silent or empty the output equals `mic` (nothing to cancel). The raw inputs are never mutated.
 ///
-/// `sample_rate` is currently unused — the filter works purely in samples/blocks/bins and is rate-agnostic.
-/// It's kept in the signature for API stability and for a future cross-correlation delay pre-alignment pass
-/// (design/04-corti-aec.md §9), which would need it.
-pub fn cancel(mic: &[f32], far_end: &[f32], _sample_rate: u32, cfg: &AecConfig) -> Vec<f32> {
+/// Pre-aligns `far_end` by estimating the bulk acoustic delay via cross-correlation (design/04-corti-aec.md
+/// §9) before running the adaptive filter. `sample_rate` gates the max-lag search window (10 ms).
+pub fn cancel(mic: &[f32], far_end: &[f32], sample_rate: u32, cfg: &AecConfig) -> Vec<f32> {
     let n = mic.len();
     if n == 0 {
         return Vec::new();
     }
+
+    // Pre-align: shift far_end forward by the estimated acoustic delay so the adaptive filter starts
+    // converged. Max search window = 10 ms (a generous room propagation bound).
+    let max_lag = (sample_rate as usize * 10) / 1000; // 10 ms
+    let delay = estimate_delay(mic, far_end, max_lag);
+    let aligned_far: Vec<f32> = if delay > 0 {
+        let mut a = vec![0.0f32; delay];
+        a.extend_from_slice(far_end);
+        a
+    } else {
+        far_end.to_vec()
+    };
+
     let b = cfg.filter_len.max(1);
     let m = 2 * b;
     let num_blocks = n.div_ceil(b);
     let padded = num_blocks * b;
 
-    // Padded, time-aligned mic (`d`) and far-end (`x`). Tap shorter than mic ⇒ zero-filled (no echo there).
     let mut d = vec![0.0f32; padded];
     d[..n].copy_from_slice(mic);
     let mut x = vec![0.0f32; padded];
-    let take = far_end.len().min(padded);
-    x[..take].copy_from_slice(&far_end[..take]);
+    let take = aligned_far.len().min(padded);
+    x[..take].copy_from_slice(&aligned_far[..take]);
 
     let mut planner = rustfft::FftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(m);
@@ -83,7 +149,7 @@ pub fn cancel(mic: &[f32], far_end: &[f32], _sample_rate: u32, cfg: &AecConfig) 
     let mut p = vec![0.0f32; m]; // smoothed far-end power per bin
     let mut out = vec![0.0f32; padded];
 
-    for _ in 0..PASSES {
+    for _ in 0..cfg.passes {
         run_pass(
             &mut w,
             &mut p,
@@ -94,6 +160,24 @@ pub fn cancel(mic: &[f32], far_end: &[f32], _sample_rate: u32, cfg: &AecConfig) 
             b,
             m,
             cfg.mu,
+            cfg.eps,
+            cfg.power_smoothing,
+            cfg.double_talk_ratio,
+            &mut out,
+        );
+    }
+
+    if cfg.suppress_residual > 0.0 {
+        suppression_pass(
+            &w,
+            fft.as_ref(),
+            ifft.as_ref(),
+            &d,
+            &x,
+            b,
+            m,
+            cfg.suppress_residual,
+            cfg.double_talk_ratio,
             cfg.eps,
             &mut out,
         );
@@ -119,6 +203,8 @@ fn run_pass(
     m: usize,
     mu: f32,
     eps: f32,
+    power_smoothing: f32,
+    double_talk_ratio: f32,
     out: &mut [f32],
 ) {
     let num_blocks = d.len() / b;
@@ -174,13 +260,21 @@ fn run_pass(
         // energy-ratio gate; a coherence-based detector and explicit delay pre-alignment are documented
         // future refinements (design/04-corti-aec.md §9) that would make adaptation more robust on real,
         // correlated speech.
-        if d_energy > DOUBLE_TALK_RATIO * x_energy {
+        if d_energy > double_talk_ratio * x_energy {
             continue;
         }
 
-        // P = γ·P + (1−γ)·|X|² (running far-end power per bin).
+        // P tracks far-end power per bin. Uses a one-sided smoother: power *increases* are tracked
+        // immediately (preventing P ≪ |X|² which would inflate the gradient and diverge the filter),
+        // while *decreases* are smoothed (conservative — P too large just shrinks the step).
         for j in 0..m {
-            p[j] = POWER_SMOOTHING * p[j] + (1.0 - POWER_SMOOTHING) * xspec[j].norm_sqr();
+            let inst = xspec[j].norm_sqr();
+            if inst > p[j] {
+                p[j] = inst.max(eps);
+            } else {
+                p[j] = power_smoothing * p[j] + (1.0 - power_smoothing) * inst;
+                p[j] = p[j].max(eps);
+            }
         }
         // E = FFT(error frame).
         fft.process(&mut espec);
@@ -198,9 +292,101 @@ fn run_pass(
             *g = Cf::new(0.0, 0.0);
         }
         fft.process(&mut grad);
-        // W += μ·G.
+        // W = (1−λ)·W + μ·G. The small leakage λ prevents unbounded weight growth over long
+        // recordings (leaky NLMS).
+        let leak = 1e-5f32;
         for j in 0..m {
-            w[j] += grad[j].scale(mu);
+            w[j] = w[j].scale(1.0 - leak) + grad[j].scale(mu);
+        }
+    }
+}
+
+/// Residual echo suppressor: a forward-only pass with the frozen filter W that applies per-bin
+/// spectral subtraction to remove echo the FDAF couldn't model (nonlinearities, late reverb).
+///
+/// For each block: Y = X⊙W is the echo estimate, E = D−Y is the FDAF error. The gain
+/// G(k) = max(1 − α·|Y(k)|²/|E(k)|², floor) attenuates bins where the echo estimate is a
+/// large fraction of the residual, leaving near-end-dominant bins untouched.
+#[allow(clippy::too_many_arguments)]
+fn suppression_pass(
+    w: &[Cf],
+    fft: &dyn Fft<f32>,
+    ifft: &dyn Fft<f32>,
+    d: &[f32],
+    x: &[f32],
+    b: usize,
+    m: usize,
+    alpha: f32,
+    double_talk_ratio: f32,
+    eps: f32,
+    out: &mut [f32],
+) {
+    let num_blocks = d.len() / b;
+    let inv_m = 1.0 / m as f32;
+    let floor = 0.01f32; // −40 dB spectral floor
+
+    let mut xspec = vec![Cf::new(0.0, 0.0); m];
+    let mut yspec = vec![Cf::new(0.0, 0.0); m];
+    let mut espec = vec![Cf::new(0.0, 0.0); m];
+
+    for k in 0..num_blocks {
+        let base = k * b;
+        let cur = &x[base..base + b];
+
+        for s in xspec.iter_mut() {
+            *s = Cf::new(0.0, 0.0);
+        }
+        if k > 0 {
+            let prev = &x[base - b..base];
+            for i in 0..b {
+                xspec[i] = Cf::new(prev[i], 0.0);
+            }
+        }
+        for i in 0..b {
+            xspec[b + i] = Cf::new(cur[i], 0.0);
+        }
+        fft.process(&mut xspec);
+
+        // Y = X ⊙ W (echo estimate in freq domain — kept for post-filter gain)
+        for j in 0..m {
+            yspec[j] = xspec[j] * w[j];
+        }
+
+        // IFFT(Y) → time-domain echo estimate; compute error e = d − y
+        let mut yspec_td = yspec.clone();
+        ifft.process(&mut yspec_td);
+
+        let dk = &d[base..base + b];
+        let mut d_energy = 0.0f32;
+        let mut x_energy = 0.0f32;
+        for i in 0..b {
+            let y_i = yspec_td[b + i].re * inv_m;
+            let e_i = dk[i] - y_i;
+            espec[i] = Cf::new(0.0, 0.0);
+            espec[b + i] = Cf::new(e_i, 0.0);
+            d_energy += dk[i] * dk[i];
+            x_energy += cur[i] * cur[i];
+        }
+
+        // During double-talk the user is speaking — pass through unsuppressed.
+        if d_energy > double_talk_ratio * x_energy {
+            for i in 0..b {
+                out[base + i] = espec[b + i].re;
+            }
+            continue;
+        }
+
+        // Spectral subtraction: suppress bins where echo estimate dominates the error.
+        fft.process(&mut espec);
+        for j in 0..m {
+            let echo_pow = yspec[j].norm_sqr();
+            let error_pow = espec[j].norm_sqr();
+            let gain = (1.0 - alpha * echo_pow / (error_pow + eps)).max(floor);
+            espec[j] = espec[j].scale(gain);
+        }
+        ifft.process(&mut espec);
+        for i in 0..b {
+            out[base + i] = espec[b + i].re * inv_m;
         }
     }
 }

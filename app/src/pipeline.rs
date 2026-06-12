@@ -56,6 +56,7 @@ struct Ctx {
     backend: Backend,
     /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
     aec_enabled: bool,
+    aec_config: corti_aec::AecConfig,
     app: AppHandle,
 }
 
@@ -80,11 +81,13 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
     // consumes the snapshot.
     let cfg = config.lock().unwrap().clone();
     let aec_enabled = cfg.aec_enabled;
+    let aec_config = cfg.aec_config();
     let mut ctx = Ctx {
         queue,
         vagus,
         backend: Backend::init(cfg),
         aec_enabled,
+        aec_config,
         app,
     };
 
@@ -126,6 +129,7 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     let cfg = config.lock().unwrap().clone();
     let backend_name = cfg.backend_name();
     ctx.aec_enabled = cfg.aec_enabled;
+    ctx.aec_config = cfg.aec_config();
     ctx.backend = Backend::init(cfg);
     eprintln!(
         "[corti] settings saved — backend now {backend_name}; AEC {}",
@@ -248,6 +252,7 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         &ctx.backend,
         ctx.aec_enabled,
         false,
+        &ctx.aec_config,
         id,
         meta,
         audio,

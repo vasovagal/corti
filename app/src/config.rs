@@ -78,6 +78,28 @@ pub struct AppConfig {
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
+    /// AEC adaptive-filter length in taps (`CORTI_AEC_FILTER_LEN`). `None` ⇒ crate default (4096).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_filter_len: Option<usize>,
+    /// AEC step size (`CORTI_AEC_MU`). `None` ⇒ crate default (0.3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_mu: Option<f32>,
+    /// AEC regularization (`CORTI_AEC_EPS`). `None` ⇒ crate default (1e-6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_eps: Option<f32>,
+    /// AEC far-end power smoothing (`CORTI_AEC_POWER_SMOOTHING`). `None` ⇒ crate default (0.9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_power_smoothing: Option<f32>,
+    /// AEC double-talk ratio (`CORTI_AEC_DOUBLE_TALK_RATIO`). `None` ⇒ crate default (2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_double_talk_ratio: Option<f32>,
+    /// AEC offline passes (`CORTI_AEC_PASSES`). `None` ⇒ crate default (2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_passes: Option<usize>,
+    /// AEC residual echo suppression factor (`CORTI_AEC_SUPPRESS_RESIDUAL`). `None` ⇒ crate default (2.5).
+    /// Set 0 to disable. Higher values suppress more aggressively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aec_suppress_residual: Option<f32>,
 }
 
 impl Default for AppConfig {
@@ -95,6 +117,30 @@ impl Default for AppConfig {
             local_embedding_model: default_embedding_model(),
             local_diarize_threshold: 0.5,
             aec_enabled: true,
+            aec_filter_len: None,
+            aec_mu: None,
+            aec_eps: None,
+            aec_power_smoothing: None,
+            aec_double_talk_ratio: None,
+            aec_passes: None,
+            aec_suppress_residual: None,
+        }
+    }
+}
+
+impl AppConfig {
+    /// Build an [`corti_aec::AecConfig`] from the app config, overlaying any tuned `Some` values onto the
+    /// crate defaults. `None` fields use the crate's built-in defaults.
+    pub fn aec_config(&self) -> corti_aec::AecConfig {
+        let d = corti_aec::AecConfig::default();
+        corti_aec::AecConfig {
+            filter_len: self.aec_filter_len.unwrap_or(d.filter_len),
+            mu: self.aec_mu.unwrap_or(d.mu),
+            eps: self.aec_eps.unwrap_or(d.eps),
+            power_smoothing: self.aec_power_smoothing.unwrap_or(d.power_smoothing),
+            double_talk_ratio: self.aec_double_talk_ratio.unwrap_or(d.double_talk_ratio),
+            passes: self.aec_passes.unwrap_or(d.passes),
+            suppress_residual: self.aec_suppress_residual.unwrap_or(d.suppress_residual),
         }
     }
 }
@@ -141,6 +187,27 @@ impl AppConfig {
         }
         if env_non_empty("CORTI_AEC").is_some() {
             cfg.aec_enabled = env_bool("CORTI_AEC", cfg.aec_enabled);
+        }
+        if let Some(n) = env_non_empty("CORTI_AEC_FILTER_LEN").and_then(|s| s.parse().ok()) {
+            cfg.aec_filter_len = Some(n);
+        }
+        if let Some(v) = env_non_empty("CORTI_AEC_MU").and_then(|s| s.parse().ok()) {
+            cfg.aec_mu = Some(v);
+        }
+        if let Some(v) = env_non_empty("CORTI_AEC_EPS").and_then(|s| s.parse().ok()) {
+            cfg.aec_eps = Some(v);
+        }
+        if let Some(v) = env_non_empty("CORTI_AEC_POWER_SMOOTHING").and_then(|s| s.parse().ok()) {
+            cfg.aec_power_smoothing = Some(v);
+        }
+        if let Some(v) = env_non_empty("CORTI_AEC_DOUBLE_TALK_RATIO").and_then(|s| s.parse().ok()) {
+            cfg.aec_double_talk_ratio = Some(v);
+        }
+        if let Some(n) = env_non_empty("CORTI_AEC_PASSES").and_then(|s| s.parse().ok()) {
+            cfg.aec_passes = Some(n);
+        }
+        if let Some(v) = env_non_empty("CORTI_AEC_SUPPRESS_RESIDUAL").and_then(|s| s.parse().ok()) {
+            cfg.aec_suppress_residual = Some(v);
         }
 
         cfg
@@ -317,6 +384,13 @@ mod tests {
             local_embedding_model: "wespeaker-resnet34".into(),
             local_diarize_threshold: 0.7,
             aec_enabled: false,
+            aec_filter_len: Some(8192),
+            aec_mu: Some(0.5),
+            aec_eps: None,
+            aec_power_smoothing: Some(0.95),
+            aec_double_talk_ratio: Some(1.5),
+            aec_passes: None,
+            aec_suppress_residual: Some(3.0),
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);

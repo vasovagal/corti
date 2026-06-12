@@ -56,7 +56,10 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
 /// track, so there is nothing to cancel — the caller transcribes the raw tap directly. This is an expected
 /// outcome, not an error. Any other channel count (0, or 3+) is a genuine error. The raw file is only read,
 /// never modified, so the originals are always preserved (design/04-corti-aec.md invariant).
-pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<Option<PathBuf>> {
+pub fn write_clean_wav(
+    raw_2track_wav: &Path,
+    aec_cfg: &corti_aec::AecConfig,
+) -> Result<Option<PathBuf>> {
     let mut reader = hound::WavReader::open(raw_2track_wav)
         .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
     let spec = reader.spec();
@@ -86,12 +89,7 @@ pub fn write_clean_wav(raw_2track_wav: &Path) -> Result<Option<PathBuf>> {
     let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
 
-    let clean = corti_aec::cancel(
-        &mic,
-        &tap,
-        spec.sample_rate,
-        &corti_aec::AecConfig::default(),
-    );
+    let clean = corti_aec::cancel(&mic, &tap, spec.sample_rate, aec_cfg);
 
     let out = clean_wav_path(raw_2track_wav);
     let out_spec = hound::WavSpec {
@@ -301,7 +299,7 @@ mod tests {
             w.finalize().unwrap();
         }
 
-        let clean_path = write_clean_wav(&raw)
+        let clean_path = write_clean_wav(&raw, &corti_aec::AecConfig::default())
             .unwrap()
             .expect("a 2-channel input produces a cleaned WAV");
         assert_eq!(clean_path, clean_wav_path(&raw));
@@ -346,7 +344,7 @@ mod tests {
         }
 
         assert_eq!(
-            write_clean_wav(&raw).unwrap(),
+            write_clean_wav(&raw, &corti_aec::AecConfig::default()).unwrap(),
             None,
             "a tap-only (1-channel) recording skips AEC cleanly"
         );
