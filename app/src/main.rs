@@ -18,6 +18,8 @@ mod cli;
 #[cfg(target_os = "macos")]
 mod config;
 #[cfg(target_os = "macos")]
+mod console;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
@@ -39,7 +41,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        other => std::process::exit(cli::dispatch(other)),
+        other => {
+            // Headless path: install a stderr-only subscriber so the operator-facing diagnostics that are
+            // now `tracing` events (AEC fallback, CPU fallback, AWS job failures, …) still print — the
+            // console buffer + on-disk log in `run_app` are GUI-only and never run here.
+            console::init_cli_tracing();
+            std::process::exit(cli::dispatch(other))
+        }
     }
 }
 
@@ -66,7 +74,7 @@ mod imp {
 
     use crate::config::AppConfig;
     use crate::pipeline::{self, PipelineMsg};
-    use crate::{permissions, tray};
+    use crate::{console, permissions, tray};
 
     /// One recording shown in the tray's `History ▸` submenu. Unlike the old `Done`-only "Recent notes"
     /// list this tracks a recording from the moment it starts (`Recording`) through every pipeline
@@ -165,7 +173,22 @@ mod imp {
     // The manual webinar's owning-app name (`corti_core::WEBINAR_NAME`) is the single signal `RecordingMeta::mode`
     // derives the webinar/call distinction from — kept in corti-core so the producer here and the consumer agree.
 
+    /// Holds the file-appender's non-blocking [`WorkerGuard`] for the process lifetime. Dropping the guard
+    /// would stop the background writer thread and lose any buffered log lines, so it lives in this static
+    /// (set once in [`run_app`]) and is never dropped while the app runs.
+    static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+        std::sync::OnceLock::new();
+
     pub fn run_app() -> Result<()> {
+        // Install the global tracing subscriber FIRST so every later line (including config-load warnings
+        // below) lands in the diagnostics console + on-disk log. `init_tracing` itself falls back to
+        // `eprintln!` for any pre-subscriber failure (e.g. an unwritable log dir).
+        let (console_buffer, log_guard) = console::init_tracing();
+        if let Some(guard) = log_guard {
+            // Keep the non-blocking writer's worker thread alive for the whole process.
+            let _ = LOG_GUARD.set(guard);
+        }
+
         let cfg = AppConfig::load();
 
         let app = tauri::Builder::default()
@@ -185,9 +208,12 @@ mod imp {
                 crate::settings::get_models_status,
                 crate::settings::get_embedding_models,
                 crate::settings::download_model,
+                crate::console::get_console_logs,
+                crate::console::get_console_logs_text,
+                crate::console::save_console_logs,
             ])
             .setup(move |app| {
-                setup(app, &cfg).map_err(|e| {
+                setup(app, &cfg, console_buffer.clone()).map_err(|e| {
                     Box::new(SetupError(format!("{e:#}"))) as Box<dyn std::error::Error>
                 })
             })
@@ -201,12 +227,21 @@ mod imp {
     }
 
     /// All fallible startup wiring, in dependency order. Runs on the main thread (Tauri's setup hook).
-    fn setup(app: &mut tauri::App, cfg: &AppConfig) -> Result<()> {
+    fn setup(
+        app: &mut tauri::App,
+        cfg: &AppConfig,
+        console_buffer: console::ConsoleBuffer,
+    ) -> Result<()> {
         // Menu-bar agent: no Dock icon, no app menu.
         app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
         // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
         app.manage(AppState::new());
+
+        // The diagnostics console ring buffer the `get_console_logs*`/`save_console_logs` commands read.
+        // It already backs the live `ConsoleLayer` (installed in `run_app`); managing it just exposes the
+        // same shared buffer to the webview.
+        app.manage(console_buffer);
 
         // Pipeline channel + shared runtime config. Both are created before the tray (its menu summary reads
         // the config via `ConfigState`) and before the worker (which holds the shared config to rebuild its
@@ -258,6 +293,13 @@ mod imp {
     ) {
         match event {
             DetectorEvent::RecordingStarted { meta } => {
+                tracing::info!(
+                    target: "corti::detector",
+                    app = %meta.owning_app.name,
+                    started_at = %meta.started_at,
+                    path = %meta.audio_path.display(),
+                    "recording started"
+                );
                 set_detector_recording(app, true);
                 tray::push_history_recording(app, &meta);
                 tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
@@ -269,12 +311,12 @@ mod imp {
                     .send(PipelineMsg::Process { meta, audio_path })
                     .is_err()
                 {
-                    eprintln!("[corti] pipeline worker gone; dropped a finished recording");
+                    tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished recording");
                 }
             }
             DetectorEvent::Error(e) => {
                 set_detector_recording(app, false);
-                eprintln!("[corti] detector error: {e}");
+                tracing::error!(target: "corti::detector", error = %e, "detector error");
                 // A capture failure is most often the missing audio-capture TCC grant (design/LESSONS §1).
                 tray::set_status(app, format!("⚠ {e}"));
             }
@@ -396,7 +438,7 @@ mod imp {
                         tray::set_status(app, format!("● Webinar recording — {WEBINAR_NAME}"));
                     }
                     Err(e) => {
-                        eprintln!("[corti] webinar capture failed to start: {e:#}");
+                        tracing::error!(target: "corti::detector", error = %format!("{e:#}"), "webinar capture failed to start");
                         // Most often the missing audio-capture TCC grant (design/LESSONS §1).
                         tray::set_status(app, format!("⚠ webinar capture failed: {e:#}"));
                     }
@@ -417,7 +459,7 @@ mod imp {
         let audio_path = match recorder.finish_tap_only() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[corti] webinar capture produced no audio: {e:#}");
+                tracing::error!(target: "corti::detector", error = %format!("{e:#}"), "webinar capture produced no audio");
                 tray::set_status(app, format!("⚠ webinar capture failed: {e:#}"));
                 return;
             }
@@ -432,7 +474,7 @@ mod imp {
             audio_path: audio_path.clone(),
         };
         if tx.send(PipelineMsg::Process { meta, audio_path }).is_err() {
-            eprintln!("[corti] pipeline worker gone; dropped a finished webinar recording");
+            tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished webinar recording");
         }
     }
 

@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 corti-core = { workspace = true }
 anyhow = { workspace = true }
+# Structured logging for the capture-state machine (issue #76): call start/stop milestones.
+tracing = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 corti-coreaudio = { workspace = true }

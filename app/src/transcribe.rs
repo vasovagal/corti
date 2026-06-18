@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use corti_core::{DiarizedTranscript, RecordingMeta};
+use tracing::{error, info, warn};
 
 use crate::config::{AppConfig, BackendChoice};
 
@@ -46,7 +47,7 @@ impl Backend {
             ),
         };
         if let BackendKind::Unavailable(reason) = &kind {
-            eprintln!("[corti] {reason}");
+            error!(target: "corti::transcribe", "{reason}");
         }
         Self { cfg, kind }
     }
@@ -139,14 +140,37 @@ pub fn transcribe_recording(
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
     let input: PathBuf = if aec_enabled && !skip_aec {
         match corti_capture::write_clean_wav(raw_audio, aec_cfg) {
-            Ok(Some(clean)) => clean,
+            Ok(Some(clean)) => {
+                info!(
+                    target: "corti::transcribe",
+                    job_id = %id,
+                    aec = true,
+                    input = %raw_audio.display(),
+                    output = %clean.display(),
+                    "AEC ran — cleaned recording"
+                );
+                clean
+            }
             Ok(None) => {
                 // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
-                eprintln!("[corti] tap-only recording — no mic track to clean; skipping AEC");
+                info!(
+                    target: "corti::transcribe",
+                    job_id = %id,
+                    aec = false,
+                    input = %raw_audio.display(),
+                    "tap-only recording — no mic track to clean; skipping AEC"
+                );
                 raw_audio.to_path_buf()
             }
             Err(e) => {
-                eprintln!("[corti] AEC failed ({e:#}); using the raw recording");
+                warn!(
+                    target: "corti::transcribe",
+                    job_id = %id,
+                    aec = false,
+                    input = %raw_audio.display(),
+                    error = %format!("{e:#}"),
+                    "AEC failed; using the raw recording"
+                );
                 raw_audio.to_path_buf()
             }
         }
@@ -203,7 +227,7 @@ fn build_sdk_config(cfg: &AppConfig) -> Option<aws_config::SdkConfig> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| eprintln!("[corti] could not build tokio runtime for AWS config: {e}"))
+        .map_err(|e| error!(target: "corti::transcribe", error = %e, "could not build tokio runtime for AWS config"))
         .ok()?;
     Some(rt.block_on(configure_loader(cfg).load()))
 }

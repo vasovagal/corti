@@ -137,6 +137,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )?));
     items.push(Box::new(MenuItem::with_id(
         app,
+        "open_diagnostics",
+        "Diagnostics…",
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
         "open_privacy",
         "Open Privacy Settings…",
         true,
@@ -308,6 +315,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
         "open_settings" => open_settings_window(app),
         "ethics_guide" => open_ethics_window(app),
+        "open_diagnostics" => open_console_window(app),
         "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
         _ => {
@@ -400,6 +408,53 @@ fn open_settings_window(app: &AppHandle) {
             }
             Err(e) => {
                 eprintln!("[corti] opening settings window failed: {e}");
+                // Don't leave a dangling Regular policy with no window.
+                revert_activation_policy_if_no_windows(&app);
+            }
+        }
+    });
+}
+
+/// Open (or focus, if already open) the on-demand Diagnostics console window. Created at runtime like the
+/// Settings/Ethics windows (ADR 0004): flips the app to `Regular` while it lives and reverts to menu-bar-only
+/// `Accessory` once it (and any other window) closes. It loads the same SPA bundle, selecting the console
+/// view via `?view=console`. Window + AppKit work runs on the main thread.
+fn open_console_window(app: &AppHandle) {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
+        // Singleton: focus the existing window instead of spawning a second.
+        if let Some(win) = app.get_webview_window("console") {
+            let _ = win.unminimize();
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+
+        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
+        let _ = app.set_activation_policy(ActivationPolicy::Regular);
+
+        match WebviewWindowBuilder::new(
+            &app,
+            "console",
+            WebviewUrl::App("index.html?view=console".into()),
+        )
+        .title("Diagnostics")
+        .inner_size(900.0, 640.0)
+        .min_inner_size(560.0, 420.0)
+        .resizable(true)
+        .build()
+        {
+            Ok(win) => {
+                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
+                let app_for_evt = app.clone();
+                win.on_window_event(move |event| {
+                    if matches!(event, WindowEvent::Destroyed) {
+                        revert_activation_policy_if_no_windows(&app_for_evt);
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[corti] opening diagnostics window failed: {e}");
                 // Don't leave a dangling Regular policy with no window.
                 revert_activation_policy_if_no_windows(&app);
             }

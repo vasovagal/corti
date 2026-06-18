@@ -124,7 +124,8 @@ impl Queue {
         let audio = meta.audio_path.to_string_lossy().into_owned();
         let status = status_to_string(JobStatus::PendingTranscription);
         let now = fmt_dt(Local::now());
-        self.conn
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO recordings
                    (id, started_at, ended_at, owning_app, bundle_id, audio_path, status, updated_at)
@@ -132,6 +133,13 @@ impl Queue {
                 params![id, started, ended, name, bundle, audio, status, now],
             )
             .context("inserting recording row")?;
+        // `INSERT OR IGNORE` is a no-op when the recording is already tracked; say so rather than implying a
+        // fresh enqueue, so the log reads honestly when diagnosing a re-delivery.
+        if inserted > 0 {
+            tracing::debug!(target: "corti::queue", job_id = %id, status = %status, "enqueue");
+        } else {
+            tracing::debug!(target: "corti::queue", job_id = %id, "enqueue (already tracked)");
+        }
         Ok(id)
     }
 
@@ -146,16 +154,18 @@ impl Queue {
 
     /// Set a job's pipeline status.
     pub fn set_status(&self, id: &str, status: JobStatus) -> Result<()> {
+        let status_str = status_to_string(status);
         let n = self
             .conn
             .execute(
                 "UPDATE recordings SET status = ?2, updated_at = ?3 WHERE id = ?1",
-                params![id, status_to_string(status), fmt_dt(Local::now())],
+                params![id, status_str, fmt_dt(Local::now())],
             )
             .context("updating status")?;
         if n == 0 {
             bail!("no recording with id {id}");
         }
+        tracing::debug!(target: "corti::queue", job_id = %id, status = %status_str, "set_status");
         Ok(())
     }
 
@@ -163,6 +173,8 @@ impl Queue {
     pub fn update(&self, id: &str, fields: JobUpdate) -> Result<()> {
         let status = fields.status.map(status_to_string);
         let note_path = fields.note_path.map(|p| p.to_string_lossy().into_owned());
+        let status_log = status.clone();
+        let note_changed = note_path.is_some();
         let n = self
             .conn
             .execute(
@@ -188,11 +200,19 @@ impl Queue {
         if n == 0 {
             bail!("no recording with id {id}");
         }
+        tracing::debug!(
+            target: "corti::queue",
+            job_id = %id,
+            status = status_log.as_deref().unwrap_or("(unchanged)"),
+            note_path_set = note_changed,
+            "update"
+        );
         Ok(())
     }
 
     /// Mark a job `Failed` with an error message (convenience over [`update`](Queue::update)).
     pub fn fail(&self, id: &str, error: &str) -> Result<()> {
+        tracing::warn!(target: "corti::queue", job_id = %id, error, "job failed");
         self.update(
             id,
             JobUpdate {

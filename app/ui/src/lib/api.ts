@@ -103,3 +103,25 @@ export interface DownloadProgress {
 
 export const onDownloadProgress = (cb: (p: DownloadProgress) => void): Promise<UnlistenFn> =>
   listen<DownloadProgress>("model-download-progress", (e) => cb(e.payload));
+
+// ----- Diagnostics console (mirror of Rust `console::ConsoleEntry`) -----
+
+/** Mirror of Rust `console::ConsoleEntry`. One captured tracing event. Field names match the Rust struct
+ * verbatim (serde serializes them as-is — no specta binding generation in corti). */
+export interface ConsoleEntry {
+  timestamp: string; // ISO-8601 UTC, e.g. "2026-06-18T17:04:05.123Z"
+  level: string; // "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"
+  target: string; // event metadata target (usually the module path)
+  message: string; // the `message` field, else a " field=value" concatenation
+}
+
+/** Snapshot of the in-memory console ring buffer, oldest entry first. */
+export const getConsoleLogs = (): Promise<ConsoleEntry[]> =>
+  invoke<ConsoleEntry[]>("get_console_logs");
+
+/** The same buffer rendered as plain text (one entry per line). */
+export const getConsoleLogsText = (): Promise<string> => invoke<string>("get_console_logs_text");
+
+/** Opens a native save dialog and writes the buffer text. Resolves true if written, false if cancelled;
+ * rejects with a string on write failure. */
+export const saveConsoleLogs = (): Promise<boolean> => invoke<boolean>("save_console_logs");

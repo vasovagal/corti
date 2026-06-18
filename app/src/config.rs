@@ -215,9 +215,22 @@ impl AppConfig {
         let path = config_path().ok()?;
         let text = std::fs::read_to_string(&path).ok()?; // missing file ⇒ None ⇒ defaults
         match toml::from_str::<Self>(&text) {
-            Ok(cfg) => Some(cfg),
+            Ok(cfg) => {
+                tracing::info!(
+                    target: "corti::config",
+                    path = %path.display(),
+                    bytes = text.len(),
+                    "loaded config"
+                );
+                Some(cfg)
+            }
             Err(e) => {
-                eprintln!("[corti] ignoring corrupt {}: {e}", path.display());
+                tracing::warn!(
+                    target: "corti::config",
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring corrupt config file"
+                );
                 None
             }
         }
@@ -231,9 +244,16 @@ impl AppConfig {
             std::fs::create_dir_all(dir)?;
         }
         let body = toml::to_string_pretty(self)?;
+        let bytes = body.len();
         let tmp = path.with_extension("toml.tmp"); // same dir ⇒ rename is atomic on one volume
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &path)?;
+        tracing::info!(
+            target: "corti::config",
+            path = %path.display(),
+            bytes,
+            "saved config"
+        );
         Ok(())
     }
 
@@ -282,7 +302,11 @@ fn parse_backend(s: Option<String>) -> BackendChoice {
         Some("aws") => BackendChoice::Aws,
         Some("local") => BackendChoice::Local,
         Some(other) => {
-            eprintln!("[corti] unknown CORTI_TRANSCRIBE_BACKEND={other:?}; using build default");
+            tracing::warn!(
+                target: "corti::config",
+                value = other,
+                "unknown CORTI_TRANSCRIBE_BACKEND; using build default"
+            );
             default_backend()
         }
         None => default_backend(),

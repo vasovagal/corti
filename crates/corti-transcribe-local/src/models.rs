@@ -107,6 +107,12 @@ pub fn discover(dir: &Path, need_diarization: bool, embedding_id: &str) -> Resul
             dir.display(),
         );
     }
+    tracing::info!(
+        target: "corti::transcribe::local",
+        dir = %dir.display(),
+        diarization = need_diarization,
+        "local models discovered"
+    );
     Ok(models)
 }
 

@@ -138,9 +138,11 @@ impl AwsTranscriber {
     }
 
     async fn upload(&self, pcm_path: &Path, key: &str) -> Result<()> {
+        let bytes = std::fs::metadata(pcm_path).map(|m| m.len()).unwrap_or(0);
         let body = aws_sdk_s3::primitives::ByteStream::from_path(pcm_path)
             .await
             .with_context(|| format!("reading {} for upload", pcm_path.display()))?;
+        let started = std::time::Instant::now();
         self.s3
             .put_object()
             .bucket(&self.opts.bucket)
@@ -149,6 +151,14 @@ impl AwsTranscriber {
             .send()
             .await
             .with_context(|| format!("uploading s3://{}/{key}", self.opts.bucket))?;
+        tracing::info!(
+            target: "corti::transcribe::aws",
+            bucket = %self.opts.bucket,
+            key,
+            bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "uploaded audio to S3"
+        );
         Ok(())
     }
 
@@ -187,8 +197,28 @@ impl AwsTranscriber {
                 .map(|e| e.is_conflict_exception())
                 .unwrap_or(false);
             if !is_conflict {
+                tracing::error!(
+                    target: "corti::transcribe::aws",
+                    job,
+                    error = %err,
+                    "StartTranscriptionJob failed"
+                );
                 return Err(err).context("StartTranscriptionJob failed");
             }
+            tracing::info!(
+                target: "corti::transcribe::aws",
+                job,
+                "transcription job already exists — re-attaching"
+            );
+        } else {
+            tracing::info!(
+                target: "corti::transcribe::aws",
+                job,
+                in_key,
+                out_key,
+                multichannel,
+                "submitted transcription job"
+            );
         }
         Ok(())
     }
@@ -200,6 +230,7 @@ impl AwsTranscriber {
         multichannel: bool,
     ) -> Result<DiarizedTranscript> {
         let deadline = Instant::now() + self.opts.max_wait;
+        let poll_started = Instant::now();
         loop {
             let resp = self
                 .transcribe
@@ -207,21 +238,38 @@ impl AwsTranscriber {
                 .transcription_job_name(job)
                 .send()
                 .await
+                .map_err(|e| {
+                    tracing::error!(target: "corti::transcribe::aws", job, error = %e, "GetTranscriptionJob failed");
+                    e
+                })
                 .context("GetTranscriptionJob failed")?;
             let tjob = resp
                 .transcription_job()
                 .context("GetTranscriptionJob returned no job")?;
             match tjob.transcription_job_status() {
-                Some(TranscriptionJobStatus::Completed) => break,
-                Some(TranscriptionJobStatus::Failed) => {
-                    bail!(
-                        "transcription job failed: {}",
-                        tjob.failure_reason().unwrap_or("unknown reason")
+                Some(TranscriptionJobStatus::Completed) => {
+                    tracing::info!(
+                        target: "corti::transcribe::aws",
+                        job,
+                        elapsed_ms = poll_started.elapsed().as_millis() as u64,
+                        "transcription job completed"
                     );
+                    break;
+                }
+                Some(TranscriptionJobStatus::Failed) => {
+                    let reason = tjob.failure_reason().unwrap_or("unknown reason");
+                    tracing::error!(target: "corti::transcribe::aws", job, reason, "transcription job failed");
+                    bail!("transcription job failed: {reason}");
                 }
                 // Queued / InProgress / None / future variants: keep waiting.
                 _ => {
                     if Instant::now() >= deadline {
+                        tracing::error!(
+                            target: "corti::transcribe::aws",
+                            job,
+                            max_wait_ms = self.opts.max_wait.as_millis() as u64,
+                            "transcription job did not finish before deadline"
+                        );
                         bail!(
                             "transcription job did not finish within {:?}",
                             self.opts.max_wait
@@ -240,6 +288,10 @@ impl AwsTranscriber {
             .key(out_key)
             .send()
             .await
+            .map_err(|e| {
+                tracing::error!(target: "corti::transcribe::aws", bucket = %self.opts.bucket, key = out_key, error = %e, "fetching transcript failed");
+                e
+            })
             .with_context(|| format!("fetching transcript s3://{}/{out_key}", self.opts.bucket))?;
         let bytes = obj
             .body
@@ -247,6 +299,13 @@ impl AwsTranscriber {
             .await
             .context("reading transcript body")?
             .into_bytes();
+        tracing::info!(
+            target: "corti::transcribe::aws",
+            bucket = %self.opts.bucket,
+            key = out_key,
+            bytes = bytes.len(),
+            "fetched transcript JSON"
+        );
         let text = String::from_utf8_lossy(&bytes);
         if multichannel {
             parse::parse_channel_transcript(&text)
@@ -256,13 +315,22 @@ impl AwsTranscriber {
     }
 
     async fn delete(&self, key: &str) {
-        let _ = self
+        if let Err(e) = self
             .s3
             .delete_object()
             .bucket(&self.opts.bucket)
             .key(key)
             .send()
-            .await;
+            .await
+        {
+            tracing::warn!(
+                target: "corti::transcribe::aws",
+                bucket = %self.opts.bucket,
+                key,
+                error = %e,
+                "failed to clean up staged S3 object"
+            );
+        }
     }
 }
 

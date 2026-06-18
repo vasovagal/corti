@@ -119,6 +119,14 @@ pub fn write_clean_wav(
         w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = mono tap ("them")
     }
     w.finalize()?;
+    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    tracing::info!(
+        target: "corti::capture",
+        path = %out.display(),
+        bytes,
+        frames,
+        "wrote AEC-cleaned WAV"
+    );
     Ok(Some(out))
 }
 
@@ -228,13 +236,21 @@ mod platform {
                 anyhow::bail!("IO proc fired but produced no audio frames (a format/layout issue)");
             }
             if handle.dropped_samples > 0 {
-                eprintln!(
-                    "[corti] WARNING: dropped {} samples during capture (disk too slow / ring overflow) — \
-                     {} may have gaps",
-                    handle.dropped_samples,
-                    self.out.display()
+                tracing::warn!(
+                    target: "corti::capture",
+                    dropped_samples = handle.dropped_samples,
+                    path = %self.out.display(),
+                    "dropped samples during capture (disk too slow / ring overflow) — recording may have gaps"
                 );
             }
+            let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);
+            tracing::info!(
+                target: "corti::capture",
+                path = %self.out.display(),
+                bytes,
+                frames = handle.frames,
+                "finalized capture WAV"
+            );
             Ok(self.out)
         }
     }

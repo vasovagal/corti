@@ -15,3 +15,5 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 # Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Structured logging (issue #76): queue transitions (enqueue/set_status/update/fail) at debug level.
+tracing = { workspace = true }
