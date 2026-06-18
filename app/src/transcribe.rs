@@ -118,8 +118,7 @@ impl Backend {
 /// tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
 /// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
-/// input) for logging. Persisting the transcript sidecar is the pipeline's concern (crash recovery), not
-/// this primitive's — callers that want it write it themselves.
+/// input) for logging. Persisting any transcript sidecar is a caller's concern, not this primitive's.
 ///
 /// `skip_aec` is set by the CLI when the input is already a `*-clean.wav` (a 2-channel AEC *output*):
 /// running AEC again would cancel a second time. The pipeline always passes `skip_aec = false` — its input

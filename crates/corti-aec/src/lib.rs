@@ -1,23 +1,30 @@
-//! Offline acoustic echo cancellation for corti.
+//! Acoustic echo cancellation for corti.
 //!
 //! Removes **speaker bleed** from the mic track when the user is on speakers: the mic hears the far-end
 //! after a room delay + coloring, so this is NOT `mic − far_end` but an adaptive filter that *learns* the
-//! echo path. Because corti transcribes after the call, this runs **offline** — it can use a long filter,
-//! double-talk gating, and a **2-pass** sweep (pass 1 converges the filter, pass 2 re-filters from sample 0
-//! so the call opening is cleaned too).
+//! echo path.
+//!
+//! Per ADR 0007 the production path is **streaming** — [`StreamingAec`] runs a single forward FDAF pass
+//! in-flight on lossless in-memory PCM, with a tunable lookahead window at the head of the stream standing
+//! in for the old offline 2-pass (warm-up convergence + an opening re-emit through the warm filter) and for
+//! a stable windowed delay-sync. It is bounded by `O(block + filter_state + lookahead)` regardless of call
+//! length. [`cancel`] is retained as a thin **offline shim** over `StreamingAec` (lookahead == the whole
+//! input), used by the tuning sweep, scoring, and the offline `write_clean_wav` path; every offline test
+//! exercises the streaming kernel through it.
 //!
 //! Implemented as an **overlap-save frequency-domain block adaptive filter** (FDAF) via `rustfft`: a
 //! single-partition, bin-wise normalized LMS update. Frequency-domain block processing is what keeps it fast
 //! even with long filters (`filter_len` of several thousand taps). Full algorithm + invariants live in
 //! `design/04-corti-aec.md`.
 //!
-//! Invariant: the raw mic + far-end tracks are always preserved upstream; this produces an *additional*
-//! cleaned track. Headphones remain the cleanest path; AEC is the speaker-user safety net.
+//! Invariant: the raw mic + far-end tracks are preserved upstream; this produces an *additional* cleaned
+//! track. Headphones remain the cleanest path; AEC is the speaker-user safety net.
 
 pub mod score;
-pub mod tune;
+pub mod streaming;
 
-use rustfft::Fft;
+pub use streaming::StreamingAec;
+
 use rustfft::num_complex::Complex;
 
 type Cf = Complex<f32>;
@@ -38,8 +45,12 @@ pub struct AecConfig {
     /// near-end is then dominating, and adapting would diverge the filter). Lower values freeze more
     /// aggressively (≈ 1.0–3.0).
     pub double_talk_ratio: f32,
-    /// Offline passes: 1 to converge `W`/`P`, 2 to re-filter from the start with the converged filter so
-    /// the call opening is cleaned rather than left under-cancelled.
+    /// Deprecated (ADR 0007): the streaming path replaces the offline 2-pass with a lookahead warm-up, so
+    /// this is ignored. Retained so existing constructors (`Default`, the tuning grid) keep compiling.
+    #[deprecated(
+        since = "0.0.0",
+        note = "ADR 0007: streaming AEC ignores `passes`; the lookahead window replaces the 2-pass"
+    )]
     pub passes: usize,
     /// Residual echo suppression overestimation factor. After the FDAF removes the bulk echo, the post-filter
     /// suppresses per-bin residual using a spectral-subtraction gain: G = max(1 − α·|Y|²/|E|², floor). Set 0
@@ -48,6 +59,7 @@ pub struct AecConfig {
 }
 
 impl Default for AecConfig {
+    #[allow(deprecated)] // `passes` is deprecated but still a field; set it to keep the struct literal valid.
     fn default() -> Self {
         Self {
             filter_len: 4096,
@@ -101,7 +113,7 @@ fn delay_fft_len(n: usize, max_lag: usize) -> usize {
 /// Total on degenerate input: mismatched `mic`/`far_end` lengths (the shorter bounds the analysis),
 /// `max_lag` larger than the signal, and non-finite samples all return a bounded lag in `[0, max_lag)`
 /// without panicking (the lag is unspecified — but still bounded — when samples are non-finite).
-fn estimate_delay(mic: &[f32], far_end: &[f32], max_lag: usize) -> usize {
+pub(crate) fn estimate_delay(mic: &[f32], far_end: &[f32], max_lag: usize) -> usize {
     let n = mic.len().min(far_end.len());
     if n == 0 || max_lag == 0 {
         return 0;
@@ -191,296 +203,40 @@ fn estimate_delay(mic: &[f32], far_end: &[f32], max_lag: usize) -> usize {
 
 /// Remove far-end echo from `mic`, returning the cleaned near-end signal (same length as `mic`).
 ///
+/// **Offline shim over [`StreamingAec`]** (ADR 0007): builds a streaming canceller whose lookahead spans the
+/// whole input, pushes the entire call, and flushes. With `lookahead == n` the whole call is warm-up — the
+/// filter converges over the full input, then the buffered span is re-emitted through the warm filter — so
+/// this is the streaming analog of the old offline 2-pass and reproduces (meets-or-exceeds) its ERLE. Used
+/// by the tuning sweep, scoring, and the offline `write_clean_wav` path so they keep working verbatim; the
+/// live capture path uses [`StreamingAec`] directly with the tunable lookahead.
+///
 /// Uses `far_end` (the time-aligned tap of what the speakers played) as the echo reference. When `far_end`
 /// is silent or empty the output equals `mic` (nothing to cancel). The raw inputs are never mutated.
 ///
-/// Pre-aligns `far_end` by estimating the bulk acoustic delay via cross-correlation (design/04-corti-aec.md
-/// §9) before running the adaptive filter. `sample_rate` gates the max-lag search window (10 ms).
-///
-/// Memory: [`estimate_delay`] is bounded by a constant independent of `n` (segmented accumulated
-/// cross-spectrum). The remaining buffers here — `d`, `x`, `out` — are intentionally `O(n)` length-`padded`
-/// `f32` (≈ `n` each, 4 bytes/sample): a whole-file offline FDAF that returns a full-length cleaned track
-/// must hold the inputs resident. These are reclaimed normally and were never the crash trigger (that was
-/// the GB-scale `Complex<f32>` allocation in `estimate_delay`, now bounded). A fully streaming /
-/// block-windowed FDAF that bounds `cancel()` itself in `n` is the documented follow-up if multi-hour
-/// offline calls ever pressure RAM (tracked GH "Bug Fix" issue) — it changes the 2-pass "restart from
-/// sample 0 with the converged filter" structure and is out of scope for this delay-estimator fix.
+/// Memory note: because the lookahead is the whole input here, the warm buffers are `O(n)` — this offline
+/// shim is for tests / offline scoring, not the multi-hour live path. The live [`StreamingAec`] path is
+/// bounded by `O(block + filter_state + lookahead)` (the #67/#68/#32 fix).
 pub fn cancel(mic: &[f32], far_end: &[f32], sample_rate: u32, cfg: &AecConfig) -> Vec<f32> {
     let n = mic.len();
     if n == 0 {
         return Vec::new();
     }
+    let far = if far_end.len() == n {
+        std::borrow::Cow::Borrowed(far_end)
+    } else {
+        // StreamingAec::push requires equal-length mic/far chunks. Offline callers may hand mismatched
+        // lengths (the shorter bounds the analysis, as the old buffer copy did); normalize to n.
+        let mut f = vec![0.0f32; n];
+        let copy = far_end.len().min(n);
+        f[..copy].copy_from_slice(&far_end[..copy]);
+        std::borrow::Cow::Owned(f)
+    };
 
-    // Pre-align: shift far_end forward by the estimated acoustic delay so the adaptive filter starts
-    // converged. Max search window = 10 ms (a generous room propagation bound).
-    let max_lag = (sample_rate as usize * 10) / 1000; // 10 ms
-    let delay = estimate_delay(mic, far_end, max_lag);
-
-    let b = cfg.filter_len.max(1);
-    let m = 2 * b;
-    let num_blocks = n.div_ceil(b);
-    let padded = num_blocks * b;
-
-    let mut d = vec![0.0f32; padded];
-    d[..n].copy_from_slice(mic);
-    // Pre-align far_end by `delay` samples directly into the zero-padded reference buffer `x` (the first
-    // `delay` entries stay zero). Equivalent to prepending `delay` zeros to far_end then copying, but
-    // without materializing that intermediate Vec — `x`'s contents (hence the filter numerics) are
-    // bit-identical to the previous code.
-    let mut x = vec![0.0f32; padded];
-    if delay < padded {
-        let copy_len = far_end.len().min(padded - delay);
-        x[delay..delay + copy_len].copy_from_slice(&far_end[..copy_len]);
-    }
-
-    let mut planner = rustfft::FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(m);
-    let ifft = planner.plan_fft_inverse(m);
-
-    let mut w = vec![Cf::new(0.0, 0.0); m]; // frequency-domain filter weights
-    let mut p = vec![0.0f32; m]; // smoothed far-end power per bin
-    let mut out = vec![0.0f32; padded];
-
-    for _ in 0..cfg.passes {
-        run_pass(
-            &mut w,
-            &mut p,
-            fft.as_ref(),
-            ifft.as_ref(),
-            &d,
-            &x,
-            b,
-            m,
-            cfg.mu,
-            cfg.eps,
-            cfg.power_smoothing,
-            cfg.double_talk_ratio,
-            &mut out,
-        );
-    }
-
-    if cfg.suppress_residual > 0.0 {
-        suppression_pass(
-            &w,
-            fft.as_ref(),
-            ifft.as_ref(),
-            &d,
-            &x,
-            b,
-            m,
-            cfg.suppress_residual,
-            cfg.double_talk_ratio,
-            cfg.eps,
-            &mut out,
-        );
-    }
-
+    let mut s = StreamingAec::new_with_lookahead(sample_rate, cfg.clone(), n);
+    let mut out = s.push(mic, &far);
+    out.extend(s.finish());
     out.truncate(n);
     out
-}
-
-/// One forward sweep over every block: estimate the echo, subtract it (writing the cleaned output), then —
-/// unless double-talk is detected — run the constrained bin-wise NLMS weight update. `w`/`p` carry over
-/// between passes; the overlap history is implicit in `x` (consecutive blocks), so each pass naturally
-/// restarts from sample 0 with the converged filter.
-#[allow(clippy::too_many_arguments)]
-fn run_pass(
-    w: &mut [Cf],
-    p: &mut [f32],
-    fft: &dyn Fft<f32>,
-    ifft: &dyn Fft<f32>,
-    d: &[f32],
-    x: &[f32],
-    b: usize,
-    m: usize,
-    mu: f32,
-    eps: f32,
-    power_smoothing: f32,
-    double_talk_ratio: f32,
-    out: &mut [f32],
-) {
-    let num_blocks = d.len() / b;
-    let inv_m = 1.0 / m as f32;
-
-    let mut xspec = vec![Cf::new(0.0, 0.0); m]; // reused: far frame → X
-    let mut yspec = vec![Cf::new(0.0, 0.0); m]; // reused: X⊙W → y
-    let mut espec = vec![Cf::new(0.0, 0.0); m]; // reused: error frame → E
-    let mut grad = vec![Cf::new(0.0, 0.0); m]; // reused: gradient
-
-    for k in 0..num_blocks {
-        let base = k * b;
-        let cur = &x[base..base + b];
-
-        // xframe = [previous b far samples ; current b far samples] (overlap-save), then FFT in place → X.
-        for s in xspec.iter_mut() {
-            *s = Cf::new(0.0, 0.0);
-        }
-        if k > 0 {
-            let prev = &x[base - b..base];
-            for i in 0..b {
-                xspec[i] = Cf::new(prev[i], 0.0);
-            }
-        }
-        for i in 0..b {
-            xspec[b + i] = Cf::new(cur[i], 0.0);
-        }
-        fft.process(&mut xspec);
-
-        // Y = X ⊙ W ; y = IFFT(Y)/M. The valid linear-convolution samples are the last B (overlap-save
-        // discards the first B as circular-wrap aliasing).
-        for j in 0..m {
-            yspec[j] = xspec[j] * w[j];
-        }
-        ifft.process(&mut yspec);
-
-        // eb = d_k − yb → cleaned output block; build the error frame [0_B ; eb] for the update. Also
-        // accumulate the block energies the double-talk gate compares.
-        let dk = &d[base..base + b];
-        let mut d_energy = 0.0f32;
-        let mut x_energy = 0.0f32;
-        for i in 0..b {
-            let y_i = yspec[b + i].re * inv_m;
-            let e_i = dk[i] - y_i;
-            out[base + i] = e_i;
-            espec[i] = Cf::new(0.0, 0.0); // first half zero
-            espec[b + i] = Cf::new(e_i, 0.0); // error in the valid second half
-            d_energy += dk[i] * dk[i];
-            x_energy += cur[i] * cur[i];
-        }
-
-        // Double-talk: near-end dominates ⇒ freeze the filter for this block. This is a coarse whole-block
-        // energy-ratio gate; a coherence-based detector and explicit delay pre-alignment are documented
-        // future refinements (design/04-corti-aec.md §9) that would make adaptation more robust on real,
-        // correlated speech.
-        if d_energy > double_talk_ratio * x_energy {
-            continue;
-        }
-
-        // P tracks far-end power per bin. Uses a one-sided smoother: power *increases* are tracked
-        // immediately (preventing P ≪ |X|² which would inflate the gradient and diverge the filter),
-        // while *decreases* are smoothed (conservative — P too large just shrinks the step).
-        for j in 0..m {
-            let inst = xspec[j].norm_sqr();
-            if inst > p[j] {
-                p[j] = inst.max(eps);
-            } else {
-                p[j] = power_smoothing * p[j] + (1.0 - power_smoothing) * inst;
-                p[j] = p[j].max(eps);
-            }
-        }
-        // E = FFT(error frame).
-        fft.process(&mut espec);
-        // G = conj(X) ⊙ E / (P + eps).
-        for j in 0..m {
-            grad[j] = (xspec[j].conj() * espec[j]).unscale(p[j] + eps);
-        }
-        // Gradient constraint: keep only the first B time-domain taps (normalized), zero the wrap-around
-        // tail, so the filter stays a genuine length-B impulse response.
-        ifft.process(&mut grad);
-        for g in grad[..b].iter_mut() {
-            *g = g.scale(inv_m);
-        }
-        for g in grad[b..].iter_mut() {
-            *g = Cf::new(0.0, 0.0);
-        }
-        fft.process(&mut grad);
-        // W = (1−λ)·W + μ·G. The small leakage λ prevents unbounded weight growth over long
-        // recordings (leaky NLMS).
-        let leak = 1e-5f32;
-        for j in 0..m {
-            w[j] = w[j].scale(1.0 - leak) + grad[j].scale(mu);
-        }
-    }
-}
-
-/// Residual echo suppressor: a forward-only pass with the frozen filter W that applies per-bin
-/// spectral subtraction to remove echo the FDAF couldn't model (nonlinearities, late reverb).
-///
-/// For each block: Y = X⊙W is the echo estimate, E = D−Y is the FDAF error. The gain
-/// G(k) = max(1 − α·|Y(k)|²/|E(k)|², floor) attenuates bins where the echo estimate is a
-/// large fraction of the residual, leaving near-end-dominant bins untouched.
-#[allow(clippy::too_many_arguments)]
-fn suppression_pass(
-    w: &[Cf],
-    fft: &dyn Fft<f32>,
-    ifft: &dyn Fft<f32>,
-    d: &[f32],
-    x: &[f32],
-    b: usize,
-    m: usize,
-    alpha: f32,
-    double_talk_ratio: f32,
-    eps: f32,
-    out: &mut [f32],
-) {
-    let num_blocks = d.len() / b;
-    let inv_m = 1.0 / m as f32;
-    let floor = 0.01f32; // −40 dB spectral floor
-
-    let mut xspec = vec![Cf::new(0.0, 0.0); m];
-    let mut yspec = vec![Cf::new(0.0, 0.0); m];
-    let mut espec = vec![Cf::new(0.0, 0.0); m];
-
-    for k in 0..num_blocks {
-        let base = k * b;
-        let cur = &x[base..base + b];
-
-        for s in xspec.iter_mut() {
-            *s = Cf::new(0.0, 0.0);
-        }
-        if k > 0 {
-            let prev = &x[base - b..base];
-            for i in 0..b {
-                xspec[i] = Cf::new(prev[i], 0.0);
-            }
-        }
-        for i in 0..b {
-            xspec[b + i] = Cf::new(cur[i], 0.0);
-        }
-        fft.process(&mut xspec);
-
-        // Y = X ⊙ W (echo estimate in freq domain — kept for post-filter gain)
-        for j in 0..m {
-            yspec[j] = xspec[j] * w[j];
-        }
-
-        // IFFT(Y) → time-domain echo estimate; compute error e = d − y
-        let mut yspec_td = yspec.clone();
-        ifft.process(&mut yspec_td);
-
-        let dk = &d[base..base + b];
-        let mut d_energy = 0.0f32;
-        let mut x_energy = 0.0f32;
-        for i in 0..b {
-            let y_i = yspec_td[b + i].re * inv_m;
-            let e_i = dk[i] - y_i;
-            espec[i] = Cf::new(0.0, 0.0);
-            espec[b + i] = Cf::new(e_i, 0.0);
-            d_energy += dk[i] * dk[i];
-            x_energy += cur[i] * cur[i];
-        }
-
-        // During double-talk the user is speaking — pass through unsuppressed.
-        if d_energy > double_talk_ratio * x_energy {
-            for i in 0..b {
-                out[base + i] = espec[b + i].re;
-            }
-            continue;
-        }
-
-        // Spectral subtraction: suppress bins where echo estimate dominates the error.
-        fft.process(&mut espec);
-        for j in 0..m {
-            let echo_pow = yspec[j].norm_sqr();
-            let error_pow = espec[j].norm_sqr();
-            let gain = (1.0 - alpha * echo_pow / (error_pow + eps)).max(floor);
-            espec[j] = espec[j].scale(gain);
-        }
-        ifft.process(&mut espec);
-        for i in 0..b {
-            out[base + i] = espec[b + i].re * inv_m;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -894,6 +650,186 @@ mod tests {
             let mic = noise(n, 0.3, n as u64 + 1);
             let far = noise(n, 0.3, n as u64 + 99);
             assert_eq!(cancel(&mic, &far, 48_000, &cfg).len(), n);
+        }
+    }
+
+    // ---- Streaming AEC (ADR 0007) ----------------------------------------------------------------------
+
+    /// Build the same synthetic echo fixture `cancels_synthetic_echo` uses: 3 s @ 48 kHz, far-end noise,
+    /// a ~1 ms-delayed decaying room impulse, and a loud 440 Hz near-end tone active only in [1s, 2s).
+    /// Returns `(mic, far, near, sr, n)`.
+    fn synthetic_echo_fixture() -> (Vec<f32>, Vec<f32>, Vec<f32>, u32, usize) {
+        let sr = 48_000u32;
+        let secs = 3usize;
+        let n = sr as usize * secs;
+        let far = noise(n, 0.5, 1);
+        let mut h = vec![0.0f32; 256];
+        for (k, slot) in h.iter_mut().enumerate().skip(50) {
+            *slot = 0.15 * (-((k - 50) as f32) / 40.0).exp();
+        }
+        let echo = convolve(&far, &h);
+        let mut near = vec![0.0f32; n];
+        for (i, slot) in near.iter_mut().enumerate() {
+            if i >= sr as usize && i < 2 * sr as usize {
+                *slot = 0.7 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin();
+            }
+        }
+        let mic: Vec<f32> = (0..n).map(|i| echo[i] + near[i]).collect();
+        (mic, far, near, sr, n)
+    }
+
+    /// ERLE (dB) over the converged tail [2s, 3s): raw echo energy vs residual.
+    fn tail_erle_db(mic: &[f32], clean: &[f32], sr: u32) -> f32 {
+        let lo = 2 * sr as usize;
+        let raw_e = energy(&mic[lo..]);
+        let res_e = energy(&clean[lo..]).max(1e-12);
+        10.0 * (raw_e / res_e).log10()
+    }
+
+    /// Push `mic`/`far` through a `StreamingAec` in the given chunk sizes (cycled), then finish; concatenate
+    /// every emitted block. Models a real capture path draining the ring in irregular bursts.
+    fn drive_streaming(
+        sr: u32,
+        cfg: &AecConfig,
+        lookahead: usize,
+        mic: &[f32],
+        far: &[f32],
+        chunks: &[usize],
+    ) -> Vec<f32> {
+        let mut s = StreamingAec::new_with_lookahead(sr, cfg.clone(), lookahead);
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut ci = 0usize;
+        while pos < mic.len() {
+            let want = chunks[ci % chunks.len()].max(1);
+            let end = (pos + want).min(mic.len());
+            out.extend(s.push(&mic[pos..end], &far[pos..end]));
+            pos = end;
+            ci += 1;
+        }
+        out.extend(s.finish());
+        out
+    }
+
+    #[test]
+    fn streaming_matches_offline_erle() {
+        // The load-bearing chunk-boundary guard: drive the SAME fixture through StreamingAec::push in
+        // irregular chunks that straddle block boundaries (prev_far overlap-save carry), plus a tiny
+        // lookahead so most of the call is true per-block streaming. Total length must equal n and the
+        // converged-tail ERLE must clear the design's 12 dB gate.
+        let (mic, far, _near, sr, n) = synthetic_echo_fixture();
+        let cfg = AecConfig::default();
+        // 0.5 s lookahead → ~24k samples warm-up; the [2s,3s) tail is pure steady-state streaming.
+        let lookahead = sr as usize / 2;
+        let clean = drive_streaming(
+            sr,
+            &cfg,
+            lookahead,
+            &mic,
+            &far,
+            &[100, 4096, 1, 9000, 4095, 4097],
+        );
+        assert_eq!(clean.len(), n, "streaming total output length must equal n");
+
+        let erle = tail_erle_db(&mic, &clean, sr);
+        assert!(erle >= 12.0, "streaming tail ERLE {erle:.1} dB < 12 dB");
+    }
+
+    #[test]
+    fn streaming_equals_shim() {
+        // Pushing the whole call in one chunk with lookahead == n must reproduce cancel() exactly — cancel()
+        // IS that shim, so this is a self-consistency / no-accidental-divergence guard.
+        let (mic, far, _near, sr, _n) = synthetic_echo_fixture();
+        let cfg = AecConfig::default();
+        let shim = cancel(&mic, &far, sr, &cfg);
+        let direct = {
+            let mut s = StreamingAec::new_with_lookahead(sr, cfg.clone(), mic.len());
+            let mut out = s.push(&mic, &far);
+            out.extend(s.finish());
+            out.truncate(mic.len());
+            out
+        };
+        assert_eq!(
+            shim, direct,
+            "one-chunk streaming must equal the cancel() shim bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn lookahead_warmup_improves_opening() {
+        // The lookahead earns its latency: a warm filter cleans the opening better than a cold one. Compare
+        // opening-region ERLE with the conservative default lookahead vs ZERO lookahead (no warm-up).
+        let (mic, far, _near, sr, _n) = synthetic_echo_fixture();
+        let cfg = AecConfig::default();
+
+        // ERLE over the opening [0, 1s) — echo-only (near-end is silent before 1 s), so it is a clean ERLE
+        // probe of how well the FILTER converged by the start of the call.
+        let opening_erle = |clean: &[f32]| -> f32 {
+            let hi = sr as usize;
+            let raw_e = energy(&mic[..hi]);
+            let res_e = energy(&clean[..hi]).max(1e-12);
+            10.0 * (raw_e / res_e).log10()
+        };
+
+        // Cold: lookahead 0 → no warm-up, filter adapts from zero through the opening.
+        let cold = drive_streaming(sr, &cfg, 0, &mic, &far, &[4096]);
+        // Warm: a full 1 s lookahead so the opening [0,1s) is entirely re-emitted through the warm filter.
+        let warm = drive_streaming(sr, &cfg, sr as usize, &mic, &far, &[4096]);
+
+        let cold_erle = opening_erle(&cold);
+        let warm_erle = opening_erle(&warm);
+        assert!(
+            warm_erle > cold_erle + 1.0,
+            "warm-up did not improve the opening: warm {warm_erle:.1} dB vs cold {cold_erle:.1} dB"
+        );
+    }
+
+    #[test]
+    fn streaming_silent_far_is_passthrough() {
+        // Streaming analog of silent_far_end_is_passthrough: no far-end ⇒ filter never moves ⇒ output is the
+        // mic bit-for-bit, even across irregular push boundaries and the warm-up/re-emit path.
+        let mic = noise(20_000, 0.4, 7);
+        let far = vec![0.0f32; mic.len()];
+        let cfg = AecConfig::default();
+        let clean = drive_streaming(48_000, &cfg, 8192, &mic, &far, &[333, 1, 5000, 4096]);
+        assert_eq!(clean, mic, "silent far-end must pass through bit-for-bit");
+    }
+
+    #[test]
+    fn streaming_dominant_near_preserved() {
+        // Streaming analog of dominant_near_end_is_preserved_exactly: loud near-end tone over a quieter
+        // uncorrelated far-end ⇒ the double-talk gate freezes every block ⇒ clean == mic bit-for-bit.
+        let sr = 48_000u32;
+        let n = sr as usize * 2;
+        let mic: Vec<f32> = (0..n)
+            .map(|i| 0.8 * (2.0 * std::f32::consts::PI * 330.0 * i as f32 / sr as f32).sin())
+            .collect();
+        let far = noise(n, 0.3, 4242);
+        let cfg = AecConfig::default();
+        let clean = drive_streaming(sr, &cfg, 12_288, &mic, &far, &[7, 4096, 100, 9000]);
+        assert_eq!(
+            clean, mic,
+            "dominant near-end must be preserved bit-for-bit"
+        );
+    }
+
+    #[test]
+    fn partial_final_block_via_push() {
+        // A total length that is not a multiple of the block size must still round-trip exactly in size
+        // through push()+finish() (the zero-padded trailing block is truncated back to the real input).
+        let cfg = AecConfig {
+            filter_len: 64,
+            ..AecConfig::default()
+        };
+        for &n in &[0usize, 1, 63, 64, 65, 200, 4097] {
+            let mic = noise(n, 0.3, n as u64 + 1);
+            let far = noise(n, 0.3, n as u64 + 99);
+            let clean = drive_streaming(48_000, &cfg, 128, &mic, &far, &[37, 64, 1, 100]);
+            assert_eq!(
+                clean.len(),
+                n,
+                "streaming output length must equal n for n={n}"
+            );
         }
     }
 }
