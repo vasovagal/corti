@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "corti-aec"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hound",
  "rayon",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "corti-app"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "corti-capture"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "corti-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "serde",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "corti-coreaudio"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
@@ -1154,7 +1154,7 @@ dependencies = [
 
 [[package]]
 name = "corti-detect"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "corti-queue"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "corti-tap"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "corti-core",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe-aws"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe-local"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "corti-vagus"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
