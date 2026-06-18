@@ -34,6 +34,19 @@ serde_json = { workspace = true }
 # Persisted, hand-editable config file (`~/.local/share/corti/config.toml`). Flat scalar struct only.
 toml = "0.8"
 
+# Diagnostics console + on-disk logs (issue #76). `tracing` is the macro surface the whole pipeline logs
+# through; `tracing-subscriber` builds the registry (env-filter from RUST_LOG/CORTI_LOG, the in-memory
+# console ring buffer, the fmt stderr layer, and the rolling file layer). `tracing-appender` provides the
+# daily-rolling file appender + a non-blocking writer so the single pipeline worker thread never stalls on
+# disk I/O. `jiff` formats ISO-8601 timestamps for console entries and the saved log file name.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+jiff = { workspace = true }
+# Native "Save log…" panel for `save_console_logs` (no tauri dialog plugin is wired in corti). Host-side
+# only, like `tauri-plugin-macos-permissions`; no `.plugin(init())` and no JS bridge.
+rfd = "0.15"
+
 # Tray + menu live in core tauri behind the `tray-icon` feature. No `image-*` feature needed: tray icons
 # are embedded at build time via `include_image!` (raw RGBA, not feature-gated).
 tauri = { version = "2", features = ["tray-icon"] }

@@ -78,6 +78,12 @@ impl LocalTranscriber {
 
 impl Transcriber for LocalTranscriber {
     fn transcribe(&self, audio: &Path, _meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+        let job_started = std::time::Instant::now();
+        tracing::info!(
+            target: "corti::transcribe::local",
+            path = %audio.display(),
+            "local transcription started"
+        );
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
         let m = models::discover(&dir, self.cfg.diarize_far_end, &self.cfg.embedding_model)?;
         let track = audio::read_two_track(audio)?;
@@ -114,7 +120,14 @@ impl Transcriber for LocalTranscriber {
             }
         }
 
-        Ok(DiarizedTranscript::new(merge_by_time(segments)))
+        let transcript = DiarizedTranscript::new(merge_by_time(segments));
+        tracing::info!(
+            target: "corti::transcribe::local",
+            elapsed_ms = job_started.elapsed().as_millis() as u64,
+            segments = transcript.segments.len(),
+            "local transcription finished"
+        );
+        Ok(transcript)
     }
 }
 
@@ -128,9 +141,10 @@ impl Transcriber for LocalTranscriber {
 /// Mac. When CoreML can't be honored, map the request to `cpu` ourselves and say so once, clearly.
 fn resolve_provider(requested: &str) -> &str {
     if requested != "cpu" && !cfg!(feature = "coreml-lib") {
-        eprintln!(
-            "[corti] provider {requested:?} unavailable in this build — running on CPU \
-             (build with the `coreml-lib` feature + a CoreML-enabled sherpa-onnx lib to enable it)"
+        tracing::warn!(
+            target: "corti::transcribe::local",
+            requested,
+            "provider unavailable in this build — running on CPU (build with the `coreml-lib` feature + a CoreML-enabled sherpa-onnx lib to enable it)"
         );
         return "cpu";
     }

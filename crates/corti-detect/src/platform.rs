@@ -198,10 +198,23 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             owning_app: owner.app,
                             audio_path: recorder.output_path().to_path_buf(),
                         };
+                        tracing::info!(
+                            target: "corti::detect",
+                            app = %meta.owning_app.name,
+                            pid = owner.pid,
+                            started_at = %meta.started_at,
+                            path = %meta.audio_path.display(),
+                            "call started — recording"
+                        );
                         self.current = Some((recorder, meta.clone()));
                         self.emit(DetectorEvent::RecordingStarted { meta });
                     }
                     Err(e) => {
+                        tracing::error!(
+                            target: "corti::detect",
+                            error = %format!("{e:#}"),
+                            "failed to start recording"
+                        );
                         self.emit(DetectorEvent::Error(format!(
                             "failed to start recording: {e:#}"
                         )));
@@ -217,6 +230,13 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 if !keep {
                     // Discard: the writer has already streamed a partial WAV to disk, so `discard()` stops
                     // the session and deletes that file (a plain `drop` would leave the partial behind).
+                    tracing::info!(
+                        target: "corti::detect",
+                        app = %meta.owning_app.name,
+                        duration_secs = duration.as_secs_f64(),
+                        kept = false,
+                        "call ended — recording discarded (below keep threshold)"
+                    );
                     recorder.discard();
                     return;
                 }
@@ -227,11 +247,26 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                         // it agrees with the `keep` decision; the written WAV may be a hair longer.
                         let delta = chrono::TimeDelta::from_std(duration).unwrap_or_default();
                         meta.ended_at = Some(meta.started_at + delta);
+                        tracing::info!(
+                            target: "corti::detect",
+                            app = %meta.owning_app.name,
+                            duration_secs = duration.as_secs_f64(),
+                            kept = true,
+                            path = %audio_path.display(),
+                            "call ended — recording kept"
+                        );
                         self.emit(DetectorEvent::RecordingFinished { meta, audio_path });
                     }
-                    Err(e) => self.emit(DetectorEvent::Error(format!(
-                        "failed to finish recording: {e:#}"
-                    ))),
+                    Err(e) => {
+                        tracing::error!(
+                            target: "corti::detect",
+                            error = %format!("{e:#}"),
+                            "failed to finish recording"
+                        );
+                        self.emit(DetectorEvent::Error(format!(
+                            "failed to finish recording: {e:#}"
+                        )));
+                    }
                 }
             }
         }

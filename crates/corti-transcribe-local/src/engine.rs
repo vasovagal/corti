@@ -51,8 +51,17 @@ pub fn build_recognizer(m: &Models, provider: &str, num_threads: i32) -> Result<
     config.model_config.model_type = Some("nemo_transducer".to_string());
     config.model_config.provider = Some(provider.to_string());
     config.model_config.num_threads = num_threads;
-    OfflineRecognizer::create(&config)
-        .context("failed to create the Parakeet recognizer (check model files / provider)")
+    let started = std::time::Instant::now();
+    let rec = OfflineRecognizer::create(&config)
+        .context("failed to create the Parakeet recognizer (check model files / provider)")?;
+    tracing::info!(
+        target: "corti::transcribe::local",
+        model = "parakeet",
+        provider,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "model loaded"
+    );
+    Ok(rec)
 }
 
 /// Build a fresh Silero VAD (stateful — one per channel).
@@ -74,8 +83,17 @@ pub fn build_vad(m: &Models, provider: &str) -> Result<VoiceActivityDetector> {
         debug: false,
     };
     // Buffer up to MAX_SPEECH_SECONDS of audio internally.
-    VoiceActivityDetector::create(&config, MAX_SPEECH_SECONDS)
-        .context("failed to create the Silero VAD (check model file)")
+    let started = std::time::Instant::now();
+    let vad = VoiceActivityDetector::create(&config, MAX_SPEECH_SECONDS)
+        .context("failed to create the Silero VAD (check model file)")?;
+    tracing::info!(
+        target: "corti::transcribe::local",
+        model = "silero_vad",
+        provider,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "model loaded"
+    );
+    Ok(vad)
 }
 
 /// Build the pyannote-segmentation + speaker-embedding diarizer (for splitting the far-end channel). The
@@ -111,8 +129,17 @@ pub fn build_diarizer(
         min_duration_on: 0.3,
         min_duration_off: 0.5,
     };
-    OfflineSpeakerDiarization::create(&config)
-        .context("failed to create speaker diarization (check segmentation/embedding models)")
+    let started = std::time::Instant::now();
+    let diar = OfflineSpeakerDiarization::create(&config)
+        .context("failed to create speaker diarization (check segmentation/embedding models)")?;
+    tracing::info!(
+        target: "corti::transcribe::local",
+        model = "diarizer",
+        provider,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "model loaded"
+    );
+    Ok(diar)
 }
 
 /// Transcribe one 16 kHz mono channel: Silero VAD chunks it into speech regions, each region is decoded by

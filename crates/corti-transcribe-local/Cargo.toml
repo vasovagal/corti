@@ -11,6 +11,8 @@ rust-version.workspace = true
 corti-core = { workspace = true }
 corti-transcribe = { workspace = true }
 anyhow = { workspace = true }
+# Structured logging (issue #76): per-model load timing + per-job transcription timing.
+tracing = { workspace = true }
 
 # ONNX runtime + models: ASR (Parakeet-TDT transducer), Silero VAD, pyannote speaker diarization — all
 # ONNX, one runtime. `static` (default) downloads a prebuilt osx-arm64 lib at first build; set

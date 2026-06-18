@@ -20,6 +20,7 @@ use corti_core::{DiarizedTranscript, JobStatus, RecordingMeta};
 use corti_queue::{Job, JobUpdate, Queue};
 use corti_vagus::Vagus;
 use tauri::AppHandle;
+use tracing::{error, info, warn};
 
 use crate::imp::{HISTORY_LIMIT, HistoryEntry};
 use crate::settings::SharedConfig;
@@ -61,7 +62,7 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
     let queue = match Queue::open() {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("[corti] cannot open job queue: {e:#}");
+            error!(target: "corti::pipeline", error = %format!("{e:#}"), "cannot open job queue");
             tray::set_status(&app, format!("⚠ queue unavailable: {e}"));
             return;
         }
@@ -69,7 +70,7 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
 
     let vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
     if let Err(e) = &vagus {
-        eprintln!("[corti] vagus not available — notes can't be filed: {e}");
+        warn!(target: "corti::pipeline", error = %e, "vagus not available — notes can't be filed");
     }
 
     // Snapshot the shared config to build the initial backend. Capture the AEC toggle before `Backend::init`
@@ -93,6 +94,13 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
         match msg {
             PipelineMsg::Process { meta, audio_path } => match ctx.queue.enqueue(&meta) {
                 Ok(id) => {
+                    info!(
+                        target: "corti::pipeline",
+                        job_id = %id,
+                        app = %meta.owning_app.name,
+                        path = %audio_path.display(),
+                        "enqueued recording for transcription"
+                    );
                     // The capture-start site already pushed a `Recording` entry (keyed by this same id);
                     // advance it to `Queued` and stamp the now-known end time before transcribing.
                     tray::update_history(
@@ -106,7 +114,12 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
                     transcribe_and_file(&mut ctx, &id, &meta, &audio_path);
                 }
                 Err(e) => {
-                    eprintln!("[corti] enqueue failed for {}: {e:#}", audio_path.display());
+                    error!(
+                        target: "corti::pipeline",
+                        path = %audio_path.display(),
+                        error = %format!("{e:#}"),
+                        "enqueue failed"
+                    );
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
@@ -124,9 +137,11 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     ctx.aec_enabled = cfg.aec_enabled;
     ctx.aec_config = cfg.aec_config();
     ctx.backend = Backend::init(cfg);
-    eprintln!(
-        "[corti] settings saved — backend now {backend_name}; AEC {}",
-        if ctx.aec_enabled { "on" } else { "off" }
+    info!(
+        target: "corti::pipeline",
+        backend = backend_name,
+        aec = if ctx.aec_enabled { "on" } else { "off" },
+        "settings saved — backend reloaded"
     );
 }
 
@@ -137,7 +152,7 @@ fn seed_history(ctx: &Ctx) {
     let jobs = match ctx.queue.all() {
         Ok(j) => j,
         Err(e) => {
-            eprintln!("[corti] could not read recordings for tray history: {e:#}");
+            warn!(target: "corti::pipeline", error = %format!("{e:#}"), "could not read recordings for tray history");
             return;
         }
     };
@@ -233,9 +248,10 @@ fn file_and_done(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, transcript: &Dia
     if ctx.vagus.is_err() {
         ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
         if let Ok(v) = &ctx.vagus {
-            eprintln!(
-                "[corti] vagus now available at `{}` — filing enabled",
-                v.bin().display()
+            info!(
+                target: "corti::pipeline",
+                bin = %v.bin().display(),
+                "vagus now available — filing enabled"
             );
         }
     }
@@ -254,6 +270,12 @@ fn file_and_done(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, transcript: &Dia
             return;
         }
     };
+    info!(
+        target: "corti::pipeline",
+        job_id = %id,
+        note_path = %note.display(),
+        "note filed"
+    );
 
     // Record the note path first (so a crash here doesn't re-file), then mark Done.
     if let Err(e) = ctx.queue.update(
@@ -263,7 +285,12 @@ fn file_and_done(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, transcript: &Dia
             ..Default::default()
         },
     ) {
-        eprintln!("[corti] note filed but could not persist note_path for {id}: {e:#}");
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "note filed but could not persist note_path"
+        );
     }
     let _ = ctx.queue.set_status(id, JobStatus::Done);
 
@@ -285,17 +312,27 @@ fn file_and_done(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, transcript: &Dia
 /// a correctness problem, so failures are only logged.
 fn prune_transient(raw: &Path, used: &Path) {
     for p in [used, raw] {
-        if p.exists()
-            && let Err(e) = std::fs::remove_file(p)
-        {
-            eprintln!("[corti] could not remove transient {}: {e}", p.display());
+        if p.exists() {
+            match std::fs::remove_file(p) {
+                Ok(()) => info!(
+                    target: "corti::pipeline",
+                    path = %p.display(),
+                    "pruned transient capture audio"
+                ),
+                Err(e) => warn!(
+                    target: "corti::pipeline",
+                    path = %p.display(),
+                    error = %e,
+                    "could not remove transient capture audio"
+                ),
+            }
         }
     }
 }
 
 /// Fail a job and surface it in the tray (both the status line and its history entry).
 fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
-    eprintln!("[corti] job {id} failed: {msg}");
+    error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
     let _ = ctx.queue.fail(id, &msg);
     tray::update_history(
         &ctx.app,

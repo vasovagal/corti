@@ -13,6 +13,8 @@ corti-transcribe = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Structured logging (issue #76): S3 upload size/key/time + job submit/poll/fetch/cleanup milestones.
+tracing = { workspace = true }
 
 # AWS Transcribe batch flow: S3 stage + StartTranscriptionJob/poll. The SDK is async, so we run a private
 # tokio current-thread runtime inside the blocking `Transcriber::transcribe` (the trait is sync by design).
