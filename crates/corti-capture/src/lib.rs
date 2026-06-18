@@ -1,10 +1,14 @@
 //! Recording orchestration: drive the [`corti_coreaudio`] capture engine for the lifetime of a meeting and
-//! write the result as a **2-track WAV** — channel 0 = the mic ("me"), channel 1 = the far-end tap
-//! ("them") — into the recordings cache (`~/Library/Caches/corti/recordings/`, never a vault; guardrail 5).
+//! write the result as a **lossless 2-track WAV** — channel 0 = the mic ("me"), channel 1 = the far-end tap
+//! ("them"), 32-bit float — into the recordings cache (`~/Library/Caches/corti/recordings/`, never a vault;
+//! guardrail 5).
 //!
 //! Keeping the two ends as separate tracks is what gives downstream code free "me vs. them" diarization and
-//! lets [`corti-aec`](../corti_aec) cancel speaker bleed offline from time-aligned signals. The raw tracks
-//! are always preserved; AEC produces an additional cleaned track and never overwrites these.
+//! lets [`corti-aec`](../corti_aec) cancel speaker bleed from time-aligned signals. Under ADR 0007
+//! (streaming-AEC-first) the captured 2-track is the **AEC input**, written lossless (float, never
+//! quantized) so the adaptive filter sees bit-exact PCM. Both the captured 2-track and the cleaned sibling
+//! AEC produces are **transient**: the pipeline deletes them after transcription, since durability and
+//! retention are deferred. There is no longer a "raw tracks always preserved" invariant.
 
 use std::path::{Path, PathBuf};
 
@@ -48,14 +52,17 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
     raw.with_file_name(format!("{stem}-clean.wav"))
 }
 
-/// Read the raw 2-track recording, cancel speaker bleed on ch0 (mic) using ch1 (far-end tap) as the
-/// reference, and write the cleaned 2-track WAV (ch0 = cleaned mic, ch1 = **raw** tap, preserved). Returns
-/// the clean path wrapped in `Some`.
+/// Read the captured 2-track recording, cancel speaker bleed on ch0 (mic) using ch1 (mono far-end tap) as the
+/// echo reference, and write the cleaned 2-track WAV (ch0 = cleaned mic, ch1 = mono tap "them"). Returns the
+/// clean path wrapped in `Some`.
 ///
 /// Returns `Ok(None)` for a **1-channel** input: a tap-only / listen-only ("webinar") recording has no mic
-/// track, so there is nothing to cancel — the caller transcribes the raw tap directly. This is an expected
-/// outcome, not an error. Any other channel count (0, or 3+) is a genuine error. The raw file is only read,
-/// never modified, so the originals are always preserved (design/04-corti-aec.md invariant).
+/// track, so there is nothing to cancel — the caller transcribes the tap directly. This is an expected
+/// outcome, not an error. Any other channel count (0, or 3+) is a genuine error.
+///
+/// The captured file is only read here, not modified; under ADR 0007 it is a **transient** intermediate that
+/// the pipeline deletes after transcription (along with this cleaned sibling) — there is no raw-retention
+/// invariant any more.
 pub fn write_clean_wav(
     raw_2track_wav: &Path,
     aec_cfg: &corti_aec::AecConfig,
@@ -89,7 +96,13 @@ pub fn write_clean_wav(
     let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
 
-    let clean = corti_aec::cancel(&mic, &tap, spec.sample_rate, aec_cfg);
+    // Drive the streaming canceller with the env-tunable lookahead (ADR 0007 §1): the lookahead window
+    // warms the filter and locks the mic↔far delay before the opening is emitted. This is the live path —
+    // `cancel()` (full-length lookahead) is only the offline test/scoring shim.
+    let mut aec = corti_aec::StreamingAec::new(spec.sample_rate, aec_cfg.clone());
+    let mut clean = aec.push(&mic, &tap);
+    clean.extend(aec.finish());
+    clean.truncate(mic.len());
 
     let out = clean_wav_path(raw_2track_wav);
     let out_spec = hound::WavSpec {
@@ -102,8 +115,8 @@ pub fn write_clean_wav(
         .with_context(|| format!("creating {}", out.display()))?;
     let frames = mic.len().max(tap.len());
     for i in 0..frames {
-        w.write_sample(clean.get(i).copied().unwrap_or(0.0))?; // ch0 = cleaned mic
-        w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = raw tap (preserved)
+        w.write_sample(clean.get(i).copied().unwrap_or(0.0))?; // ch0 = cleaned mic ("me")
+        w.write_sample(tap.get(i).copied().unwrap_or(0.0))?; // ch1 = mono tap ("them")
     }
     w.finalize()?;
     Ok(Some(out))

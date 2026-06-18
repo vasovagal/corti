@@ -1,5 +1,9 @@
 //! Audition tool for offline AEC.
 //!
+// `--passes` is retained as a no-op CLI flag for A/B parity with older invocations; the streaming path
+// ignores `AecConfig::passes` (ADR 0007). Allow the deprecation here so the audition tool still surfaces it.
+#![allow(deprecated)]
+//!
 //! ```text
 //! cargo run -p corti-aec --example aec_file -- path/to/recording.wav
 //! cargo run -p corti-aec --example aec_file -- --filter-len 8192 --mu 0.5 path/to/recording.wav

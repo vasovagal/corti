@@ -49,13 +49,48 @@ unsafe extern "C" {
 }
 
 /// How long the ring buffers before the writer must catch up, and the channel headroom used to size it.
-/// 8 s at up to 8 channels (48 kHz) ≈ 12 MB — generous slack for a transient disk stall, still bounded.
-const RING_SECONDS: usize = 8;
+///
+/// Default is **30 s** at up to 8 channels (48 kHz) ≈ 46 MB — a deliberately generous safety margin
+/// against a transient disk stall (ADR 0007: "ring defaulted bigger/safer"), still bounded regardless
+/// of recording length. Override at runtime with `CORTI_CAPTURE_RING_SECS` (an integer count of seconds),
+/// clamped to `[RING_SECONDS_MIN, RING_SECONDS_MAX]`. The cap of 300 s bounds worst-case RAM at
+/// 300 s × 8 ch × 48 kHz × 4 bytes ≈ 460 MB; the floor of 5 s keeps enough slack to be useful.
+/// Unset / empty / unparseable values fall back to the default.
+const RING_SECONDS_DEFAULT: usize = 30;
+const RING_SECONDS_MIN: usize = 5;
+const RING_SECONDS_MAX: usize = 300;
 const RING_MAX_CHANNELS: usize = 8;
+
+/// Name of the env var that overrides the ring duration in seconds.
+const RING_SECONDS_ENV: &str = "CORTI_CAPTURE_RING_SECS";
+
+/// Pure parse+clamp of a raw `CORTI_CAPTURE_RING_SECS` value, factored out so the policy is testable
+/// without mutating the process-global environment. Unset / empty / unparseable → default; in-range →
+/// as given; out-of-range (including 0) → clamped to `[RING_SECONDS_MIN, RING_SECONDS_MAX]`.
+fn clamp_ring_secs(raw: Option<&str>) -> usize {
+    match raw.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) => {
+            let clamped = n.clamp(RING_SECONDS_MIN, RING_SECONDS_MAX);
+            if clamped != n {
+                eprintln!(
+                    "[corti] {RING_SECONDS_ENV}={n} out of range; clamped to {clamped} \
+                     (allowed {RING_SECONDS_MIN}..={RING_SECONDS_MAX})"
+                );
+            }
+            clamped
+        }
+        None => RING_SECONDS_DEFAULT,
+    }
+}
+
+/// Resolve the ring duration in seconds, reading the env override once at ring construction.
+fn ring_seconds() -> usize {
+    clamp_ring_secs(std::env::var(RING_SECONDS_ENV).ok().as_deref())
+}
 
 /// Ring capacity in samples for the given rate. Bounded regardless of recording length.
 fn ring_capacity(sample_rate: u32) -> usize {
-    (sample_rate as usize).max(8_000) * RING_MAX_CHANNELS * RING_SECONDS
+    (sample_rate as usize).max(8_000) * RING_MAX_CHANNELS * ring_seconds()
 }
 
 /// What system audio to tap alongside the mic.
@@ -500,8 +535,9 @@ unsafe extern "C" fn io_proc(
     0
 }
 
-/// The streaming writer thread: drain the ring, downmix each interleaved frame per `layout`, and write 16-bit
-/// PCM to `out` incrementally. Returns the number of output frames written. Creates the file lazily — only
+/// The streaming writer thread: drain the ring, downmix each interleaved frame per `layout`, and write it to
+/// `out` incrementally — lossless 32-bit float for the 2-track AEC input, 16-bit PCM for the tap-only /
+/// diagnostic layouts. Returns the number of output frames written. Creates the file lazily — only
 /// once the first callback has revealed the channel layout — so a permission-denied run (no callbacks) leaves
 /// no file behind.
 fn run_writer(
@@ -527,11 +563,19 @@ fn run_writer(
     let tap = total.saturating_sub(mic);
     let out_channels = layout.out_channels(mic as u32, tap as u32);
 
+    // The 2-track recording is the **AEC input** (ADR 0007 §1/§2: the streaming canceller runs over this
+    // lossless 2-track post-capture). Writing it as 32-bit float preserves the bit-exact mic + mono echo
+    // reference the adaptive filter needs — quantizing here would impose an ERLE ceiling (ADR 0007 Context).
+    // The tap-only / diagnostic layouts carry no mic, so they are never an AEC input and stay compact 16-bit.
+    let (bits_per_sample, sample_format) = match layout {
+        OutputLayout::TwoTrack => (32, hound::SampleFormat::Float),
+        OutputLayout::TapOnlyMono | OutputLayout::AllChannels => (16, hound::SampleFormat::Int),
+    };
     let spec = hound::WavSpec {
         channels: out_channels as u16,
         sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        bits_per_sample,
+        sample_format,
     };
     let mut writer = hound::WavWriter::create(&out, spec)
         .map_err(|e| anyhow!("creating {}: {e}", out.display()))?;
@@ -570,7 +614,9 @@ fn run_writer(
     Ok(frames_written)
 }
 
-/// Downmix one interleaved capture frame into the output channels for `layout` and write them as 16-bit PCM.
+/// Downmix one interleaved capture frame into the output channels for `layout` and write them. The 2-track
+/// AEC-input layout is written **lossless** as 32-bit float (ch0 = mono mic, ch1 = mono tap echo reference);
+/// the tap-only / diagnostic layouts are 16-bit PCM (matching the spec chosen in [`run_writer`]).
 fn write_frame<W: std::io::Write + std::io::Seek>(
     writer: &mut hound::WavWriter<W>,
     frame: &[f32],
@@ -580,8 +626,8 @@ fn write_frame<W: std::io::Write + std::io::Seek>(
 ) -> Result<(), hound::Error> {
     match layout {
         OutputLayout::TwoTrack => {
-            writer.write_sample(f32_to_i16(frame_mean(frame, 0, mic)))?; // ch0 = me
-            writer.write_sample(f32_to_i16(frame_mean(frame, mic, total - mic)))?; // ch1 = them
+            writer.write_sample(frame_mean(frame, 0, mic))?; // ch0 = me (lossless f32)
+            writer.write_sample(frame_mean(frame, mic, total - mic))?; // ch1 = them (mono echo ref)
         }
         OutputLayout::TapOnlyMono => {
             writer.write_sample(f32_to_i16(frame_mean(frame, mic, total - mic)))?; // them
@@ -828,10 +874,10 @@ mod tests {
     }
 
     /// End-to-end writer test (no CoreAudio): push interleaved [mic, tapL, tapR] frames into the ring, drop
-    /// the producer to signal end-of-stream, and confirm the writer streams a 16-bit 2-track WAV with the
-    /// mic on ch0 and the averaged tap on ch1.
+    /// the producer to signal end-of-stream, and confirm the writer streams a **lossless 32-bit float**
+    /// 2-track WAV (the AEC input — ADR 0007) with the mic on ch0 and the averaged tap on ch1.
     #[test]
-    fn writer_streams_two_track_16bit_with_downmix() {
+    fn writer_streams_two_track_f32_with_downmix() {
         let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(1024);
         let frames = [
             [1.0f32, 0.25, 0.75], // me=1.0   them=mean(.25,.75)=.5
@@ -868,20 +914,11 @@ mod tests {
         let mut r = hound::WavReader::open(&out).unwrap();
         let spec = r.spec();
         assert_eq!(spec.channels, 2);
-        assert_eq!(spec.bits_per_sample, 16);
-        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
-        let got: Vec<i16> = r.samples::<i16>().collect::<Result<_, _>>().unwrap();
-        assert_eq!(
-            got,
-            vec![
-                f32_to_i16(1.0),
-                f32_to_i16(0.5),
-                f32_to_i16(0.0),
-                f32_to_i16(0.75),
-                f32_to_i16(-1.0),
-                f32_to_i16(-0.75),
-            ]
-        );
+        assert_eq!(spec.bits_per_sample, 32);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+        let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        // ch0 = mic (lossless), ch1 = averaged tap — bit-exact, no quantization (the AEC input).
+        assert_eq!(got, vec![1.0, 0.5, 0.0, 0.75, -1.0, -0.75]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -954,5 +991,44 @@ mod tests {
         assert!(!out.exists(), "no audio ⇒ no file");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ring_secs_unset_or_garbage_uses_default() {
+        assert_eq!(clamp_ring_secs(None), RING_SECONDS_DEFAULT);
+        assert_eq!(clamp_ring_secs(Some("")), RING_SECONDS_DEFAULT);
+        assert_eq!(clamp_ring_secs(Some("   ")), RING_SECONDS_DEFAULT);
+        assert_eq!(clamp_ring_secs(Some("abc")), RING_SECONDS_DEFAULT);
+        assert_eq!(clamp_ring_secs(Some("-5")), RING_SECONDS_DEFAULT);
+        assert_eq!(clamp_ring_secs(Some("4.5")), RING_SECONDS_DEFAULT);
+    }
+
+    #[test]
+    fn ring_secs_in_range_passes_through_with_trim() {
+        assert_eq!(clamp_ring_secs(Some("60")), 60);
+        assert_eq!(clamp_ring_secs(Some("  45 ")), 45);
+        assert_eq!(clamp_ring_secs(Some("5")), RING_SECONDS_MIN);
+        assert_eq!(clamp_ring_secs(Some("300")), RING_SECONDS_MAX);
+    }
+
+    #[test]
+    fn ring_secs_out_of_range_is_clamped() {
+        assert_eq!(clamp_ring_secs(Some("0")), RING_SECONDS_MIN);
+        assert_eq!(clamp_ring_secs(Some("1")), RING_SECONDS_MIN);
+        assert_eq!(clamp_ring_secs(Some("100000")), RING_SECONDS_MAX);
+    }
+
+    #[test]
+    fn ring_capacity_reflects_default_seconds() {
+        // No env override set in this assertion's expectation: default 30 s.
+        assert_eq!(
+            ring_capacity(48_000),
+            48_000 * RING_MAX_CHANNELS * RING_SECONDS_DEFAULT
+        );
+        // Sample-rate floor of 8 kHz still applies.
+        assert_eq!(
+            ring_capacity(4_000),
+            8_000 * RING_MAX_CHANNELS * RING_SECONDS_DEFAULT
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Read the 2-track WAV that `corti-capture` writes (ch0 = mic/me, ch1 = system-tap/them) and split it into
-//! per-channel mono `f32` buffers for the ONNX pipeline. The raw capture is 16-bit int; an AEC-cleaned WAV is
-//! 32-bit float — both are accepted and normalized to `f32`.
+//! per-channel mono `f32` buffers for the ONNX pipeline. Both 16-bit int and 32-bit float WAVs are accepted
+//! and normalized to `f32` (under ADR 0007 the 2-track capture is itself 32-bit float — the lossless AEC input).
 
 use std::path::Path;
 

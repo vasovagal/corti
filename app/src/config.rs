@@ -93,9 +93,6 @@ pub struct AppConfig {
     /// AEC double-talk ratio (`CORTI_AEC_DOUBLE_TALK_RATIO`). `None` ⇒ crate default (2.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aec_double_talk_ratio: Option<f32>,
-    /// AEC offline passes (`CORTI_AEC_PASSES`). `None` ⇒ crate default (2).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub aec_passes: Option<usize>,
     /// AEC residual echo suppression factor (`CORTI_AEC_SUPPRESS_RESIDUAL`). `None` ⇒ crate default (2.5).
     /// Set 0 to disable. Higher values suppress more aggressively.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,7 +119,6 @@ impl Default for AppConfig {
             aec_eps: None,
             aec_power_smoothing: None,
             aec_double_talk_ratio: None,
-            aec_passes: None,
             aec_suppress_residual: None,
         }
     }
@@ -131,6 +127,7 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Build an [`corti_aec::AecConfig`] from the app config, overlaying any tuned `Some` values onto the
     /// crate defaults. `None` fields use the crate's built-in defaults.
+    #[allow(deprecated)] // `passes` is a deprecated AecConfig field (ADR 0007); set from the default, ignored by the streaming path.
     pub fn aec_config(&self) -> corti_aec::AecConfig {
         let d = corti_aec::AecConfig::default();
         corti_aec::AecConfig {
@@ -139,7 +136,7 @@ impl AppConfig {
             eps: self.aec_eps.unwrap_or(d.eps),
             power_smoothing: self.aec_power_smoothing.unwrap_or(d.power_smoothing),
             double_talk_ratio: self.aec_double_talk_ratio.unwrap_or(d.double_talk_ratio),
-            passes: self.aec_passes.unwrap_or(d.passes),
+            passes: d.passes,
             suppress_residual: self.aec_suppress_residual.unwrap_or(d.suppress_residual),
         }
     }
@@ -202,9 +199,6 @@ impl AppConfig {
         }
         if let Some(v) = env_non_empty("CORTI_AEC_DOUBLE_TALK_RATIO").and_then(|s| s.parse().ok()) {
             cfg.aec_double_talk_ratio = Some(v);
-        }
-        if let Some(n) = env_non_empty("CORTI_AEC_PASSES").and_then(|s| s.parse().ok()) {
-            cfg.aec_passes = Some(n);
         }
         if let Some(v) = env_non_empty("CORTI_AEC_SUPPRESS_RESIDUAL").and_then(|s| s.parse().ok()) {
             cfg.aec_suppress_residual = Some(v);
@@ -389,7 +383,6 @@ mod tests {
             aec_eps: None,
             aec_power_smoothing: Some(0.95),
             aec_double_talk_ratio: Some(1.5),
-            aec_passes: None,
             aec_suppress_residual: Some(3.0),
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();

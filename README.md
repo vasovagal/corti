@@ -20,14 +20,13 @@ signals. Exactly what this app does: audio → notes.
   2-track WAV through a single CoreAudio aggregate device — no virtual audio drivers, no
   ScreenCaptureKit.
 - **Knows who you were talking to.** Attributes each recording to the app that owned the call.
-- **Offline echo cancellation.** An FDAF adaptive filter strips speaker bleed from the mic
-  track when you're on speakers, plus a residual echo suppressor that eliminates the faint
-  ghosts the adaptive filter can't model — so the transcriber doesn't misattribute bleed as
-  "Me." The raw tracks are always preserved. Tune with `corti --calibrate-aec`.
+- **Echo cancellation on lossless audio.** An FDAF adaptive filter strips speaker bleed from
+  the mic track when you're on speakers, plus a residual echo suppressor that eliminates the
+  faint ghosts the adaptive filter can't model — so the transcriber doesn't misattribute bleed
+  as "Me." The mic and far-end are captured as separate lossless tracks (the far-end as a mono
+  echo reference) so the filter sees bit-exact audio.
 - **Diarized, timestamped transcripts.** Clean Markdown with word-level timestamps and
   **Me** / **Them** speaker labels, dropped right into your vagus vault.
-- **Crash-recoverable.** A durable job queue resumes interrupted transcriptions after a crash
-  or restart — you never lose a recording.
 - **Two transcription backends, picked at runtime.** **AWS Transcribe** for cloud accuracy,
   or a **fully offline on-device** backend (NVIDIA Parakeet-TDT-0.6B-v3 via ONNX) when nothing
   may leave the machine. Both compile in; choose with `CORTI_TRANSCRIBE_BACKEND`.
@@ -62,20 +61,16 @@ transcription run in the background; the UI never blocks.
 
 ## AEC tuning
 
-The echo canceller works out of the box for typical laptop-speaker setups. If your
-room/speakers produce unusual echo, `corti --calibrate-aec` sweeps 144 parameter combinations
-against your recent recordings and saves the best config:
+The echo canceller works out of the box for typical laptop-speaker setups. Individual
+parameters can be set via environment variables (`CORTI_AEC_FILTER_LEN`, `CORTI_AEC_MU`,
+`CORTI_AEC_POWER_SMOOTHING`, `CORTI_AEC_DOUBLE_TALK_RATIO`, `CORTI_AEC_SUPPRESS_RESIDUAL`) or
+persisted in `config.toml`.
 
-```sh
-corti --calibrate-aec                    # auto-picks 3 most recent 2-channel recordings
-corti --calibrate-aec ~/path/to/*.wav    # explicit recordings
-corti --calibrate-aec --dry-run          # print results without saving
-```
-
-Individual parameters can also be set via environment variables (`CORTI_AEC_FILTER_LEN`,
-`CORTI_AEC_MU`, `CORTI_AEC_POWER_SMOOTHING`, `CORTI_AEC_DOUBLE_TALK_RATIO`,
-`CORTI_AEC_SUPPRESS_RESIDUAL`) or persisted in `config.toml`. See
-[`design/04a-aec-calibration.md`](./design/04a-aec-calibration.md) for the full analysis.
+> The automated `corti --calibrate-aec` parameter sweep was dropped per
+> [ADR 0007](./design/adr/0007-streaming-aec-first.md) (streaming AEC-first): it depended on
+> persisted raw 2-track recordings, which the no-durability/no-raw-retention stance removes.
+> See [`design/04a-aec-calibration.md`](./design/04a-aec-calibration.md) for the original
+> tuning analysis.
 
 ## Status
 

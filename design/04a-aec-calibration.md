@@ -1,5 +1,12 @@
 # 04a — AEC calibration: from echo ghosts to clean attribution
 
+> **Superseded — calibration dropped per [ADR 0007](adr/0007-streaming-aec-first.md).** The
+> `corti --calibrate-aec` parameter sweep described here read **persisted raw 2-track
+> recordings**, which the streaming-AEC-first / no-durability stance removes. The CLI
+> entrypoint and the sweep driver (`tune.rs`) have been deleted. This post-mortem is kept for
+> the analysis and the still-valid env-var/`config.toml` AEC overrides; revisit calibration
+> when durability + raw retention return.
+
 Post-mortem and reference for the June 2026 AEC tuning work. Companion to
 [`04-corti-aec.md`](04-corti-aec.md); that doc covers the algorithm, this one covers why the defaults
 weren't enough and what we did about it.
