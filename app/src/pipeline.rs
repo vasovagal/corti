@@ -53,12 +53,16 @@ struct Ctx {
     aec_enabled: bool,
     aec_config: corti_aec::AecConfig,
     app: AppHandle,
+    /// Clone of the managed stats buffer; the worker records coarse stage wall-clock here.
+    stats: crate::stats::StatsBuffer,
+    /// Low-cardinality backend label for stage samples; refreshed on a live backend switch.
+    backend_label: &'static str,
 }
 
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
 /// exits. Holds the [`SharedConfig`] so a Settings save (`PipelineMsg::ReloadConfig`) can rebuild the
 /// backend live.
-pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
+pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>, stats: crate::stats::StatsBuffer) {
     let queue = match Queue::open() {
         Ok(q) => q,
         Err(e) => {
@@ -78,6 +82,7 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
     let cfg = config.lock().unwrap().clone();
     let aec_enabled = cfg.aec_enabled;
     let aec_config = cfg.aec_config();
+    let backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     let mut ctx = Ctx {
         queue,
         vagus,
@@ -85,6 +90,8 @@ pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>) {
         aec_enabled,
         aec_config,
         app,
+        stats,
+        backend_label,
     };
 
     seed_history(&ctx);
@@ -136,6 +143,7 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     let backend_name = cfg.backend_name();
     ctx.aec_enabled = cfg.aec_enabled;
     ctx.aec_config = cfg.aec_config();
+    ctx.backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     ctx.backend = Backend::init(cfg);
     info!(
         target: "corti::pipeline",
@@ -206,6 +214,7 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
     // Run the shared transcription core: AEC (speaker-bleed removal) → backend. The pipeline's input is the
     // lossless 2-track capture, so `skip_aec` is false; a tap-only recording is handled inside (`Ok(None)`).
     // Only a real transcription failure returns `Err` here.
+    let _t0 = std::time::Instant::now();
     let transcript = match crate::transcribe::transcribe_recording(
         &ctx.backend,
         ctx.aec_enabled,
@@ -216,6 +225,9 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         audio,
     ) {
         Ok((transcript, input)) => {
+            // Record the wall-clock of the transcribe (AEC + backend) stage. For the AWS backend this is
+            // poll-sleep I/O-wait; for local it is CPU — the backend label lets the panel distinguish them.
+            ctx.stats.record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
             // ADR 0007 (no retention): the capture audio is a **transient** intermediate, kept only long
             // enough to transcribe. Delete it — and the cleaned sibling AEC produced, when distinct — now
             // that the transcript is in hand. Durability/retention are deferred, so nothing keeps these.
@@ -223,6 +235,8 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
             transcript
         }
         Err(e) => {
+            // Still record the wall-clock spent before failure (useful for spotting AWS timeouts).
+            ctx.stats.record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
             // Transcription failed — keep the capture audio so a `--redo` can re-run it (AEC has no raw
             // fallback once it runs at capture time; the lossless 2-track on disk is the only copy).
             fail(ctx, id, meta, format!("transcription failed: {e:#}"));
@@ -235,7 +249,11 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         return;
     }
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
+    // File stage (vagus filing). No backend dimension; label "vagus". Recorded after the call, which
+    // always returns (file_and_done is a separate fn), so this fires on both success and filing failure.
+    let _tf = std::time::Instant::now();
     file_and_done(ctx, id, meta, &transcript);
+    ctx.stats.record_stage("file", _tf.elapsed(), "vagus");
 }
 
 /// File the transcript into vagus and mark the job `Done`.

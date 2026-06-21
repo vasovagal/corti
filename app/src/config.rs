@@ -266,6 +266,17 @@ impl AppConfig {
             _ => "none",
         }
     }
+
+    /// Stable, low-cardinality label for stats records ("aws" | "local" | "none"), distinct from the
+    /// human-readable [`backend_name`]. Feature-gated like backend_name so an uncompiled backend reads
+    /// "none".
+    pub fn backend_label(&self) -> &'static str {
+        match self.transcribe_backend {
+            BackendChoice::Aws if cfg!(feature = "aws") => "aws",
+            BackendChoice::Local if cfg!(feature = "local") => "local",
+            _ => "none",
+        }
+    }
 }
 
 /// Path to the persisted config: a sibling of `queue.db` in `corti_queue::data_dir()`
