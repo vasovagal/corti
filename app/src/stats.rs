@@ -302,14 +302,16 @@ fn sample(app: &tauri::AppHandle, cfg: &SharedConfig) -> StatsSnapshot {
 pub fn spawn_sampler(app: tauri::AppHandle, cfg: SharedConfig, buffer: StatsBuffer) {
     std::thread::Builder::new()
         .name("corti-stats".to_string())
-        .spawn(move || loop {
-            let started = Instant::now();
-            let snap = sample(&app, &cfg);
-            buffer.push(snap);
-            // Steady 1 Hz cadence regardless of sample cost.
-            let elapsed = started.elapsed();
-            if elapsed < Duration::from_secs(1) {
-                std::thread::sleep(Duration::from_secs(1) - elapsed);
+        .spawn(move || {
+            loop {
+                let started = Instant::now();
+                let snap = sample(&app, &cfg);
+                buffer.push(snap);
+                // Steady 1 Hz cadence regardless of sample cost.
+                let elapsed = started.elapsed();
+                if elapsed < Duration::from_secs(1) {
+                    std::thread::sleep(Duration::from_secs(1) - elapsed);
+                }
             }
         })
         .expect("spawning corti-stats sampler thread");

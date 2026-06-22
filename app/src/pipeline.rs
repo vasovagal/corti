@@ -62,7 +62,12 @@ struct Ctx {
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
 /// exits. Holds the [`SharedConfig`] so a Settings save (`PipelineMsg::ReloadConfig`) can rebuild the
 /// backend live.
-pub fn run(app: AppHandle, config: SharedConfig, rx: Receiver<PipelineMsg>, stats: crate::stats::StatsBuffer) {
+pub fn run(
+    app: AppHandle,
+    config: SharedConfig,
+    rx: Receiver<PipelineMsg>,
+    stats: crate::stats::StatsBuffer,
+) {
     let queue = match Queue::open() {
         Ok(q) => q,
         Err(e) => {
@@ -227,7 +232,8 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         Ok((transcript, input)) => {
             // Record the wall-clock of the transcribe (AEC + backend) stage. For the AWS backend this is
             // poll-sleep I/O-wait; for local it is CPU — the backend label lets the panel distinguish them.
-            ctx.stats.record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
+            ctx.stats
+                .record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
             // ADR 0007 (no retention): the capture audio is a **transient** intermediate, kept only long
             // enough to transcribe. Delete it — and the cleaned sibling AEC produced, when distinct — now
             // that the transcript is in hand. Durability/retention are deferred, so nothing keeps these.
@@ -236,7 +242,8 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         }
         Err(e) => {
             // Still record the wall-clock spent before failure (useful for spotting AWS timeouts).
-            ctx.stats.record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
+            ctx.stats
+                .record_stage("transcribe", _t0.elapsed(), ctx.backend_label);
             // Transcription failed — keep the capture audio so a `--redo` can re-run it (AEC has no raw
             // fallback once it runs at capture time; the lossless 2-track on disk is the only copy).
             fail(ctx, id, meta, format!("transcription failed: {e:#}"));
