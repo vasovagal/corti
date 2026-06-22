@@ -52,8 +52,12 @@ pub struct LocalConfig {
     /// Silero VAD speech-probability threshold (0.0–1.0). Default `0.5` (Silero's default). Lower detects
     /// more speech (fewer dropped words, more false positives on noise); higher is stricter.
     pub vad_threshold: f32,
-    /// Silero VAD minimum trailing silence (seconds) before a speech region is closed. Default `0.25`
-    /// (Silero's default). Larger keeps within-utterance pauses together; smaller splits more aggressively.
+    /// Silero VAD minimum trailing silence (seconds) before a speech region is closed. Default `1.0`
+    /// (benchmark-tuned, up from Silero's 0.25). Larger keeps within-utterance pauses together so each ASR
+    /// chunk carries more context (up to the 20 s `MAX_SPEECH_SECONDS` cap); smaller splits more
+    /// aggressively at pauses, fragmenting words across chunk seams. The Planet Money sweep
+    /// (`design/06-benchmark-harness.md`) showed a monotone WER drop 0.25→1.25 (≈ −38 % relative), plateauing
+    /// ~1.0–1.5; 1.0 is the conservative pick capturing essentially all of it.
     pub vad_min_silence: f32,
     /// Far-end diarization speaker count: `-1` (default) auto-estimates via [`Self::diarize_threshold`];
     /// a value `> 0` pins a known speaker count (avoids over/under-clustering, #18) when it is known a priori.
@@ -81,7 +85,7 @@ impl Default for LocalConfig {
             embedding_model: models::DEFAULT_EMBEDDING_ID.to_string(),
             diarize_threshold: 0.5,
             vad_threshold: 0.5,
-            vad_min_silence: 0.25,
+            vad_min_silence: 1.0, // benchmark-tuned (was 0.25); see field doc + design/06-benchmark-harness.md
 
             diarize_num_clusters: -1,
             diarize_min_duration_on: 0.3,

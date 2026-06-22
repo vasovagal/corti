@@ -32,8 +32,11 @@ type Cf = Complex<f32>;
 /// NLMS configuration.
 #[derive(Debug, Clone)]
 pub struct AecConfig {
-    /// Adaptive-filter length in taps (e.g. 4096 ≈ 85 ms of echo at 48 kHz). Also the block hop; the FFT
-    /// size is `2 · filter_len`.
+    /// Adaptive-filter length in taps. Default `8192` (≈ 170 ms at 48 kHz), benchmark-tuned up from 4096:
+    /// the real captured room IR has a ~400 ms reverb tail that a 4096-tap (≈ 85 ms) filter under-models, so
+    /// 8192 roughly doubled synthetic-fixture ERLE and gave a small real-capture gain at trivial cost (see
+    /// `design/06-benchmark-harness.md`). Beyond ~12288 taps the real-world gain reverses (over-fit). Also the
+    /// block hop; the FFT size is `2 · filter_len`.
     pub filter_len: usize,
     /// Step size (≈ 0.1–0.5).
     pub mu: f32,
@@ -68,7 +71,7 @@ impl Default for AecConfig {
     #[allow(deprecated)] // `passes` is deprecated but still a field; set it to keep the struct literal valid.
     fn default() -> Self {
         Self {
-            filter_len: 4096,
+            filter_len: 8192, // benchmark-tuned (was 4096); see field doc + design/06-benchmark-harness.md
             mu: 0.3,
             eps: 1e-6,
             power_smoothing: 0.9,
