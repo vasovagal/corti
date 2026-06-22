@@ -78,7 +78,7 @@ pub struct AppConfig {
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
-    /// AEC adaptive-filter length in taps (`CORTI_AEC_FILTER_LEN`). `None` ⇒ crate default (4096).
+    /// AEC adaptive-filter length in taps (`CORTI_AEC_FILTER_LEN`). `None` ⇒ crate default (8192).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aec_filter_len: Option<usize>,
     /// AEC step size (`CORTI_AEC_MU`). `None` ⇒ crate default (0.3).
