@@ -26,6 +26,8 @@ mod pipeline;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
+mod stats;
+#[cfg(target_os = "macos")]
 mod transcribe;
 #[cfg(target_os = "macos")]
 mod tray;
@@ -58,7 +60,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-mod imp {
+pub(crate) mod imp {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -211,6 +213,7 @@ mod imp {
                 crate::console::get_console_logs,
                 crate::console::get_console_logs_text,
                 crate::console::save_console_logs,
+                crate::stats::get_stats,
             ])
             .setup(move |app| {
                 setup(app, &cfg, console_buffer.clone()).map_err(|e| {
@@ -243,6 +246,11 @@ mod imp {
         // same shared buffer to the webview.
         app.manage(console_buffer);
 
+        // Dedicated COUNT-capped stats ring (separate from the console log ring): the 1 Hz sampler
+        // writes here and the get_stats command reads it. Clone first — manage() consumes one handle.
+        let stats_buffer = crate::stats::StatsBuffer::new();
+        app.manage(stats_buffer.clone());
+
         // Pipeline channel + shared runtime config. Both are created before the tray (its menu summary reads
         // the config via `ConfigState`) and before the worker (which holds the shared config to rebuild its
         // backend when the Settings screen saves).
@@ -261,11 +269,17 @@ mod imp {
         {
             let handle = app.handle().clone();
             let shared_cfg = shared_cfg.clone();
+            let stats = stats_buffer.clone();
             std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
-                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx))
+                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats))
                 .context("spawning pipeline worker")?;
         }
+
+        // 1 Hz stats sampler on its OWN `corti-stats` thread — never on the pipeline thread (guardrail 9).
+        // `shared_cfg` (the outer binding from setup) is still in scope here; the in-block shadow was
+        // block-scoped to the pipeline `{ }` above.
+        crate::stats::spawn_sampler(app.handle().clone(), shared_cfg.clone(), stats_buffer);
 
         // Manual "Webinar mode" handle: owns the live tap-only recorder + a clone of the pipeline channel.
         // Managed after the channel exists and before the detector closure consumes `pipe_tx`.

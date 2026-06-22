@@ -125,3 +125,39 @@ export const getConsoleLogsText = (): Promise<string> => invoke<string>("get_con
 /** Opens a native save dialog and writes the buffer text. Resolves true if written, false if cancelled;
  * rejects with a string on write failure. */
 export const saveConsoleLogs = (): Promise<boolean> => invoke<boolean>("save_console_logs");
+
+// ----- Resource stats (mirror of Rust `stats::*`; serde field names verbatim — no specta in corti) -----
+
+/** Mirror of Rust `stats::ThreadStat`. One OS thread's scheduler-averaged CPU share. */
+export interface ThreadStat {
+  name: string; // thread name (e.g. "corti-pipeline", "corti-stats"); may be "" for unnamed threads
+  cpu_pct: number; // scheduler-averaged CPU %, per-core (Mach cpu_usage permille / 10; decays, not exact)
+}
+
+/** Mirror of Rust `stats::StageSample`. One completed coarse pipeline stage. */
+export interface StageSample {
+  timestamp: string; // ISO-8601 UTC
+  stage: string; // "transcribe" | "file"
+  backend: string; // "aws" | "local" | "none" | "vagus"
+  duration_ms: number;
+}
+
+/** Mirror of Rust `stats::StatsSnapshot`. One 1 Hz sample of process health. */
+export interface StatsSnapshot {
+  timestamp: string; // ISO-8601 UTC, same format as ConsoleEntry.timestamp
+  backend: string; // active transcription backend label ("AWS Transcribe" | "Parakeet (local)" | "none")
+  detector_recording: boolean;
+  webinar_recording: boolean;
+  phys_mb: number; // phys_footprint, mebibytes (MiB)
+  rss_mb: number; // resident set size, mebibytes (MiB)
+  threads: ThreadStat[];
+}
+
+/** Mirror of Rust `stats::StatsReport`. One coherent read of the stats buffer. */
+export interface StatsReport {
+  history: StatsSnapshot[]; // 1 Hz memory/thread samples, oldest first (~5 min ring)
+  stages: StageSample[]; // process-global completed pipeline-stage timings, oldest first (not per-sample)
+}
+
+/** One coherent snapshot of the stats buffer: memory/thread history + global stage timings. */
+export const getStats = (): Promise<StatsReport> => invoke<StatsReport>("get_stats");
