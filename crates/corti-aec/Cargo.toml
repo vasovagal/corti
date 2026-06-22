@@ -10,7 +10,11 @@ rust-version.workspace = true
 [dependencies]
 # Frequency-domain block adaptive filter (overlap-save FDAF) — see design/04-corti-aec.md.
 rustfft = "6"
+# `AecScores` derives Serialize so scores can be emitted as JSON (the aec_file `--json` flag / corti-bench).
+serde.workspace = true
 
 [dev-dependencies]
 # The `aec_file` audition example reads/writes WAVs; tests are pure DSP (std only).
 hound = "3.5"
+# `aec_file --json` serializes AecScores to one JSON line (example-only; not needed by the library).
+serde_json.workspace = true

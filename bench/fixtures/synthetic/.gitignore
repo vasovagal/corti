@@ -1,0 +1,4 @@
+# Regenerable audio artifacts — rebuild via build_synthetic.py.
+# Committed: build_synthetic.py, near.reference.txt, README.md, .gitignore.
+*.wav
+room_ir/*.wav

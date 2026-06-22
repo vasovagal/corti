@@ -1,0 +1,23 @@
+{
+  "mode": "asr",
+  "_comment": "Round 1 ASR/memory sweep over clean 3-min pristine clips. Coordinate-descent: one knob family per run vs the shipping baseline. Metrics: WER (vs aligned reference) + peak RSS + asr_ms.",
+  "fixtures": [
+    {"id": "dough",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.reference.txt"},
+    {"id": "trees",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.reference.txt"},
+    {"id": "hackers", "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.reference.txt"}
+  ],
+  "runs": [
+    {"name": "baseline",   "flags": {}},
+    {"name": "vad_t0.3",   "flags": {"vad-threshold": 0.3}},
+    {"name": "vad_t0.4",   "flags": {"vad-threshold": 0.4}},
+    {"name": "vad_t0.6",   "flags": {"vad-threshold": 0.6}},
+    {"name": "vad_sil0.1", "flags": {"vad-min-silence": 0.1}},
+    {"name": "vad_sil0.5", "flags": {"vad-min-silence": 0.5}},
+    {"name": "blank_p1",   "flags": {"asr-blank-penalty": 1.0}},
+    {"name": "blank_p2",   "flags": {"asr-blank-penalty": 2.0}},
+    {"name": "blank_n1",   "flags": {"asr-blank-penalty": -1.0}},
+    {"name": "beam4",      "flags": {"asr-decoding": "modified_beam_search", "asr-beam": 4}},
+    {"name": "threads2",   "flags": {"threads": 2}},
+    {"name": "threads8",   "flags": {"threads": 8}}
+  ]
+}

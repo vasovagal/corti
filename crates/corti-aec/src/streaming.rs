@@ -241,8 +241,10 @@ impl StreamingAec {
     /// Lock the delay over the warm-up window, run convergence (discarded) + opening re-emit. Transitions
     /// `warming -> false` and frees the warm buffers. Appends the cleaned opening to `out`.
     fn lock_and_emit_opening(&mut self, out: &mut Vec<f32>) {
-        // (1) Lock the delay over the whole warm-up window. max_lag identical to offline cancel() (10 ms).
-        let max_lag = (self.sample_rate as usize * 10) / 1000;
+        // (1) Lock the delay over the whole warm-up window. Search window from cfg.max_lag_ms (default
+        // 10 ms, the legacy hardcoded value). This drives both the live streaming path and the offline
+        // cancel() shim, which is `new_with_lookahead(.., n)` over this same kernel.
+        let max_lag = (self.sample_rate as f32 * self.cfg.max_lag_ms / 1000.0) as usize;
         self.delay = estimate_delay(&self.warm_mic, &self.warm_far, max_lag);
 
         // Prime the far delay line with `delay` zeros (offline's x[delay..] pre-shift analog).

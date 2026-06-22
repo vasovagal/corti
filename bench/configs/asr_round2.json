@@ -1,0 +1,22 @@
+{
+  "mode": "asr",
+  "_comment": "Round 2: stack/refine the round-1 winners (vad_min_silence=0.5 was best, vad_threshold=0.3 second). Explore the min-silence axis and combine with a lower VAD threshold + light blank penalty.",
+  "fixtures": [
+    {"id": "dough",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.reference.txt"},
+    {"id": "trees",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.reference.txt"},
+    {"id": "hackers", "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.reference.txt"}
+  ],
+  "runs": [
+    {"name": "baseline",          "flags": {}},
+    {"name": "sil0.5",            "flags": {"vad-min-silence": 0.5}},
+    {"name": "sil0.4",            "flags": {"vad-min-silence": 0.4}},
+    {"name": "sil0.6",            "flags": {"vad-min-silence": 0.6}},
+    {"name": "sil0.75",           "flags": {"vad-min-silence": 0.75}},
+    {"name": "sil1.0",            "flags": {"vad-min-silence": 1.0}},
+    {"name": "sil0.5_t0.3",       "flags": {"vad-min-silence": 0.5, "vad-threshold": 0.3}},
+    {"name": "sil0.6_t0.3",       "flags": {"vad-min-silence": 0.6, "vad-threshold": 0.3}},
+    {"name": "sil0.5_t0.2",       "flags": {"vad-min-silence": 0.5, "vad-threshold": 0.2}},
+    {"name": "sil0.5_t0.3_blank1","flags": {"vad-min-silence": 0.5, "vad-threshold": 0.3, "asr-blank-penalty": 1.0}},
+    {"name": "t0.2",              "flags": {"vad-threshold": 0.2}}
+  ]
+}

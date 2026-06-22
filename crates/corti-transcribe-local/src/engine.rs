@@ -40,7 +40,18 @@ pub fn resample_to_16k(samples: &[f32], from_hz: i32) -> Result<Vec<f32>> {
 }
 
 /// Build the Parakeet-TDT offline recognizer (CPU by default; `coreml` opt-in via `provider`).
-pub fn build_recognizer(m: &Models, provider: &str, num_threads: i32) -> Result<OfflineRecognizer> {
+///
+/// Decoding overrides are optional: `decoding = None` (and the other `None`s) leaves sherpa-onnx's defaults
+/// untouched (today's greedy path, byte-identical). `Some("modified_beam_search")` + `max_active_paths`
+/// enables beam search; `blank_penalty` tunes the transducer's blank bias.
+pub fn build_recognizer(
+    m: &Models,
+    provider: &str,
+    num_threads: i32,
+    decoding: Option<&str>,
+    max_active_paths: Option<i32>,
+    blank_penalty: Option<f32>,
+) -> Result<OfflineRecognizer> {
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.transducer = OfflineTransducerModelConfig {
         encoder: Some(path_str(&m.parakeet_encoder)),
@@ -51,6 +62,15 @@ pub fn build_recognizer(m: &Models, provider: &str, num_threads: i32) -> Result<
     config.model_config.model_type = Some("nemo_transducer".to_string());
     config.model_config.provider = Some(provider.to_string());
     config.model_config.num_threads = num_threads;
+    if let Some(d) = decoding {
+        config.decoding_method = Some(d.to_string());
+    }
+    if let Some(p) = max_active_paths {
+        config.max_active_paths = p;
+    }
+    if let Some(b) = blank_penalty {
+        config.blank_penalty = b;
+    }
     let started = std::time::Instant::now();
     let rec = OfflineRecognizer::create(&config)
         .context("failed to create the Parakeet recognizer (check model files / provider)")?;
@@ -64,12 +84,19 @@ pub fn build_recognizer(m: &Models, provider: &str, num_threads: i32) -> Result<
     Ok(rec)
 }
 
-/// Build a fresh Silero VAD (stateful — one per channel).
-pub fn build_vad(m: &Models, provider: &str) -> Result<VoiceActivityDetector> {
+/// Build a fresh Silero VAD (stateful — one per channel). `threshold` is the speech-probability cutoff and
+/// `min_silence` the trailing-silence (seconds) that closes a speech region; both default to Silero's
+/// values (0.5 / 0.25) at the [`crate::LocalConfig`] level so behaviour is unchanged unless tuned.
+pub fn build_vad(
+    m: &Models,
+    provider: &str,
+    threshold: f32,
+    min_silence: f32,
+) -> Result<VoiceActivityDetector> {
     let silero = SileroVadModelConfig {
         model: Some(path_str(&m.vad)),
-        threshold: 0.5,
-        min_silence_duration: 0.25,
+        threshold,
+        min_silence_duration: min_silence,
         min_speech_duration: 0.25,
         window_size: VAD_WINDOW as i32,
         max_speech_duration: MAX_SPEECH_SECONDS,
@@ -105,6 +132,9 @@ pub fn build_diarizer(
     provider: &str,
     num_threads: i32,
     threshold: f32,
+    num_clusters: i32,
+    min_duration_on: f32,
+    min_duration_off: f32,
 ) -> Result<OfflineSpeakerDiarization> {
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
@@ -121,13 +151,14 @@ pub fn build_diarizer(
             debug: false,
             provider: Some(provider.to_string()),
         },
-        // Unknown number of far-end speakers → estimate via the clustering threshold (num_clusters < 0).
+        // `num_clusters < 0` (default) estimates the far-end speaker count via the clustering `threshold`;
+        // a value `> 0` pins a known count.
         clustering: FastClusteringConfig {
-            num_clusters: -1,
+            num_clusters,
             threshold,
         },
-        min_duration_on: 0.3,
-        min_duration_off: 0.5,
+        min_duration_on,
+        min_duration_off,
     };
     let started = std::time::Instant::now();
     let diar = OfflineSpeakerDiarization::create(&config)
@@ -307,7 +338,7 @@ mod tests {
                 embedding,
                 vad: PathBuf::new(),
             };
-            let diar = build_diarizer(&m, "cpu", 1, 0.5);
+            let diar = build_diarizer(&m, "cpu", 1, 0.5, -1, 0.3, 0.5);
             assert!(
                 diar.is_ok(),
                 "embedding {id} ({}) failed to load: {:?}",

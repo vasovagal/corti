@@ -1,0 +1,13 @@
+{
+  "mode": "asr",
+  "_comment": "Diarization (opt-in far-end path) on the FULL dough episode (7 real speakers) → cpWER + speaker-count-error vs the full turns.json, plus peak RSS (diarize loads pyannote-seg + TitaNet embedding). Tunes the over-clustering knob (#18): diarize_threshold and the known-count override num_clusters=7. titanet only (the fetched embedding). Full-episode WER here also includes inserted ads (a documented noise floor), so read cpWER/speaker-count, not absolute WER.",
+  "fixtures": [
+    {"id": "dough_full", "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.full.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.reference.txt", "turns": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.turns.json"}
+  ],
+  "runs": [
+    {"name": "diar_base",  "flags": {"diarize": true}},
+    {"name": "diar_t0.3",  "flags": {"diarize": true, "diarize-threshold": 0.3}},
+    {"name": "diar_t0.7",  "flags": {"diarize": true, "diarize-threshold": 0.7}},
+    {"name": "diar_nc7",   "flags": {"diarize": true, "diarize-num-clusters": 7}}
+  ]
+}

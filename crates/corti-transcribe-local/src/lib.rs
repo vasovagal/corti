@@ -49,6 +49,30 @@ pub struct LocalConfig {
     /// Diarization clustering threshold (0.0–1.0) that estimates the far-end speaker count — higher merges
     /// more, lower splits more. Default `0.5` (sherpa-onnx's default); tune to curb over-clustering (#18).
     pub diarize_threshold: f32,
+    /// Silero VAD speech-probability threshold (0.0–1.0). Default `0.5` (Silero's default). Lower detects
+    /// more speech (fewer dropped words, more false positives on noise); higher is stricter.
+    pub vad_threshold: f32,
+    /// Silero VAD minimum trailing silence (seconds) before a speech region is closed. Default `1.0`
+    /// (benchmark-tuned, up from Silero's 0.25). Larger keeps within-utterance pauses together so each ASR
+    /// chunk carries more context (up to the 20 s `MAX_SPEECH_SECONDS` cap); smaller splits more
+    /// aggressively at pauses, fragmenting words across chunk seams. The Planet Money sweep
+    /// (`design/06-benchmark-harness.md`) showed a monotone WER drop 0.25→1.25 (≈ −38 % relative), plateauing
+    /// ~1.0–1.5; 1.0 is the conservative pick capturing essentially all of it.
+    pub vad_min_silence: f32,
+    /// Far-end diarization speaker count: `-1` (default) auto-estimates via [`Self::diarize_threshold`];
+    /// a value `> 0` pins a known speaker count (avoids over/under-clustering, #18) when it is known a priori.
+    pub diarize_num_clusters: i32,
+    /// Far-end diarization minimum speech-on duration (seconds) for a segment. Default `0.3`.
+    pub diarize_min_duration_on: f32,
+    /// Far-end diarization minimum silence-off duration (seconds) between segments. Default `0.5`.
+    pub diarize_min_duration_off: f32,
+    /// ASR decoding method override: `None` (default) keeps sherpa-onnx's default (greedy); `Some("modified_beam_search")`
+    /// switches to beam search (use with [`Self::asr_max_active_paths`]). `None` ⇒ byte-identical to today.
+    pub asr_decoding: Option<String>,
+    /// Beam width for `modified_beam_search` (sherpa `max_active_paths`); `None` keeps sherpa's default.
+    pub asr_max_active_paths: Option<i32>,
+    /// Transducer blank penalty; higher discourages blank (fewer deletions, risks insertions). `None` keeps the default.
+    pub asr_blank_penalty: Option<f32>,
 }
 
 impl Default for LocalConfig {
@@ -60,6 +84,15 @@ impl Default for LocalConfig {
             diarize_far_end: false,
             embedding_model: models::DEFAULT_EMBEDDING_ID.to_string(),
             diarize_threshold: 0.5,
+            vad_threshold: 0.5,
+            vad_min_silence: 1.0, // benchmark-tuned (was 0.25); see field doc + design/06-benchmark-harness.md
+
+            diarize_num_clusters: -1,
+            diarize_min_duration_on: 0.3,
+            diarize_min_duration_off: 0.5,
+            asr_decoding: None,
+            asr_max_active_paths: None,
+            asr_blank_penalty: None,
         }
     }
 }
@@ -91,13 +124,25 @@ impl Transcriber for LocalTranscriber {
         let threads = self.cfg.num_threads;
 
         // One recognizer load per job, shared across both channels.
-        let rec = engine::build_recognizer(&m, provider, threads)?;
+        let rec = engine::build_recognizer(
+            &m,
+            provider,
+            threads,
+            self.cfg.asr_decoding.as_deref(),
+            self.cfg.asr_max_active_paths,
+            self.cfg.asr_blank_penalty,
+        )?;
         let mut segments = Vec::new();
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
         if !track.mic.is_empty() {
             let mic = engine::resample_to_16k(&track.mic, track.sample_rate)?;
-            let vad = engine::build_vad(&m, provider)?;
+            let vad = engine::build_vad(
+                &m,
+                provider,
+                self.cfg.vad_threshold,
+                self.cfg.vad_min_silence,
+            )?;
             let words = engine::transcribe_channel(&rec, &vad, &mic);
             segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
         }
@@ -105,12 +150,24 @@ impl Transcriber for LocalTranscriber {
         // ch1 (system tap) → far end.
         if !track.them.is_empty() {
             let them = engine::resample_to_16k(&track.them, track.sample_rate)?;
-            let vad = engine::build_vad(&m, provider)?;
+            let vad = engine::build_vad(
+                &m,
+                provider,
+                self.cfg.vad_threshold,
+                self.cfg.vad_min_silence,
+            )?;
             let words = engine::transcribe_channel(&rec, &vad, &them);
             if self.cfg.diarize_far_end {
                 // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
-                let diar =
-                    engine::build_diarizer(&m, provider, threads, self.cfg.diarize_threshold)?;
+                let diar = engine::build_diarizer(
+                    &m,
+                    provider,
+                    threads,
+                    self.cfg.diarize_threshold,
+                    self.cfg.diarize_num_clusters,
+                    self.cfg.diarize_min_duration_on,
+                    self.cfg.diarize_min_duration_off,
+                )?;
                 let turns = engine::diarize_channel(&diar, &them);
                 segments.extend(diarize_words(&words, &turns, SEGMENT_GAP, "Them"));
             } else {

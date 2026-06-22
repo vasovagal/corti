@@ -1,0 +1,15 @@
+{
+  "mode": "asr",
+  "_comment": "Round 3: find where vad_min_silence plateaus (it interacts with MAX_SPEECH_SECONDS=20 cap), and whether +vad_threshold=0.3 extends the win.",
+  "fixtures": [
+    {"id":"dough","wav":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.wav","ref":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5844617.sweep.reference.txt"},
+    {"id":"trees","wav":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.wav","ref":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5856509.sweep.reference.txt"},
+    {"id":"hackers","wav":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.wav","ref":"/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/nx-s1-5859441.sweep.reference.txt"}
+  ],
+  "runs": [
+    {"name":"sil1.25","flags":{"vad-min-silence":1.25}},
+    {"name":"sil1.5","flags":{"vad-min-silence":1.5}},
+    {"name":"sil2.0","flags":{"vad-min-silence":2.0}},
+    {"name":"sil1.0_t0.3","flags":{"vad-min-silence":1.0,"vad-threshold":0.3}}
+  ]
+}

@@ -1,0 +1,7 @@
+# Pinned dependencies for the corti bench scoring layer.
+# Created/verified on Python 3.11 (macOS arm64), 2026-06-21.
+jiwer==4.0.0
+meeteval==0.4.3
+numpy==2.4.6
+scipy==1.17.1
+soundfile==0.14.0
