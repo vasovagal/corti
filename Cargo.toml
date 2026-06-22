@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/vasovagal/corti"
@@ -27,16 +27,16 @@ rust-version = "1.96"
 [workspace.dependencies]
 # Internal crates. `version` is required alongside `path` so the crates are publishable to crates.io
 # (publish rewrites path deps to version deps).
-corti-core = { path = "crates/corti-core", version = "0.7.0" }
-corti-vagus = { path = "crates/corti-vagus", version = "0.7.0" }
-corti-coreaudio = { path = "crates/corti-coreaudio", version = "0.7.0" }
-corti-capture = { path = "crates/corti-capture", version = "0.7.0" }
-corti-detect = { path = "crates/corti-detect", version = "0.7.0" }
-corti-transcribe = { path = "crates/corti-transcribe", version = "0.7.0" }
-corti-transcribe-aws = { path = "crates/corti-transcribe-aws", version = "0.7.0" }
-corti-transcribe-local = { path = "crates/corti-transcribe-local", version = "0.7.0" }
-corti-queue = { path = "crates/corti-queue", version = "0.7.0" }
-corti-aec = { path = "crates/corti-aec", version = "0.7.0" }
+corti-core = { path = "crates/corti-core", version = "0.8.0" }
+corti-vagus = { path = "crates/corti-vagus", version = "0.8.0" }
+corti-coreaudio = { path = "crates/corti-coreaudio", version = "0.8.0" }
+corti-capture = { path = "crates/corti-capture", version = "0.8.0" }
+corti-detect = { path = "crates/corti-detect", version = "0.8.0" }
+corti-transcribe = { path = "crates/corti-transcribe", version = "0.8.0" }
+corti-transcribe-aws = { path = "crates/corti-transcribe-aws", version = "0.8.0" }
+corti-transcribe-local = { path = "crates/corti-transcribe-local", version = "0.8.0" }
+corti-queue = { path = "crates/corti-queue", version = "0.8.0" }
+corti-aec = { path = "crates/corti-aec", version = "0.8.0" }
 
 # Shared third-party deps, pinned once here.
 anyhow = "1"
