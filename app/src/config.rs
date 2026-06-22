@@ -138,6 +138,7 @@ impl AppConfig {
             double_talk_ratio: self.aec_double_talk_ratio.unwrap_or(d.double_talk_ratio),
             passes: d.passes,
             suppress_residual: self.aec_suppress_residual.unwrap_or(d.suppress_residual),
+            max_lag_ms: d.max_lag_ms,
         }
     }
 }
