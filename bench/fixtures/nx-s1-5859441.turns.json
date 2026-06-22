@@ -1,0 +1,594 @@
+[
+  {
+    "speaker": "ANNOUNCER",
+    "text": "This is Planet Money from NPR."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "On Friday, if all goes according to plan, representatives from the US and Iran will meet in Geneva to sign another 60-day ceasefire agreement. But the two sides still have not come to an agreement on what's been at the heart of this war and decades of conflict, Iran's development of nuclear weapons."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Right. This conflict has been on-again, off-again for years. And while the most recent iteration has been very violent with bombs and blockades, there is a whole other almost entirely invisible war that the US and allies have been waging with Iran using cyber espionage, or, more accurately, cyber sabotage-- you know, computer viruses, malware. Recently, we heard a story about a piece of malware that might have been used in this invisible war that was diabolically cunning because it exploited weaknesses in computers, yes, but also, maybe in the human psyche. The more I think about it, the more I think this must have driven people insane. But it also might have saved the world from nuclear destruction."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "We heard about this hack from someone whose job it is to identify computer hacks that could be a threat to all of us."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "What's your name? What do you do?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "My name is Juan Andres Guerrero-Saade, which is why everybody calls me Jags."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "J-A-G-S, Jags. His initials are shorter and cooler."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, actually, he is a pretty cool guy. He's got a fauxhawk, sleeves of tattoos. He was on track to go get a PhD in philosophy, but now?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "I'm a security researcher, who, I think, would be the simplest term. I think some folks would say cyber-paleontologist."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Cyber-paleontologist, like he digs for the remnants of cyber-attacks. Jags works for a cybersecurity company called SentinelOne. It helps big companies like Samsung and the Golden State Warriors and the government protect their computers and networks."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, hacking is a whole industry. And defending against hacks is this whole other industry. Jags just so happens to have the raddest job of all, which is dusting off old malware files buried deep on servers, and reverse-engineering how hackers got into systems in the first place, and what they did when they got there, so he can figure out how to defend against similar attacks in the future."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "And Jags is kind of a big deal. There are actually a couple of pieces in the International Spy Museum in DC based on his cyber-paleontology work."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Ah, this is a little crude, but in the Jurassic Park movie, which paleontologist are you?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "As long as you don't immediately default to Jeff Goldblum and--"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "I was going to go Jeff Goldblum!"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "But I think that he is, like, a chaos theory mathematician, which I think fits the bill, right? I-- what the hell do I actually know about paleontology?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Right."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "We met up with Jags because we wanted to get a peek into the invisible war, because Jags has made a stunning discovery of a highly specialized, highly sophisticated cyber-weapon."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Often, these weapons don't even get detected. If they do, it's not usually until years later, when someone like Jags comes across an old fragment and tries to reconstruct what top-secret mission the weapon was designed to carry out."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "For Jags, the fragment he found wasn't even a piece of code. It was just six words. It came from a leaked list of malware from the NSA."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, the list came from this tool the NSA had meant to help NSA operators, while they were hacking into some computer in enemy territory, figure out whether some other hacker was already there, and if so, whether they were friends or foes."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Essentially, it'll run all these checks, and it's going to give the operators-- it's going to give a list of instructions of saying, hey, look, suspicious thing here. We don't know what that is. Known malware-- pull back."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Like little warning signs. And this was a budding cyber-paleontologist's dream. Each piece of malware on that list had the potential to teach you so much about how the world's top hackers were getting the job done. And maybe one would turn out to be an incredibly sophisticated cyber weapon."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags, with great excitement, got a hold of this list and started scouring it for something he should start digging into. And one item screamed, look here."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "There's one, just one line that's, like, completely different to all the other ones."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "OK."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "And it just says, \"Fast16. Nothing to see here, carry on.\""
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "In all caps?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "That's it. There's nothing else like it."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Fast16 was what the NSA was calling the malware, and the cryptic instruction the agency was giving its operators-- not seek help or pull back, simply, nothing to see here, carry on."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "You can't put that there. Like, it was, like, catnip, right? It felt like bait. We couldn't let it go. I couldn't let it go."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "He didn't let it go. He had to know what this thing was. What did it do? What was its target? The NSA seemed to know about it, but who made it? And what was so top, top, top secret that the NSA was resorting to Jedi mind tricks to try to keep its own people in the dark?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "At this point, Jags just had the name of this malware, Fast16, just a tibia. But he was able to use that to dig up the rest of the bones. Basically, he rummaged around this, like, public library of suspected malware until he found it. And eventually, he was able to put together the pieces of the skeleton that is Fast16. But still, when you try to reverse-engineer it to understand what its secret mission was, he couldn't."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "I worked these, like, cracked out nights. And very often, I'll run into something. I'm like, oh, my god, I found this amazing thing. And then by the morning, you're like, no, this doesn't work."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "We call this the Valley of Despair."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Oh, yes, I have built a home in the Valley of Despair. I'm in the process of gentrifying the Valley of Despair, if any of you would like to join me there."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "After many, many fruitless nights, weeks, months, Jags had to turn to other projects and had to put Fast16 down. But to remind him of what was not solved, he inked Fast16 on his skin forever."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Fast16 has been on the back of my arm for a while now."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "You got it tattooed? Oh, yeah. Where is Fast16?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "It's here. You can see Fast16 and then, \"Nothing to see here, carry on.\""
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Nothing to see here, carry on. Hello, and welcome to Planet Money. I'm Nick Fountain."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "And I'm Erika Beras. Today on the show, Nothing to See Here. Carry On."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, Jags sets out to solve the mystery of Fast16 and finds a cyberweapon with the potential to chip away at our very grasp of reality. So what was this mysterious piece of malware that was so secret that the NSA was using Jedi mind tricks to try to keep their people away from it and so enticing that security researchers, or at least one overcaffeinated, keyboard-wielding security researcher got it tattooed on his tricep?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Theoretical tricep, yes."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags, said researcher, was pretty blocked, but he knew he had to keep at it, because he had a hunch that Fast16 might reveal important details about that invisible side of the conflicts we read about every day, like back when security researchers discovered a cybersabotage operation that blew everyone's mind. It was called Stuxnet."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, Stuxnet is kind of the mother of all cybersabotage operations."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "In many ways, my industry is birthed by the discovery of Stuxnet."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "For those not familiar, Stuxnet was this absolutely bonkers hacking operation that reportedly slowed down Iran's nuclear program back in the mid-2000s. And to hear Jags describe it, it totally redefined what was possible."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "So before Stuxnet, if you went to these antivirus conferences with a lot of fun gals and guys, the possibility of cyber espionage was discussed as that, as a possibility."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "It was theoretical."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "It was theoretical. There were--"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Wouldn't it be cool? This might be happening."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Yeah, you're like, there's no way, people won't. There's value there, of course. And then, you know, Stuxnet is discovered, and you realize, not only has this been happening and at a scale and capacity way above anything we'd ever found before, but it's been happening for years."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "What had been happening was that Israel and the US, allegedly, had used cyberweapons to destroy real-world, physical things. They did this by managing to get a thumbdrive into Iran and inserting malware into the computer network at the heart of their uranium enrichment program, the system that controlled the centrifuges."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And Stuxnet was very, very clever. It spread throughout the network and carefully noted how everything looked when it was working normally, saved that, and then gave the centrifuges instructions to go haywire, speeding up and slowing down and braking, all while making everything in the computer system look A-OK. It looked normal."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "So the operators are hearing that these things are, like, making these weird noises. They're spinning up. They sound like-- it sounds like things aren't going well in this room next door. But I'm looking at the computer, and the computer tells me everything's normal."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "All in all, Stuxnet reportedly destroyed a fifth of all the centrifuges that Iran was using. It led to nuclear scientists getting fired. And most importantly, it is widely believed to have slowed down Iran's nuclear program."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And to the cyber-paleontologists of the world like Jags, when the bones of Stuxnet were dug up, they revealed this whole new age of cyberwarfare. But Jags always believed that Stuxnet was just a hint of what was out there."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Just a tibia."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Clearly, we didn't even know about all the different things they were doing."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "So year after year, Jags remained committed to figuring out his white whale, figuring out the puzzle of Fast16. Who made it? Who were they targeting? What exactly were they doing to that target, and how? But he didn't make much progress until earlier this year for a very this-year reason-- AI."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, here's why. Jags heads a big team of researchers at his cybersecurity firm. And like everyone else these days, he was wondering, could these new AI tools help us in our jobs? Could they do our jobs? Could they do a job that was so hard, even I, Jags, couldn't do it? Could they solve the puzzle that is Fast16?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "There is no public guide to solving it. If it's going to figure it out, it's going to have to figure it out just in this little sandbox with a few tools and go, all right, kid, like, what can you do?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags sent a colleague to oversee these AI tests. That colleague was Vitaly Kamluk, a Belarusian cybersecurity researcher who also has a fauxhawk. He lives in Singapore and, according to Jags, is very zen-like."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And Jags says Vitaly, like any self-respecting human, he decided to, John Henry-style, try to beat the machines."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "I, being put in that position, would have said, cool, let's go make the AI sweat. And Vitaly, being a much more patient, zen master-style dude, he said, well, if I'm going to know if it's doing well, I need to know what this thing does. And Vitaly spent, like, two weeks in a black dark hole somewhere, not answering messages, nothing. I was like, is this guy OK? Like, what happened to Vitaly? And all of a sudden, I get from Vitaly super late, I guess, for him."
+  },
+  {
+    "speaker": "KAMLUK",
+    "text": "Yeah, yeah, it was, like, about 1:00 AM or so."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "And he's like, hey, man, like, I need to talk."
+  },
+  {
+    "speaker": "KAMLUK",
+    "text": "Jags, yeah, we need to talk."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "This, of course, is Vitaly Kamluk, reverse-engineering legend."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "He describes you as zen-like. Do you think that's fair?"
+  },
+  {
+    "speaker": "KAMLUK",
+    "text": "Zen-like?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yes."
+  },
+  {
+    "speaker": "KAMLUK",
+    "text": "Does it make me more peaceful and simple? I hope so, but--"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "But on this call, he was not very zen-like. Vitaly said he'd done the reverse-engineering, and he'd had the AI models double and triple-check his work. And now, Jags says, he seemed pretty disturbed."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "He's like, look, I need you to test me here. But like, all the models, at least, agree with me, so I now need to talk to a human being. This is Stuxnet-like. And I hear that kind of nonsense from students, right? Like, you know, I hear this kind of-- I'm like a lightning rod. Anybody in this industry is a lightning rod for, like, DMs from people clearly having, like, schizophrenic episodes of, like, the government's spying on me. So you hear this kind of stuff all the time. When you hear it from Vitaly, who's a very measured person, it makes you take pause, and you go, OK, what are you talking about? What do you mean?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Vitaly explained, they're from the same era, the mid-2000s. And even though they don't share any code, they seem to share similar architecture. But Vitaly couldn't figure out what exactly Fast16's mission was, only that it targeted the part of a computer that did complex math."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Think of it as, like, floating point math, like the really, really details-based, hard calculation stuff that most of the time, you never deal with. And I've never run into a piece of malware that does that."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags says he's never seen malware that messed with high-precision math. Most spy malware is designed to steal data, or, like in Stuxnet, make things go haywire. But this one was basically telling the computer, 2 plus 2 equals 5."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "So at this point, Jags had found Fast16 buried in a cyberlibrary based on a hunch that it was something to pay attention to. And Vitaly had confirmed it was, because who messes with math? And maybe more importantly, whose math were they messing with?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Who is running high-precision calculations back in 2005, doing something so interesting that it got somebody to build a super-specific, custom piece of malware to modify and mess with their workloads? Everything about this thing screams special. Like, it screams unique. It screams groundbreaking. And I think what's most excruciating about it is that the mystery won't yield. Like, you just kind of have to keep pushing and say, OK, why?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "After the break--"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "OK. I guess we're back to the trenches of, like, OK, how do we nail this thing?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "--Jags puts all the pieces together. So Jags and Vitaly, still separated by a 12-hour time difference, set out to answer their next question-- whose math was Fast16 designed to target?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And pretty quickly, they come upon a major clue by looking at a rules engine embedded in Fast16's code, like, a list of instructions, basically if-then rules. If Fast16 sees something happen on a computer--"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Then it goes, oh, I've recognized this thing. What does my rule engine say? Oh, if I find this thing, then I need to change these 6 bytes into these 6 other bytes. If I find this thing, then I need to set this thing back into whatever the old value was. If I find this thing-- right? But what the hell do those 6 bytes represent?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "So they start scanning old systems and software from way back in the day, looking for those strings of bytes. Jags says it was like looking through a mathematician's notebook of scribbles for a particular string of numbers, which is not easy. And it's not like old code just exists out in the wild. But eventually, they do find a few pieces of software that contain some of those same strings of 6 bytes, which all had to do with complex physics modeling, like how to design a car that'll crumple safely when it crashes or a bridge that will withstand an earthquake."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "For Vitaly, the idea that someone was targeting calculations that were supposed to keep us safe was incredibly disturbing."
+  },
+  {
+    "speaker": "KAMLUK",
+    "text": "Like, do they have limits, really? Like, is this a new type of evil ideas? I felt that the target was scientists, civil engineers, corrupt their calculation results. And that would eventually produce risks for lives of others. So I was terrified. Like, why would people do that?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Very soon, they had a breakthrough that kind of answered the question. Jags was searching around for one of those pieces of software. It's called LS-DYNA. It's short for Livermore Software Dynamic Analysis."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Something that I run into right away as I'm looking up LS-DYNA, is this report by the good ISIS."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "The good ISIS?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "That's what they call themselves. I don't know what ISIS stands for. It's some kind of think tank, the good ISIS."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Institute for--"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "For something or other. And the good ISIS has this report saying, if you look back at this research that Iranian scientists have been publicly putting out, you can see that they were using software that they shouldn't have been using."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "They knew that these guys had this piece of software, LS-DYNA?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Yeah, and what's interesting is the example they put for LS-DYNA is trying to figure out the right explosive materials for nuclear payloads."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "In other words, this documentation from the Institute of Science and International Security seemed to suggest that the software Fast16 was supposed to mess with was being used by Iranian nuclear scientists to maybe design nuclear bombs."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "So that was the software that the Fast16 malware was likely targeting, telling it, if you find these bytes, change them to these other ones. But why change those specific bytes? What would changing the math in this software achieve?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "To solve that part of the puzzle, they had to get their hands on that software the Iranian scientists were using, a very bespoke piece of physics modeling software released decades ago, very much not on the App Store."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Did you pay for it?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "No, you can't buy it. You can't just buy it. And moreover, people don't love it when you're like, hey, do you happen to have a copy of your software from 21 years ago? They're like, why? Don't worry about it. Don't worry about it. Just-- you know, so you gotta get your hands on this thing somehow."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And Jags and Vitaly did. And what they found was that Fast16 was designed to hide in scientists' computers and do nothing, basically to keep watch, to wait for LS-DYNA to get installed. At that point, it would stay low-key until it saw the computer doing these very specific tests that only someone developing a nuclear warhead would be doing. It had to do with the pressure calculations to simulate a nuclear explosion. And that is when Fast16 would do its mayhem. At the point when the engineers got near the pressure they needed, Fast16 would throw those calculations off by changing the math, the old 2 plus 2 equals 5 trick."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "And furthermore, it was designed to spread from computer to computer."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "The idea being that if you-- if I come to this computer and I run this simulation workload and go, hey, those results don't look right, let's go try this other computer, and you go and you run it in the other one, that, too, will give you the right wrong answer."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "The exact same wrong answer."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Exactly. And so the idea was to drive these people nuts, right? Like, you go, and, like, it's right math, wrong answer, right formula, wrong answer over and over, everywhere you go. And you probably don't know that it's wrong until you then go and try to do another thing with it. And you go, damn it, this thing is not working."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Right? Like, it's devious. And the cunning of this attack is truly fascinating. Because at some point, I think, before you ever consider that the computers are wrong--"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "--you almost certainly look at these scientists and go, maybe you guys are clowns. Maybe you guys don't know what the hell you're doing."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags and Vitaly were flabbergasted by the sophistication and the technical prowess of this malware from decades ago. Not just the coding parts, but also the deep knowledge of nuclear physics."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And after so many late nights of being haunted by Fast16, Jags and Vitaly were finally able to announce in April of this year that Fast16, which they'd started looking into on a hunch, was, indeed, a major cyber weapon whose mission seemed like it was to sabotage Iran's nuclear development program. Was it worth the wait?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Oh, absolutely. I mean, walking around with this, like, bag of open questions, right?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Yeah, there are still some unknowns. Number one, we don't know definitively that this was targeting Iran. For example, North Korea also had nuclear ambitions at that time."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "You look back, and you go, well, North Korea was having a whole lot of problems with their missile program back then. We don't know where all of these things were being used. We just know of one target that they definitely used this kind of stuff against, which is Iran."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "You're that confident?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Look, let's put it a different way, right? We've never, ever, ever, ever, ever, ever, ever heard of anybody doing this kind of cybersabotage anywhere for anything other than the Iranian nuclear program in the same era as when Fast16 is developed."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Thing number two we don't know-- who did this. It has echoes of Stuxnet, which is widely reported to have been deployed by the US and Israel. But when we reached out to the NSA and the CIA and the Israeli Defense Forces and asked them, was Fast16 you, they didn't deny it."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "They didn't confirm it either."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, that's true, too. The IDF never got back to us. And the others said, basically, sorry, but we have nothing to offer you on this."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Jags, for his part, also checked in with them."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Before you publish, do you reach out to the US and Israeli intelligence community and ask them, are we going to blow your cover?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Yeah. Yeah, but I won't go too far into that, right? Like, most of the time, we are good collaborators and good friends."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Do these meetings happen in person?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "No."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Was there any pushback this time?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "No."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Meaning, we're not worried about you blowing our cover, you weird paleontologist. This stuff is 20 years old."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Right. And the third thing we don't know is why the NSA wrote, in reference to Fast16, the instructions, \"Nothing to see here, carry on.\" Was that, like, with a wink?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "One day, when this stuff is declassified, we might get an answer to all three of those questions. But we're much less likely to figure out, did Fast16 change history? Jags says he's sure it was deployed because he couldn't have found it otherwise. But like, did it slow down Iran's or someone's nuclear program? Did it bring them to the bargaining table?"
+  },
+  {
+    "speaker": "BERAS",
+    "text": "Yeah, did it prevent nuclear war?"
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "And the last enduring mystery, how did Fast16 mess with the minds of the scientists who encountered it? Like, I have this picture in my head of the nuclear scientists in Iran working on this project of intense national significance. Presumably, their boss's boss was constantly giving updates to Iran's president or the Ayatollah. And these scientists would have been doing their experiments right and then, infuriatingly, getting the wrong answer. Is epistemological warfare what you would call this?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "If I had called it that, they would have said, oh, I was just being pretentious. I wouldn't have allowed myself that as a repentant philosopher."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Yeah, but as a repentant philosopher?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Yeah, sure. I think epistemological warfare is a fascinating way to frame it."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Break that out a little for me."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "Well, I think the-- we take for granted how much we take for granted. Certainty-- people think that certainty is a matter of coherent deduction, that somehow, you're sitting here, and you have this perfect, cohesive worldview. That's not actually how it works. That's not how anything works. If you questioned everything in your life, you would be paralyzed, right? If you questioned that when you, you know, get out of bed, you don't know if, like, the floor is going to hold you, right, you wouldn't be able to function."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Jags told us about an interaction he recently had with Vitaly that kind of brings this home. They were in Singapore, where Vitaly lives, on their way to a hacker conference to present their Fast16 research."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "He gets us on a train, and he goes, oh, look, it's a driverless train. The train just, you know-- and I can't remember. We were talking about something to do with Fast16. He stops, and he goes, I mean, this is precisely the kind of system that you would degrade with this kind of attack. You know, there was a collision, and they said there was no cyberattack involved. And then we looked at each other, and we go-- you know, you kind of shrug, and you go, well, as far as we know."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Right. What I find fascinating is that these experts who spend their lives staring at computers, who know their capabilities more than anyone, are also some of the most skeptical people when it comes to trusting computers. Does that ever get to you?"
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "No."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Oh."
+  },
+  {
+    "speaker": "GUERRERO-SAADE",
+    "text": "No, I-- I don't know. I'm telling you, man, I'm not wired quite the right way."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "To me, questioning everything does seem paralyzing, but they seem well-attuned to life in the computer age, life in the time of epistemological warfare. If you are an intelligence operative who has info on a clandestine operation and want to tell me about it, you can reach me at-- you know. Who am I kidding? You know how to find me."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "And if you live outside the United States, we also need your help. For Planet Money summer school, we are scouring the world for the most interesting, surprising economic ideas that should spread. Think, like, a different way to do taxes, a mega-project that came in under budget. Somehow, rent is cheap. Get in touch, and tell us about an idea the world should know about. Email us at planetmoney@npr.org, and put Summer School in the subject. We might use your idea on the podcast. This episode was produced by Willa Rubin and edited by Marianne McCune. It was fact-checked by Charlotte Isidore and engineered by Kwesi Lee. Alex Goldmark is our executive producer."
+  },
+  {
+    "speaker": "FOUNTAIN",
+    "text": "Special thanks to the research team at Symantec, who also dug into Fast16, Andy Greenberg from Wired, who broke the story, Kim Zetter, who wrote the definitive book about Stuxnet, and David Albright of-- and I can't believe I'm saying this-- the good ISIS, which, now, I know, stands for the Institute for Science and International Security. Jags has a podcast with also a funny name. It's called the Three Buddy Problem. I'm Nick Fountain."
+  },
+  {
+    "speaker": "BERAS",
+    "text": "And I'm Erika Beras. This is NPR. Thanks for listening."
+  }
+]

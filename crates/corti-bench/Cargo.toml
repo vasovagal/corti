@@ -1,0 +1,35 @@
+[package]
+name = "corti-bench"
+description = "Benchmark + tuning harness for corti: parameterized offline AEC + local transcription emitting JSON metrics, plus serial-locked 2-track capture. Drives the Planet Money optimization sweep (design/06-benchmark-harness.md). Apple-Silicon/macOS, not published."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "corti-bench"
+path = "src/main.rs"
+
+[dependencies]
+# Drive the LOCAL pipeline directly (AWS is intentionally out of scope for the harness).
+corti-core = { workspace = true }
+corti-transcribe = { workspace = true }
+corti-transcribe-local = { workspace = true }
+corti-aec = { workspace = true }
+corti-capture = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# WAV I/O (same version the rest of the workspace links).
+hound = "3.5"
+# The harness is the one place we allow a real arg parser (the shipping bins hand-roll args by policy).
+clap = { version = "4", features = ["derive"] }
+# flock(2) for the single-experiment lock (one Mac → one experiment at a time).
+libc = "0.2"

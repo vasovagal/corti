@@ -1,0 +1,13 @@
+# NO clean 5-minute reference exists for this episode.
+#
+# The NPR transcript is full-episode and UNTIMED, so it cannot be reliably
+# sliced to the [120s, 420s) audio window in nx-s1-5859441.5min.wav.
+#
+# For scoring:
+#   * FAST SWEEP / relative ranking -> transcribe nx-s1-5859441.5min.wav, but score only
+#     against the full-episode reference as a loose signal, OR hand-align a window
+#     once and cache it. Use 5min WAVs for parameter ranking, not absolute WER.
+#   * ABSOLUTE WER / cpWER -> transcribe nx-s1-5859441.full.wav and score against
+#     nx-s1-5859441.reference.txt (running text) and nx-s1-5859441.turns.json (per-speaker turns).
+#
+# See README.md ("Scoring targets").

@@ -1,0 +1,30 @@
+{
+  "mode": "aec",
+  "_comment": "AEC sweep on the real-room-IR synthetic fixtures. echoonly = pure dB-ERLE; doubletalk = ERLE + near-end preservation. The real captured delay is ~24 ms, so max_lag_ms (default 10) is the prime suspect.",
+  "fixtures": [
+    {"id": "echoonly",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/synthetic/echoonly.wav"},
+    {"id": "doubletalk", "wav": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/synthetic/doubletalk.wav", "near": "/Users/xlange/code/vasovagal/corti-worktrees/bench-harness/bench/fixtures/synthetic/near.wav"}
+  ],
+  "runs": [
+    {"name": "baseline",        "flags": {}},
+    {"name": "maxlag15",        "flags": {"max-lag-ms": 15}},
+    {"name": "maxlag20",        "flags": {"max-lag-ms": 20}},
+    {"name": "maxlag25",        "flags": {"max-lag-ms": 25}},
+    {"name": "maxlag30",        "flags": {"max-lag-ms": 30}},
+    {"name": "maxlag40",        "flags": {"max-lag-ms": 40}},
+    {"name": "filter8192",      "flags": {"filter-len": 8192}},
+    {"name": "filter16384",     "flags": {"filter-len": 16384}},
+    {"name": "mu0.5",           "flags": {"mu": 0.5}},
+    {"name": "mu0.7",           "flags": {"mu": 0.7}},
+    {"name": "psmooth0.95",     "flags": {"power-smoothing": 0.95}},
+    {"name": "psmooth0.85",     "flags": {"power-smoothing": 0.85}},
+    {"name": "dtr1.5",          "flags": {"double-talk-ratio": 1.5}},
+    {"name": "dtr3.0",          "flags": {"double-talk-ratio": 3.0}},
+    {"name": "supp3.5",         "flags": {"suppress-residual": 3.5}},
+    {"name": "nosupp",          "flags": {"no-suppress": true}},
+    {"name": "maxlag30_f8192",  "flags": {"max-lag-ms": 30, "filter-len": 8192}},
+    {"name": "maxlag30_mu0.5",  "flags": {"max-lag-ms": 30, "mu": 0.5}},
+    {"name": "maxlag30_f8192_mu0.5", "flags": {"max-lag-ms": 30, "filter-len": 8192, "mu": 0.5}},
+    {"name": "maxlag30_f16384_mu0.5_supp3.5", "flags": {"max-lag-ms": 30, "filter-len": 16384, "mu": 0.5, "suppress-residual": 3.5}}
+  ]
+}

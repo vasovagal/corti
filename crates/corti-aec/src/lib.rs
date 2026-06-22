@@ -56,6 +56,12 @@ pub struct AecConfig {
     /// suppresses per-bin residual using a spectral-subtraction gain: G = max(1 − α·|Y|²/|E|², floor). Set 0
     /// to disable. Typical range 1.5–4.0; higher → more aggressive (risks near-end distortion).
     pub suppress_residual: f32,
+    /// Delay-search window (milliseconds) for [`estimate_delay`]: the bulk speaker→mic acoustic delay is
+    /// searched in `[0, sample_rate · max_lag_ms/1000)` samples. Default 10.0 ms (≈480 samples at 48 kHz),
+    /// which is the legacy hardcoded window — keep it to reproduce prior behavior bit-for-bit. Raise it for
+    /// rooms with a longer propagation delay; a wider window costs a slightly larger delay-FFT and admits
+    /// more spurious-peak risk.
+    pub max_lag_ms: f32,
 }
 
 impl Default for AecConfig {
@@ -69,6 +75,7 @@ impl Default for AecConfig {
             double_talk_ratio: 2.0,
             passes: 2,
             suppress_residual: 2.5,
+            max_lag_ms: 10.0,
         }
     }
 }

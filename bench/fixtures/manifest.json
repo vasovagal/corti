@@ -1,0 +1,69 @@
+{
+  "source": "NPR Planet Money",
+  "rss": "https://feeds.npr.org/510289/podcast.xml",
+  "episodes": [
+    {
+      "id": "nx-s1-5844617",
+      "title": "There's no business like dough business",
+      "mp3_url": "https://npr.simplecastaudio.com/43b5acee-463e-4612-95ad-d2596d9dd337/episodes/d93bd302-5976-4583-98ac-3ebc7799c321/audio/128/default.mp3/default.mp3_ywr3ahjkcgo_b74019da861de4d091d518847a2552d9_30088536.mp3",
+      "mp3_sha256": "14ed4b0e347a0659f30eb16247b93f252c27767c1f08eaef0de63d7be86dd751",
+      "duration_s": 1880.529,
+      "transcript_url": "https://www.npr.org/transcripts/nx-s1-5844617",
+      "speaker_count": 7,
+      "speakers": [
+        "ALAM",
+        "ANNOUNCER",
+        "FISCHER",
+        "GOLDMAN",
+        "HOROWITZ-GHAZI",
+        "KRONFELD",
+        "YATES"
+      ],
+      "ref_word_count": 4777,
+      "turn_count": 106,
+      "excerpt_start_s": 120,
+      "excerpt_len_s": 300
+    },
+    {
+      "id": "nx-s1-5856509",
+      "title": "It's my tree. Why can't I cut it down?",
+      "mp3_url": "https://npr.simplecastaudio.com/43b5acee-463e-4612-95ad-d2596d9dd337/episodes/4f5c11ea-4513-45e7-b3d2-daa362e5bdfb/audio/128/default.mp3/default.mp3_ywr3ahjkcgo_e00c17e3a13dcf4db52cad6b39683683_28061016.mp3",
+      "mp3_sha256": "27ed49accb7944dda2e1c691b826fab067559be5180aca3f638a5c23c6193c60",
+      "duration_s": 1753.809,
+      "transcript_url": "https://www.npr.org/transcripts/nx-s1-5856509",
+      "speaker_count": 6,
+      "speakers": [
+        "ANNOUNCER",
+        "ARONCZYK",
+        "BOND",
+        "GRAHAM-HUDAK",
+        "GUO",
+        "WELDON"
+      ],
+      "ref_word_count": 4509,
+      "turn_count": 123,
+      "excerpt_start_s": 120,
+      "excerpt_len_s": 300
+    },
+    {
+      "id": "nx-s1-5859441",
+      "title": "Can computer hackers get inside your mind?",
+      "mp3_url": "https://npr.simplecastaudio.com/43b5acee-463e-4612-95ad-d2596d9dd337/episodes/90de8e2e-0f97-48f2-95d3-caee255b1414/audio/128/default.mp3/default.mp3_ywr3ahjkcgo_5f0fadc72e6c18f51c8052b437693138_31969353.mp3",
+      "mp3_sha256": "46502e79ebe4cf1d5abbee561adf32a55eb81623e65f0b040a50d996a4f44303",
+      "duration_s": 1998.08,
+      "transcript_url": "https://www.npr.org/transcripts/nx-s1-5859441",
+      "speaker_count": 5,
+      "speakers": [
+        "ANNOUNCER",
+        "BERAS",
+        "FOUNTAIN",
+        "GUERRERO-SAADE",
+        "KAMLUK"
+      ],
+      "ref_word_count": 4529,
+      "turn_count": 148,
+      "excerpt_start_s": 120,
+      "excerpt_len_s": 300
+    }
+  ]
+}

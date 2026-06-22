@@ -14,16 +14,18 @@
 //! wall-clock time so you can confirm it runs far faster than real time, then A/B the channels with
 //! `afplay` (split with the `corti-coreaudio` `splitwav` example).
 //!
-//! Pass `--score` to also print echo suppression / near-end preservation metrics.
+//! Pass `--score` to also print echo suppression / near-end preservation metrics, or `--json` to print
+//! those metrics plus the true dB-ERLE as one machine-readable JSON line (for the corti-bench harness).
 
 use std::path::PathBuf;
 use std::time::Instant;
 
+use corti_aec::score::{AecScores, erle_db};
 use corti_aec::{AecConfig, cancel};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (cfg, score, input) = parse_args(&args)?;
+    let (cfg, score, json, input) = parse_args(&args)?;
 
     let mut reader = hound::WavReader::open(&input)?;
     let spec = reader.spec();
@@ -44,8 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
 
-    println!(
-        "config: filter_len={} mu={} eps={:.0e} power_smoothing={} double_talk_ratio={} passes={} suppress_residual={}",
+    // `--json` mode emits exactly one JSON line on stdout; keep the human-readable config/timing chatter
+    // off stdout so the JSON stays cleanly parseable. (Route it to stderr.)
+    macro_rules! info {
+        ($($arg:tt)*) => {
+            if json { eprintln!($($arg)*) } else { println!($($arg)*) }
+        };
+    }
+
+    info!(
+        "config: filter_len={} mu={} eps={:.0e} power_smoothing={} double_talk_ratio={} passes={} suppress_residual={} max_lag_ms={}",
         cfg.filter_len,
         cfg.mu,
         cfg.eps,
@@ -53,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.double_talk_ratio,
         cfg.passes,
         cfg.suppress_residual,
+        cfg.max_lag_ms,
     );
 
     let started = Instant::now();
@@ -60,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = started.elapsed();
 
     let dur = mic.len() as f32 / spec.sample_rate as f32;
-    println!(
+    info!(
         "AEC: {} frames ({dur:.1}s @ {} Hz) cleaned in {:.3}s ({:.0}× real-time)",
         mic.len(),
         spec.sample_rate,
@@ -68,12 +79,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dur / elapsed.as_secs_f32().max(1e-6),
     );
 
-    if score {
+    if score || json {
         let s = corti_aec::score::score(&mic, &tap, &clean, spec.sample_rate);
-        println!(
-            "score: echo_suppression={:.3} near_end_preservation={:.3} combined={:.3}",
-            s.echo_suppression, s.near_end_preservation, s.combined,
-        );
+        // No clean near-end reference for an offline 2-track pair, so erle_db treats the scored span as
+        // echo-only (its documented `near_ref == None` assumption).
+        let erle = erle_db(&mic, &clean, &tap, spec.sample_rate, None);
+        if json {
+            let scores = AecScores {
+                echo_suppression: s.echo_suppression,
+                near_end_preservation: s.near_end_preservation,
+                combined: s.combined,
+                erle_db: erle,
+            };
+            println!("{}", serde_json::to_string(&scores)?);
+        } else {
+            println!(
+                "score: echo_suppression={:.3} near_end_preservation={:.3} combined={:.3} erle_db={:.1}",
+                s.echo_suppression, s.near_end_preservation, s.combined, erle,
+            );
+        }
     }
 
     let stem = input
@@ -94,13 +118,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         writer.write_sample(tap.get(i).copied().unwrap_or(0.0))?;
     }
     writer.finalize()?;
-    println!("wrote {}", out.display());
+    info!("wrote {}", out.display());
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> Result<(AecConfig, bool, PathBuf), Box<dyn std::error::Error>> {
+fn parse_args(
+    args: &[String],
+) -> Result<(AecConfig, bool, bool, PathBuf), Box<dyn std::error::Error>> {
     let mut cfg = AecConfig::default();
     let mut score = false;
+    let mut json = false;
     let mut input: Option<PathBuf> = None;
     let mut i = 0;
 
@@ -146,15 +173,25 @@ fn parse_args(args: &[String]) -> Result<(AecConfig, bool, PathBuf), Box<dyn std
                     .ok_or("--suppress-residual requires a value")?
                     .parse()?;
             }
+            "--max-lag-ms" => {
+                i += 1;
+                cfg.max_lag_ms = args
+                    .get(i)
+                    .ok_or("--max-lag-ms requires a value")?
+                    .parse()?;
+            }
             "--no-suppress" => {
                 cfg.suppress_residual = 0.0;
             }
             "--score" => {
                 score = true;
             }
+            "--json" => {
+                json = true;
+            }
             arg if arg.starts_with('-') => {
-                return Err(format!("unknown flag: {arg}\n\nusage: aec_file [OPTIONS] <2-track.wav>\n\noptions:\n  --filter-len <N>       adaptive filter length (default {})\n  --mu <F>               step size (default {})\n  --eps <F>              regularization (default {:.0e})\n  --power-smoothing <F>  far-end power smoothing (default {})\n  --double-talk-ratio <F> double-talk threshold (default {})\n  --passes <N>           offline passes (default {})\n  --suppress-residual <F> residual echo suppression factor (default {}, 0=off)\n  --no-suppress          disable residual echo suppression\n  --score                print echo suppression / preservation metrics",
-                    cfg.filter_len, cfg.mu, cfg.eps, cfg.power_smoothing, cfg.double_talk_ratio, cfg.passes, cfg.suppress_residual).into());
+                return Err(format!("unknown flag: {arg}\n\nusage: aec_file [OPTIONS] <2-track.wav>\n\noptions:\n  --filter-len <N>       adaptive filter length (default {})\n  --mu <F>               step size (default {})\n  --eps <F>              regularization (default {:.0e})\n  --power-smoothing <F>  far-end power smoothing (default {})\n  --double-talk-ratio <F> double-talk threshold (default {})\n  --passes <N>           offline passes (default {})\n  --suppress-residual <F> residual echo suppression factor (default {}, 0=off)\n  --max-lag-ms <F>       delay-search window in ms (default {})\n  --no-suppress          disable residual echo suppression\n  --score                print echo suppression / preservation metrics\n  --json                 print metrics (incl. erle_db) as one JSON line on stdout",
+                    cfg.filter_len, cfg.mu, cfg.eps, cfg.power_smoothing, cfg.double_talk_ratio, cfg.passes, cfg.suppress_residual, cfg.max_lag_ms).into());
             }
             _ => {
                 if input.is_some() {
@@ -167,5 +204,5 @@ fn parse_args(args: &[String]) -> Result<(AecConfig, bool, PathBuf), Box<dyn std
     }
 
     let input = input.ok_or("usage: aec_file [OPTIONS] <2-track.wav>")?;
-    Ok((cfg, score, input))
+    Ok((cfg, score, json, input))
 }

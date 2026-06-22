@@ -1,0 +1,6 @@
+# Raw / derived heavy artifacts — re-derivable via ./fetch.sh
+*.mp3
+*.mp3.finalurl
+*.html
+*.wav
+podcast.xml
