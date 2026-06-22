@@ -47,6 +47,11 @@ jiff = { workspace = true }
 # only, like `tauri-plugin-macos-permissions`; no `.plugin(init())` and no JS bridge.
 rfd = "0.15"
 
+# Process self-introspection for the in-app stats sampler (issue: stats observability): proc_pid_rusage
+# (phys_footprint + RSS) and proc_pidinfo (per-thread CPU/names). Already in Cargo.lock transitively; this
+# declares the direct dependency so `app` may call libc::* on the dedicated corti-stats thread.
+libc = "0.2"
+
 # Tray + menu live in core tauri behind the `tray-icon` feature. No `image-*` feature needed: tray icons
 # are embedded at build time via `include_image!` (raw RGBA, not feature-gated).
 tauri = { version = "2", features = ["tray-icon"] }
