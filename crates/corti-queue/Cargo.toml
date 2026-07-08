@@ -9,11 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 corti-core = { workspace = true }
+# The background-jobs table lives in this same DB (and borrows this crate's Connection).
+corti-jobs = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 # JobStatus' snake_case wire form is the source of truth for the `status` column (no drift).
 serde_json = { workspace = true }
-# Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# Bundled SQLite: shared workspace pin so corti-queue and corti-jobs borrow the same Connection type.
+rusqlite = { workspace = true }
 # Structured logging (issue #76): queue transitions (enqueue/set_status/update/fail) at debug level.
 tracing = { workspace = true }

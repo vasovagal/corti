@@ -11,6 +11,8 @@ before any architectural change, and update the matching ADR when you change a d
   binaries, no older OS (`minimumSystemVersion = 15.0`).
 - **Rust 1.96+** (pinned via `rust-version` in `Cargo.toml`).
 - **Node.js 24+** and a current **Xcode / macOS SDK** for the Tauri frontend.
+- **cmake** (`brew install cmake`) — builds the vendored, statically-linked libopus behind
+  `corti-audio` (see the `LIBOPUS_*` pins in `.cargo/config.toml`; preinstalled on CI runners).
 
 ## Workspace layout
 
@@ -19,13 +21,15 @@ before any architectural change, and update the matching ADR when you change a d
 | `corti-core` | Shared domain types (no platform deps) |
 | `corti-coreaudio` | Owned CoreAudio bindings: mic-in-use listener, process attribution, process taps |
 | `corti-detect` | Start/stop trigger + attribution state machine |
-| `corti-capture` | Aggregate-device capture graph → multitrack WAV |
+| `corti-capture` | Aggregate-device capture graph → streamed 2-track Ogg-Opus (WAV via `CORTI_CAPTURE_FORMAT=wav`) |
+| `corti-audio` | Ogg-Opus codec seam: streaming encoder + universal decoder (WAV or Opus → f32 tracks) |
 | `corti-transcribe` | `Transcriber` trait + diarized-transcript Markdown renderer |
 | `corti-transcribe-aws` | AWS Transcribe batch backend (`aws` feature) |
 | `corti-transcribe-local` | Local offline backend — Parakeet-TDT via ONNX/sherpa-onnx (`local` feature) |
 | `corti-aec` | Offline NLMS/FDAF echo canceller — removes speaker bleed from the mic track |
 | `corti-tap` | Standalone CLI: force-tap system audio to a WAV on demand (`--inbox` to file a note) |
 | `corti-queue` | Durable job store + crash recovery |
+| `corti-jobs` | Small background-job layer in queue.db: retries with backoff + periodic schedules |
 | `corti-vagus` | The `vagus` CLI shell-out (the only vagus touchpoint) |
 | `app/` | Tauri 2 tray binary |
 

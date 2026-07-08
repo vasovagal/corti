@@ -66,6 +66,7 @@ export default function Settings() {
 
       <main className="tab-content">
         <Transcription cfg={cfg} backends={backends} onChange={setCfg} />
+        <Paths cfg={cfg} onChange={setCfg} />
 
         <div className="settings-actions">
           <button className="btn-add" onClick={save} disabled={saving}>
@@ -74,7 +75,6 @@ export default function Settings() {
           {status && <span className="muted small">{status}</span>}
         </div>
 
-        <Paths />
         <Models />
       </main>
     </div>

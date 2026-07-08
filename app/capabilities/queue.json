@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "queue-window",
+  "description": "The Recording Queue window: read-only queue listing, the Retry command, and the queue-changed event.",
+  "platforms": ["macOS"],
+  "windows": ["queue"],
+  "permissions": ["core:default"]
+}
