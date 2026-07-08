@@ -1,8 +1,8 @@
 # app — the Tauri tray surface
 
-> Verified against **v0.8.0 + feat/pipeline-docs-and-streaming + #85 (durable-jobs stack)**. Current-state
-> internals of the `app/` crate (`corti-app`, bin `corti`); `file.rs:line` anchors point into this
-> worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
+> Verified against **v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing)**.
+> Current-state internals of the `app/` crate (`corti-app`, bin `corti`); `file.rs:line` anchors point
+> into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
 The app is a windowless macOS menu-bar agent. One OS process; no `#[tokio::main]` — it runs on
 Tauri's own event loop (`app.run(|_,_| {})`, `app/src/main.rs:288`). All live state is a single
@@ -29,6 +29,10 @@ Transient / not app-owned:
 - **`corti-webinar-finish`** — one per manual webinar stop (`main.rs:514`); writes the WAV, sends
   `PipelineMsg::Process`, exits.
 - **`corti-capture-writer`** — one per recording, inside `CaptureSession`; streams the 2-track WAV.
+- **`corti-live`** — one per live-eligible detector recording (#87, `app/src/live.rs`); drains the
+  bounded capture tee, transcribes as the call runs, and appends segments to the vagus note. Spawned
+  by the detector's `LiveHook`, finalized/discarded by the pipeline thread — see
+  [transcription.md](transcription.md#live-inbox-filing-87).
 - **CoreAudio HAL callback threads** — `MicMonitor` listeners; they only `tx.send(Msg::…)` and never
   touch capture (guardrail 9).
 
@@ -86,8 +90,16 @@ pipeline: on stop the transient `corti-webinar-finish` thread sends an identical
 retry/retention — are in [`transcription.md`](transcription.md). In brief: #85 made durability real via
 `corti-jobs`, so a transcribe/file failure schedules a durable retry job (backoff, ≤5 attempts) and an
 hourly sweep enforces retention; the queue rows still back tray history and `corti --list`, seeded from
-the newest few at startup (`seed_history`, `pipeline.rs:380`) with orphaned jobs recovered
-(`recover_running`, `pipeline.rs:126`).
+the newest few at startup (`seed_history`, `pipeline.rs:537`) with orphaned jobs recovered
+(`recover_running`, `pipeline.rs:142`).
+
+#87 layers **live inbox filing** onto this handoff: `Detector::start_with_live_hook` (`main.rs:366`)
+carries an `AppLiveHook` (`app/src/live.rs:237`) that spawns a per-recording `corti-live` thread when
+eligible; at `Process` time the worker asks `LiveManager::finalize` first, and a live-filed note sends
+the job straight to `Done` (batch skipped). Live telemetry adds **no new stage** — during the call the
+stage stays `Recording` (the How window's `recording` flag already covers it). Discards and detector
+errors send `PipelineMsg::LiveDiscarded` so the session (and any partial note) is torn down on the
+pipeline thread. See [transcription.md](transcription.md#live-inbox-filing-87).
 
 ## Tray
 
@@ -192,8 +204,11 @@ When the Settings window saves, `set_config` writes the shared config and sends
 `PipelineMsg::ReloadConfig` via `reload_tx` (`settings.rs:190`); the serial worker rebuilds its backend +
 AEC toggle between jobs — or immediately if idle (`reload_config`, `pipeline.rs:183,362`). The
 retention sweep reads `retention_days` live from the same `SharedConfig` (#85), so a saved change applies
-to the next sweep with no reload. Env knobs (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`,
-`CORTI_LANGUAGE`, `CORTI_LOCAL_*`, `CORTI_RETENTION_DAYS`) still seed the initial config (`config.rs`).
+to the next sweep with no reload; the live-filing hook snapshots the config at each recording start (#87),
+so `live_filing` needs no reload either. Env knobs (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`,
+`CORTI_LANGUAGE`, `CORTI_LOCAL_*`, `CORTI_RETENTION_DAYS`, `CORTI_LIVE_FILING`) still seed the initial
+config (`config.rs`). `live_filing` (default **true**, `config.rs:107`) gates #87's live inbox filing and
+has a Settings-window checkbox next to the AEC toggle.
 
 ## Diagnostics console + stats sampler
 

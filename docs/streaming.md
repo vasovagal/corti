@@ -1,6 +1,6 @@
 # Chunked / live transcription
 
-_Verified against v0.8.0 + feat/pipeline-docs-and-streaming._
+_Verified against v0.9.0 + feat/live-inbox-filing (#87)._
 
 The local backend can transcribe audio **as it arrives**, in arbitrary-sized chunks, over the same resident
 Parakeet engine the batch path uses — no second model, no async runtime in the engine. This page is the API
@@ -106,13 +106,24 @@ lookahead (`CORTI_AEC_LOOKAHEAD_SECS`, default 5 s) warms the filter, so the **f
 the lookahead — noted in `--help`. `--live` and `--inbox` are **mutually exclusive** (the parser bails,
 `main.rs:36`): live prints a transcript, it does not file to vagus.
 
+## In-app consumer — live inbox filing (#87, ADR 0010)
+
+The app now drives the same path for detector recordings. `Detector::start_with_live_hook`
+(`crates/corti-detect/src/platform.rs:66`) consults an app-supplied `LiveHook` (`platform.rs:37`) at every
+recording start; `AppLiveHook` (`app/src/live.rs:237`) returns a bounded tee (`TEE_BACKLOG = 256` chunks
+≈ 22 s of slack, `live.rs:47`) when `live_filing` is on, the backend is local, and the models are on disk —
+otherwise `None` and the batch path runs unchanged. One `corti-live` std thread per recording
+(`session_thread`, `live.rs:330`) mirrors `corti-tap --live`'s chunk loop (`consume_chunks`, `live.rs:416`)
+and appends each closed segment to the vagus note as it lands. Filing semantics — lazy note creation, the
+`State:` line contract, fallback and crash recovery — are in
+[transcription.md](transcription.md#live-inbox-filing-87); the write-authority amendment is
+[ADR 0010](../design/adr/0010-live-inbox-filing.md).
+
 ## What this is *not* (yet)
 
-This is the transcription **core**, not the ADR 0008 live-transcript UI. Still open:
-
 - **Live quality < batch.** A live word is only correct once its VAD region closes; there is no trailing-window
-  re-decode (ADR 0008's Path A windowed interim, benchmark-tunable). The filed vagus note stays the batch
-  `OfflineRecognizer` pass — the live buffer is throwaway.
-- **App pipeline wiring is #74.** The tee delivers downmixed capture, but a live *cleaned mic* stream needs
-  `StreamingAec.push()` inside the capture-writer thread (ADR 0007's tracked follow-up). Until #74 lands, only
-  `corti-tap --live` drives the live path; the app pipeline and the ADR 0008 push-driven window are follow-up.
+  re-decode (ADR 0008's Path A windowed interim, benchmark-tunable). When live filing succeeds, the live pass
+  **is** the filed note (#87); the batch `OfflineRecognizer` pass runs only as the fallback.
+- **The ADR 0008 push-driven live-transcript window is still open.** #87 wired `StreamingAec::push` +
+  `LiveTranscriber` into the app (closing #74's in-app gap for the filing path), but the in-process UI window
+  and its Channel transport remain follow-up.

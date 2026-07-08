@@ -33,10 +33,13 @@ signals. Exactly what this app does: audio → notes.
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
   `--label` to name it).
-- **Live, chunked transcription.** A `LiveTranscriber` decodes partial segments off the
-  capture ring while the call is still running — try it with `corti-tap --live` (app wiring is
-  a follow-up, [#74](https://github.com/vasovagal/corti/issues/74)). See
-  [`docs/streaming.md`](./docs/streaming.md).
+- **Live inbox filing.** With the local backend, the app transcribes the call **as it happens**
+  and appends finalized segments to the vagus note mid-call — `tail -f` the note and watch the
+  conversation arrive. The note's first body line is `State: transcribing` while streaming and
+  flips in place to `State: transcribed ` (same byte width) when final — the contract inbox
+  agents key off. Also available standalone as `corti-tap --live`. See
+  [`docs/streaming.md`](./docs/streaming.md) and
+  [`docs/transcription.md`](./docs/transcription.md).
 
 ## How it works
 
@@ -50,15 +53,18 @@ signals. Exactly what this app does: audio → notes.
   in-process capture            one CoreAudio aggregate device, no subprocess
      process tap ─┐
      mic ─────────┼─▶ ring ─▶ 2-track WAV   (ch0 Me · ch1 Them)
-       │  Action::Stop
+       │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet ─▶ append segments
+       │                              to the vagus note as the call happens (local backend)
+       │  Action::Stop                └─ finish flips `State: transcribing` → `transcribed`
        ▼
+  batch fallback (live off/ineligible/failed):
   AEC   FDAF adaptive filter + residual suppressor — strips speaker bleed off the mic track
        │
        ▼
   transcribe   Parakeet-TDT (offline ONNX)  |  AWS Transcribe
        │       → diarized, word-timestamped Markdown
        ▼
-  vagus CLI    files the note (corti never writes your vault directly)
+  vagus CLI    files the note (corti's other note writes are confined to notes it created — ADR 0010)
 ```
 
 Internals — the same data flow with `file:line` anchors — live in

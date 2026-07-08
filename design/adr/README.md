@@ -15,6 +15,7 @@ Append-only decision log (Context / Decision / Consequences). Guardrails in
 | [0007](0007-streaming-aec-first.md) | Accepted (v0.8.0, #75) | streaming AEC-first pipeline; defer durability, calibration, compression — *durability partially reversed by #85 (durable jobs + retry + retention returned via `corti-jobs`)* |
 | [0008](0008-live-streaming-transcript-in-process.md) | Proposed | live streaming transcript: first push-driven window, in-process transport |
 | [0009](0009-chunked-transcription-api.md) | Accepted | chunked/live transcription: pull-based sync core, batch refactored onto it |
+| [0010](0010-live-inbox-filing.md) | Accepted | live inbox filing: corti may append to / state-flip / delete notes it created — *amends 0001's boundary and 0008's file stance* |
 
 **Two ADRs share number 0006** — `distribution-unsigned-cask-tap` (Accepted) and
 `far-end-recording-notice-spike` (Proposed spike) — a numbering collision left as-is; disambiguate by

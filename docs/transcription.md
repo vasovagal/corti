@@ -1,13 +1,16 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against v0.8.0 + feat/pipeline-docs-and-streaming + #85 (durable-jobs stack).
+> Verified against v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
 `enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store, and #85 added a
 `corti-jobs` layer on top of it for durable retry-with-backoff and an hourly retention sweep (see
-_The queue_ and _The pipeline worker_ below). Filing shells out to the external `vagus` CLI, the only
-subprocess in the note path.
+_The queue_ and _The pipeline worker_ below). #87 adds a **live** first-class path for detector
+recordings: when the local backend + models are available, the note is written *during* the call and
+this whole batch machinery becomes the fallback (§Live inbox filing). Filing shells out to the
+external `vagus` CLI, the only subprocess in the note path; after creation corti may also append to /
+state-flip / delete that one note (ADR 0010).
 
 ## The `Transcriber` trait
 
@@ -149,24 +152,62 @@ visible in the Recording Queue window.
 
 `ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 
-## Filing to vagus
+## Live inbox filing (#87)
 
-`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs:132`) →
-`add_note` (`:100`), which **shells out** to the external `vagus` binary:
+For detector recordings, transcription + filing now happen **while the call records**, so `tail -f`
+on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTranscriber`s → note) is in
+[streaming.md](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010); the write authority is
+[ADR 0010](../design/adr/0010-live-inbox-filing.md). The filing semantics:
+
+- **State-line contract (for inbox agents).** The first corti-authored body line (right under vagus's
+  `# <title>` heading) is exactly `State: transcribing` while segments stream in, and exactly
+  `State: transcribed ` — one trailing space, same byte width — once final
+  (`crates/corti-vagus/src/note.rs:22`). The flip is an in-place seek+write of that line's bytes only
+  (`flip_state`, `note.rs:41`): no rename, no rewrite, so a `tail -f` follower keeps its inode.
+  Batch-filed notes carry the same `State: transcribed ` first line (`recording_body`,
+  `crates/corti-vagus/src/lib.rs:186`) — one contract, live or batch.
+- **Lazy note creation.** The note is created (`vagus add-note --print-path`, initial body =
+  `live_initial_body`, `lib.rs:197`) on the **first finalized segment**, not at recording start — a
+  too-short discarded recording almost never creates one. If a discard happens after creation, the
+  session deletes the note file. The created path is persisted into the queue row immediately
+  (`PipelineMsg::LiveNoteCreated` → `live_note_created`, `app/src/pipeline.rs:452` — the row is
+  created at status `Recording` if it doesn't exist yet).
+- **Segment lines are byte-identical to batch's** (`DiarizedTranscript::to_markdown` over a single
+  segment), appended in **finalize order** — which may interleave `Me`/`Them` differently than the
+  batch `merge_by_time` timeline. Accepted; the finish-time tails *are* merged by start time.
+- **Finish.** On `RecordingFinished`, the pipeline's `Process` handler finalizes the session
+  (`LiveManager::finalize`, `app/src/live.rs:164`): AEC tail → `finish()` both transcribers → append
+  tails → flip the state line → the job goes **straight to `Done`** with the note path
+  (`live_filed`, `pipeline.rs:419`) — batch transcription skipped; `prune_transient` still runs (the
+  WAV was written normally — the tee is a tee). No new telemetry stage: live transcription happens
+  under `Recording`.
+- **Fallback — no double notes, ever.** Factory ineligible (config off, non-local backend, models
+  missing), no note created (silent call), or any live-path error ⇒ the batch path runs unchanged,
+  except that `file_and_done` first checks the row's `note_path`: an existing partial live note is
+  **rewritten in place** (state line + full batch transcript, same inode — `rewrite_body`,
+  `note.rs:61`; branch at `pipeline.rs:660`) instead of filing a second note. #85's crash-recovery /
+  retry path flows through the same branch (non-terminal row + `note_path` → batch transcribe →
+  rewrite + flip). Webinar/manual captures have no live hook and always take the batch path.
+
+## Filing to vagus (batch path)
+
+`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs:134`) →
+`add_note` (`:102`), which **shells out** to the external `vagus` binary:
 
 ```
 vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
 ```
 
 `--print-path` skips the editor and prints the created note path, which corti captures. The body
-(`recording_body`, `:182`) is an auto-capture context line plus
+(`recording_body`, `:186`) is the `State: transcribed ` line (#87), an auto-capture context line, and
 `DiarizedTranscript::to_markdown()`. The binary is resolved via `$VAGUS_BIN` → `vagus` on `PATH` →
-Homebrew/cargo locations (`discover`, `:37`), re-probed on each filing attempt so a mid-session
+Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
 
 Ordering is crash-safe: `queue.update(note_path=…)` is persisted **before** `set_status(Done)`
-(`file_and_done`, `pipeline.rs:485`), so a retry re-file can't duplicate a note. A transient error →
-`schedule_retry` / the retry job's backoff; only unrecoverable states go through `fail` → tray `Failed`.
+(`file_and_done`, `pipeline.rs:642`), and a re-file that finds a persisted note rewrites it in place
+(#87) rather than duplicating it. A transient error → `schedule_retry` / the retry job's backoff;
+only unrecoverable states go through `fail` → tray `Failed`.
 
 ## Shared types (`corti-core`)
 
