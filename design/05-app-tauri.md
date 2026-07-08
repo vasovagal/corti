@@ -1,5 +1,10 @@
 # 05 — app (Tauri 2 tray binary)
 
+> **Stale — design-time snapshot.** Superseded by [docs/app.md](../docs/app.md); kept for design
+> rationale. AEC is called a "passthrough stub" (false — real `StreamingAec` is wired, ADR 0007); the
+> module list omits `cli`/`console`/`settings`/`stats` and the `app/ui/` React frontend; and the
+> crash-recovery / `resumable()` durability steps are deferred, not shipped.
+
 The menu-bar app that ties everything together: a blinking record icon while capturing, and the
 detect → capture → (aec) → transcribe → vagus pipeline. **Built** ✅ — the crate is `app/` (`corti-app`,
 bin `corti`); `cargo build`/`clippy -D warnings`/`fmt`/`test` are clean. See the "Built" section at the

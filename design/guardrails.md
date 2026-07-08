@@ -15,7 +15,8 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
    pipeline is backend-agnostic. The `aws` and `local` features compile independently (both can be on at
    once) and the active backend is chosen at **runtime** (`CORTI_TRANSCRIBE_BACKEND`). (ADR 0003)
 7. **The pipeline is crash-recoverable.** A recording's progress is persisted (`corti-queue`) so a crash
-   mid-upload/transcribe/file resumes rather than loses the note.
+   mid-upload/transcribe/file resumes rather than loses the note. *(Deferred per ADR 0007 — at v0.8.0 the
+   queue is a session-spanning record only; `resumable()`/`prune_done` exist but no startup recovery runs.)*
 8. **Attribution is best-effort and must never block capture.** Prefer a known conferencing app; skip
    `com.apple.*` audio helpers; fall back to the frontmost app, then "Unknown app".
 9. **CoreAudio listener callbacks run on a HAL thread** — they must not block and must only hand work to

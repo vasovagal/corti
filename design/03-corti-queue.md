@@ -1,5 +1,10 @@
 # 03 — corti-queue
 
+> **Stale — design-time snapshot.** Superseded by [docs/transcription.md](../docs/transcription.md); kept for
+> design rationale. Crash recovery is described here as live; v0.8.0 defers durability (ADR 0007) —
+> `resumable()`/`prune_done` exist but no `app/` caller runs them, so the queue is a session-spanning
+> record only.
+
 Durable job store so a crash mid-pipeline never loses a recording (guardrail 7). A recording moves
 `Recording → PendingTranscription → Transcribing → PendingNote → Done` (or `Failed`); every non-terminal
 state is resumable on startup.
