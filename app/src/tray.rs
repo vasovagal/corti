@@ -144,6 +144,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )?));
     items.push(Box::new(MenuItem::with_id(
         app,
+        "open_how",
+        "How Corti Works…",
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
         "open_diagnostics",
         "Diagnostics…",
         true,
@@ -334,6 +341,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         "open_settings" => open_settings_window(app),
         "open_queue" => open_queue_window(app),
         "ethics_guide" => open_ethics_window(app),
+        "open_how" => open_how_window(app),
         "open_diagnostics" => open_console_window(app),
         "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
@@ -477,6 +485,19 @@ fn open_console_window(app: &AppHandle) {
             }
         }
     });
+}
+
+/// The "How Corti Works" window: a live diagram of the detect → capture → echo-cancel → transcribe →
+/// file pipeline with the active stage pulsing (view selected via `?view=how`).
+fn open_how_window(app: &AppHandle) {
+    open_app_window(
+        app,
+        "how",
+        "index.html?view=how",
+        "How Corti Works",
+        (880.0, 560.0),
+        (560.0, 420.0),
+    );
 }
 
 /// Return to `Accessory` (menu-bar-only) once no webview windows remain — future-proof against more

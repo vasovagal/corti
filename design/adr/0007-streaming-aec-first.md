@@ -1,6 +1,6 @@
 # ADR 0007 — Streaming AEC-first pipeline: defer durability, calibration, and compression
 
-- **Status:** Proposed (2026-06-18)
+- **Status:** Accepted (2026-06-18; implemented v0.8.0, #75)
 - **Supersedes (in part):** ADR 0005 (AEC stays offline/2-pass) — see Decision 1.
 
 ## Context

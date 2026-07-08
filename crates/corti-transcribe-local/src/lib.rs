@@ -15,6 +15,7 @@
 //! See `design/02-corti-transcribe.md` and `design/adr/0003-local-asr-sherpa-onnx.md`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker};
@@ -23,7 +24,13 @@ use corti_transcribe::segment::{SEGMENT_GAP, diarize_words, merge_by_time, words
 
 mod audio;
 mod engine;
+mod live;
 pub mod models;
+
+pub use corti_transcribe::segment::Word;
+pub use live::{LiveEngine, LiveTranscriber};
+#[cfg(feature = "stream")]
+pub use live::{LiveSink, LiveWordStream, live_word_stream};
 
 /// Where the ONNX models live and how to run them. Built by the app from its config.
 #[derive(Debug, Clone)]
@@ -107,6 +114,31 @@ impl LocalTranscriber {
     pub fn new(cfg: LocalConfig) -> Self {
         Self { cfg }
     }
+
+    /// Load the models + recognizer once and return a [`LiveEngine`] for driving chunked/live transcription
+    /// (ADR 0009). The far-end diarization models are **not** required here — the live path attributes the
+    /// far end to a single `Them`, like the batch default — so only Parakeet + Silero VAD must be present.
+    /// Spawn one [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
+    pub fn live_engine(&self) -> Result<LiveEngine> {
+        let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
+        let m = models::discover(&dir, false, &self.cfg.embedding_model)?;
+        let provider = resolve_provider(self.cfg.provider.as_str()).to_string();
+        let rec = engine::build_recognizer(
+            &m,
+            &provider,
+            self.cfg.num_threads,
+            self.cfg.asr_decoding.as_deref(),
+            self.cfg.asr_max_active_paths,
+            self.cfg.asr_blank_penalty,
+        )?;
+        Ok(LiveEngine::new(
+            rec,
+            m,
+            provider,
+            self.cfg.vad_threshold,
+            self.cfg.vad_min_silence,
+        ))
+    }
 }
 
 impl Transcriber for LocalTranscriber {
@@ -123,15 +155,15 @@ impl Transcriber for LocalTranscriber {
         let provider = resolve_provider(self.cfg.provider.as_str());
         let threads = self.cfg.num_threads;
 
-        // One recognizer load per job, shared across both channels.
-        let rec = engine::build_recognizer(
+        // One recognizer load per job, shared across both channels (and both `LiveTranscriber`s).
+        let rec = Arc::new(engine::build_recognizer(
             &m,
             provider,
             threads,
             self.cfg.asr_decoding.as_deref(),
             self.cfg.asr_max_active_paths,
             self.cfg.asr_blank_penalty,
-        )?;
+        )?);
         let mut segments = Vec::new();
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
@@ -143,7 +175,7 @@ impl Transcriber for LocalTranscriber {
                 self.cfg.vad_threshold,
                 self.cfg.vad_min_silence,
             )?;
-            let words = engine::transcribe_channel(&rec, &vad, &mic);
+            let words = engine::transcribe_channel(rec.clone(), vad, &mic);
             segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
         }
 
@@ -156,7 +188,7 @@ impl Transcriber for LocalTranscriber {
                 self.cfg.vad_threshold,
                 self.cfg.vad_min_silence,
             )?;
-            let words = engine::transcribe_channel(&rec, &vad, &them);
+            let words = engine::transcribe_channel(rec.clone(), vad, &them);
             if self.cfg.diarize_far_end {
                 // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
                 let diar = engine::build_diarizer(

@@ -21,6 +21,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -63,6 +64,47 @@ const RING_MAX_CHANNELS: usize = 8;
 
 /// Name of the env var that overrides the ring duration in seconds.
 const RING_SECONDS_ENV: &str = "CORTI_CAPTURE_RING_SECS";
+
+/// Frames per [`CaptureTee`] chunk (~85 ms at 48 kHz). Small enough for low live latency, large enough that
+/// per-chunk channel + downmix overhead is negligible.
+const TEE_FRAMES_PER_CHUNK: usize = 4096;
+
+/// A chunk of **downmixed** capture handed to an optional live consumer: mono mic ("me") and mono tap
+/// ("them"), the same number of frames, at the capture sample rate. `mic` is empty for a tap-only capture.
+/// Delivered off the writer thread over the bounded [`CaptureTee`] channel.
+#[derive(Debug, Clone)]
+pub struct CaptureChunk {
+    pub mic: Vec<f32>,
+    pub tap: Vec<f32>,
+}
+
+/// A **bounded, lossy** tee of the downmixed capture stream, for live consumers (AEC / transcription).
+///
+/// The writer thread `try_send`s ~[`TEE_FRAMES_PER_CHUNK`]-frame chunks and **never blocks**: if the consumer
+/// falls behind (channel full) or hangs up, the chunk is dropped and counted — the on-disk WAV is unaffected.
+/// The tee is strictly additive; with no tee attached the writer path is byte-identical to before (ADR 0009).
+/// Construct from the `SyncSender` half of a `sync_channel` (the caller keeps the `Receiver`); size the
+/// channel for the live latency you can tolerate.
+pub struct CaptureTee {
+    tx: SyncSender<CaptureChunk>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl CaptureTee {
+    /// Wrap a bounded sender as a lossy tee.
+    pub fn new(tx: SyncSender<CaptureChunk>) -> Self {
+        Self {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// A handle to the live-updating dropped-chunk counter. Clone it **before** starting capture to observe
+    /// drops mid-recording; the final total is also on [`RecordingHandle::tee_dropped_chunks`].
+    pub fn dropped_counter(&self) -> Arc<AtomicU64> {
+        self.dropped.clone()
+    }
+}
 
 /// Pure parse+clamp of a raw `CORTI_CAPTURE_RING_SECS` value, factored out so the policy is testable
 /// without mutating the process-global environment. Unset / empty / unparseable → default; in-range →
@@ -143,6 +185,9 @@ pub struct RecordingHandle {
     /// Samples dropped because the writer couldn't keep up (ring overflow). Should be 0; a non-zero value
     /// means the disk stalled and the recording may have gaps.
     pub dropped_samples: u64,
+    /// Live-tee chunks dropped because the consumer fell behind (bounded, lossy by design — never affects the
+    /// on-disk WAV). 0 when no [`CaptureTee`] was attached.
+    pub tee_dropped_chunks: u64,
 }
 
 impl RecordingHandle {
@@ -228,6 +273,9 @@ pub struct CaptureSession {
     /// The streaming writer thread; joined on `stop`/`Drop` so the file is flushed and finalized.
     writer: Option<JoinHandle<Result<u64>>>,
     out: PathBuf,
+    /// The live-tee dropped-chunk counter, shared with the writer thread; read into [`RecordingHandle`] at
+    /// `stop`. `None` when no tee was attached.
+    tee_dropped: Option<Arc<AtomicU64>>,
 }
 
 // The raw pointers make this !Send by default; the session owns them for its whole lifetime and tears the
@@ -237,7 +285,20 @@ unsafe impl Send for CaptureSession {}
 impl CaptureSession {
     /// Begin capturing `target` + the default mic, streaming `layout` to `out`. Returns once IO has started.
     pub fn start_recording(target: TapTarget, out: PathBuf, layout: OutputLayout) -> Result<Self> {
-        Self::start_inner(target, true, out, layout)
+        Self::start_inner(target, true, out, layout, None)
+    }
+
+    /// Like [`start_recording`], additionally teeing downmixed chunks to a live consumer. The tee is
+    /// bounded and lossy — it never blocks the writer and never affects the on-disk WAV (ADR 0009).
+    ///
+    /// [`start_recording`]: CaptureSession::start_recording
+    pub fn start_recording_with_tee(
+        target: TapTarget,
+        out: PathBuf,
+        layout: OutputLayout,
+        tee: CaptureTee,
+    ) -> Result<Self> {
+        Self::start_inner(target, true, out, layout, Some(tee))
     }
 
     /// Like [`start_recording`], but **tap-only**: the microphone is never opened (no orange "mic in use"
@@ -251,7 +312,20 @@ impl CaptureSession {
         out: PathBuf,
         layout: OutputLayout,
     ) -> Result<Self> {
-        Self::start_inner(target, false, out, layout)
+        Self::start_inner(target, false, out, layout, None)
+    }
+
+    /// Like [`start_tap_only_recording`], additionally teeing downmixed chunks (the `mic` side is empty) to a
+    /// live consumer. Bounded, lossy, never affects the WAV (ADR 0009).
+    ///
+    /// [`start_tap_only_recording`]: CaptureSession::start_tap_only_recording
+    pub fn start_tap_only_recording_with_tee(
+        target: TapTarget,
+        out: PathBuf,
+        layout: OutputLayout,
+        tee: CaptureTee,
+    ) -> Result<Self> {
+        Self::start_inner(target, false, out, layout, Some(tee))
     }
 
     /// Shared start path. The aggregate's clock-leading main sub-device is the default **input** device when
@@ -264,6 +338,7 @@ impl CaptureSession {
         capture_mic: bool,
         out: PathBuf,
         layout: OutputLayout,
+        tee: Option<CaptureTee>,
     ) -> Result<Self> {
         // 1. Tap.
         let description = unsafe { make_tap_description(&target)? };
@@ -333,12 +408,13 @@ impl CaptureSession {
 
         // 6. Writer thread. Spawned last — there are no fallible steps after this, so it never needs an
         //    error-path teardown of its own.
+        let tee_dropped = tee.as_ref().map(|t| t.dropped.clone());
         let writer = {
             let shared = shared.clone();
             let out = out.clone();
             std::thread::Builder::new()
                 .name("corti-capture-writer".into())
-                .spawn(move || run_writer(consumer, shared, out, layout, sample_rate))
+                .spawn(move || run_writer(consumer, shared, out, layout, sample_rate, tee))
                 .context("spawning capture writer thread")?
         };
 
@@ -353,7 +429,14 @@ impl CaptureSession {
             sample_rate,
             writer: Some(writer),
             out,
+            tee_dropped,
         })
+    }
+
+    /// The capture sample rate (read from the aggregate's input format, default 48 kHz). Available before
+    /// `stop` so a live consumer can build its resampler / AEC at the right rate.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     /// Stop capturing, flush the writer, and return the recording's metadata. Errors if the writer hit an
@@ -381,6 +464,13 @@ impl CaptureSession {
             AudioHardwareDestroyProcessTap(self.tap_id);
         }
 
+        // The writer has joined, so the tee counter is final. Read it before forgetting `self`.
+        let tee_dropped_chunks = self
+            .tee_dropped
+            .as_ref()
+            .map(|d| d.load(Ordering::Acquire))
+            .unwrap_or(0);
+
         let out = std::mem::take(&mut self.out);
         let sample_rate = self.sample_rate;
         std::mem::forget(self);
@@ -396,6 +486,7 @@ impl CaptureSession {
             tap_channels: total - mic,
             callbacks,
             dropped_samples: dropped,
+            tee_dropped_chunks,
         })
     }
 }
@@ -546,6 +637,7 @@ fn run_writer(
     out: PathBuf,
     layout: OutputLayout,
     sample_rate: u32,
+    tee: Option<CaptureTee>,
 ) -> Result<u64> {
     // Wait for the first callback to publish the channel layout (Acquire pairs with the io proc's Release
     // store of `total_channels`), or for end-of-stream (producer dropped ⇒ no audio ⇒ no file).
@@ -582,6 +674,10 @@ fn run_writer(
 
     let mut frame: Vec<f32> = Vec::with_capacity(total);
     let mut frames_written: u64 = 0;
+    // Live-tee accumulators: downmixed mono mic + tap, flushed to the consumer every TEE_FRAMES_PER_CHUNK
+    // frames. Only touched when a tee is attached — the default path is byte-identical.
+    let mut tee_mic: Vec<f32> = Vec::new();
+    let mut tee_tap: Vec<f32> = Vec::new();
     loop {
         let avail = consumer.slots();
         if avail == 0 {
@@ -602,16 +698,48 @@ fn run_writer(
                 write_frame(&mut writer, &frame, layout, mic, total)
                     .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
                 frames_written += 1;
+                if let Some(t) = &tee {
+                    if mic > 0 {
+                        tee_mic.push(frame_mean(&frame, 0, mic));
+                    }
+                    tee_tap.push(frame_mean(&frame, mic, total - mic));
+                    if tee_tap.len() >= TEE_FRAMES_PER_CHUNK {
+                        send_tee_chunk(t, &mut tee_mic, &mut tee_tap);
+                    }
+                }
                 frame.clear();
             }
         }
         chunk.commit_all();
+    }
+    // Flush a trailing partial tee chunk (the WAV drops its partial frame, but a short live chunk is fine).
+    if let Some(t) = &tee {
+        send_tee_chunk(t, &mut tee_mic, &mut tee_tap);
     }
     // A trailing partial frame (incomplete) is discarded.
     writer
         .finalize()
         .map_err(|e| anyhow!("finalizing {}: {e}", out.display()))?;
     Ok(frames_written)
+}
+
+/// Hand the accumulated downmixed chunk to the tee consumer, non-blocking. On a full or hung-up channel the
+/// chunk is dropped and counted — capture never stalls on a slow live consumer (ADR 0009).
+fn send_tee_chunk(tee: &CaptureTee, mic: &mut Vec<f32>, tap: &mut Vec<f32>) {
+    if tap.is_empty() {
+        return;
+    }
+    let chunk = CaptureChunk {
+        mic: std::mem::take(mic),
+        tap: std::mem::take(tap),
+    };
+    // `mem::take` left both Vecs at capacity 0; re-reserve so the next chunk doesn't re-grow by repeated
+    // reallocation on the writer thread.
+    *mic = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
+    *tap = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
+    if tee.tx.try_send(chunk).is_err() {
+        tee.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Downmix one interleaved capture frame into the output channels for `layout` and write them. The 2-track
@@ -907,6 +1035,7 @@ mod tests {
             out.clone(),
             OutputLayout::TwoTrack,
             48_000,
+            None,
         )
         .unwrap();
         assert_eq!(n, 3, "three output frames");
@@ -951,6 +1080,7 @@ mod tests {
             out.clone(),
             OutputLayout::TapOnlyMono,
             48_000,
+            None,
         )
         .unwrap();
         assert_eq!(n, 2);
@@ -985,6 +1115,7 @@ mod tests {
             out.clone(),
             OutputLayout::TwoTrack,
             48_000,
+            None,
         )
         .unwrap();
         assert_eq!(n, 0);
@@ -1030,5 +1161,117 @@ mod tests {
             ring_capacity(4_000),
             8_000 * RING_MAX_CHANNELS * RING_SECONDS_DEFAULT
         );
+    }
+
+    /// With a tee attached and a consumer that keeps up, chunks arrive downmixed correctly (ch0 mean → mic,
+    /// tap channels mean → tap) and no chunk is dropped. Exercises the writer end-to-end, no CoreAudio.
+    #[test]
+    fn tee_delivers_downmixed_chunks_without_drops() {
+        let frames = TEE_FRAMES_PER_CHUNK + 10; // one full tee chunk + a short trailing flush
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(frames * 3 + 8);
+        // Interleaved [mic, tapL, tapR]: mic = 1.0, tap mean = mean(0.25, 0.75) = 0.5, every frame.
+        for _ in 0..frames {
+            for &s in &[1.0f32, 0.25, 0.75] {
+                producer.push(s).unwrap();
+            }
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(3),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureChunk>(8);
+        let tee = CaptureTee::new(tx);
+        let dropped = tee.dropped_counter();
+
+        let dir = std::env::temp_dir().join("corti-tee-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("tee.wav");
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            Some(tee),
+        )
+        .unwrap();
+        assert_eq!(n as usize, frames);
+
+        let mut got_mic = 0usize;
+        let mut got_tap = 0usize;
+        while let Ok(chunk) = rx.try_recv() {
+            for &m in &chunk.mic {
+                assert!((m - 1.0).abs() < 1e-6, "mic downmix");
+            }
+            for &t in &chunk.tap {
+                assert!((t - 0.5).abs() < 1e-6, "tap downmix");
+            }
+            got_mic += chunk.mic.len();
+            got_tap += chunk.tap.len();
+        }
+        assert_eq!(got_mic, frames, "every frame teed to mic");
+        assert_eq!(got_tap, frames, "every frame teed to tap");
+        assert_eq!(dropped.load(Ordering::Acquire), 0, "consumer kept up");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bounded tee whose consumer never drains overflows: chunks past the channel capacity are dropped and
+    /// counted, and the writer still finishes (never blocks). The WAV is unaffected.
+    #[test]
+    fn tee_drops_and_counts_when_consumer_stalls() {
+        let chunks = 5usize;
+        let frames = chunks * TEE_FRAMES_PER_CHUNK;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(frames * 2 + 8);
+        for _ in 0..frames {
+            for &s in &[0.5f32, 0.5] {
+                producer.push(s).unwrap();
+            }
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(0),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: false,
+        });
+        drop(producer);
+
+        // Capacity 1, and we never receive → at most 1 chunk fits, the rest are dropped.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<CaptureChunk>(1);
+        let tee = CaptureTee::new(tx);
+        let dropped = tee.dropped_counter();
+
+        let dir = std::env::temp_dir().join("corti-tee-drop-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("tee-drop.wav");
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TapOnlyMono,
+            48_000,
+            Some(tee),
+        )
+        .unwrap();
+        assert_eq!(
+            n as usize, frames,
+            "writer wrote every frame despite tee drops"
+        );
+        // 5 chunks produced, channel holds 1 → at least 3 dropped (the undrained receiver still holds 1).
+        assert!(
+            dropped.load(Ordering::Acquire) >= (chunks as u64 - 2),
+            "stalled consumer must drop+count chunks (dropped = {})",
+            dropped.load(Ordering::Acquire)
+        );
+        // Tap-only ⇒ no mic teed; the WAV is a normal 1-channel file.
+        assert!(out.exists());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -133,10 +133,30 @@ pub fn write_clean_wav(
 #[cfg(target_os = "macos")]
 pub use platform::Recorder;
 
+/// Bounded, lossy live-tee of the downmixed capture stream (ADR 0009); re-exported so callers depend only on
+/// `corti-capture`. See [`Recorder::start_with_tee`].
+#[cfg(target_os = "macos")]
+pub use corti_coreaudio::{CaptureChunk, CaptureTee};
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use corti_coreaudio::{CaptureSession, OutputLayout, TapTarget};
+    use corti_coreaudio::{CaptureSession, CaptureTee, OutputLayout, TapTarget};
+
+    /// A fresh recording path in the recordings cache for `app`, creating the cache dir.
+    fn new_recording_path(app: &corti_core::OwningApp) -> Result<PathBuf> {
+        let dir = recordings_dir()?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let stem = recording_stem(app, chrono::Local::now());
+        Ok(dir.join(format!("{stem}.wav")))
+    }
+
+    fn tap_target(pid: Option<i32>) -> TapTarget {
+        match pid {
+            Some(pid) => TapTarget::Process(pid),
+            None => TapTarget::Global,
+        }
+    }
 
     /// An in-progress recording. Built from the owning app's PID (per-app tap, falling back to a global tap
     /// inside the engine if the PID can't be resolved). The session streams the chosen layout straight to
@@ -153,17 +173,33 @@ mod platform {
         /// Start recording the given app (`pid = None` ⇒ global tap of all system audio) to a fresh file in
         /// the recordings cache. Returns the recorder and the output path.
         pub fn start(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
-            let dir = recordings_dir()?;
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let stem = recording_stem(app, chrono::Local::now());
-            let out = dir.join(format!("{stem}.wav"));
-            let target = match pid {
-                Some(pid) => TapTarget::Process(pid),
-                None => TapTarget::Global,
-            };
-            let session =
-                CaptureSession::start_recording(target, out.clone(), OutputLayout::TwoTrack)
-                    .with_context(|| format!("starting capture for {}", app.name))?;
+            let out = new_recording_path(app)?;
+            let session = CaptureSession::start_recording(
+                tap_target(pid),
+                out.clone(),
+                OutputLayout::TwoTrack,
+            )
+            .with_context(|| format!("starting capture for {}", app.name))?;
+            Ok(Self { session, out })
+        }
+
+        /// Like [`start`], additionally teeing bounded, downmixed live chunks to `tee` (ADR 0009). The tee
+        /// never blocks capture and never affects the on-disk 2-track WAV.
+        ///
+        /// [`start`]: Recorder::start
+        pub fn start_with_tee(
+            app: &corti_core::OwningApp,
+            pid: Option<i32>,
+            tee: CaptureTee,
+        ) -> Result<Self> {
+            let out = new_recording_path(app)?;
+            let session = CaptureSession::start_recording_with_tee(
+                tap_target(pid),
+                out.clone(),
+                OutputLayout::TwoTrack,
+                tee,
+            )
+            .with_context(|| format!("starting capture for {}", app.name))?;
             Ok(Self { session, out })
         }
 
@@ -173,18 +209,31 @@ mod platform {
         ///
         /// [`start`]: Recorder::start
         pub fn start_tap_only(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
-            let dir = recordings_dir()?;
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let stem = recording_stem(app, chrono::Local::now());
-            let out = dir.join(format!("{stem}.wav"));
-            let target = match pid {
-                Some(pid) => TapTarget::Process(pid),
-                None => TapTarget::Global,
-            };
+            let out = new_recording_path(app)?;
             let session = CaptureSession::start_tap_only_recording(
-                target,
+                tap_target(pid),
                 out.clone(),
                 OutputLayout::TapOnlyMono,
+            )
+            .with_context(|| format!("starting tap-only capture for {}", app.name))?;
+            Ok(Self { session, out })
+        }
+
+        /// Like [`start_tap_only`], additionally teeing bounded, downmixed live chunks (the `mic` side is
+        /// empty) to `tee` (ADR 0009).
+        ///
+        /// [`start_tap_only`]: Recorder::start_tap_only
+        pub fn start_tap_only_with_tee(
+            app: &corti_core::OwningApp,
+            pid: Option<i32>,
+            tee: CaptureTee,
+        ) -> Result<Self> {
+            let out = new_recording_path(app)?;
+            let session = CaptureSession::start_tap_only_recording_with_tee(
+                tap_target(pid),
+                out.clone(),
+                OutputLayout::TapOnlyMono,
+                tee,
             )
             .with_context(|| format!("starting tap-only capture for {}", app.name))?;
             Ok(Self { session, out })
@@ -193,6 +242,12 @@ mod platform {
         /// The path the recording will be written to.
         pub fn output_path(&self) -> &Path {
             &self.out
+        }
+
+        /// The capture sample rate (Hz). Available immediately after `start*` so a live tee consumer can build
+        /// its resampler / AEC at the right rate.
+        pub fn sample_rate(&self) -> u32 {
+            self.session.sample_rate()
         }
 
         /// Stop capture and finalize the streamed WAV (2-track for [`start`], 1-track for
@@ -241,6 +296,14 @@ mod platform {
                     dropped_samples = handle.dropped_samples,
                     path = %self.out.display(),
                     "dropped samples during capture (disk too slow / ring overflow) — recording may have gaps"
+                );
+            }
+            if handle.tee_dropped_chunks > 0 {
+                tracing::warn!(
+                    target: "corti::capture",
+                    tee_dropped_chunks = handle.tee_dropped_chunks,
+                    path = %self.out.display(),
+                    "dropped live tee chunks (consumer fell behind) — the live transcript may have gaps"
                 );
             }
             let bytes = std::fs::metadata(&self.out).map(|m| m.len()).unwrap_or(0);

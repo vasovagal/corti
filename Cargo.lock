@@ -1516,10 +1516,12 @@ dependencies = [
  "anyhow",
  "aws-config",
  "chrono",
+ "corti-aec",
  "corti-capture",
  "corti-core",
  "corti-transcribe",
  "corti-transcribe-aws",
+ "corti-transcribe-local",
  "corti-vagus",
  "libc",
  "tokio",
@@ -1560,8 +1562,10 @@ dependencies = [
  "corti-core",
  "corti-transcribe",
  "dirs",
+ "futures-core",
  "hound",
  "sherpa-onnx",
+ "tokio",
  "tracing",
 ]
 

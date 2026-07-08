@@ -1,5 +1,10 @@
 # 04 — corti-aec (offline acoustic echo cancellation)
 
+> **Stale — design-time snapshot.** Superseded by [docs/audio-pipeline.md](../docs/audio-pipeline.md); kept for design
+> rationale. Describes an offline time-domain NLMS `cancel(mic, far, sr, cfg)`; v0.8.0 ships
+> `StreamingAec` — a frequency-domain FDAF (ADR 0007) with a wider `AecConfig` (power-smoothing,
+> double-talk ratio, residual suppressor, max-lag). `cancel()` survives only as a thin offline shim.
+
 Removes **speaker bleed** from the mic track: when the user is on speakers (not headphones), the mic
 physically hears the far-end audio (see [`LESSONS.md`](LESSONS.md) §4). corti has both the mic track and the
 *clean* far-end (tap) track, perfectly time-aligned, so it can cancel the echo.

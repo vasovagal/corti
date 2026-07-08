@@ -33,14 +33,48 @@ signals. Exactly what this app does: audio → notes.
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
   `--label` to name it).
+- **Live, chunked transcription.** A `LiveTranscriber` decodes partial segments off the
+  capture ring while the call is still running — try it with `corti-tap --live` (app wiring is
+  a follow-up, [#74](https://github.com/vasovagal/corti/issues/74)). See
+  [`docs/streaming.md`](./docs/streaming.md).
 
-**How it works:** detect → capture (mic + system tap) → echo-cancel → transcribe → file to
-vagus (via the `vagus` CLI; corti never writes your vault directly).
+## How it works
+
+```text
+  mic-in-use (CoreAudio HAL DeviceIsRunningSomewhere)
+       │
+       ▼
+  detector state machine        debounce 1.5s / coalesce 2s / discard < 3s
+       │  Action::Start
+       ▼
+  in-process capture            one CoreAudio aggregate device, no subprocess
+     process tap ─┐
+     mic ─────────┼─▶ ring ─▶ 2-track WAV   (ch0 Me · ch1 Them)
+       │  Action::Stop
+       ▼
+  AEC   FDAF adaptive filter + residual suppressor — strips speaker bleed off the mic track
+       │
+       ▼
+  transcribe   Parakeet-TDT (offline ONNX)  |  AWS Transcribe
+       │       → diarized, word-timestamped Markdown
+       ▼
+  vagus CLI    files the note (corti never writes your vault directly)
+```
+
+Internals — the same data flow with `file:line` anchors — live in
+[`docs/architecture.md`](./docs/architecture.md).
+
+## In the app
+
+Past the tray menu, corti ships a **Settings** window (backend, S3 bucket, model download), an
+**Ethics & Legality** guide (recording-consent norms by jurisdiction), and a **Diagnostics**
+console with a live stats panel (CPU/RSS, per-stage timings, rolling logs). From the shell,
+`corti --list` prints every tracked recording with its pipeline status and filed note.
 
 ## Install
 
 ```sh
-brew tap vasovagal/corti
+brew tap vasovagal/tap
 brew install --cask corti
 ```
 
@@ -74,12 +108,12 @@ persisted in `config.toml`.
 
 ## Status
 
-The full pipeline is built and tested end-to-end (detect → capture → AEC → transcribe →
-vagus, crash-recoverable), with both transcription backends working. The live join-call → note
-loop needs a signed `.app` to exercise the macOS audio-capture (TCC) grant. See
-[`design/STATUS.md`](./design/STATUS.md).
+Pre-1.0. The full pipeline runs end-to-end (detect → capture → AEC → transcribe → vagus) with
+both backends working; the live join-call → note loop still needs a signed `.app` to exercise
+the macOS audio-capture (TCC) grant.
 
 ## More
 
+- [`docs/`](./docs/) — current-state internals: pipeline data flow, streaming, the crate map.
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — build, test, workspace layout, dev setup.
 - [`design/`](./design/) — ADRs, guardrails, and the rationale behind the stack.

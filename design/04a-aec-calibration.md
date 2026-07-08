@@ -135,17 +135,19 @@ was lost.
 
 ## Maintaining accuracy
 
-The defaults (`mu=0.3`, `filter_len=4096`, `power_smoothing=0.9`, `double_talk_ratio=2.0`,
+The defaults (`mu=0.3`, `filter_len=8192` (benchmark-tuned up from 4096; see
+`design/06-benchmark-harness.md`), `power_smoothing=0.9`, `double_talk_ratio=2.0`,
 `suppress_residual=2.5`) are now baked into `AecConfig::default()`. These were validated across 6
 recordings spanning Zoom and Slack, speaker setups, and call durations from 12 to 54 minutes.
 
 For users whose setup produces unusual echo characteristics (different speaker placement, room
-acoustics, or conferencing apps that do aggressive preprocessing), the `--calibrate-aec` CLI command
-runs the 144-config sweep against recent recordings and saves the best parameters to `config.toml`.
-Individual parameters can also be overridden via `CORTI_AEC_*` environment variables.
+acoustics, or conferencing apps that do aggressive preprocessing), individual parameters can be
+overridden via `CORTI_AEC_*` environment variables. The `--calibrate-aec` sweep that once auto-saved
+best parameters to `config.toml` was **removed** with durability (see the banner; ADR 0007) — it read
+persisted raw recordings that no longer exist.
 
-The scoring and sweep infrastructure lives in `corti_aec::score` and `corti_aec::tune`. The
-`aec_file` example accepts all AEC parameters as CLI flags for A/B testing individual recordings.
+The sweep driver (`corti_aec::tune`, `--calibrate-aec`) is deleted; the `aec_file` example still
+accepts all AEC parameters as CLI flags for A/B testing individual recordings.
 
 ## Will new users need to recalibrate?
 
@@ -165,7 +167,7 @@ Zoom/Slack/Meet/Teams. The three things that matter:
    transcription — a slightly under-cancelled echo that gets post-filtered is better than a
    diverged filter that distorts the user's voice.
 
-The `--calibrate-aec` command exists for users who want to squeeze out the last few percent, but the
-defaults are designed to be good-enough-without-tuning. The main scenario where recalibration helps is
-external speakers at a distance (conference room setups with longer room impulse responses), where
-bumping `filter_len` to 8192 or 16384 would model the longer echo path.
+The defaults are designed to be good-enough-without-tuning. The main scenario where hand-tuning helps
+is external speakers at a distance (conference room setups with longer room impulse responses), where
+bumping `filter_len` (via `CORTI_AEC_*`) models the longer echo path — the automated `--calibrate-aec`
+sweep that once did this is gone (ADR 0007).

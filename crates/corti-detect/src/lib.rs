@@ -48,6 +48,9 @@ pub enum DetectorEvent {
         meta: RecordingMeta,
         audio_path: PathBuf,
     },
+    /// A started recording was discarded below the keep threshold (too short): no WAV was kept. Lets a
+    /// consumer that reacted to `RecordingStarted` unwind its in-flight state instead of sitting on it.
+    RecordingDiscarded { meta: RecordingMeta },
     /// A non-fatal error (capture failed to start/finish, or a device rebind failed). The detector keeps
     /// running.
     Error(String),

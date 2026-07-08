@@ -536,3 +536,68 @@ h3 {
   border-radius: 4px;
   padding: 1px 6px;
 }
+
+/* How Corti Works diagram */
+.how-flow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 6px 0;
+  margin: 20px 0;
+}
+.how-step {
+  display: flex;
+  align-items: stretch;
+  flex: 1 1 150px;
+}
+.how-box {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+.how-box h4 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+.how-box p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.how-arrow {
+  align-self: center;
+  padding: 0 8px;
+  color: var(--fg-muted);
+  font-size: 18px;
+}
+/* The active stage throbs: a ~1.2s opacity + accent-glow pulse. Idle leaves every box calm. */
+.how-box-active {
+  border-color: var(--accent);
+  animation: how-pulse 1.2s ease-in-out infinite;
+}
+@keyframes how-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  50% {
+    opacity: 0.72;
+    box-shadow: 0 0 12px 2px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .how-box-active {
+    animation: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+}
+.how-detail {
+  margin-top: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: var(--fg-muted);
+}

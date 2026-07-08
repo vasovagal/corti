@@ -49,6 +49,9 @@ fn main() -> anyhow::Result<()> {
                     audio_path.display()
                 );
             }
+            DetectorEvent::RecordingDiscarded { meta } => {
+                println!("✗ discarded (too short): {}", meta.owning_app.name);
+            }
             DetectorEvent::Error(e) => println!("⚠ error: {e}"),
         }
     }

@@ -28,7 +28,7 @@ use corti_vagus::Vagus;
 use tauri::AppHandle;
 use tracing::{error, info, warn};
 
-use crate::imp::{HISTORY_LIMIT, HistoryEntry};
+use crate::imp::{HISTORY_LIMIT, HistoryEntry, Stage, set_stage};
 use crate::settings::SharedConfig;
 use crate::transcribe::Backend;
 use crate::tray;
@@ -173,6 +173,9 @@ pub fn run(
                         error = %format!("{e:#}"),
                         "enqueue failed"
                     );
+                    // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
+                    // the diagram doesn't sit on Transcribing forever.
+                    set_stage(&ctx.app, Stage::Idle);
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
@@ -243,6 +246,13 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
                     crate::jobs::on_exhausted(ctx, job, &msg);
                 }
                 Err(e) => eprintln!("[corti] cannot record job failure: {e:#}"),
+            }
+            // A retry attempt's `transcribe_and_file` left the stage at Transcribing/Filing; that attempt
+            // just ended (parked in backoff, exhausted → `fail`, or a bookkeeping error), so drop back to
+            // Idle. Gated to the transcription retry so the retention sweep never disturbs the stage — it
+            // runs on this same thread while a capture may be live (Recording is owned by the detector).
+            if job.kind == crate::jobs::RETRY_TRANSCRIPTION {
+                set_stage(&ctx.app, Stage::Idle);
             }
         }
     }
@@ -341,6 +351,9 @@ fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error)
         &ctx.app,
         format!("⚠ {} — will retry: {msg}", meta.owning_app.name),
     );
+    // The attempt is over; the recording now waits in backoff until the retry job fires. Nothing is
+    // actively running, so the diagram returns to Idle.
+    set_stage(&ctx.app, Stage::Idle);
 }
 
 /// Apply a saved config change: re-read the shared runtime config and rebuild the backend + AEC toggle. A
@@ -414,6 +427,8 @@ pub(crate) fn transcribe_and_file(
             },
         )
         .context("queue update before transcribe")?;
+    // An attempt is now actively running — both the live path and a retry job land here.
+    set_stage(&ctx.app, Stage::Transcribing);
     tray::set_status(
         &ctx.app,
         format!("Transcribing — {}…", meta.owning_app.name),
@@ -456,6 +471,7 @@ pub(crate) fn transcribe_and_file(
             },
         )
         .context("queue set PendingNote")?;
+    set_stage(&ctx.app, Stage::Filing);
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
     // File stage (vagus filing). No backend dimension; label "vagus".
     let tf = std::time::Instant::now();
@@ -528,6 +544,7 @@ fn file_and_done(
         None,
         Some(note.clone()),
     );
+    set_stage(&ctx.app, Stage::Idle);
     tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
     Ok(())
 }
@@ -562,6 +579,7 @@ fn prune_transient(raw: &Path, used: &Path) {
 pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
     error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
     let _ = ctx.queue.fail(id, &msg);
+    set_stage(&ctx.app, Stage::Idle);
     tray::update_history(
         &ctx.app,
         id,

@@ -1,6 +1,6 @@
 # ADR 0005 — Streaming compressed capture: bounded-RAM disk writer; keep AEC offline
 
-- **Status:** Proposed (2026-06-07)
+- **Status:** Partly superseded by ADR 0007 (compression + 2-pass-offline AEC; ring/writer design shipped as-is) (proposed 2026-06-07)
 
 ## Context
 

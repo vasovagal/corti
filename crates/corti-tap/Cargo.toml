@@ -25,8 +25,14 @@ corti-transcribe = { workspace = true, optional = true }
 corti-transcribe-aws = { workspace = true, optional = true }
 corti-vagus = { workspace = true, optional = true }
 aws-config = { version = "1", optional = true }
-tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
+tokio = { workspace = true, features = ["rt", "time", "net"], optional = true }
+
+# --live: bounded capture tee → optional streaming AEC → local live transcription. Only pulled in with the
+# `live` feature (it links the heavy sherpa-onnx ASR stack — kept off the default build; ADR 0009).
+corti-transcribe-local = { workspace = true, optional = true }
+corti-aec = { workspace = true, optional = true }
 
 [features]
 default = ["inbox"]
 inbox = ["dep:corti-transcribe", "dep:corti-transcribe-aws", "dep:corti-vagus", "dep:aws-config", "dep:tokio"]
+live = ["dep:corti-transcribe-local", "dep:corti-aec"]

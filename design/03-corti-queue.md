@@ -1,5 +1,11 @@
 # 03 — corti-queue
 
+> **Stale — design-time snapshot.** Superseded by [docs/transcription.md](../docs/transcription.md); kept for
+> design rationale. The `recordings` state machine below is accurate, but durability is now delivered by the
+> `corti-jobs` layer on top of this queue (#85), not the `resumable()`/`prune_done` helpers sketched here:
+> transient transcribe/file failures schedule a durable retry job with backoff, orphaned jobs are recovered
+> at startup, and an hourly sweep enforces retention. See `crates/corti-jobs/src/lib.rs` and `app/src/jobs.rs`.
+
 Durable job store so a crash mid-pipeline never loses a recording (guardrail 7). A recording moves
 `Recording → PendingTranscription → Transcribing → PendingNote → Done` (or `Failed`); every non-terminal
 state is resumable on startup.

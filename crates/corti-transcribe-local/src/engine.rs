@@ -9,6 +9,7 @@
 //! regions reach the recognizer.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use corti_transcribe::segment::{SpeakerTurn, Word};
@@ -20,12 +21,13 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector,
 };
 
+use crate::live::LiveTranscriber;
 use crate::models::Models;
 
 /// All ONNX models run at 16 kHz mono.
-const TARGET_RATE: i32 = 16_000;
+pub(crate) const TARGET_RATE: i32 = 16_000;
 /// Silero VAD window (samples at 16 kHz). 512 is the value Silero v4/v5 expect.
-const VAD_WINDOW: usize = 512;
+pub(crate) const VAD_WINDOW: usize = 512;
 /// Cap a single speech segment so ASR stays under Parakeet's offline clip limit (~30 s).
 const MAX_SPEECH_SECONDS: f32 = 20.0;
 
@@ -173,29 +175,22 @@ pub fn build_diarizer(
     Ok(diar)
 }
 
-/// Transcribe one 16 kHz mono channel: Silero VAD chunks it into speech regions, each region is decoded by
-/// the recognizer, and token timestamps are offset to absolute time and reassembled into [`Word`]s.
+/// Transcribe one 16 kHz mono channel by driving the shared live engine over the whole buffer: push it in a
+/// single shot, then flush. Batch and live share exactly one decode path ([`LiveTranscriber`]) — the only
+/// difference is that batch feeds the entire channel at once, so a single push then finish is byte-identical
+/// to the old `.chunks(512)` loop (same VAD window sequence, same regions, same words). `vad` is consumed
+/// (one stateful VAD per channel); `rec` is shared across both channels via the `Arc`.
+///
+/// [`LiveTranscriber`]: crate::LiveTranscriber
 pub fn transcribe_channel(
-    rec: &OfflineRecognizer,
-    vad: &VoiceActivityDetector,
+    rec: Arc<OfflineRecognizer>,
+    vad: VoiceActivityDetector,
     samples_16k: &[f32],
 ) -> Vec<Word> {
-    let mut words = Vec::new();
-    let drain = |vad: &VoiceActivityDetector, words: &mut Vec<Word>| {
-        while let Some(seg) = vad.front() {
-            let offset = seg.start() as f64 / TARGET_RATE as f64;
-            words.extend(asr_segment(rec, seg.samples(), offset));
-            vad.pop();
-        }
-    };
-
-    for chunk in samples_16k.chunks(VAD_WINDOW) {
-        vad.accept_waveform(chunk);
-        drain(vad, &mut words);
-    }
-    vad.flush();
-    drain(vad, &mut words);
-    words
+    let mut live = LiveTranscriber::new(rec, vad);
+    // The channel is already at 16 kHz (the caller resampled), so `push` does no resampling.
+    live.push(samples_16k, TARGET_RATE as u32);
+    live.finish()
 }
 
 /// Run far-end diarization on a 16 kHz mono channel → time-ordered speaker turns labelled `Them N`.
@@ -215,7 +210,11 @@ pub fn diarize_channel(diar: &OfflineSpeakerDiarization, samples_16k: &[f32]) ->
 }
 
 /// Decode one VAD speech region and lift its token timestamps to absolute time.
-fn asr_segment(rec: &OfflineRecognizer, samples_16k: &[f32], offset_sec: f64) -> Vec<Word> {
+pub(crate) fn asr_segment(
+    rec: &OfflineRecognizer,
+    samples_16k: &[f32],
+    offset_sec: f64,
+) -> Vec<Word> {
     let stream = rec.create_stream();
     stream.accept_waveform(TARGET_RATE, samples_16k);
     rec.decode(&stream);

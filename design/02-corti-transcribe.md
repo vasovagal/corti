@@ -1,4 +1,4 @@
-# 02 — corti-transcribe (+ aws, + whisper)
+# 02 — corti-transcribe (+ aws, + local Parakeet)
 
 Turns a recorded 2-track WAV into a `DiarizedTranscript` (defined in `corti-core`, which also renders it to
 Markdown via `to_markdown()`). Backends are **feature-flavored** behind one trait so the rest of the

@@ -31,6 +31,7 @@ before any architectural change, and update the matching ADR when you change a d
 | `corti-queue` | Durable job store + crash recovery |
 | `corti-jobs` | Small background-job layer in queue.db: retries with backoff + periodic schedules |
 | `corti-vagus` | The `vagus` CLI shell-out (the only vagus touchpoint) |
+| `corti-bench` | Audio-quality benchmark harness (WER/cpWER/RSS/ERLE sweep over `bench/`) |
 | `app/` | Tauri 2 tray binary |
 
 ## Build / test
@@ -52,6 +53,10 @@ cargo tauri build                        # produces .app + .dmg under target/...
 The app's transcription features are `aws` (default) and `local`; ship builds use
 `--features aws,local` and select the active backend at runtime via
 `CORTI_TRANSCRIBE_BACKEND`.
+
+Build the frontend first: the app crate's `generate_context!()` reads `frontendDist`
+(`app/ui/dist`) from `tauri.conf.json`, so `cargo` won't compile the workspace until
+`npm --prefix app/ui run build` has produced it — CI enforces this ordering (`ci.yml`).
 
 ### Local backend models
 

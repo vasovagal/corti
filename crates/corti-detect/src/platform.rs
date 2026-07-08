@@ -238,6 +238,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                         "call ended — recording discarded (below keep threshold)"
                     );
                     recorder.discard();
+                    self.emit(DetectorEvent::RecordingDiscarded { meta });
                     return;
                 }
                 match recorder.finish() {

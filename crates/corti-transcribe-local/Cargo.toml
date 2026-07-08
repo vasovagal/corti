@@ -25,6 +25,11 @@ hound = "3.5"
 # Default model cache under ~/Library/Caches/corti/models/ (guardrail #5: outside any vault).
 dirs = "6"
 
+# Async `Stream` adapter (feature `stream` only — sync core, async at the edge; ADR 0009). Pinned in the
+# workspace root.
+tokio = { workspace = true, features = ["sync"], optional = true }
+futures-core = { workspace = true, optional = true }
+
 [features]
 # Signals that this build links a *CoreML-enabled* sherpa-onnx static lib (which you must supply via
 # SHERPA_ONNX_LIB_DIR / SHERPA_ONNX_ARCHIVE_DIR — the crates.io prebuilt has no CoreML execution provider).
@@ -33,6 +38,10 @@ dirs = "6"
 # through instead of mapping it to `cpu`. OFF by default → CPU-only build, byte-for-byte unchanged.
 # See design/adr/0003-local-asr-sherpa-onnx.md.
 coreml-lib = []
+
+# Async adapter: a `futures_core::Stream<Item = Vec<Word>>` over the sync `LiveTranscriber` (ADR 0009). OFF
+# by default — no tokio/futures in the default build; the core stays runtime-free (guardrail 9).
+stream = ["dep:tokio", "dep:futures-core"]
 
 [dev-dependencies]
 # The transcribe_file example builds a RecordingMeta, which carries chrono timestamps.
