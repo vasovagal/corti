@@ -1,20 +1,19 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import Queue from "./Queue";
 import Settings from "./Settings";
 import Console from "./Console";
 import How from "./How";
 import { validate } from "./lib/data";
 import "./styles.css";
 
-// One bundle serves every webview window; the tray opens each via a `?view=` query param.
+// One bundle serves every webview window; the tray picks a view via the URL query
+// (`index.html?view=settings`, `?view=console`, `?view=queue`, `?view=how`; no query = the Ethics Guide).
 const view = new URLSearchParams(window.location.search).get("view");
-const isSettings = view === "settings";
-const isConsole = view === "console";
-const isHow = view === "how";
 
 // Fail loudly in dev if a hand-edit to the Ethics Guide JSON datasets broke their shape/counts.
-if (!isSettings && !isConsole && !isHow && import.meta.env.DEV) {
+if (view === null && import.meta.env.DEV) {
   try {
     validate();
   } catch (e) {
@@ -27,6 +26,16 @@ if (!root) throw new Error("missing #root element");
 
 ReactDOM.createRoot(root).render(
   <React.StrictMode>
-    {isSettings ? <Settings /> : isConsole ? <Console /> : isHow ? <How /> : <App />}
+    {view === "settings" ? (
+      <Settings />
+    ) : view === "console" ? (
+      <Console />
+    ) : view === "queue" ? (
+      <Queue />
+    ) : view === "how" ? (
+      <How />
+    ) : (
+      <App />
+    )}
   </React.StrictMode>,
 );

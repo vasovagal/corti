@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 use corti_core::{JobStatus, OwningApp, RecordingMeta};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -31,7 +31,8 @@ pub fn data_dir() -> Result<PathBuf> {
 
 /// One tracked recording and where it is in the pipeline. Returned by [`Queue::get`],
 /// [`Queue::resumable`], and [`Queue::all`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `transcribe_secs` is an `f64` (only `PartialEq`), same situation as `AppConfig`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     /// Stable id (the recording's filename stem, e.g. `20260530-135756-slack`).
     pub id: String,
@@ -50,6 +51,9 @@ pub struct Job {
     pub note_path: Option<PathBuf>,
     /// Last error (set alongside `Failed`).
     pub error: Option<String>,
+    /// Wall-clock seconds the (successful) transcription took, for the Queue UI's
+    /// "transcribed 55 min in 30 s" line.
+    pub transcribe_secs: Option<f64>,
     pub updated_at: DateTime<Local>,
 }
 
@@ -77,6 +81,9 @@ pub struct JobUpdate {
     pub transcribe_job: Option<String>,
     pub note_path: Option<PathBuf>,
     pub error: Option<String>,
+    pub transcribe_secs: Option<f64>,
+    /// Re-point the row at a different audio file (the legacy-WAV backfill swaps `.wav` → `.ogg`).
+    pub audio_path: Option<PathBuf>,
 }
 
 /// The durable job store. Open with [`Queue::open`] (or [`Queue::open_at`] for an explicit path).
@@ -100,7 +107,8 @@ impl Queue {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut conn =
+            Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
         // WAL keeps readers and the writer from blocking each other and survives crashes cleanly.
@@ -108,7 +116,33 @@ impl Queue {
         let _: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
             .context("enabling WAL")?;
+        migrate(&mut conn).context("migrating queue schema")?;
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        corti_jobs::Jobs::ensure_schema(&conn)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .context("stamping user_version")?;
+        Ok(Self { conn })
+    }
+
+    /// Borrow the embedded background-jobs store. Same connection, same single owner thread — the
+    /// returned view must not outlive this `Queue` (the borrow enforces it).
+    pub fn jobs(&self) -> corti_jobs::Jobs<'_> {
+        corti_jobs::Jobs::new(&self.conn)
+    }
+
+    /// Open the queue **read-only** — for UI command threads that must never become a second writer
+    /// (the pipeline thread stays the sole one; WAL supports concurrent readers beside it). Skips the
+    /// migration (read-only can't run it; the pipeline's open already has). Errors if the DB doesn't
+    /// exist yet, and any accidental write fails loudly at the SQLite layer.
+    pub fn open_read_only() -> Result<Self> {
+        let path = data_dir()?.join("queue.db");
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("setting busy_timeout")?;
         Ok(Self { conn })
     }
 
@@ -179,12 +213,14 @@ impl Queue {
             .conn
             .execute(
                 "UPDATE recordings SET
-                   status         = COALESCE(?2, status),
-                   s3_uri         = COALESCE(?3, s3_uri),
-                   transcribe_job = COALESCE(?4, transcribe_job),
-                   note_path      = COALESCE(?5, note_path),
-                   error          = COALESCE(?6, error),
-                   updated_at     = ?7
+                   status          = COALESCE(?2, status),
+                   s3_uri          = COALESCE(?3, s3_uri),
+                   transcribe_job  = COALESCE(?4, transcribe_job),
+                   note_path       = COALESCE(?5, note_path),
+                   error           = COALESCE(?6, error),
+                   transcribe_secs = COALESCE(?7, transcribe_secs),
+                   audio_path      = COALESCE(?8, audio_path),
+                   updated_at      = ?9
                  WHERE id = ?1",
                 params![
                     id,
@@ -193,6 +229,8 @@ impl Queue {
                     fields.transcribe_job,
                     note_path,
                     fields.error,
+                    fields.transcribe_secs,
+                    fields.audio_path.map(|p| p.to_string_lossy().into_owned()),
                     fmt_dt(Local::now()),
                 ],
             )
@@ -207,6 +245,29 @@ impl Queue {
             note_path_set = note_changed,
             "update"
         );
+        Ok(())
+    }
+
+    /// Reset a `Failed` recording for a (manual) retry: status back to `PendingTranscription` with the
+    /// error **cleared** — the COALESCE-based [`update`](Queue::update) can't NULL a field, hence the
+    /// dedicated method. Errors if the row isn't currently `Failed` (the UI races the pipeline).
+    pub fn retry_reset(&self, id: &str) -> Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE recordings SET status = ?2, error = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = ?4",
+                params![
+                    id,
+                    status_to_string(JobStatus::PendingTranscription),
+                    fmt_dt(Local::now()),
+                    status_to_string(JobStatus::Failed),
+                ],
+            )
+            .context("resetting failed recording")?;
+        if n == 0 {
+            bail!("no Failed recording with id {id}");
+        }
         Ok(())
     }
 
@@ -247,53 +308,142 @@ impl Queue {
         raws.into_iter().map(raw_to_job).collect()
     }
 
-    /// Delete `Done` rows last updated before `older_than`, returning the audio paths of the pruned
-    /// recordings so the caller can delete the cached WAVs (this method touches only the DB). Lets the
-    /// recordings cache be reclaimed on a retention policy, e.g. `Local::now() - Duration::days(30)`.
-    pub fn prune_done(&self, older_than: DateTime<Local>) -> Result<Vec<PathBuf>> {
-        let done = status_to_string(JobStatus::Done);
-        let cutoff = fmt_dt(older_than);
-        let paths: Vec<PathBuf> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT audio_path FROM recordings WHERE status = ?1 AND updated_at < ?2",
-            )?;
-            stmt.query_map(params![done, cutoff], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect()
-        };
+    /// Terminal (`Done` | `Failed`) rows last updated before `older_than` — the retention sweep's
+    /// audio-deletion candidates, oldest first. **Read-only**: rows now outlive their audio, so the
+    /// Recording Queue window keeps showing history ("Filed in brain") after the files are reclaimed.
+    pub fn expired(&self, older_than: DateTime<Local>) -> Result<Vec<Job>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLS} FROM recordings
+             WHERE status IN (?1, ?2) AND updated_at < ?3 ORDER BY started_at"
+        ))?;
+        let raws = stmt
+            .query_map(
+                params![
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                    fmt_dt(older_than),
+                ],
+                read_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        raws.into_iter().map(raw_to_job).collect()
+    }
+
+    /// Row GC: delete terminal (`Done` | `Failed`) rows last updated before `older_than`. Bounds
+    /// queue.db and the Recording Queue's history list on a much longer horizon than the audio
+    /// retention (90 days vs ~7), so "Filed in brain" history stays useful for a quarter. Returns how
+    /// many rows went; non-terminal rows are never touched.
+    pub fn delete_terminal_older_than(&self, older_than: DateTime<Local>) -> Result<usize> {
         self.conn
             .execute(
-                "DELETE FROM recordings WHERE status = ?1 AND updated_at < ?2",
-                params![done, cutoff],
+                "DELETE FROM recordings WHERE status IN (?1, ?2) AND updated_at < ?3",
+                params![
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                    fmt_dt(older_than),
+                ],
             )
-            .context("pruning done rows")?;
-        Ok(paths)
+            .context("deleting expired terminal rows")
     }
 }
 
-/// Columns in storage order; shared by every `SELECT` so [`read_row`] indices stay aligned.
+/// Columns in a fixed order shared by every `SELECT` so [`read_row`] indices stay aligned.
 const COLS: &str = "id, started_at, ended_at, owning_app, bundle_id, audio_path, \
-                    status, s3_uri, transcribe_job, note_path, error, updated_at";
+                    status, s3_uri, transcribe_job, note_path, error, updated_at, \
+                    transcribe_secs";
+
+/// Bumped whenever [`migrate`] gains a step; stamped into `PRAGMA user_version` on every open.
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS recordings(
-  id             TEXT PRIMARY KEY,
-  started_at     TEXT NOT NULL,
-  ended_at       TEXT,
-  owning_app     TEXT NOT NULL,
-  bundle_id      TEXT,
-  audio_path     TEXT NOT NULL,
-  status         TEXT NOT NULL,
-  s3_uri         TEXT,
-  transcribe_job TEXT,
-  note_path      TEXT,
-  error          TEXT,
-  updated_at     TEXT NOT NULL
+  id              TEXT PRIMARY KEY,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  owning_app      TEXT NOT NULL,
+  bundle_id       TEXT,
+  audio_path      TEXT NOT NULL,
+  status          TEXT NOT NULL,
+  s3_uri          TEXT,
+  transcribe_job  TEXT,
+  note_path       TEXT,
+  error           TEXT,
+  updated_at      TEXT NOT NULL,
+  transcribe_secs REAL
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
 ";
+
+/// Bring a pre-existing DB up to [`SCHEMA_VERSION`]. Runs before `execute_batch(SCHEMA)`, so a fresh DB
+/// (no `recordings` table yet) skips straight through and is created in the current shape. Every step is
+/// safe to re-run: a crash between a step committing and the `user_version` stamp just replays it.
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("reading user_version")?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='recordings')",
+            [],
+            |r| r.get(0),
+        )
+        .context("probing for recordings table")?;
+    if version < 1 && has_table {
+        migrate_v0_to_v1(conn).context("migrating queue schema v0 → v1")?;
+    }
+    Ok(())
+}
+
+/// v0 → v1: add `transcribe_secs`, and rewrite every stored timestamp to the fixed-width UTC `…Z` form
+/// [`fmt_dt`] now writes. v0 stored `DateTime<Local>::to_rfc3339()` — local-*offset* strings whose lexical
+/// order diverges from chronological order the moment two rows carry different offsets (DST transition,
+/// timezone travel), corrupting `ORDER BY started_at` and every `updated_at < cutoff` retention check.
+fn migrate_v0_to_v1(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction().context("starting migration tx")?;
+    // Replayed after a crash mid-migration, the column may already be there; the rewrite below is
+    // idempotent (re-formatting a `…Z` string is a no-op).
+    let has_col: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('recordings') WHERE name='transcribe_secs')",
+            [],
+            |r| r.get(0),
+        )
+        .context("probing for transcribe_secs column")?;
+    if !has_col {
+        tx.execute("ALTER TABLE recordings ADD COLUMN transcribe_secs REAL", [])
+            .context("adding transcribe_secs column")?;
+    }
+    let rows: Vec<(String, String, Option<String>, String)> = {
+        let mut stmt = tx.prepare("SELECT id, started_at, ended_at, updated_at FROM recordings")?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()
+            .context("reading rows for timestamp rewrite")?
+    };
+    {
+        let mut write = tx.prepare(
+            "UPDATE recordings SET started_at = ?2, ended_at = ?3, updated_at = ?4 WHERE id = ?1",
+        )?;
+        for (id, started, ended, updated) in rows {
+            write
+                .execute(params![
+                    id,
+                    reformat_utc(&started)?,
+                    ended.as_deref().map(reformat_utc).transpose()?,
+                    reformat_utc(&updated)?,
+                ])
+                .with_context(|| format!("rewriting timestamps for {id}"))?;
+        }
+    }
+    tx.commit().context("committing v0 → v1 migration")
+}
+
+/// Any-offset RFC3339 → the canonical UTC `…Z` form (what [`fmt_dt`] writes).
+fn reformat_utc(s: &str) -> Result<String> {
+    Ok(fmt_dt(parse_dt(s)?))
+}
 
 /// The job id for a recording: its filename stem (already unique + stable), falling back to the start
 /// time if the path somehow has no stem. Public so callers (the tray) can key a pre-enqueue history
@@ -321,6 +471,7 @@ struct RawRow {
     note_path: Option<String>,
     error: Option<String>,
     updated_at: String,
+    transcribe_secs: Option<f64>,
 }
 
 fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -337,6 +488,7 @@ fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         note_path: row.get(9)?,
         error: row.get(10)?,
         updated_at: row.get(11)?,
+        transcribe_secs: row.get(12)?,
     })
 }
 
@@ -353,12 +505,17 @@ fn raw_to_job(r: RawRow) -> Result<Job> {
         transcribe_job: r.transcribe_job,
         note_path: r.note_path.map(PathBuf::from),
         error: r.error,
+        transcribe_secs: r.transcribe_secs,
         updated_at: parse_dt(&r.updated_at)?,
     })
 }
 
+/// The canonical stored form: UTC, millisecond precision, `Z` suffix — fixed-width, so lexical order
+/// (which SQLite's TEXT comparisons use) equals chronological order. Never store a local offset here;
+/// that's the v0 bug [`migrate_v0_to_v1`] cleans up.
 fn fmt_dt(dt: DateTime<Local>) -> String {
-    dt.to_rfc3339()
+    dt.with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Local>> {
@@ -391,6 +548,7 @@ mod tests {
         fn memory() -> Self {
             let conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(SCHEMA).unwrap();
+            corti_jobs::Jobs::ensure_schema(&conn).unwrap();
             Self { conn }
         }
     }
@@ -506,30 +664,56 @@ mod tests {
     }
 
     #[test]
-    fn prune_done_removes_old_done_rows_and_returns_paths() {
+    fn expired_lists_terminal_rows_read_only() {
         let q = Queue::memory();
-        let a = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
-        let b = q.enqueue(&meta("/cache/b.wav", "us.zoom.xos")).unwrap();
+        let a = q.enqueue(&meta("/cache/a.ogg", "us.zoom.xos")).unwrap();
+        let b = q.enqueue(&meta("/cache/b.ogg", "us.zoom.xos")).unwrap();
+        let c = q.enqueue(&meta("/cache/c.ogg", "us.zoom.xos")).unwrap();
         q.set_status(&a, JobStatus::Done).unwrap();
-        // b stays PendingTranscription.
+        q.fail(&b, "boom").unwrap();
+        // c stays PendingTranscription.
 
-        // Cutoff in the future ⇒ the Done row counts as old and is pruned.
-        let removed = q
-            .prune_done(Local::now() + chrono::Duration::seconds(60))
-            .unwrap();
-        assert_eq!(removed, vec![PathBuf::from("/cache/a.wav")]);
-        assert!(q.get(&a).unwrap().is_none());
-        assert!(q.get(&b).unwrap().is_some()); // non-terminal never pruned
+        // Future cutoff ⇒ both terminal rows are sweep candidates; the pending one never is.
+        let future = Local::now() + chrono::Duration::seconds(60);
+        let ids: Vec<String> = q
+            .expired(future)
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert_eq!(ids, vec![a.clone(), b.clone()]);
+        // Read-only: every row (and its status) survives the query.
+        assert_eq!(q.get(&a).unwrap().unwrap().status, JobStatus::Done);
+        assert_eq!(q.get(&b).unwrap().unwrap().status, JobStatus::Failed);
+        let _ = c;
 
-        // A past cutoff prunes nothing (the just-marked Done row is newer than it).
-        let a2 = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
-        q.set_status(&a2, JobStatus::Done).unwrap();
+        // A past cutoff matches nothing (the rows were just touched).
         assert!(
-            q.prune_done(Local::now() - chrono::Duration::hours(1))
+            q.expired(Local::now() - chrono::Duration::hours(1))
                 .unwrap()
                 .is_empty()
         );
-        assert!(q.get(&a2).unwrap().is_some());
+    }
+
+    #[test]
+    fn delete_terminal_older_than_spares_non_terminal() {
+        let q = Queue::memory();
+        let a = q.enqueue(&meta("/cache/a.ogg", "us.zoom.xos")).unwrap();
+        let b = q.enqueue(&meta("/cache/b.ogg", "us.zoom.xos")).unwrap();
+        let c = q.enqueue(&meta("/cache/c.ogg", "us.zoom.xos")).unwrap();
+        q.set_status(&a, JobStatus::Done).unwrap();
+        q.fail(&b, "boom").unwrap();
+
+        let n = q
+            .delete_terminal_older_than(Local::now() + chrono::Duration::seconds(60))
+            .unwrap();
+        assert_eq!(n, 2);
+        assert!(q.get(&a).unwrap().is_none());
+        assert!(q.get(&b).unwrap().is_none());
+        assert!(
+            q.get(&c).unwrap().is_some(),
+            "non-terminal rows are never GC'd"
+        );
     }
 
     #[test]
@@ -549,6 +733,134 @@ mod tests {
             "pending_transcription"
         );
         assert!(status_from_str("not_a_status").is_err());
+    }
+
+    /// The v0 schema verbatim (pre-`user_version`, pre-`transcribe_secs`, local-offset timestamps), for
+    /// migration tests. Keep frozen — this is what shipped DBs look like.
+    const V0_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS recordings(
+  id             TEXT PRIMARY KEY,
+  started_at     TEXT NOT NULL,
+  ended_at       TEXT,
+  owning_app     TEXT NOT NULL,
+  bundle_id      TEXT,
+  audio_path     TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  s3_uri         TEXT,
+  transcribe_job TEXT,
+  note_path      TEXT,
+  error          TEXT,
+  updated_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
+";
+
+    #[test]
+    fn migrates_v0_db_to_utc_and_adds_transcribe_secs() {
+        let dir = std::env::temp_dir().join("corti-queue-test-migrate-v0");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.db");
+
+        // Build a v0 DB whose lexical timestamp order CONTRADICTS chronological order:
+        // `earlier` = 23:30+12:00 = 11:30Z, `later` = 08:00-07:00 = 15:00Z — yet "08:…" < "23:…".
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(V0_SCHEMA).unwrap();
+            for (id, ts) in [
+                ("later", "2026-03-08T08:00:00-07:00"),
+                ("earlier", "2026-03-08T23:30:00+12:00"),
+            ] {
+                conn.execute(
+                    "INSERT INTO recordings (id, started_at, owning_app, audio_path, status, updated_at)
+                     VALUES (?1, ?2, 'Zoom', '/cache/x.wav', 'done', ?2)",
+                    params![id, ts],
+                )
+                .unwrap();
+            }
+            // v0 lexical ordering really is wrong — the precondition this migration exists for.
+            let first: String = conn
+                .query_row(
+                    "SELECT id FROM recordings ORDER BY started_at LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(first, "later");
+        }
+
+        let q = Queue::open_at(&path).unwrap();
+        let version: i64 = q
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // Chronological order restored, timestamps canonicalized, new column readable as NULL.
+        let jobs = q.all().unwrap();
+        assert_eq!(
+            jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "later"]
+        );
+        for job in &jobs {
+            assert_eq!(job.transcribe_secs, None);
+            let raw: String = q
+                .conn
+                .query_row(
+                    "SELECT started_at FROM recordings WHERE id = ?1",
+                    params![&job.id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(raw.ends_with('Z'), "expected UTC Z form, got {raw}");
+        }
+
+        // Reopening (already at v1) is a clean no-op.
+        drop(q);
+        let q = Queue::open_at(&path).unwrap();
+        assert_eq!(q.all().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fmt_dt_is_fixed_width_sortable_utc() {
+        let dt = Local.with_ymd_and_hms(2026, 5, 30, 14, 5, 0).unwrap();
+        let s = fmt_dt(dt);
+        assert!(s.ends_with('Z'), "expected Z suffix: {s}");
+        assert_eq!(s.len(), "2026-05-30T21:05:00.000Z".len());
+        assert_eq!(parse_dt(&s).unwrap(), dt); // round-trips through the canonical form
+    }
+
+    #[test]
+    fn retry_reset_requires_failed_and_clears_error() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
+        // Not Failed yet ⇒ refuses (the UI can race the pipeline).
+        assert!(q.retry_reset(&id).is_err());
+
+        q.fail(&id, "boom").unwrap();
+        q.retry_reset(&id).unwrap();
+        let job = q.get(&id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::PendingTranscription);
+        assert_eq!(job.error, None);
+    }
+
+    #[test]
+    fn update_records_transcribe_secs() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
+        q.update(
+            &id,
+            JobUpdate {
+                transcribe_secs: Some(30.5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let job = q.get(&id).unwrap().unwrap();
+        assert_eq!(job.transcribe_secs, Some(30.5));
+        assert_eq!(job.status, JobStatus::PendingTranscription); // untouched
     }
 
     #[test]

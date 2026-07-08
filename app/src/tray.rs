@@ -123,6 +123,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     }
     items.push(Box::new(MenuItem::with_id(
         app,
+        "open_queue",
+        "Recording Queue…",
+        true,
+        None::<&str>,
+    )?));
+    items.push(Box::new(MenuItem::with_id(
+        app,
         "open_settings",
         "Settings…",
         true,
@@ -198,6 +205,7 @@ pub fn push_history_recording(app: &AppHandle, meta: &corti_core::RecordingMeta)
 /// An existing entry with the same id is moved to the front and replaced (keeps the list de-duplicated when
 /// a recording is re-seen, e.g. on resume).
 pub fn push_history(app: &AppHandle, entry: HistoryEntry) {
+    let id = entry.id.clone();
     if let Some(state) = app.try_state::<AppState>() {
         let mut history = state.history.lock().unwrap();
         history.retain(|e| e.id != entry.id);
@@ -207,6 +215,7 @@ pub fn push_history(app: &AppHandle, entry: HistoryEntry) {
         }
     }
     refresh_menu(app);
+    emit_queue_changed(app, &id);
 }
 
 /// Update an existing history entry in place (status / error / note_path / ended_at), then rebuild the
@@ -236,6 +245,15 @@ pub fn update_history(
         }
     }
     refresh_menu(app);
+    emit_queue_changed(app, id);
+}
+
+/// Tell any open Recording Queue window to refetch its list. Coarse-grained by design: the payload is
+/// just the touched id; the window re-pulls everything (the list is tiny). Every tray history change
+/// routes through here, so the window tracks the pipeline for free.
+pub fn emit_queue_changed(app: &AppHandle, id: &str) {
+    use tauri::Emitter;
+    let _ = app.emit("queue-changed", id);
 }
 
 /// The read-only Settings-summary labels for the tray, derived live from the current config so they reflect
@@ -321,6 +339,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         "quit" => app.exit(0),
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
         "open_settings" => open_settings_window(app),
+        "open_queue" => open_queue_window(app),
         "ethics_guide" => open_ethics_window(app),
         "open_how" => open_how_window(app),
         "open_diagnostics" => open_console_window(app),
@@ -334,14 +353,23 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     }
 }
 
-/// Open (or focus, if already open) the in-app "Ethics & Legality Guide" webview window. This is the
-/// app's only window — the tray/pipeline stay windowless (ADR 0004). Window + AppKit work must run on
-/// the main thread, like every other tray mutation here.
-fn open_ethics_window(app: &AppHandle) {
+/// Open (or focus, if already open) one of the app's singleton webview windows. They all load the same
+/// SPA bundle, selecting a view via the URL query (ADR 0004: the tray/pipeline stay windowless; windows
+/// are created on demand). Flips the app to `Regular` (Dock presence + focusability) while any window
+/// lives and reverts to menu-bar-only `Accessory` once the last one closes. Window + AppKit work must
+/// run on the main thread, like every other tray mutation here.
+fn open_app_window(
+    app: &AppHandle,
+    label: &'static str,
+    url: &'static str,
+    title: &'static str,
+    size: (f64, f64),
+    min_size: (f64, f64),
+) {
     let app = app.clone();
     let _ = app.clone().run_on_main_thread(move || {
         // Singleton: focus the existing window instead of spawning a second.
-        if let Some(win) = app.get_webview_window("ethics") {
+        if let Some(win) = app.get_webview_window(label) {
             let _ = win.unminimize();
             let _ = win.show();
             let _ = win.set_focus();
@@ -351,10 +379,10 @@ fn open_ethics_window(app: &AppHandle) {
         // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
         let _ = app.set_activation_policy(ActivationPolicy::Regular);
 
-        match WebviewWindowBuilder::new(&app, "ethics", WebviewUrl::App("index.html".into()))
-            .title("Ethics & Legality Guide")
-            .inner_size(900.0, 700.0)
-            .min_inner_size(640.0, 480.0)
+        match WebviewWindowBuilder::new(&app, label, WebviewUrl::App(url.into()))
+            .title(title)
+            .inner_size(size.0, size.1)
+            .min_inner_size(min_size.0, min_size.1)
             .resizable(true)
             .build()
         {
@@ -368,7 +396,7 @@ fn open_ethics_window(app: &AppHandle) {
                 });
             }
             Err(e) => {
-                eprintln!("[corti] opening ethics window failed: {e}");
+                eprintln!("[corti] opening {label} window failed: {e}");
                 // Don't leave a dangling Regular policy with no window.
                 revert_activation_policy_if_no_windows(&app);
             }
@@ -376,51 +404,40 @@ fn open_ethics_window(app: &AppHandle) {
     });
 }
 
-/// Open (or focus, if already open) the in-app Settings window. Created on demand like the Ethics window
-/// (ADR 0004): flips the app to `Regular` while it lives and reverts to menu-bar-only `Accessory` once it
-/// (and any other window) closes. It loads the same SPA bundle as the Ethics window, selecting the settings
-/// view via the `?view=settings` query. Window + AppKit work runs on the main thread.
+/// The in-app "Ethics & Legality Guide" window.
+fn open_ethics_window(app: &AppHandle) {
+    open_app_window(
+        app,
+        "ethics",
+        "index.html",
+        "Ethics & Legality Guide",
+        (900.0, 700.0),
+        (640.0, 480.0),
+    );
+}
+
+/// The Settings editor window.
 fn open_settings_window(app: &AppHandle) {
-    let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        // Singleton: focus the existing window instead of spawning a second.
-        if let Some(win) = app.get_webview_window("settings") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-            return;
-        }
+    open_app_window(
+        app,
+        "settings",
+        "index.html?view=settings",
+        "Settings",
+        (720.0, 640.0),
+        (560.0, 420.0),
+    );
+}
 
-        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
-        let _ = app.set_activation_policy(ActivationPolicy::Regular);
-
-        match WebviewWindowBuilder::new(
-            &app,
-            "settings",
-            WebviewUrl::App("index.html?view=settings".into()),
-        )
-        .title("Settings")
-        .inner_size(720.0, 640.0)
-        .min_inner_size(560.0, 420.0)
-        .resizable(true)
-        .build()
-        {
-            Ok(win) => {
-                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
-                let app_for_evt = app.clone();
-                win.on_window_event(move |event| {
-                    if matches!(event, WindowEvent::Destroyed) {
-                        revert_activation_policy_if_no_windows(&app_for_evt);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("[corti] opening settings window failed: {e}");
-                // Don't leave a dangling Regular policy with no window.
-                revert_activation_policy_if_no_windows(&app);
-            }
-        }
-    });
+/// The printer-queue-style Recording Queue window.
+fn open_queue_window(app: &AppHandle) {
+    open_app_window(
+        app,
+        "queue",
+        "index.html?view=queue",
+        "Recording Queue",
+        (760.0, 560.0),
+        (560.0, 400.0),
+    );
 }
 
 /// Open (or focus, if already open) the on-demand Diagnostics console window. Created at runtime like the
@@ -470,48 +487,17 @@ fn open_console_window(app: &AppHandle) {
     });
 }
 
-/// Open (or focus, if already open) the on-demand "How Corti Works" window: a live diagram of the
-/// detect → capture → echo-cancel → transcribe → file pipeline with the active stage pulsing. Created at
-/// runtime like the Settings/Diagnostics windows (ADR 0004): flips the app to `Regular` while it lives
-/// and reverts to menu-bar-only `Accessory` once it (and any other window) closes. It loads the same SPA
-/// bundle, selecting the view via `?view=how`. Window + AppKit work runs on the main thread.
+/// The "How Corti Works" window: a live diagram of the detect → capture → echo-cancel → transcribe →
+/// file pipeline with the active stage pulsing (view selected via `?view=how`).
 fn open_how_window(app: &AppHandle) {
-    let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        // Singleton: focus the existing window instead of spawning a second.
-        if let Some(win) = app.get_webview_window("how") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-            return;
-        }
-
-        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
-        let _ = app.set_activation_policy(ActivationPolicy::Regular);
-
-        match WebviewWindowBuilder::new(&app, "how", WebviewUrl::App("index.html?view=how".into()))
-            .title("How Corti Works")
-            .inner_size(880.0, 560.0)
-            .min_inner_size(560.0, 420.0)
-            .resizable(true)
-            .build()
-        {
-            Ok(win) => {
-                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
-                let app_for_evt = app.clone();
-                win.on_window_event(move |event| {
-                    if matches!(event, WindowEvent::Destroyed) {
-                        revert_activation_policy_if_no_windows(&app_for_evt);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("[corti] opening how-corti-works window failed: {e}");
-                // Don't leave a dangling Regular policy with no window.
-                revert_activation_policy_if_no_windows(&app);
-            }
-        }
-    });
+    open_app_window(
+        app,
+        "how",
+        "index.html?view=how",
+        "How Corti Works",
+        (880.0, 560.0),
+        (560.0, 420.0),
+    );
 }
 
 /// Return to `Accessory` (menu-bar-only) once no webview windows remain — future-proof against more

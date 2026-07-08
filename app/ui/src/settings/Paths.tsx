@@ -1,16 +1,30 @@
 import { useEffect, useState } from "react";
-import { getPaths, revealPath, setModelsDir, type PathsDto } from "../lib/api";
+import {
+  getPaths,
+  revealPath,
+  setModelsDir,
+  type PathsDto,
+  type SettingsDto,
+} from "../lib/api";
 
 function mb(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
-// Settings → Storage: the recordings cache and (when the local backend is compiled in) the models dir.
-// Changing the models dir validates it sits outside any notes vault, server-side (guardrail #5).
-export function Paths() {
+// Settings → Storage: the recordings cache, the retention window for its audio, and (when the local
+// backend is compiled in) the models dir. Changing the models dir validates it sits outside any notes
+// vault, server-side (guardrail #5). The retention edit rides the shared Save button via `onChange`.
+export function Paths({
+  cfg,
+  onChange,
+}: {
+  cfg: SettingsDto;
+  onChange: (cfg: SettingsDto) => void;
+}) {
   const [paths, setPaths] = useState<PathsDto | null>(null);
   const [modelsDirEdit, setModelsDirEdit] = useState("");
   const [error, setError] = useState("");
+  const retentionPinned = cfg.env_managed.includes("retention_days");
 
   const refresh = () =>
     getPaths()
@@ -61,6 +75,32 @@ export function Paths() {
             Reveal in Finder
           </button>
         </div>
+      </div>
+
+      <div className="settings-field">
+        <label>Keep recordings for</label>
+        <div className="other-row">
+          <input
+            type="number"
+            min={1}
+            max={365}
+            value={cfg.retention_days}
+            disabled={retentionPinned}
+            onChange={(e) =>
+              onChange({ ...cfg, retention_days: Number(e.target.value) })
+            }
+            style={{ width: "5em" }}
+          />
+          <span className="muted small">days</span>
+          {retentionPinned && (
+            <span className="muted small">set by CORTI_RETENTION_DAYS</span>
+          )}
+        </div>
+        <p className="muted small">
+          Audio older than this is deleted by the hourly sweep. Notes and
+          transcripts are never touched, and history stays visible in the
+          Recording Queue.
+        </p>
       </div>
 
       {paths.models_dir !== null && (

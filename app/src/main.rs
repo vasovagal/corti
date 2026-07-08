@@ -23,9 +23,13 @@ mod config;
 #[cfg(target_os = "macos")]
 mod console;
 #[cfg(target_os = "macos")]
+mod jobs;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
+#[cfg(target_os = "macos")]
+mod queue_ui;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
@@ -266,6 +270,10 @@ pub(crate) mod imp {
                 crate::console::save_console_logs,
                 crate::stats::get_stats,
                 crate::activity::get_pipeline_activity,
+                crate::queue_ui::list_recordings,
+                crate::queue_ui::retry_recording,
+                crate::queue_ui::open_note,
+                crate::queue_ui::reveal_audio,
             ])
             .setup(move |app| {
                 setup(app, &cfg, console_buffer.clone()).map_err(|e| {
@@ -337,6 +345,10 @@ pub(crate) mod imp {
         // Manual "Webinar mode" handle: owns the live tap-only recorder + a clone of the pipeline channel.
         // Managed after the channel exists and before the detector closure consumes `pipe_tx`.
         app.manage(Webinar::new(pipe_tx.clone()));
+
+        // The Recording Queue window's path to the pipeline thread (its Retry button is a message,
+        // never a direct queue write).
+        app.manage(crate::queue_ui::PipelineTx(Mutex::new(pipe_tx.clone())));
 
         // Detector: mic on/off → recordings. Its callback runs off the HAL thread (guardrail 9).
         let handle = app.handle().clone();
