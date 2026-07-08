@@ -22,7 +22,7 @@ use corti_vagus::Vagus;
 use tauri::AppHandle;
 use tracing::{error, info, warn};
 
-use crate::imp::{HISTORY_LIMIT, HistoryEntry};
+use crate::imp::{HISTORY_LIMIT, HistoryEntry, Stage, set_stage};
 use crate::settings::SharedConfig;
 use crate::transcribe::Backend;
 use crate::tray;
@@ -132,6 +132,9 @@ pub fn run(
                         error = %format!("{e:#}"),
                         "enqueue failed"
                     );
+                    // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
+                    // the diagram doesn't sit on Transcribing forever.
+                    set_stage(&ctx.app, Stage::Idle);
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
             },
@@ -210,6 +213,7 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         );
         return;
     }
+    set_stage(&ctx.app, Stage::Transcribing);
     tray::set_status(
         &ctx.app,
         format!("Transcribing — {}…", meta.owning_app.name),
@@ -255,6 +259,7 @@ fn transcribe_and_file(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Pa
         fail(ctx, id, meta, format!("queue set PendingNote: {e:#}"));
         return;
     }
+    set_stage(&ctx.app, Stage::Filing);
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
     // File stage (vagus filing). No backend dimension; label "vagus". Recorded after the call, which
     // always returns (file_and_done is a separate fn), so this fires on both success and filing failure.
@@ -328,6 +333,7 @@ fn file_and_done(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, transcript: &Dia
         None,
         Some(note.clone()),
     );
+    set_stage(&ctx.app, Stage::Idle);
     tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
 }
 
@@ -359,6 +365,7 @@ fn prune_transient(raw: &Path, used: &Path) {
 fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
     error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
     let _ = ctx.queue.fail(id, &msg);
+    set_stage(&ctx.app, Stage::Idle);
     tray::update_history(
         &ctx.app,
         id,

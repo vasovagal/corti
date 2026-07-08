@@ -161,3 +161,16 @@ export interface StatsReport {
 
 /** One coherent snapshot of the stats buffer: memory/thread history + global stage timings. */
 export const getStats = (): Promise<StatsReport> => invoke<StatsReport>("get_stats");
+
+// ----- Pipeline activity (mirror of Rust `activity::PipelineActivity`) -----
+
+/** Mirror of Rust `activity::PipelineActivity`. `stage` is a stable id (see lib/pipeline.ts); `detail`
+ * is the tray status line; `recording` is true while either capture source is live. */
+export interface PipelineActivity {
+  stage: string;
+  detail: string;
+  recording: boolean;
+}
+
+export const getPipelineActivity = (): Promise<PipelineActivity> =>
+  invoke<PipelineActivity>("get_pipeline_activity");

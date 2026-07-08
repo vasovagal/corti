@@ -8,11 +8,14 @@
 //! - **Detector callback** (off the HAL thread) flips the blink state + status line immediately and hands
 //!   each finished recording to the **pipeline worker** over a channel — it never blocks on transcription.
 //! - **Pipeline worker** is the sole owner of the `corti_queue::Queue` (rusqlite `Connection` is `Send` but
-//!   not `Sync`). It resumes crashed jobs on startup, then runs each recording through the pipeline serially
-//!   on its own thread (transcription blocks; guardrail 9 keeps it off the UI loop).
+//!   not `Sync`). It runs each recording through the pipeline serially on its own thread (transcription
+//!   blocks; guardrail 9 keeps it off the UI loop). The queue is a session-spanning record, not a resumable
+//!   store — crash recovery is deferred (ADR 0007).
 //! - **Blink thread** toggles two template icons ~every 500 ms, marshalling AppKit calls to the main thread.
 
 // macOS-only by design — like the rest of the workspace, this compiles to a stub elsewhere.
+#[cfg(target_os = "macos")]
+mod activity;
 #[cfg(target_os = "macos")]
 mod cli;
 #[cfg(target_os = "macos")]
@@ -63,7 +66,7 @@ fn main() {
 pub(crate) mod imp {
     use std::collections::VecDeque;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
 
@@ -103,6 +106,43 @@ pub(crate) mod imp {
         pub note_path: Option<PathBuf>,
     }
 
+    /// The coarse pipeline stage the "How Corti Works" window highlights. A single low-cardinality signal
+    /// distinct from the free-text `status` line: the UI maps it to which diagram box pulses. The shipped
+    /// pipeline folds echo cancellation into `Transcribing` (one `transcribe_recording` call), so
+    /// [`Stage::CancellingEcho`] is defined for completeness but not emitted on its own.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum Stage {
+        Idle = 0,
+        Recording = 1,
+        CancellingEcho = 2,
+        Transcribing = 3,
+        Filing = 4,
+    }
+
+    impl Stage {
+        fn from_u8(v: u8) -> Stage {
+            match v {
+                1 => Stage::Recording,
+                2 => Stage::CancellingEcho,
+                3 => Stage::Transcribing,
+                4 => Stage::Filing,
+                _ => Stage::Idle,
+            }
+        }
+
+        /// Stable id the UI keys its diagram on — mirrored in `app/ui/src/lib/pipeline.ts`.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Stage::Idle => "idle",
+                Stage::Recording => "recording",
+                Stage::CancellingEcho => "cancelling_echo",
+                Stage::Transcribing => "transcribing",
+                Stage::Filing => "filing",
+            }
+        }
+    }
+
     /// Shared app state (managed singleton). Everything here is read/written from background threads, so it
     /// is `Send + Sync`; the tray rebuilds its menu from this snapshot whenever it changes.
     pub struct AppState {
@@ -114,6 +154,11 @@ pub(crate) mod imp {
         pub webinar_recording: AtomicBool,
         /// The status line shown at the top of the tray menu.
         pub status: Mutex<String>,
+        /// The current pipeline [`Stage`], read by the `get_pipeline_activity` command. A single global
+        /// stage (like `status`), last-writer-wins — not "newest recording": with overlapping jobs an older
+        /// job's worker transitions can clobber a live capture's `Recording`. The UI compensates by treating
+        /// the `recording` flag as authoritative for the Detect/Capture boxes regardless of stage.
+        pub stage: AtomicU8,
         /// The most-recent recordings (front = newest), capped at [`HISTORY_LIMIT`] — the `History ▸`
         /// submenu's source of truth, covering in-flight, failed, and filed recordings (issue #3).
         pub history: Mutex<VecDeque<HistoryEntry>>,
@@ -130,8 +175,14 @@ pub(crate) mod imp {
                 detector_recording: AtomicBool::new(false),
                 webinar_recording: AtomicBool::new(false),
                 status: Mutex::new("Starting…".to_string()),
+                stage: AtomicU8::new(Stage::Idle as u8),
                 history: Mutex::new(VecDeque::new()),
             }
+        }
+
+        /// The current pipeline stage.
+        pub fn stage(&self) -> Stage {
+            Stage::from_u8(self.stage.load(Ordering::Relaxed))
         }
     }
 
@@ -214,6 +265,7 @@ pub(crate) mod imp {
                 crate::console::get_console_logs_text,
                 crate::console::save_console_logs,
                 crate::stats::get_stats,
+                crate::activity::get_pipeline_activity,
             ])
             .setup(move |app| {
                 setup(app, &cfg, console_buffer.clone()).map_err(|e| {
@@ -265,7 +317,8 @@ pub(crate) mod imp {
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
-        // Pipeline worker (sole Queue owner). It resumes crashed jobs, then drains the channel serially.
+        // Pipeline worker (sole Queue owner). Seeds tray history from the queue, then drains the channel
+        // serially — no crash recovery (deferred, ADR 0007; the queue is a session-spanning record only).
         {
             let handle = app.handle().clone();
             let shared_cfg = shared_cfg.clone();
@@ -315,21 +368,43 @@ pub(crate) mod imp {
                     "recording started"
                 );
                 set_detector_recording(app, true);
+                set_stage(app, Stage::Recording);
                 tray::push_history_recording(app, &meta);
                 tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
             }
             DetectorEvent::RecordingFinished { meta, audio_path } => {
                 set_detector_recording(app, false);
+                // Bridge to the pipeline's own Transcribing set so the diagram doesn't sit on Recording
+                // while the finished job waits in the channel.
+                set_stage(app, Stage::Transcribing);
                 tray::set_status(app, format!("Transcribing — {}…", meta.owning_app.name));
                 if pipe_tx
                     .send(PipelineMsg::Process { meta, audio_path })
                     .is_err()
                 {
                     tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished recording");
+                    // Worker gone: nothing will transcribe, so don't leave the diagram on Transcribing.
+                    set_stage(app, Stage::Idle);
                 }
+            }
+            DetectorEvent::RecordingDiscarded { meta } => {
+                set_detector_recording(app, false);
+                set_stage(app, Stage::Idle);
+                // Resolve the orphaned `Recording` history row the RecordingStarted push created. JobStatus
+                // has no "discarded" state, so mark it Failed with a clear reason. Also clears the stuck blink.
+                tray::update_history(
+                    app,
+                    &corti_queue::job_id(&meta),
+                    JobStatus::Failed,
+                    None,
+                    Some("Discarded — too short".to_string()),
+                    None,
+                );
+                tray::set_status(app, "Discarded — too short".to_string());
             }
             DetectorEvent::Error(e) => {
                 set_detector_recording(app, false);
+                set_stage(app, Stage::Idle);
                 tracing::error!(target: "corti::detector", error = %e, "detector error");
                 // A capture failure is most often the missing audio-capture TCC grant (design/LESSONS §1).
                 tray::set_status(app, format!("⚠ {e}"));
@@ -340,6 +415,14 @@ pub(crate) mod imp {
     fn set_detector_recording(app: &tauri::AppHandle, on: bool) {
         if let Some(state) = app.try_state::<AppState>() {
             state.detector_recording.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Set the current pipeline [`Stage`] (read by `get_pipeline_activity`). Tracks the tray status line:
+    /// set wherever the status changes phase.
+    pub(crate) fn set_stage(app: &tauri::AppHandle, stage: Stage) {
+        if let Some(state) = app.try_state::<AppState>() {
+            state.stage.store(stage as u8, Ordering::Relaxed);
         }
     }
 
@@ -412,6 +495,7 @@ pub(crate) mod imp {
                 tx,
             } => {
                 set_webinar_recording(app, false);
+                set_stage(app, Stage::Transcribing);
                 tray::set_status(app, format!("Transcribing — {WEBINAR_NAME}…"));
                 let app = app.clone();
                 std::thread::Builder::new()
@@ -449,6 +533,7 @@ pub(crate) mod imp {
                         }
                         tray::push_history_recording(app, &meta);
                         set_webinar_recording(app, true);
+                        set_stage(app, Stage::Recording);
                         tray::set_status(app, format!("● Webinar recording — {WEBINAR_NAME}"));
                     }
                     Err(e) => {
@@ -474,6 +559,8 @@ pub(crate) mod imp {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(target: "corti::detector", error = %format!("{e:#}"), "webinar capture produced no audio");
+                // The toggle already bridged the stage to Transcribing; nothing will transcribe now.
+                set_stage(app, Stage::Idle);
                 tray::set_status(app, format!("⚠ webinar capture failed: {e:#}"));
                 return;
             }
@@ -489,6 +576,7 @@ pub(crate) mod imp {
         };
         if tx.send(PipelineMsg::Process { meta, audio_path }).is_err() {
             tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished webinar recording");
+            set_stage(app, Stage::Idle);
         }
     }
 
