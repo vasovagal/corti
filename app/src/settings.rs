@@ -42,6 +42,7 @@ pub struct SettingsDto {
     pub local_embedding_model: String,
     pub aec_enabled: bool,
     pub retention_days: u32,
+    pub live_filing: bool,
     pub env_managed: Vec<String>,
 }
 
@@ -73,6 +74,7 @@ impl From<&AppConfig> for SettingsDto {
             local_embedding_model: cfg.local_embedding_model.clone(),
             aec_enabled: cfg.aec_enabled,
             retention_days: cfg.retention_days,
+            live_filing: cfg.live_filing,
             env_managed: config::env_managed_fields(),
         }
     }
@@ -173,6 +175,9 @@ pub fn set_config(
     }
     if !pinned("retention_days") {
         to_save.retention_days = dto.retention_days;
+    }
+    if !pinned("live_filing") {
+        to_save.live_filing = dto.live_filing;
     }
 
     to_save

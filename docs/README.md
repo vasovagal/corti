@@ -22,6 +22,6 @@ anchors into the shipped code. This is the "as-built" companion to the "as-desig
 |------|-------|
 | [architecture.md](architecture.md) | The whole-pipeline mechanistic graph: every thread, channel, ring, and ownership chain, with the two common misconceptions corrected. Start here. |
 | [audio-pipeline.md](audio-pipeline.md) | Data plane: mic-in-use detection, aggregate-device + process-tap capture, the `io_proc` → ring → writer path, and offline file-to-file AEC. |
-| [transcription.md](transcription.md) | The `Transcriber` trait, local (Parakeet/sherpa-onnx) and AWS backends, the queue's real (history-only) role, and filing to vagus. |
+| [transcription.md](transcription.md) | The `Transcriber` trait, local (Parakeet/sherpa-onnx) and AWS backends, the queue + durable jobs, live inbox filing (#87, the `State:` line contract), and filing to vagus. |
 | [app.md](app.md) | Tauri app surface: tray, windows, commands, threads. |
-| [streaming.md](streaming.md) | The chunked `LiveTranscriber` API + tokio `Stream` adapter. |
+| [streaming.md](streaming.md) | The chunked `LiveTranscriber` API + tokio `Stream` adapter, the capture tee, and the in-app live-filing consumer. |

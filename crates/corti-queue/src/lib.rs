@@ -84,6 +84,9 @@ pub struct JobUpdate {
     pub transcribe_secs: Option<f64>,
     /// Re-point the row at a different audio file (the legacy-WAV backfill swaps `.wav` → `.ogg`).
     pub audio_path: Option<PathBuf>,
+    /// Stamp the recording's end time. Needed by #87: a row created mid-call (live note filing) has
+    /// no end time yet, and the later `enqueue` is an `INSERT OR IGNORE` no-op that can't supply it.
+    pub ended_at: Option<DateTime<Local>>,
 }
 
 /// The durable job store. Open with [`Queue::open`] (or [`Queue::open_at`] for an explicit path).
@@ -220,7 +223,8 @@ impl Queue {
                    error           = COALESCE(?6, error),
                    transcribe_secs = COALESCE(?7, transcribe_secs),
                    audio_path      = COALESCE(?8, audio_path),
-                   updated_at      = ?9
+                   ended_at        = COALESCE(?9, ended_at),
+                   updated_at      = ?10
                  WHERE id = ?1",
                 params![
                     id,
@@ -231,6 +235,7 @@ impl Queue {
                     fields.error,
                     fields.transcribe_secs,
                     fields.audio_path.map(|p| p.to_string_lossy().into_owned()),
+                    fields.ended_at.map(fmt_dt),
                     fmt_dt(Local::now()),
                 ],
             )
@@ -641,6 +646,39 @@ mod tests {
         let job = q.get(&id).unwrap().unwrap();
         assert_eq!(job.s3_uri.as_deref(), Some("s3://bucket/a.wav"));
         assert_eq!(job.note_path, Some(PathBuf::from("/vault/note.md")));
+    }
+
+    /// #87: a row created mid-call has no end time; `JobUpdate.ended_at` stamps it later (and a
+    /// `None` leaves an existing value intact, like every other partial field).
+    #[test]
+    fn update_stamps_ended_at() {
+        let q = Queue::memory();
+        let mut m = meta("/cache/a.wav", "us.zoom.xos");
+        m.ended_at = None; // row created while still recording (LiveNoteCreated)
+        let id = q.enqueue(&m).unwrap();
+        assert_eq!(q.get(&id).unwrap().unwrap().ended_at, None);
+
+        let ended = Local.with_ymd_and_hms(2026, 5, 30, 14, 35, 0).unwrap();
+        q.update(
+            &id,
+            JobUpdate {
+                ended_at: Some(ended),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(q.get(&id).unwrap().unwrap().ended_at, Some(ended));
+
+        // A later disjoint update must not clear it.
+        q.update(
+            &id,
+            JobUpdate {
+                status: Some(JobStatus::Done),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(q.get(&id).unwrap().unwrap().ended_at, Some(ended));
     }
 
     #[test]

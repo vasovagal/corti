@@ -1,13 +1,16 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against v0.8.0 + feat/pipeline-docs-and-streaming + #85 (durable-jobs stack).
+> Verified against v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
 `enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store, and #85 added a
 `corti-jobs` layer on top of it for durable retry-with-backoff and an hourly retention sweep (see
-_The queue_ and _The pipeline worker_ below). Filing shells out to the external `vagus` CLI, the only
-subprocess in the note path.
+_The queue_ and _The pipeline worker_ below). #87 adds a **live** first-class path for detector
+recordings: when the local backend + models are available, the note is written *during* the call and
+this whole batch machinery becomes the fallback (§Live inbox filing). Filing shells out to the
+external `vagus` CLI, the only subprocess in the note path; after creation corti may also append to /
+state-flip / delete that one note (ADR 0010).
 
 ## The `Transcriber` trait
 
@@ -96,7 +99,7 @@ this is an ordinary blocking call.
 `$CORTI_DATA_DIR`; outside any vault, guardrail 5). One `recordings` row per recording mirrors `Job`;
 `job_id` is the recording filename stem, making everything idempotent on it. #85 added a
 `transcribe_secs` column (`src/lib.rs:56`) for the Recording Queue window's "transcribed 55 min in 30 s"
-line, and a v0→v1 migration (`:400`) that rewrites every stored timestamp to the fixed-width UTC `…Z`
+line, and a v0→v1 migration (`:409`) that rewrites every stored timestamp to the fixed-width UTC `…Z`
 form so string ordering is chronological.
 
 `JobStatus` (`corti-core recording.rs:119`) is the state machine:
@@ -106,67 +109,112 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
                                                               ↘ Failed
 ```
 
-API the app uses: `enqueue` (`:152`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
+API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
 `set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), plus #85's `retry_reset`
-(`:254`), `expired` (`:314`), `delete_terminal_older_than` (`:336`), and `all` (`:301`). `queue.jobs()`
-(`:129`) hands out a `corti_jobs::Jobs` borrowing the same live `Connection` for the background-job table.
+(`:259`), `expired` (`:319`), `delete_terminal_older_than` (`:341`), and `all` (`:306`). `queue.jobs()`
+(`:132`) hands out a `corti_jobs::Jobs` borrowing the same live `Connection` for the background-job table.
 
 **Durability is delivered by `corti-jobs` (#85), on top of the queue.** `crates/corti-jobs/src/lib.rs` is
 a small background-job layer sharing `queue.db`: kinds are strings with JSON payloads; `claim_due`
 (`:142`) marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
 (`:250`) can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
 pipeline seeds tray history (issue #3) and then calls `recover_running` on boot
-(`app/src/pipeline.rs:126`); `corti --list` and the tray `History ▸` submenu survive restarts. (A crash
+(`app/src/pipeline.rs:142`); `corti --list` and the tray `History ▸` submenu survive restarts. (A crash
 during a recording's *first* in-process attempt, before any failure schedules a retry job, still strands
-that row — durability is job-level, not a full sweep of non-terminal recordings.)
+that row — durability is job-level, not a full sweep of non-terminal recordings. Rows stranded at
+`Recording` are the exception: #87's startup reaper revives or fails them — see §Live inbox filing.)
 
 ## The pipeline worker
 
 `app/src/pipeline.rs` — a single `corti-pipeline` thread, the sole `Queue` owner (rusqlite
-`Connection` is `Send`, not `Sync`). Its loop (`run`, `:87`) is a **tick**:
-`rx.recv_timeout(next_wake(..))` (`:195`) blocks for a new message or until the next background job is
-due (clamped to `MAX_IDLE_WAIT = 60 s`, `:44`), then `drain_due_jobs` (`:210`) claims and runs every due
-job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` (`:47`).
+`Connection` is `Send`, not `Sync`). Its loop (`run`, `:101`) is a **tick**:
+`rx.recv_timeout(next_wake(..))` (`:185`) blocks for a new message or until the next background job is
+due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) claims and runs every due
+job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
 
-Per `Process` job, `transcribe_and_file` (`:413`): `queue.update(Transcribing)` →
+Per `Process` job, `transcribe_and_file` (`:736`): `queue.update(Transcribing)` →
 `transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on this
-thread) → `queue.update(PendingNote, transcribe_secs)` → `file_and_done` (`:485`); on success the
+thread) → `queue.update(PendingNote, transcribe_secs)` → `file_and_done` (`:808`); on success the
 transient WAVs are pruned (`prune_transient`). It returns `Result` instead of terminal-failing — a
-live-path error goes to `schedule_retry` (`:320`), which keeps the row at `PendingTranscription` and
+live-path error goes to `schedule_retry` (`:434`), which keeps the row at `PendingTranscription` and
 enqueues a durable `retry_transcription` job.
 
 **Retry with backoff.** `retry_transcription` (`app/src/jobs.rs:71`) re-runs `transcribe_and_file` from
 the capture audio (no transcript sidecar exists, so a `PendingNote` re-file re-transcribes too). Failed
-attempts back off `1 m → 2 m → … → 1 h` cap (`JOB_BACKOFF`, `pipeline.rs:37`) over `RETRY_MAX_ATTEMPTS =
+attempts back off `1 m → 2 m → … → 1 h` cap (`JOB_BACKOFF`, `pipeline.rs:38`) over `RETRY_MAX_ATTEMPTS =
 5` (`jobs.rs:23`); exhaustion terminal-fails the recording (`on_exhausted` → `fail`). The Recording Queue
-window's Retry button sends `PipelineMsg::Retry`, handled by `manual_retry` (`:266`).
+window's Retry button sends `PipelineMsg::Retry`, handled by `manual_retry` (`:380`).
 
 **Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
-`enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:135` (also fires at startup),
+`enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:175` (also fires at startup),
 deletes audio older than `retention_days` (config, default 7) plus the AEC sibling, then GCs terminal
 recording rows after 90 days and parked job rows after 30. Rows outlive the audio so history stays
 visible in the Recording Queue window.
 
 `ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 
-## Filing to vagus
+## Live inbox filing (#87)
 
-`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs:132`) →
-`add_note` (`:100`), which **shells out** to the external `vagus` binary:
+For detector recordings, transcription + filing now happen **while the call records**, so `tail -f`
+on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTranscriber`s → note) is in
+[streaming.md](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010); the write authority is
+[ADR 0010](../design/adr/0010-live-inbox-filing.md). The filing semantics:
+
+- **State-line contract (for inbox agents).** The first corti-authored body line (right under vagus's
+  `# <title>` heading) is exactly `State: transcribing` while segments stream in, and exactly
+  `State: transcribed ` — one trailing space, same byte width — once final
+  (`crates/corti-vagus/src/note.rs:22`). The flip is an in-place seek+write of that line's bytes only
+  (`flip_state`, `note.rs:41`): no rename, no rewrite, so a `tail -f` follower keeps its inode.
+  Batch-filed notes carry the same `State: transcribed ` first line (`recording_body`,
+  `crates/corti-vagus/src/lib.rs:186`) — one contract, live or batch.
+- **Lazy note creation.** The note is created (`vagus add-note --print-path`, initial body =
+  `live_initial_body`, `lib.rs:197`) on the **first finalized segment**, not at recording start — a
+  too-short discarded recording almost never creates one. If a discard happens after creation, the
+  session deletes the note file. The created path is persisted into the queue row immediately
+  (`PipelineMsg::LiveNoteCreated` → `live_note_created`, `app/src/pipeline.rs:512` — the row is
+  created at status `Recording` if it doesn't exist yet).
+- **Segment lines are byte-identical to batch's** (`DiarizedTranscript::to_markdown` over a single
+  segment), appended in **finalize order** — which may interleave `Me`/`Them` differently than the
+  batch `merge_by_time` timeline. Accepted; the finish-time tails *are* merged by start time.
+- **Finish.** On `RecordingFinished`, the pipeline's `Process` handler finalizes the session
+  (`LiveManager::finalize`, `app/src/live.rs:172`): AEC tail → `finish()` both transcribers → append
+  tails → flip the state line → the job goes **straight to `Done`** with the note path
+  (`live_filed`, `pipeline.rs:476`) — batch transcription skipped; `prune_transient` still runs (the
+  WAV was written normally — the tee is a tee). No new telemetry stage: live transcription happens
+  under `Recording`.
+- **Fallback — no double notes, ever.** Factory ineligible (config off, non-local backend, models
+  missing), no note created (silent call), or any live-path error ⇒ the batch path runs unchanged,
+  except that `file_and_done` first checks the row's `note_path`: an existing partial live note is
+  **rewritten in place** (state line + full batch transcript, same inode — `rewrite_body`,
+  `note.rs:61`; branch at `pipeline.rs:826`) instead of filing a second note. #85's crash-recovery /
+  retry path flows through the same branch (non-terminal row + `note_path` → batch transcribe →
+  rewrite + flip). Webinar/manual captures have no live hook and always take the batch path.
+- **Startup reaper.** A quit/crash mid-call can strand a row at `Recording` (created by the live
+  note's mid-call persist). At startup the worker reaps them (`reap_recording_rows`,
+  `app/src/pipeline.rs:623`): audio still on disk → reset to `PendingTranscription` + a due-now
+  durable retry (which rewrites the note in place); audio gone → terminal `Failed`, with the note's
+  state line flipped and an "incomplete" annotation appended (`close_out_note`, `pipeline.rs:676` —
+  every terminal failure path does this) so no inbox agent waits on `State: transcribing` forever.
+
+## Filing to vagus (batch path)
+
+`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs:134`) →
+`add_note` (`:102`), which **shells out** to the external `vagus` binary:
 
 ```
 vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
 ```
 
 `--print-path` skips the editor and prints the created note path, which corti captures. The body
-(`recording_body`, `:182`) is an auto-capture context line plus
+(`recording_body`, `:186`) is the `State: transcribed ` line (#87), an auto-capture context line, and
 `DiarizedTranscript::to_markdown()`. The binary is resolved via `$VAGUS_BIN` → `vagus` on `PATH` →
-Homebrew/cargo locations (`discover`, `:37`), re-probed on each filing attempt so a mid-session
+Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
 
 Ordering is crash-safe: `queue.update(note_path=…)` is persisted **before** `set_status(Done)`
-(`file_and_done`, `pipeline.rs:485`), so a retry re-file can't duplicate a note. A transient error →
-`schedule_retry` / the retry job's backoff; only unrecoverable states go through `fail` → tray `Failed`.
+(`file_and_done`, `pipeline.rs:808`), and a re-file that finds a persisted note rewrites it in place
+(#87) rather than duplicating it. A transient error → `schedule_retry` / the retry job's backoff;
+only unrecoverable states go through `fail` → tray `Failed`.
 
 ## Shared types (`corti-core`)
 

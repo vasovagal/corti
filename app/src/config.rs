@@ -101,6 +101,10 @@ pub struct AppConfig {
     /// (`CORTI_RETENTION_DAYS`, default 7, clamped to 1–365). Notes and transcripts are never touched,
     /// and the queue row outlives the audio so history stays visible in the Recording Queue window.
     pub retention_days: u32,
+    /// Live inbox filing (issue #87, `CORTI_LIVE_FILING`, default on): transcribe detector recordings
+    /// in-app while the call runs and append finalized segments to the vagus note as they land. Requires
+    /// the local backend with its models installed; otherwise (or when off) the batch path runs unchanged.
+    pub live_filing: bool,
 }
 
 impl Default for AppConfig {
@@ -125,6 +129,7 @@ impl Default for AppConfig {
             aec_double_talk_ratio: None,
             aec_suppress_residual: None,
             retention_days: 7,
+            live_filing: true,
         }
     }
 }
@@ -214,6 +219,9 @@ impl AppConfig {
             .filter(|d| (1..=365).contains(d))
         {
             cfg.retention_days = d;
+        }
+        if env_non_empty("CORTI_LIVE_FILING").is_some() {
+            cfg.live_filing = env_bool("CORTI_LIVE_FILING", cfg.live_filing);
         }
 
         cfg
@@ -313,6 +321,7 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_LOCAL_DIARIZE_THRESHOLD", "local_diarize_threshold"),
         ("CORTI_AEC", "aec_enabled"),
         ("CORTI_RETENTION_DAYS", "retention_days"),
+        ("CORTI_LIVE_FILING", "live_filing"),
     ]
     .into_iter()
     .filter(|(var, _)| env_non_empty(var).is_some())
@@ -399,6 +408,7 @@ mod tests {
             "CORTI_LOCAL_EMBEDDING",
             "CORTI_LOCAL_DIARIZE_THRESHOLD",
             "CORTI_AEC",
+            "CORTI_LIVE_FILING",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
             unsafe { std::env::remove_var(k) };
@@ -433,6 +443,7 @@ mod tests {
             aec_double_talk_ratio: Some(1.5),
             aec_suppress_residual: Some(3.0),
             retention_days: 14,
+            live_filing: false,
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);

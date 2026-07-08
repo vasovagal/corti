@@ -21,7 +21,7 @@ mod machine;
 mod platform;
 
 #[cfg(target_os = "macos")]
-pub use platform::Detector;
+pub use platform::{Detector, LiveHook};
 
 /// Debounce window: a rising edge must persist this long before a recording starts (drops notification
 /// chirps and brief device reacquisitions).

@@ -15,6 +15,7 @@ export interface SettingsDto {
   local_embedding_model: string; // a corti-transcribe-local EMBEDDING_IDS id, e.g. "titanet"
   aec_enabled: boolean;
   retention_days: number;
+  live_filing: boolean;
   env_managed: string[];
 }
 
