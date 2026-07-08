@@ -5,7 +5,7 @@
 > into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
 The app is a windowless macOS menu-bar agent. One OS process; no `#[tokio::main]` — it runs on
-Tauri's own event loop (`app.run(|_,_| {})`, `app/src/main.rs:288`). All live state is a single
+Tauri's own event loop (`app.run(|_,_| {})`, `app/src/main.rs:290`). All live state is a single
 managed `AppState`; the tray is rebuilt from it on every change. Windows are on-demand and almost
 entirely poll-based.
 
@@ -16,17 +16,17 @@ Every AppKit / tray / window mutation is marshalled to the Tauri main thread via
 
 | Thread | Spawned | Role |
 |---|---|---|
-| Tauri main | `app.run` (`main.rs:288`) | event loop; owns all AppKit/tray/window mutation |
-| `corti-pipeline` | `main.rs:336` | **sole** `corti_queue::Queue` owner; a tick loop that drains `PipelineMsg` **and** due `corti-jobs` (retry/sweep) serially — see [transcription.md](transcription.md) |
+| Tauri main | `app.run` (`main.rs:290`) | event loop; owns all AppKit/tray/window mutation |
+| `corti-pipeline` | `main.rs:343` | **sole** `corti_queue::Queue` owner; a tick loop that drains `PipelineMsg` **and** due `corti-jobs` (retry/sweep) serially — see [transcription.md](transcription.md) |
 | `corti-detect` | inside `Detector::start` (`crates/corti-detect/src/platform.rs`) | the poller — mic-in-use state machine, owns the in-flight `Recorder` |
-| `corti-stats` | `main.rs:343` | 1 Hz sampler → `StatsBuffer` ring |
+| `corti-stats` | `main.rs:350` | 1 Hz sampler → `StatsBuffer` ring |
 | `corti-blink` | `tray.rs:297` | 500 ms tray-icon swap while recording |
 
 #85's durable background jobs add **no** new OS thread — the retry and hourly retention sweep run on the
 existing `corti-pipeline` thread's tick loop, interleaved with recordings.
 
 Transient / not app-owned:
-- **`corti-webinar-finish`** — one per manual webinar stop (`main.rs:514`); writes the WAV, sends
+- **`corti-webinar-finish`** — one per manual webinar stop (`main.rs:536`); writes the WAV, sends
   `PipelineMsg::Process`, exits.
 - **`corti-capture-writer`** — one per recording, inside `CaptureSession`; streams the 2-track WAV.
 - **`corti-live`** — one per live-eligible detector recording (#87, `app/src/live.rs`); drains the
@@ -42,30 +42,30 @@ Deliberately no tokio in the capture/pipeline path — `std::sync::mpsc` + std t
 
 ## AppState — the single source of truth
 
-`app.manage(AppState::new())` (`main.rs:302`) registers one managed singleton, read/written from
+`app.manage(AppState::new())` (`main.rs:304`) registers one managed singleton, read/written from
 every background thread. The tray owns no state — it snapshots this on each rebuild
 (`build_menu`, `tray.rs:47`):
 
 - `detector_recording: AtomicBool`, `webinar_recording: AtomicBool` — independent capture-source
   flags; the icon blinks while *either* is true, and they never clobber each other.
 - `status: Mutex<String>` — the top menu line.
-- `stage: AtomicU8` — the current pipeline `Stage` (`main.rs:119`), read by the `get_pipeline_activity`
+- `stage: AtomicU8` — the current pipeline `Stage` (`main.rs:121`), read by the `get_pipeline_activity`
   command for the How-Corti-Works window. A single last-writer-wins global (like `status`), so with
   overlapping jobs an older worker can clobber a live capture's `Recording` — the UI treats the
   `recording` flag as authoritative for the Detect/Capture boxes.
-- `history: Mutex<VecDeque<HistoryEntry>>` — capped at `HISTORY_LIMIT = 5` (`main.rs:172`); the
+- `history: Mutex<VecDeque<HistoryEntry>>` — capped at `HISTORY_LIMIT = 5` (`main.rs:174`); the
   `History ▸` submenu's source (in-flight, failed, and filed recordings).
 
 The `Backend:` / `Bucket:` summary lines are **not** in `AppState` — `build_menu` derives them live
-from `settings::ConfigState` so they track saved edits (`main.rs:175`).
+from `settings::ConfigState` so they track saved edits (`main.rs:177`).
 
 Three more managed holders exist only to keep non-`Sync` objects alive (or hand background commands a
 channel), and are never locked for read access:
-- `DetectorHandle(Mutex<Detector>)` (`main.rs:196`, managed `main.rs:358`) — keeping it alive keeps
+- `DetectorHandle(Mutex<Detector>)` (`main.rs:198`, managed `main.rs:371`) — keeping it alive keeps
   the `corti-detect` worker alive; `Detector::drop` stops the worker and removes HAL listeners.
-- `Webinar(Mutex<WebinarState>)` (`main.rs:202`) — the live tap-only recorder + a clone of the
+- `Webinar(Mutex<WebinarState>)` (`main.rs:204`) — the live tap-only recorder + a clone of the
   pipeline channel.
-- `queue_ui::PipelineTx(Mutex<Sender<PipelineMsg>>)` (managed `main.rs:351`, #85) — a clone of the
+- `queue_ui::PipelineTx(Mutex<Sender<PipelineMsg>>)` (managed `main.rs:358`, #85) — a clone of the
   pipeline channel so the Recording Queue window's Retry command messages the queue-owning thread
   rather than writing the DB directly.
 
@@ -74,32 +74,34 @@ channel), and are never locked for read access:
 ```
 mic-in-use (CoreAudio) ─► corti-detect worker ─► Recorder ─► DetectorEvent
                                                                   │  (on the detect thread)
-                                                       handle_detector_event (main.rs:368)
+                                                       handle_detector_event (main.rs:381)
                                                                   │
                               detector_recording flag + tray  ◄───┤
                                                                   │  PipelineMsg::Process
-                                                                  ▼  (std::sync::mpsc, main.rs:317)
+                                                                  ▼  (std::sync::mpsc, main.rs:319)
                                               corti-pipeline worker ─► transcribe ─► vagus ─► Done
 ```
 
 `Detector::start` gets a callback that captures a cloned `AppHandle` and `pipe_tx`
-(`main.rs:356`); on `RecordingFinished` the callback sends `PipelineMsg::Process { meta, audio_path }`
-(`main.rs:394`). The manual **webinar** path (`imp::toggle`, `main.rs:467`) rejoins the *same*
+(`main.rs:366`); on `RecordingFinished` the callback sends `PipelineMsg::Process { meta, audio_path }`
+(`main.rs:407`). The manual **webinar** path (`imp::toggle`, `main.rs:489`) rejoins the *same*
 pipeline: on stop the transient `corti-webinar-finish` thread sends an identical `Process`
-(`main.rs:589`). Pipeline internals — the sole-`Queue`-owner rule, the durable-jobs tick loop, and
+(`main.rs:611`). Pipeline internals — the sole-`Queue`-owner rule, the durable-jobs tick loop, and
 retry/retention — are in [`transcription.md`](transcription.md). In brief: #85 made durability real via
 `corti-jobs`, so a transcribe/file failure schedules a durable retry job (backoff, ≤5 attempts) and an
 hourly sweep enforces retention; the queue rows still back tray history and `corti --list`, seeded from
-the newest few at startup (`seed_history`, `pipeline.rs:537`) with orphaned jobs recovered
+the newest few at startup (`seed_history`, `pipeline.rs:703`) with orphaned jobs recovered
 (`recover_running`, `pipeline.rs:142`).
 
 #87 layers **live inbox filing** onto this handoff: `Detector::start_with_live_hook` (`main.rs:366`)
 carries an `AppLiveHook` (`app/src/live.rs:237`) that spawns a per-recording `corti-live` thread when
 eligible; at `Process` time the worker asks `LiveManager::finalize` first, and a live-filed note sends
 the job straight to `Done` (batch skipped). Live telemetry adds **no new stage** — during the call the
-stage stays `Recording` (the How window's `recording` flag already covers it). Discards and detector
-errors send `PipelineMsg::LiveDiscarded` so the session (and any partial note) is torn down on the
-pipeline thread. See [transcription.md](transcription.md#live-inbox-filing-87).
+stage stays `Recording` (the How window's `recording` flag already covers it). A discard (too short)
+or a capture that fails to finish sends `PipelineMsg::LiveDiscarded` so the session is torn down on the
+pipeline thread without joining (the session deletes its own partial note); errors the recording
+survives (e.g. a mic-monitor rebind) never touch it. See
+[transcription.md](transcription.md#live-inbox-filing-87).
 
 ## Tray
 
@@ -111,7 +113,7 @@ mutation re-fetches it via `app.tray_by_id(TRAY_ID)` (`tray.rs:283`).
 **Rebuild-wholesale.** `build_menu` (`tray.rs:47`) reconstructs the *entire* menu from `AppState`
 on every change and swaps it via `TrayIcon::set_menu`. Nothing mutates a live menu item. Because the
 menu is swapped, clicks route through a **global** `Builder::on_menu_event` → `handle_menu_event`
-(`main.rs:253`; `tray.rs:336`) rather than a per-menu handler, so dynamically-swapped menus still
+(`main.rs:255`; `tray.rs:336`) rather than a per-menu handler, so dynamically-swapped menus still
 fire. Items, in order:
 
 | id | kind | notes |
@@ -175,7 +177,7 @@ back to `Accessory` once the last window closes.
 
 ## Command surface — pull, plus one push
 
-Windows read host state via `invoke` commands registered in `main.rs:256-277`:
+Windows read host state via `invoke` commands registered in `main.rs:258-279`:
 
 ```
 get_config · set_config · get_backends · get_aws_status · verify_aws · get_paths ·
@@ -190,7 +192,7 @@ window (`queue_ui.rs`, #85) is the exception to pure polling — it pulls `list_
 refetches on the pushed **`queue-changed`** event, whose reads go through a per-call **read-only** SQLite
 connection so the pipeline thread stays the DB's only writer.
 
-Rust→JS push events: **`model-download-progress`** — `app.emit(...)` in `settings.rs:519,532,579` for
+Rust→JS push events: **`model-download-progress`** — `app.emit(...)` in `settings.rs:532,545,592` for
 the Settings model-downloader progress bar — and #85's **`queue-changed`** (`tray::emit_queue_changed`),
 emitted whenever any tray-history change moves so the Queue window tracks the pipeline for free. A live
 recording indicator could also poll `get_stats` (whose `StatsSnapshot` carries `detector_recording` /
@@ -199,10 +201,10 @@ recording indicator could also poll `get_stats` (whose `StatsSnapshot` carries `
 ## Config / settings flow
 
 `AppConfig` is loaded once and shared as `SharedConfig = Arc<Mutex<AppConfig>>`; the managed
-`ConfigState { config, reload_tx }` (`main.rs:319`) holds it plus a clone of the pipeline sender.
+`ConfigState { config, reload_tx }` (`main.rs:321`) holds it plus a clone of the pipeline sender.
 When the Settings window saves, `set_config` writes the shared config and sends
-`PipelineMsg::ReloadConfig` via `reload_tx` (`settings.rs:190`); the serial worker rebuilds its backend +
-AEC toggle between jobs — or immediately if idle (`reload_config`, `pipeline.rs:183,362`). The
+`PipelineMsg::ReloadConfig` via `reload_tx` (`settings.rs:195`); the serial worker rebuilds its backend +
+AEC toggle between jobs — or immediately if idle (`reload_config`, `pipeline.rs:293,594`). The
 retention sweep reads `retention_days` live from the same `SharedConfig` (#85), so a saved change applies
 to the next sweep with no reload; the live-filing hook snapshots the config at each recording start (#87),
 so `live_filing` needs no reload either. Env knobs (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`,

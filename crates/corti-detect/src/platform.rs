@@ -32,7 +32,7 @@ enum Msg {
 /// how a live consumer gets a capture tee attached at `Recorder::start` time without corti-detect knowing
 /// anything about transcription: the hook hands back a plain [`corti_capture::CaptureTee`] (or `None` for
 /// no live path) and is told the full recording meta + sample rate once capture is actually running. All
-/// three methods are invoked on the detect worker thread and must return promptly — a slow `attach` delays
+/// methods are invoked on the detect worker thread and must return promptly — a slow `attach` delays
 /// the start of the recording itself.
 pub trait LiveHook: Send + 'static {
     /// Decide whether this recording gets a live tee. Called before `Recorder::start`; `app` is the
@@ -45,6 +45,10 @@ pub trait LiveHook: Send + 'static {
     /// [`attach`](Self::attach) returned `Some` but the recorder failed to start — discard any pending
     /// live state; `started` will not be called.
     fn aborted(&self);
+    /// The recording ended in failure (capture could not finish): no
+    /// [`DetectorEvent::RecordingFinished`] will follow, so tear down any live state for this
+    /// recording. Never called for errors the recording survives (e.g. a mic-monitor rebind failure).
+    fn failed(&self, meta: &RecordingMeta);
 }
 
 /// Watches the mic and turns confirmed on/off transitions into recordings, emitting [`DetectorEvent`]s
@@ -305,6 +309,11 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                         self.emit(DetectorEvent::RecordingFinished { meta, audio_path });
                     }
                     Err(e) => {
+                        // The recording is over but produced nothing to process: let the live hook
+                        // tear down its session (no RecordingFinished will follow).
+                        if let Some(hook) = &self.live {
+                            hook.failed(&meta);
+                        }
                         tracing::error!(
                             target: "corti::detect",
                             error = %format!("{e:#}"),

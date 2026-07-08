@@ -65,10 +65,10 @@ pub enum PipelineMsg {
         meta: RecordingMeta,
         note_path: PathBuf,
     },
-    /// #87: the recording ended without a `Process` (discarded as too short, or the detector errored —
-    /// `id = None` means "whatever session is active"). Tear down the live session, delete its partial
-    /// note, and close any queue row `LiveNoteCreated` made.
-    LiveDiscarded { id: Option<String> },
+    /// #87: the recording ended without a `Process` (discarded as too short, or its capture failed to
+    /// finish). Tear down the live session — it deletes its own partial note — and close any queue
+    /// row `LiveNoteCreated` made.
+    LiveDiscarded { id: String },
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -144,6 +144,30 @@ pub fn run(
         Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
         Err(e) => eprintln!("[corti] cannot recover background jobs: {e:#}"),
     }
+    // #87: revive/close out rows stranded at `Recording` by a quit or crash mid-call. Without this
+    // they sit non-terminal forever, their notes stay at `State: transcribing`, and the retention
+    // sweep (which only matches terminal rows) never reclaims their audio.
+    for (row, outcome) in reap_recording_rows(&ctx.queue) {
+        match outcome {
+            Reaped::Retrying => {
+                eprintln!(
+                    "[corti] recovering recording {} stranded by the last shutdown",
+                    row.id
+                );
+                tray::update_history(
+                    &ctx.app,
+                    &row.id,
+                    JobStatus::PendingTranscription,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            Reaped::Failed(msg) => {
+                tray::update_history(&ctx.app, &row.id, JobStatus::Failed, None, Some(msg), None);
+            }
+        }
+    }
     // The retention sweep runs hourly AND right now (enqueue_periodic arms it due immediately).
     if let Err(e) = ctx
         .queue
@@ -178,6 +202,24 @@ pub fn run(
                         None,
                         None,
                     );
+                    // #87: a row created mid-call by LiveNoteCreated has no end time (this enqueue was
+                    // an INSERT OR IGNORE no-op for it) — stamp it now that the recording is over.
+                    if meta.ended_at.is_some()
+                        && let Err(e) = ctx.queue.update(
+                            &id,
+                            JobUpdate {
+                                ended_at: meta.ended_at,
+                                ..Default::default()
+                            },
+                        )
+                    {
+                        warn!(
+                            target: "corti::pipeline",
+                            job_id = %id,
+                            error = %format!("{e:#}"),
+                            "could not persist the recording end time"
+                        );
+                    }
                     // #87: if a live session filed this recording as it happened, the job is already
                     // done — batch transcription is skipped entirely. Any other live outcome (no
                     // session, no note, error) falls back to today's batch path; a partial live note
@@ -226,6 +268,21 @@ pub fn run(
                         error = %format!("{e:#}"),
                         "enqueue failed"
                     );
+                    // #87: still settle any live session so its note isn't stranded at
+                    // `State: transcribing` — with no queue row the outcome can only be logged.
+                    match ctx.live.finalize(&corti_queue::job_id(&meta)) {
+                        Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
+                            target: "corti::live",
+                            note_path = %note_path.display(),
+                            "live note filed but its recording row could not be created"
+                        ),
+                        Some(crate::live::LiveOutcome::Failed { error, .. }) => warn!(
+                            target: "corti::live",
+                            error = %error,
+                            "live session failed alongside the enqueue failure"
+                        ),
+                        Some(crate::live::LiveOutcome::NoNote) | None => {}
+                    }
                     // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
                     // the diagram doesn't sit on Transcribing forever.
                     set_stage(&ctx.app, Stage::Idle);
@@ -237,7 +294,7 @@ pub fn run(
             Ok(PipelineMsg::LiveNoteCreated { meta, note_path }) => {
                 live_note_created(&ctx, &meta, note_path)
             }
-            Ok(PipelineMsg::LiveDiscarded { id }) => live_discarded(&ctx, id.as_deref()),
+            Ok(PipelineMsg::LiveDiscarded { id }) => live_discarded(&ctx, &id),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
@@ -446,42 +503,52 @@ fn live_filed(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Path, note:
 }
 
 /// #87: persist a just-created live note's path. Mid-recording there is no queue row yet, so one is
-/// created (status `Recording` — truthful in the Queue window); if the row already exists (the note
-/// was created during the finalize tail, after `Process` enqueued it) only `note_path` is recorded —
-/// the status is owned by whichever handler is driving the row.
+/// created (status `Recording` — truthful in the Queue window) **only while the session is still
+/// active**: the first segment can close while a discarded call's backlog drains, in which case
+/// `LiveDiscarded` already tore the session down and its Discard verdict will delete the note — a
+/// row created now would be a zombie. If the row already exists (the note was created during the
+/// finalize tail, after `Process` enqueued it — or the job even finished already) only `note_path`
+/// is recorded and the row's current status is preserved, never regressed.
 fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
     let id = corti_queue::job_id(meta);
-    let result = match ctx.queue.get(&id) {
-        Ok(None) => ctx.queue.enqueue(meta).and_then(|id| {
+    let (result, history_status) = match ctx.queue.get(&id) {
+        Ok(None) => {
+            if !ctx.live.is_active(&id) {
+                warn!(
+                    target: "corti::live",
+                    job_id = %id,
+                    "ignoring a live note from an already-torn-down session"
+                );
+                return;
+            }
+            let created = ctx.queue.enqueue(meta).and_then(|id| {
+                ctx.queue.update(
+                    &id,
+                    JobUpdate {
+                        status: Some(JobStatus::Recording),
+                        note_path: Some(note_path.clone()),
+                        ..Default::default()
+                    },
+                )
+            });
+            (created, live_note_history_status(None))
+        }
+        Ok(Some(row)) => (
             ctx.queue.update(
                 &id,
                 JobUpdate {
-                    status: Some(JobStatus::Recording),
                     note_path: Some(note_path.clone()),
                     ..Default::default()
                 },
-            )
-        }),
-        Ok(Some(_)) => ctx.queue.update(
-            &id,
-            JobUpdate {
-                note_path: Some(note_path.clone()),
-                ..Default::default()
-            },
+            ),
+            live_note_history_status(Some(row.status)),
         ),
-        Err(e) => Err(e),
+        Err(e) => (Err(e), live_note_history_status(None)),
     };
     match result {
-        // The Recording history entry (pushed at capture start) gains the note path, so the tray's
-        // in-flight line is clickable and opens the growing note.
-        Ok(()) => tray::update_history(
-            &ctx.app,
-            &id,
-            JobStatus::Recording,
-            None,
-            None,
-            Some(note_path),
-        ),
+        // The history entry gains the note path, so the tray's line is clickable and opens the
+        // (possibly still growing) note.
+        Ok(()) => tray::update_history(&ctx.app, &id, history_status, None, None, Some(note_path)),
         Err(e) => warn!(
             target: "corti::live",
             job_id = %id,
@@ -491,12 +558,20 @@ fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
     }
 }
 
-/// #87: a recording ended without a `Process` (discarded as too short, or the detector errored).
-/// Tear down the live session — it deletes any partial note — and terminally close a queue row
-/// `LiveNoteCreated` may have made, so nothing is left dangling at `Recording`.
-fn live_discarded(ctx: &Ctx, id: Option<&str>) {
+/// #87: the tray status to stamp when a live note path lands. A fresh row is `Recording`; an
+/// existing row keeps whatever status the pipeline already drove it to — a short call's
+/// `LiveNoteCreated` can be handled after `live_filed` marked the job `Done`, and must never
+/// regress it back to `Recording`.
+fn live_note_history_status(existing: Option<JobStatus>) -> JobStatus {
+    existing.unwrap_or(JobStatus::Recording)
+}
+
+/// #87: a recording ended without a `Process` (discarded as too short, or its capture failed to
+/// finish). Tear down the live session — non-joining; the session deletes its own partial note —
+/// and terminally close a queue row `LiveNoteCreated` may have made, so nothing dangles at
+/// `Recording`.
+fn live_discarded(ctx: &Ctx, id: &str) {
     ctx.live.discard(id);
-    let Some(id) = id else { return };
     match ctx.queue.get(id) {
         Ok(Some(row)) if !row.status.is_terminal() => {
             let _ = ctx.queue.update(
@@ -529,6 +604,97 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
         aec = if ctx.aec_enabled { "on" } else { "off" },
         "settings saved — backend reloaded"
     );
+}
+
+/// Outcome of reaping one row stranded at `Recording`.
+enum Reaped {
+    /// Audio still on disk — reset to `PendingTranscription` with a due-now durable retry (which
+    /// reaches `file_and_done`'s rewrite-in-place branch via the persisted `note_path`).
+    Retrying,
+    /// Audio gone — terminally failed; the note (if any) was flipped + annotated.
+    Failed(String),
+}
+
+/// #87: startup reaper for rows stranded at `Recording` by a quit/crash mid-call (they only exist
+/// because a live session persisted its note path mid-recording). Nothing else ever touches them —
+/// `retry_transcription` skips `Recording` and the retention sweep only matches terminal rows — so
+/// without this the row, its `State: transcribing` note, and its audio would sit forever. Queue-only
+/// (no tray) so it is testable; the caller surfaces each outcome in the tray.
+fn reap_recording_rows(queue: &Queue) -> Vec<(Job, Reaped)> {
+    let rows = match queue.all() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("[corti] cannot scan for stranded recordings: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|r| r.status == JobStatus::Recording)
+    {
+        let outcome = if row.audio_path.exists() {
+            let reset = queue.update(
+                &row.id,
+                JobUpdate {
+                    status: Some(JobStatus::PendingTranscription),
+                    ..Default::default()
+                },
+            );
+            let retry = queue.jobs().enqueue(
+                crate::jobs::RETRY_TRANSCRIPTION,
+                &crate::jobs::id_payload(&row.id),
+                crate::jobs::RETRY_MAX_ATTEMPTS,
+                Utc::now(),
+            );
+            match reset.and(retry.map(|_| ())) {
+                Ok(()) => Reaped::Retrying,
+                Err(e) => {
+                    eprintln!("[corti] cannot revive stranded recording {}: {e:#}", row.id);
+                    continue;
+                }
+            }
+        } else {
+            let msg = "app quit during the recording — audio incomplete".to_string();
+            if let Err(e) = queue.fail(&row.id, &msg) {
+                eprintln!("[corti] cannot fail stranded recording {}: {e:#}", row.id);
+                continue;
+            }
+            if let Some(note) = &row.note_path {
+                close_out_note(note, &msg);
+            }
+            Reaped::Failed(msg)
+        };
+        out.push((row, outcome));
+    }
+    out
+}
+
+/// #87: a recording is terminally failing while its note may still read `State: transcribing` —
+/// flip the state line (inbox agents must not wait on it forever) and append why the transcript is
+/// incomplete. Best-effort; the flip is idempotent.
+fn close_out_note(note: &Path, reason: &str) {
+    if !note.exists() {
+        return;
+    }
+    if let Err(e) = corti_vagus::note::flip_state(note) {
+        warn!(
+            target: "corti::live",
+            note_path = %note.display(),
+            error = %format!("{e:#}"),
+            "could not flip the state line of a failed recording's note"
+        );
+        return;
+    }
+    let line = format!("\n> corti: transcription incomplete — {reason}\n");
+    if let Err(e) = corti_vagus::note::append(note, &line) {
+        warn!(
+            target: "corti::live",
+            note_path = %note.display(),
+            error = %format!("{e:#}"),
+            "could not annotate a failed recording's note"
+        );
+    }
 }
 
 /// Seed the tray's `History ▸` submenu with the most recent recordings from the durable queue, so the
@@ -763,6 +929,13 @@ fn prune_transient(raw: &Path, used: &Path) {
 /// the retry job's backoff instead.
 pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
     error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
+    // #87: a partial live note for this recording may still read `State: transcribing`; the batch
+    // pass that would have rewritten it is never coming, so close it out.
+    if let Ok(Some(row)) = ctx.queue.get(id)
+        && let Some(note) = row.note_path
+    {
+        close_out_note(&note, &msg);
+    }
     let _ = ctx.queue.fail(id, &msg);
     set_stage(&ctx.app, Stage::Idle);
     tray::update_history(
@@ -774,4 +947,124 @@ pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
         None,
     );
     tray::set_status(&ctx.app, format!("⚠ {} — {msg}", meta.owning_app.name));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use corti_core::OwningApp;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("corti-pipeline-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn meta(audio: PathBuf) -> RecordingMeta {
+        RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
+            audio_path: audio,
+        }
+    }
+
+    /// #87 startup reaper: a `Recording` row with audio on disk is revived (PendingTranscription +
+    /// due-now retry); one whose audio is gone is terminally failed and its live note flipped +
+    /// annotated; terminal rows are untouched.
+    #[test]
+    fn reaper_revives_or_fails_stranded_recording_rows() {
+        let dir = test_dir("reaper");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+
+        // A: stranded mid-call, audio still on disk.
+        let audio_a = dir.join("a.wav");
+        std::fs::write(&audio_a, b"x").unwrap();
+        let a = queue.enqueue(&meta(audio_a)).unwrap();
+        queue.set_status(&a, JobStatus::Recording).unwrap();
+
+        // B: stranded mid-call, audio gone, live note still saying `State: transcribing`.
+        let note_b = dir.join("note-b.md");
+        std::fs::write(
+            &note_b,
+            format!(
+                "---\nsource: x\n---\n\n# T\n\n{}\n\n> ctx\n\n## Transcript\n\n",
+                corti_vagus::note::STATE_TRANSCRIBING
+            ),
+        )
+        .unwrap();
+        let b = queue.enqueue(&meta(dir.join("missing.wav"))).unwrap();
+        queue
+            .update(
+                &b,
+                JobUpdate {
+                    status: Some(JobStatus::Recording),
+                    note_path: Some(note_b.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // C: already terminal — never touched.
+        let c = queue.enqueue(&meta(dir.join("c.wav"))).unwrap();
+        queue.set_status(&c, JobStatus::Done).unwrap();
+
+        let outcomes = reap_recording_rows(&queue);
+        assert_eq!(outcomes.len(), 2, "only the two Recording rows are reaped");
+
+        let for_id = |id: &str| {
+            outcomes
+                .iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(_, o)| o)
+                .unwrap()
+        };
+        assert!(matches!(for_id(&a), Reaped::Retrying));
+        assert!(matches!(for_id(&b), Reaped::Failed(_)));
+
+        // A: reset + a due-now durable retry queued.
+        assert_eq!(
+            queue.get(&a).unwrap().unwrap().status,
+            JobStatus::PendingTranscription
+        );
+        assert!(
+            queue.jobs().next_due_at().unwrap().is_some(),
+            "a retry job must be queued"
+        );
+
+        // B: terminally failed; note flipped in place + annotated.
+        let row_b = queue.get(&b).unwrap().unwrap();
+        assert_eq!(row_b.status, JobStatus::Failed);
+        let note = std::fs::read_to_string(&note_b).unwrap();
+        assert!(note.contains("State: transcribed \n"), "got: {note}");
+        assert!(!note.contains(corti_vagus::note::STATE_TRANSCRIBING));
+        assert!(note.contains("transcription incomplete"), "got: {note}");
+
+        // C untouched.
+        assert_eq!(queue.get(&c).unwrap().unwrap().status, JobStatus::Done);
+
+        // Idempotent: nothing left at Recording.
+        assert!(reap_recording_rows(&queue).is_empty());
+    }
+
+    /// #87: a late `LiveNoteCreated` must never regress an existing row's tray status (a short
+    /// call's message can be handled after the job is already `Done`).
+    #[test]
+    fn live_note_history_status_never_regresses() {
+        assert_eq!(live_note_history_status(None), JobStatus::Recording);
+        assert_eq!(
+            live_note_history_status(Some(JobStatus::Done)),
+            JobStatus::Done
+        );
+        assert_eq!(
+            live_note_history_status(Some(JobStatus::Transcribing)),
+            JobStatus::Transcribing
+        );
+        assert_eq!(
+            live_note_history_status(Some(JobStatus::Failed)),
+            JobStatus::Failed
+        );
+    }
 }

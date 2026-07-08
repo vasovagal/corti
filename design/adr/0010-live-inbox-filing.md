@@ -16,26 +16,31 @@ webview), where a file is IPC across a boundary that doesn't exist. Here the rea
 
 ## Decision
 
-corti may perform exactly three writes beyond `add-note`, all confined to `corti-vagus` and only
+corti may perform exactly four writes beyond `add-note`, all confined to `corti-vagus` and only
 against a path `vagus add-note --print-path` returned for a recording corti is processing:
 
-1. **Append** body content (transcript segments) while the recording is live.
+1. **Append** body content: transcript segments while the recording is live, and a terse
+   "transcription incomplete" annotation when a recording terminally fails.
 2. **Flip the state line in place.** The first corti-authored body line is exactly
    `State: transcribing` while streaming and exactly `State: transcribed ` (one trailing space —
    same byte width) when final. The flip seeks and overwrites only that line's bytes: no rename, no
    truncation, so a `tail -f` follower keeps its inode. Batch-filed notes carry the same
    `State: transcribed ` first line, so inbox agents have one contract.
-3. **Delete** the note when its recording is discarded (too short / capture error).
+3. **Rewrite the body in place** (truncate + write on the same file — frontmatter/title kept, inode
+   kept) when the batch pass supersedes a partial live note. Never a second note.
+4. **Delete** the note when its recording is discarded (too short / capture error).
 
 Nothing else in the vault, ever — no index writes, no other files, no notes corti didn't create.
 
 ## Consequences
 
-- ADR 0001's boundary widens by these three operations but stays in one crate (`corti-vagus/src/note.rs`);
+- ADR 0001's boundary widens by these four operations but stays in one crate (`corti-vagus/src/note.rs`);
   everything else remains unaware of vagus.
 - ADR 0008's "no live on-disk transcript" stance holds for the in-process window; it no longer covers
   external readers.
 - vagus indexes the note at creation; the body growing afterwards is invisible to the index until a
   reindex — acceptable, vagus reindexes on its own cadence.
-- The batch path may rewrite a partial live note's body in place (truncate + write, same inode) when it
-  supersedes a failed live session — the one case a follower can see the file shrink.
+- The body rewrite is the one case a follower can see the file shrink; the mid-stream flip never
+  shrinks or renames.
+- No recording may strand a note at `State: transcribing`: every terminal path flips the line
+  (finish, batch rewrite, failure close-out) or deletes the note (discard).

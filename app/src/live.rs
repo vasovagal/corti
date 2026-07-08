@@ -14,11 +14,13 @@
 //!
 //! ## Finish / discard
 //! The tee sender is dropped when the recorder stops, which ends the chunk loop; the thread then waits
-//! for an explicit verdict so a finished recording and a discarded one are never confused:
+//! for an explicit verdict so a finished recording and a discarded one are never confused (live-path
+//! errors also park at the verdict wait, so the thread never outruns its recording):
 //! - the pipeline's `Process` handler calls [`LiveManager::finalize`] → finish both transcribers, append
 //!   the tails (merged by start time), flip the state line in place, report [`LiveOutcome::Filed`];
-//! - a discard/detector-error sends `PipelineMsg::LiveDiscarded` → [`LiveManager::discard`] → the
-//!   partial note (if any) is deleted.
+//! - a discard (too short) or a failed capture finish sends `PipelineMsg::LiveDiscarded` →
+//!   [`LiveManager::discard`] delivers the verdict **without joining** and the thread deletes its own
+//!   partial note on the way out.
 //!
 //! Segments are appended in **finalize order**, which may interleave `Me`/`Them` differently than the
 //! batch path's `merge_by_time` — accepted by design; the segment *lines* are byte-identical to
@@ -142,10 +144,13 @@ impl LiveManager {
                             dropped,
                         })
                     };
-                    // Shouldn't happen (one detector recording at a time), but never leak a thread.
+                    // Shouldn't happen (one detector recording at a time), but never leak a session.
+                    // Finish, never discard: the previous call's note must survive (its path was
+                    // persisted at creation, so the batch/rewrite paths still find it). Non-joining —
+                    // this runs on the detect worker, which must not block on a decode.
                     if let Some(stale) = stale {
-                        warn!(target: "corti::live", job_id = %stale.id, "stale live session at spawn — discarding it");
-                        settle(stale, Verdict::Discard);
+                        warn!(target: "corti::live", job_id = %stale.id, "stale live session at spawn — finishing it detached");
+                        let _ = stale.verdict_tx.send(Verdict::Finish);
                     }
                 }
                 Err(e) => {
@@ -160,9 +165,12 @@ impl LiveManager {
     }
 
     /// The recording finished: tell the session to finalize (finish transcribers, append tails, flip
-    /// the state line) and return how it ended. `None` when no live session exists for this id.
+    /// the state line) and return how it ended. `None` when no live session exists for this id. This
+    /// is the only joining path: the tee sender died when the recorder stopped (before the triggering
+    /// `Process` was sent), so the thread is at (or heading to) its verdict wait and the join is
+    /// bounded by the final flush/decode. A panicked thread reports as a live-path failure.
     pub fn finalize(&self, id: &str) -> Option<LiveOutcome> {
-        let active = self.take_active(Some(id))?;
+        let active = self.take_active(id)?;
         let dropped = active.dropped.load(Ordering::Relaxed);
         if dropped > 0 {
             warn!(
@@ -172,65 +180,49 @@ impl LiveManager {
                 "live tee dropped chunks (consumer fell behind) — the live transcript may have gaps"
             );
         }
-        Some(settle(active, Verdict::Finish))
+        let _ = active.verdict_tx.send(Verdict::Finish);
+        Some(
+            active
+                .handle
+                .join()
+                .unwrap_or_else(|_| LiveOutcome::Failed {
+                    error: "live transcription thread panicked".to_string(),
+                    note_path: None,
+                }),
+        )
     }
 
-    /// The recording was discarded (or the detector errored, `id = None` ⇒ any session): tear the
-    /// session down and delete its partial note, if one was created.
-    pub fn discard(&self, id: Option<&str>) {
-        self.inner.lock().unwrap().pending.take(); // an un-started tee, if the abort raced oddly
-        let Some(active) = self.take_active(id) else {
-            return;
-        };
-        let job_id = active.id.clone();
-        // The session deletes its own note on a Discard verdict; if it already bailed with an error
-        // before the verdict arrived, the note it reports is deleted here instead.
-        if let LiveOutcome::Failed {
-            note_path: Some(path),
-            ..
-        } = settle(active, Verdict::Discard)
-        {
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!(
-                    target: "corti::live",
-                    job_id = %job_id,
-                    note_path = %path.display(),
-                    "deleted partial live note of a discarded recording"
-                ),
-                Err(e) => warn!(
-                    target: "corti::live",
-                    job_id = %job_id,
-                    note_path = %path.display(),
-                    error = %e,
-                    "could not delete the partial live note"
-                ),
-            }
+    /// The recording was discarded (too short) or its capture failed to finish: tear the session
+    /// down. **Non-joining** — the verdict is delivered and the thread deletes its own note on the
+    /// way out, so the caller never blocks on a session that may still be mid-decode.
+    pub fn discard(&self, id: &str) {
+        self.inner.lock().unwrap().pending.take(); // an un-started tee, if an abort raced oddly
+        if let Some(active) = self.take_active(id) {
+            info!(target: "corti::live", job_id = %id, "discarding live session (detached)");
+            let _ = active.verdict_tx.send(Verdict::Discard);
         }
     }
 
-    /// Take the active session out, if `id` matches (or unconditionally for `None`).
-    fn take_active(&self, id: Option<&str>) -> Option<Active> {
+    /// Whether a live session for `id` is still active (not yet finalized or discarded). Guards the
+    /// `LiveNoteCreated` handler against creating a queue row for an already-torn-down session.
+    pub fn is_active(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .is_some_and(|a| a.id == id)
+    }
+
+    /// Take the active session out, if `id` matches.
+    fn take_active(&self, id: &str) -> Option<Active> {
         let mut inner = self.inner.lock().unwrap();
-        match (&inner.active, id) {
-            (Some(a), Some(id)) if a.id != id => None,
-            (Some(_), _) => inner.active.take(),
-            (None, _) => None,
+        if inner.active.as_ref().is_some_and(|a| a.id == id) {
+            inner.active.take()
+        } else {
+            None
         }
     }
-}
-
-/// Deliver the verdict and join the session thread. The tee sender is already dropped by the time any
-/// verdict is sent (the recorder stopped before the triggering event fired), so the join is bounded by
-/// the final flush/decode, not by capture. A panicked thread reports as a live-path failure.
-fn settle(active: Active, verdict: Verdict) -> LiveOutcome {
-    let _ = active.verdict_tx.send(verdict);
-    active
-        .handle
-        .join()
-        .unwrap_or_else(|_| LiveOutcome::Failed {
-            error: "live transcription thread panicked".to_string(),
-            note_path: None,
-        })
 }
 
 /// The app-side factory the detector consults at every recording start (`corti_detect::LiveHook`).
@@ -297,6 +289,14 @@ impl corti_detect::LiveHook for AppLiveHook {
     fn aborted(&self) {
         self.manager.take_pending();
     }
+
+    fn failed(&self, meta: &RecordingMeta) {
+        // Capture could not finish, so no `RecordingFinished`/`Process` will ever finalize this
+        // session — tear it down on the pipeline thread (which also owns any queue row to close).
+        let _ = self.pipe_tx.send(PipelineMsg::LiveDiscarded {
+            id: corti_queue::job_id(meta),
+        });
+    }
 }
 
 /// Pure config-level eligibility for live filing (the on-disk models check happens after). Returning
@@ -352,19 +352,23 @@ fn session_thread(
     }
 }
 
-/// Load the engine, consume tee chunks until the recorder stops (tee disconnect), then act on the
-/// finish/discard verdict.
+/// Everything a running session owns besides the writer, so an engine/consume error can be parked
+/// while the parts (and the verdict logic) stay in one place.
 #[cfg(feature = "local")]
-fn run_session(
-    rx: &Receiver<CaptureChunk>,
-    verdict_rx: &Receiver<Verdict>,
-    sample_rate: u32,
-    cfg: &AppConfig,
-    writer: &mut NoteWriter<VagusFiler>,
-) -> Result<LiveOutcome> {
+struct SessionParts {
+    mic: corti_transcribe_local::LiveTranscriber,
+    them: corti_transcribe_local::LiveTranscriber,
+    aec: Option<StreamingAec>,
+    mic_seg: Segmenter,
+    them_seg: Segmenter,
+}
+
+/// Build the engine + per-channel state on the live thread — chunks buffer in the bounded tee
+/// meanwhile.
+#[cfg(feature = "local")]
+fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
     use corti_transcribe_local::{LocalConfig, LocalTranscriber};
 
-    // The engine loads here, on the live thread — chunks buffer in the bounded tee meanwhile.
     let local_cfg = LocalConfig {
         model_dir: cfg.local_model_dir.clone(),
         provider: cfg.local_provider.clone(),
@@ -376,29 +380,59 @@ fn run_session(
     let engine = LocalTranscriber::new(local_cfg)
         .live_engine()
         .context("loading the local live engine")?;
-    let mut mic = engine.channel().context("building the mic transcriber")?;
-    let mut them = engine.channel().context("building the tap transcriber")?;
-    // Streaming AEC on the mic, per config (skipped cleanly per-chunk when the mic side is empty).
-    let mut aec = cfg
-        .aec_enabled
-        .then(|| StreamingAec::new(sample_rate, cfg.aec_config()));
-    let mut mic_seg = Segmenter::new(Speaker::Me);
-    let mut them_seg = Segmenter::new(Speaker::Other("Them".to_string()));
+    Ok(SessionParts {
+        mic: engine.channel().context("building the mic transcriber")?,
+        them: engine.channel().context("building the tap transcriber")?,
+        // Streaming AEC on the mic, per config (skipped cleanly per-chunk when the mic side is empty).
+        aec: cfg
+            .aec_enabled
+            .then(|| StreamingAec::new(sample_rate, cfg.aec_config())),
+        mic_seg: Segmenter::new(Speaker::Me),
+        them_seg: Segmenter::new(Speaker::Other("Them".to_string())),
+    })
+}
 
-    consume_chunks(
-        rx,
-        sample_rate,
-        &mut aec,
-        &mut mic,
-        &mut them,
-        &mut mic_seg,
-        &mut them_seg,
-        writer,
-    )?;
+/// Load the engine and consume tee chunks, then act on the finish/discard verdict. Any error is
+/// **held until the verdict arrives** — the thread must outlive its recording so a Discard can still
+/// delete the note (the manager's discard path is non-joining); the bounded tee keeps dropping
+/// chunks meanwhile, so the capture writer is never blocked by a parked session.
+#[cfg(feature = "local")]
+fn run_session(
+    rx: &Receiver<CaptureChunk>,
+    verdict_rx: &Receiver<Verdict>,
+    sample_rate: u32,
+    cfg: &AppConfig,
+    writer: &mut NoteWriter<VagusFiler>,
+) -> Result<LiveOutcome> {
+    let mut parts = build_parts(sample_rate, cfg);
+    let consumed = match parts.as_mut() {
+        Ok(p) => consume_chunks(
+            rx,
+            sample_rate,
+            &mut p.aec,
+            &mut p.mic,
+            &mut p.them,
+            &mut p.mic_seg,
+            &mut p.them_seg,
+            writer,
+        ),
+        // Engine failed to load: fall through to the verdict wait; the error surfaces on Finish.
+        Err(_) => Ok(()),
+    };
 
     match verdict_rx.recv() {
         Ok(Verdict::Finish) => {
-            finish_session(sample_rate, aec, mic, them, mic_seg, them_seg, writer)
+            let p = parts?;
+            consumed?;
+            finish_session(
+                sample_rate,
+                p.aec,
+                p.mic,
+                p.them,
+                p.mic_seg,
+                p.them_seg,
+                writer,
+            )
         }
         Ok(Verdict::Discard) => {
             writer.discard();
@@ -961,6 +995,46 @@ mod tests {
             finish_session(48_000, aec, mic, them, mic_seg, them_seg, &mut writer).unwrap();
         assert!(matches!(outcome, LiveOutcome::NoNote));
         assert!(!note.exists());
+    }
+
+    /// `is_active` guards the `LiveNoteCreated` handler: only a matching, not-yet-torn-down session
+    /// counts; `discard` (non-joining) clears it and still delivers the Discard verdict to the thread.
+    #[test]
+    fn is_active_matches_only_live_sessions_and_discard_is_non_joining() {
+        use std::time::Duration;
+
+        let m = LiveManager::new();
+        assert!(!m.is_active("a"));
+
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict>();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<&'static str>();
+        let handle = std::thread::spawn(move || {
+            let got = match verdict_rx.recv() {
+                Ok(Verdict::Discard) => "discard",
+                Ok(Verdict::Finish) => "finish",
+                Err(_) => "none",
+            };
+            let _ = probe_tx.send(got);
+            LiveOutcome::NoNote
+        });
+        m.inner.lock().unwrap().active = Some(Active {
+            id: "a".into(),
+            verdict_tx,
+            handle,
+            dropped: Arc::new(AtomicU64::new(0)),
+        });
+
+        assert!(m.is_active("a"));
+        assert!(!m.is_active("b"));
+        m.discard("b"); // wrong id: session untouched
+        assert!(m.is_active("a"));
+
+        m.discard("a"); // returns without joining; the verdict still reaches the thread
+        assert!(!m.is_active("a"));
+        assert_eq!(
+            probe_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "discard"
+        );
     }
 
     /// The fallback decision: config-level eligibility.

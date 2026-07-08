@@ -427,9 +427,10 @@ pub(crate) mod imp {
                     None,
                 );
                 tray::set_status(app, "Discarded — too short".to_string());
-                // #87: tear down any live session for this recording (deletes its partial note). Handled
-                // on the pipeline thread — it owns the queue row LiveNoteCreated may have made.
-                let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id: Some(id) });
+                // #87: tear down any live session for this recording (it deletes its own partial
+                // note). Handled on the pipeline thread — it owns the queue row LiveNoteCreated may
+                // have made.
+                let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id });
             }
             DetectorEvent::Error(e) => {
                 set_detector_recording(app, false);
@@ -437,9 +438,10 @@ pub(crate) mod imp {
                 tracing::error!(target: "corti::detector", error = %e, "detector error");
                 // A capture failure is most often the missing audio-capture TCC grant (design/LESSONS §1).
                 tray::set_status(app, format!("⚠ {e}"));
-                // #87: an errored recording never reaches `Process`, so no finalize will come — discard
-                // whatever live session is active (id unknown here) rather than leaving it parked.
-                let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id: None });
+                // #87: no live teardown here — `Error` also fires for failures the recording
+                // SURVIVES (e.g. a mic-monitor rebind), and killing the session then would delete a
+                // live note mid-call. The one terminal case (capture failed to finish) reaches the
+                // pipeline via the detector's `LiveHook::failed` instead.
             }
         }
     }

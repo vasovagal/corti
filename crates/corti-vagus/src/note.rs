@@ -1,10 +1,10 @@
 //! In-place note writes for live inbox filing (ADR 0010).
 //!
-//! ADR 0001 confines corti to `vagus add-note`; ADR 0010 amends that with exactly three writes, all
-//! against a path `--print-path` returned: **append** body content while a call is live, **flip** the
-//! state line in place when the transcript is final, and **rewrite** the body when the batch path
-//! supersedes a partial live note. (The fourth permitted action — deleting the note when its recording
-//! is discarded — is a plain `remove_file` at the call site.)
+//! ADR 0001 confines corti to `vagus add-note`; ADR 0010 amends that with exactly four operations,
+//! all against a path `--print-path` returned: **append** body content (live segments, or a failure
+//! annotation), **flip** the state line in place when the transcript is final, **rewrite** the body
+//! when the batch path supersedes a partial live note, and **delete** the note when its recording is
+//! discarded (a plain `remove_file` at the call site — the first three live here).
 //!
 //! ## The state-line contract (issue #87)
 //! The first corti-authored body line (right under vagus's `# <title>` heading) is exactly
