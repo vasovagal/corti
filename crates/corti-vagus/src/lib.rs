@@ -23,6 +23,8 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use corti_core::{DiarizedTranscript, RecordingMeta};
 
+pub mod note;
+
 /// A handle to the `vagus` binary.
 #[derive(Debug)]
 pub struct Vagus {
@@ -176,17 +178,32 @@ fn looked_in(candidates: &[PathBuf]) -> String {
     format!("checked {}", parts.join(", "))
 }
 
-/// Compose the note body: a short auto-capture context line, then the diarized transcript. `pub` so the app
-/// can render the same body when it writes a note to an explicit path (the `corti --input --output` CLI)
-/// instead of filing through `vagus add-note`.
+/// Compose the note body: the [`note::STATE_TRANSCRIBED`] state line (every recording note carries it —
+/// issue #87's contract for inbox agents, uniform across live- and batch-filed notes), a short
+/// auto-capture context line, then the diarized transcript. `pub` so the app can render the same body when
+/// it writes a note to an explicit path (the `corti --input --output` CLI) instead of filing through
+/// `vagus add-note`.
 pub fn recording_body(meta: &RecordingMeta, transcript: &DiarizedTranscript) -> String {
-    let mut body = format!(
-        "> Auto-captured by corti from {}.\n\n",
+    format!(
+        "{}\n\n{}{}",
+        note::STATE_TRANSCRIBED,
+        body_preamble(meta),
+        transcript.to_markdown()
+    )
+}
+
+/// The initial body of a live-filed note (issue #87): the `State: transcribing` line, then the shared
+/// preamble. Segment lines are appended as the call proceeds; [`note::flip_state`] finalizes the state line.
+pub fn live_initial_body(meta: &RecordingMeta) -> String {
+    format!("{}\n\n{}", note::STATE_TRANSCRIBING, body_preamble(meta))
+}
+
+/// The context + heading every recording note shares between the state line and the transcript.
+fn body_preamble(meta: &RecordingMeta) -> String {
+    format!(
+        "> Auto-captured by corti from {}.\n\n## Transcript\n\n",
         meta.owning_app.name
-    );
-    body.push_str("## Transcript\n\n");
-    body.push_str(&transcript.to_markdown());
-    body
+    )
 }
 
 #[cfg(test)]
@@ -205,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn body_includes_context_and_transcript() {
+    fn body_includes_state_line_context_and_transcript() {
         let t = DiarizedTranscript::new(vec![TranscriptSegment {
             speaker: Speaker::Me,
             start: 0.0,
@@ -213,9 +230,24 @@ mod tests {
             text: "hello".into(),
         }]);
         let body = recording_body(&meta(), &t);
+        // The first body line is the (padded) final state line — issue #87's inbox-agent contract.
+        assert!(body.starts_with("State: transcribed \n\n"), "got: {body}");
         assert!(body.contains("Auto-captured by corti from Zoom."));
         assert!(body.contains("## Transcript"));
         assert!(body.contains("**[00:00] Me:** hello"));
+    }
+
+    #[test]
+    fn live_initial_body_starts_transcribing_and_shares_the_preamble() {
+        let live = live_initial_body(&meta());
+        assert!(live.starts_with("State: transcribing\n\n"), "got: {live}");
+        assert!(live.ends_with("> Auto-captured by corti from Zoom.\n\n## Transcript\n\n"));
+        // Same shape as the batch body: flipping the state line + appending segments converges.
+        let batch = recording_body(&meta(), &DiarizedTranscript::default());
+        assert_eq!(
+            live.replace(note::STATE_TRANSCRIBING, note::STATE_TRANSCRIBED),
+            batch.replace("_(no speech transcribed)_\n", "")
+        );
     }
 
     /// A unique temp dir per test, so parallel tests never share fake binaries.
