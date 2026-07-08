@@ -53,6 +53,11 @@ tracing-appender = "0.2"
 # ISO-8601 timestamps for console entries + log file names (UTC, with `Z`).
 jiff = "0.2"
 
+# Async edge adapters only (feature-gated): the sync engine stays runtime-free; async lives at the boundary
+# (ADR 0009). `default-features = false` keeps the base pin minimal — crates opt into the features they need.
+tokio = { version = "1", default-features = false }
+futures-core = "0.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1 # single-unit codegen: best raw speed for the M1 Pro daily driver (ADR 0002/0003)

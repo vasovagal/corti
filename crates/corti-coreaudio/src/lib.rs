@@ -20,6 +20,9 @@ pub mod listener;
 pub mod process;
 pub mod tap;
 
-pub use capture::{CaptureSession, CapturedAudio, OutputLayout, RecordingHandle, TapTarget};
+pub use capture::{
+    CaptureChunk, CaptureSession, CaptureTee, CapturedAudio, OutputLayout, RecordingHandle,
+    TapTarget,
+};
 pub use listener::{DefaultInputDeviceMonitor, MicMonitor, default_input_device, is_running};
 pub use process::{MicOwner, mic_owner, other_app_holds_input};
