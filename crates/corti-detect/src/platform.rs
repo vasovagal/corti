@@ -28,6 +28,25 @@ enum Msg {
     Shutdown,
 }
 
+/// App-supplied live-transcription hook (issue #87). The detect worker owns the [`Recorder`], so this is
+/// how a live consumer gets a capture tee attached at `Recorder::start` time without corti-detect knowing
+/// anything about transcription: the hook hands back a plain [`corti_capture::CaptureTee`] (or `None` for
+/// no live path) and is told the full recording meta + sample rate once capture is actually running. All
+/// three methods are invoked on the detect worker thread and must return promptly — a slow `attach` delays
+/// the start of the recording itself.
+pub trait LiveHook: Send + 'static {
+    /// Decide whether this recording gets a live tee. Called before `Recorder::start`; `app` is the
+    /// best-effort owning-app attribution (the full [`RecordingMeta`] doesn't exist yet — the recorder
+    /// chooses the output path).
+    fn attach(&self, app: &corti_core::OwningApp) -> Option<corti_capture::CaptureTee>;
+    /// Capture started with the tee attached: the definitive meta (with `audio_path`) plus the capture
+    /// sample rate (to size a resampler/AEC). Only called when [`attach`](Self::attach) returned `Some`.
+    fn started(&self, meta: &RecordingMeta, sample_rate: u32);
+    /// [`attach`](Self::attach) returned `Some` but the recorder failed to start — discard any pending
+    /// live state; `started` will not be called.
+    fn aborted(&self);
+}
+
 /// Watches the mic and turns confirmed on/off transitions into recordings, emitting [`DetectorEvent`]s
 /// from a dedicated worker thread (never the HAL callback thread).
 pub struct Detector {
@@ -39,6 +58,15 @@ impl Detector {
     /// Begin watching the default input device. `on_event` is invoked from the worker thread; it must not
     /// be invoked from a HAL callback (guardrail 9), which this guarantees.
     pub fn start(on_event: impl Fn(DetectorEvent) + Send + 'static) -> Result<Self> {
+        Self::start_with_live_hook(on_event, None)
+    }
+
+    /// Like [`start`](Self::start), with an optional [`LiveHook`] consulted at every recording start
+    /// (issue #87). Additive: `start` delegates here with `None` and behaves exactly as before.
+    pub fn start_with_live_hook(
+        on_event: impl Fn(DetectorEvent) + Send + 'static,
+        live: Option<Box<dyn LiveHook>>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
 
         // Default-device-change listener: created once (it watches the system object, which never
@@ -67,6 +95,7 @@ impl Detector {
                     self_pid: std::process::id() as i32,
                     current: None,
                     on_event,
+                    live,
                 };
                 worker.run(initial);
             })?;
@@ -113,6 +142,8 @@ struct Worker<F: Fn(DetectorEvent)> {
     self_pid: i32,
     current: Option<(Recorder, RecordingMeta)>,
     on_event: F,
+    /// Optional live-transcription hook (issue #87), consulted at every recording start.
+    live: Option<Box<dyn LiveHook>>,
 }
 
 impl<F: Fn(DetectorEvent)> Worker<F> {
@@ -190,7 +221,15 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 // Attribution is best-effort and never blocks capture (guardrail 8): a missing PID just
                 // means a global tap.
                 let owner = mic_owner();
-                match Recorder::start(&owner.app, owner.pid) {
+                // Live hook (issue #87): the tee must exist before the recorder starts (the writer thread
+                // captures it at session creation), so `attach` runs on the incomplete attribution.
+                let tee = self.live.as_ref().and_then(|h| h.attach(&owner.app));
+                let live_attached = tee.is_some();
+                let started = match tee {
+                    Some(tee) => Recorder::start_with_tee(&owner.app, owner.pid, tee),
+                    None => Recorder::start(&owner.app, owner.pid),
+                };
+                match started {
                     Ok(recorder) => {
                         let meta = RecordingMeta {
                             started_at: Local::now(),
@@ -203,13 +242,20 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             app = %meta.owning_app.name,
                             pid = owner.pid,
                             started_at = %meta.started_at,
+                            live = live_attached,
                             path = %meta.audio_path.display(),
                             "call started — recording"
                         );
+                        if live_attached && let Some(hook) = &self.live {
+                            hook.started(&meta, recorder.sample_rate());
+                        }
                         self.current = Some((recorder, meta.clone()));
                         self.emit(DetectorEvent::RecordingStarted { meta });
                     }
                     Err(e) => {
+                        if live_attached && let Some(hook) = &self.live {
+                            hook.aborted();
+                        }
                         tracing::error!(
                             target: "corti::detect",
                             error = %format!("{e:#}"),
