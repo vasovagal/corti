@@ -25,6 +25,8 @@ mod console;
 #[cfg(target_os = "macos")]
 mod jobs;
 #[cfg(target_os = "macos")]
+mod live;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
@@ -325,15 +327,20 @@ pub(crate) mod imp {
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
+        // Live-filing sessions (#87): shared between the detector hook (spawns them) and the pipeline
+        // worker (finalizes/discards them).
+        let live_manager = Arc::new(crate::live::LiveManager::new());
+
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned
         // background jobs, then drains recordings + due durable jobs (retry/sweep) serially (#85).
         {
             let handle = app.handle().clone();
             let shared_cfg = shared_cfg.clone();
             let stats = stats_buffer.clone();
+            let live = live_manager.clone();
             std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
-                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats))
+                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats, live))
                 .context("spawning pipeline worker")?;
         }
 
@@ -351,10 +358,16 @@ pub(crate) mod imp {
         app.manage(crate::queue_ui::PipelineTx(Mutex::new(pipe_tx.clone())));
 
         // Detector: mic on/off → recordings. Its callback runs off the HAL thread (guardrail 9).
+        // The live hook (#87) is consulted at every recording start; when live filing is eligible it
+        // attaches a bounded tee and spawns the per-recording `corti-live` thread.
+        let live_hook =
+            crate::live::AppLiveHook::new(live_manager, shared_cfg.clone(), pipe_tx.clone());
         let handle = app.handle().clone();
-        let detector =
-            Detector::start(move |event| handle_detector_event(&handle, &pipe_tx, event))
-                .context("starting detector")?;
+        let detector = Detector::start_with_live_hook(
+            move |event| handle_detector_event(&handle, &pipe_tx, event),
+            Some(Box::new(live_hook)),
+        )
+        .context("starting detector")?;
         app.manage(DetectorHandle(Mutex::new(detector)));
 
         // Best-effort permission check (microphone via the plugin; system-audio via the Settings link).
@@ -402,17 +415,21 @@ pub(crate) mod imp {
             DetectorEvent::RecordingDiscarded { meta } => {
                 set_detector_recording(app, false);
                 set_stage(app, Stage::Idle);
+                let id = corti_queue::job_id(&meta);
                 // Resolve the orphaned `Recording` history row the RecordingStarted push created. JobStatus
                 // has no "discarded" state, so mark it Failed with a clear reason. Also clears the stuck blink.
                 tray::update_history(
                     app,
-                    &corti_queue::job_id(&meta),
+                    &id,
                     JobStatus::Failed,
                     None,
                     Some("Discarded — too short".to_string()),
                     None,
                 );
                 tray::set_status(app, "Discarded — too short".to_string());
+                // #87: tear down any live session for this recording (deletes its partial note). Handled
+                // on the pipeline thread — it owns the queue row LiveNoteCreated may have made.
+                let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id: Some(id) });
             }
             DetectorEvent::Error(e) => {
                 set_detector_recording(app, false);
@@ -420,6 +437,9 @@ pub(crate) mod imp {
                 tracing::error!(target: "corti::detector", error = %e, "detector error");
                 // A capture failure is most often the missing audio-capture TCC grant (design/LESSONS §1).
                 tray::set_status(app, format!("⚠ {e}"));
+                // #87: an errored recording never reaches `Process`, so no finalize will come — discard
+                // whatever live session is active (id unknown here) rather than leaving it parked.
+                let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id: None });
             }
         }
     }

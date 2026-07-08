@@ -16,6 +16,7 @@
 //! possible while it's still on disk (a transcription failure keeps it; once transcribed it is pruned).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -57,6 +58,17 @@ pub enum PipelineMsg {
     /// handled between jobs (the worker is serial) so it applies to the next recording — or immediately when
     /// the worker is idle and blocked waiting for one.
     ReloadConfig,
+    /// #87: the live thread created the inbox note mid-recording. Persist its path into a durable row
+    /// right away — the no-double-notes guarantee and crash-recovery rewrites key on the row's
+    /// `note_path`.
+    LiveNoteCreated {
+        meta: RecordingMeta,
+        note_path: PathBuf,
+    },
+    /// #87: the recording ended without a `Process` (discarded as too short, or the detector errored —
+    /// `id = None` means "whatever session is active"). Tear down the live session, delete its partial
+    /// note, and close any queue row `LiveNoteCreated` made.
+    LiveDiscarded { id: Option<String> },
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -79,6 +91,8 @@ pub(crate) struct Ctx {
     /// The live runtime config — the retention sweep reads `retention_days` from here on every run, so
     /// a Settings change applies to the next sweep without any reload plumbing.
     pub(crate) config: SharedConfig,
+    /// #87: the live-filing sessions the detector hook spawns; the worker finalizes (or discards) them.
+    pub(crate) live: Arc<crate::live::LiveManager>,
 }
 
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
@@ -89,6 +103,7 @@ pub fn run(
     config: SharedConfig,
     rx: Receiver<PipelineMsg>,
     stats: crate::stats::StatsBuffer,
+    live: Arc<crate::live::LiveManager>,
 ) {
     let queue = match Queue::open() {
         Ok(q) => q,
@@ -120,6 +135,7 @@ pub fn run(
         stats,
         backend_label,
         config: config.clone(),
+        live,
     };
 
     seed_history(&ctx);
@@ -162,8 +178,45 @@ pub fn run(
                         None,
                         None,
                     );
-                    if let Err(e) = transcribe_and_file(&mut ctx, &id, &meta, &audio_path) {
-                        schedule_retry(&ctx, &id, &meta, e);
+                    // #87: if a live session filed this recording as it happened, the job is already
+                    // done — batch transcription is skipped entirely. Any other live outcome (no
+                    // session, no note, error) falls back to today's batch path; a partial live note
+                    // is persisted first so `file_and_done` rewrites it instead of double-filing.
+                    match ctx.live.finalize(&id) {
+                        Some(crate::live::LiveOutcome::Filed { note_path }) => {
+                            live_filed(&mut ctx, &id, &meta, &audio_path, note_path);
+                        }
+                        live_result => {
+                            if let Some(crate::live::LiveOutcome::Failed { error, note_path }) =
+                                live_result
+                            {
+                                warn!(
+                                    target: "corti::live",
+                                    job_id = %id,
+                                    error = %error,
+                                    "live filing failed — falling back to batch transcription"
+                                );
+                                if let Some(partial) = note_path
+                                    && let Err(e) = ctx.queue.update(
+                                        &id,
+                                        JobUpdate {
+                                            note_path: Some(partial),
+                                            ..Default::default()
+                                        },
+                                    )
+                                {
+                                    warn!(
+                                        target: "corti::live",
+                                        job_id = %id,
+                                        error = %format!("{e:#}"),
+                                        "could not persist the partial live note path"
+                                    );
+                                }
+                            }
+                            if let Err(e) = transcribe_and_file(&mut ctx, &id, &meta, &audio_path) {
+                                schedule_retry(&ctx, &id, &meta, e);
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -181,6 +234,10 @@ pub fn run(
             },
             Ok(PipelineMsg::Retry { id }) => manual_retry(&mut ctx, &id),
             Ok(PipelineMsg::ReloadConfig) => reload_config(&mut ctx, &config),
+            Ok(PipelineMsg::LiveNoteCreated { meta, note_path }) => {
+                live_note_created(&ctx, &meta, note_path)
+            }
+            Ok(PipelineMsg::LiveDiscarded { id }) => live_discarded(&ctx, id.as_deref()),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
@@ -356,6 +413,106 @@ fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error)
     set_stage(&ctx.app, Stage::Idle);
 }
 
+/// #87 happy path: the live session already wrote the whole note and flipped its state line, so the
+/// job goes straight to `Done` — batch transcription is skipped. The WAV was still written by the
+/// capture writer (the tee is a tee), so the transient prune runs exactly as on the batch path.
+fn live_filed(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Path, note: PathBuf) {
+    info!(
+        target: "corti::pipeline",
+        job_id = %id,
+        note_path = %note.display(),
+        "note filed live during the recording — skipping batch transcription"
+    );
+    prune_transient(audio, &corti_capture::clean_wav_path(audio));
+    // Same crash-safe ordering as file_and_done: persist note_path first, then mark Done.
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            note_path: Some(note.clone()),
+            ..Default::default()
+        },
+    ) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "live note filed but could not persist note_path"
+        );
+    }
+    let _ = ctx.queue.set_status(id, JobStatus::Done);
+    tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(note));
+    set_stage(&ctx.app, Stage::Idle);
+    tray::set_status(&ctx.app, format!("✓ Filed — {}", meta.note_title()));
+}
+
+/// #87: persist a just-created live note's path. Mid-recording there is no queue row yet, so one is
+/// created (status `Recording` — truthful in the Queue window); if the row already exists (the note
+/// was created during the finalize tail, after `Process` enqueued it) only `note_path` is recorded —
+/// the status is owned by whichever handler is driving the row.
+fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
+    let id = corti_queue::job_id(meta);
+    let result = match ctx.queue.get(&id) {
+        Ok(None) => ctx.queue.enqueue(meta).and_then(|id| {
+            ctx.queue.update(
+                &id,
+                JobUpdate {
+                    status: Some(JobStatus::Recording),
+                    note_path: Some(note_path.clone()),
+                    ..Default::default()
+                },
+            )
+        }),
+        Ok(Some(_)) => ctx.queue.update(
+            &id,
+            JobUpdate {
+                note_path: Some(note_path.clone()),
+                ..Default::default()
+            },
+        ),
+        Err(e) => Err(e),
+    };
+    match result {
+        // The Recording history entry (pushed at capture start) gains the note path, so the tray's
+        // in-flight line is clickable and opens the growing note.
+        Ok(()) => tray::update_history(
+            &ctx.app,
+            &id,
+            JobStatus::Recording,
+            None,
+            None,
+            Some(note_path),
+        ),
+        Err(e) => warn!(
+            target: "corti::live",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "could not persist the live note path"
+        ),
+    }
+}
+
+/// #87: a recording ended without a `Process` (discarded as too short, or the detector errored).
+/// Tear down the live session — it deletes any partial note — and terminally close a queue row
+/// `LiveNoteCreated` may have made, so nothing is left dangling at `Recording`.
+fn live_discarded(ctx: &Ctx, id: Option<&str>) {
+    ctx.live.discard(id);
+    let Some(id) = id else { return };
+    match ctx.queue.get(id) {
+        Ok(Some(row)) if !row.status.is_terminal() => {
+            let _ = ctx.queue.update(
+                id,
+                JobUpdate {
+                    status: Some(JobStatus::Failed),
+                    error: Some("Discarded — too short".to_string()),
+                    ..Default::default()
+                },
+            );
+            tray::emit_queue_changed(&ctx.app, id);
+        }
+        _ => {}
+    }
+}
+
 /// Apply a saved config change: re-read the shared runtime config and rebuild the backend + AEC toggle. A
 /// job already transcribing finishes on the old backend (the worker is serial), so this is exactly "takes
 /// effect on the next recording".
@@ -488,6 +645,34 @@ fn file_and_done(
     meta: &RecordingMeta,
     transcript: &DiarizedTranscript,
 ) -> Result<()> {
+    // #87: a note may already exist for this recording — a partial live note (live path failed
+    // mid-call), or a fully-filed one re-reached by a crash-recovery retry. Rewrite its body in place
+    // (same file, same inode) instead of filing a second note: the queue row's `note_path` is the
+    // no-double-notes authority. A recorded-but-deleted note falls through to a fresh filing.
+    if let Some(existing) = ctx
+        .queue
+        .get(id)
+        .ok()
+        .flatten()
+        .and_then(|row| row.note_path)
+        && existing.exists()
+    {
+        corti_vagus::note::rewrite_body(&existing, &corti_vagus::recording_body(meta, transcript))
+            .context("rewriting the existing note")?;
+        info!(
+            target: "corti::pipeline",
+            job_id = %id,
+            note_path = %existing.display(),
+            "batch transcript rewrote the existing note in place"
+        );
+        let _ = ctx.queue.set_status(id, JobStatus::Done);
+        let title = meta.note_title();
+        tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(existing));
+        set_stage(&ctx.app, Stage::Idle);
+        tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
+        return Ok(());
+    }
+
     // Startup discovery may have failed only because vagus wasn't installed yet — `brew install vagus`
     // mid-session is the expected fix, and a tray app shouldn't need a relaunch to notice. Retry once
     // per filing attempt: one `vagus --version` spawn, only on the filing path of a concluded recording,

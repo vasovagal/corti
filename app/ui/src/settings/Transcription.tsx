@@ -274,6 +274,21 @@ export function Transcription({ cfg, backends, onChange }: Props) {
       </label>
       <p className="muted small">Clean speaker bleed from the mic track before transcription.</p>
 
+      <label className="radio">
+        <input
+          type="checkbox"
+          checked={cfg.live_filing}
+          disabled={isEnv("live_filing")}
+          onChange={(e) => set("live_filing", e.target.checked)}
+        />
+        Live inbox filing
+        {envBadge("live_filing")}
+      </label>
+      <p className="muted small">
+        Write the note while the call is still recording (local backend with installed models; falls
+        back to normal end-of-call transcription otherwise).
+      </p>
+
       <p className="callout">Changes apply to the next recording.</p>
     </section>
   );

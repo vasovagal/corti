@@ -69,7 +69,7 @@ pub fn rewrite_body(path: &Path, new_body: &str) -> Result<()> {
         .truncate(true)
         .open(path)
         .with_context(|| format!("opening {} to rewrite its body", path.display()))?;
-    f.write_all(content[..keep].as_bytes())?;
+    f.write_all(&content.as_bytes()[..keep])?;
     f.write_all(new_body.as_bytes())?;
     f.flush()?;
     Ok(())
