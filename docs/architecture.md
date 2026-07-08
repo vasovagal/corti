@@ -1,6 +1,6 @@
 # Architecture — the whole-pipeline graph
 
-> Verified against v0.8.0 + feat/pipeline-docs-and-streaming.
+> Verified against v0.8.0 + feat/pipeline-docs-and-streaming + #85 (durable-jobs stack).
 
 corti is a windowless macOS menu-bar agent that watches for a call, captures a 2-track WAV to
 disk, then — after the call ends — cleans, transcribes, and files it. Everything runs in **one
@@ -44,13 +44,19 @@ Read it as three long-lived worker threads (detector, pipeline, plus the per-rec
 writer) fed by HAL callback threads, with the tray/main thread (not drawn) owning all AppKit
 mutation. Two misconceptions this graph is meant to kill are corrected in §Corrections.
 
+The `enqueue → transcribe → file → Done` line is the happy path; #85 wrapped it in a **tick loop**. The
+pipeline thread `recv_timeout`s on the channel, so between recordings it also drains due `corti-jobs`:
+a failed transcribe/file doesn't terminal-fail but schedules a durable retry job (backoff, ≤5 attempts,
+looping back into `transcribe → file`), and an hourly periodic sweep enforces audio retention. Same one
+thread, still serial — see [transcription.md](transcription.md).
+
 ## Threads
 
 | Thread | Spawned | Owns / does |
 |--------|---------|-------------|
 | Tauri main | `app.run` (`app/src/main.rs`) | The event loop; every tray/menu/window mutation is marshalled here via `run_on_main_thread`. |
 | `corti-detect` worker | `Detector::start` (`crates/corti-detect/src/platform.rs:41`, spawn `:60`) | `Machine` + `MicMonitor` + `DefaultInputDeviceMonitor` + the in-flight `Recorder`. The state machine + poll loop. |
-| `corti-pipeline` | `app/src/main.rs:326-329` | **Sole** `Queue` owner; drains `PipelineMsg`, runs transcribe → file serially (`app/src/pipeline.rs:65`). |
+| `corti-pipeline` | `app/src/main.rs:336-339` | **Sole** `Queue` owner; a tick loop (`run`, `app/src/pipeline.rs:87`) that drains `PipelineMsg` **and** due `corti-jobs` (retry/sweep) serially. |
 | `corti-capture-writer` (one per recording) | `crates/corti-coreaudio/src/capture.rs:416` | Drains the `rtrb` ring and writes the 2-track WAV with `hound` (`run_writer`, `:634`). |
 | `corti-blink`, `corti-stats` | `app/src/tray.rs`, `app/src/stats.rs` | Icon-swap animation; 1 Hz stats sampler. |
 | CoreAudio HAL callback threads | OS/CoreAudio | `MicMonitor`/`DefaultInputDeviceMonitor` trampolines and `io_proc`. They only push (`tx.send` / ring write) — never touch capture state (guardrail 9). |
@@ -63,8 +69,8 @@ See [app.md](app.md) for the tray/window/command surface and the full thread inv
 |---------|------|-----------|---------|
 | HAL → detector | `std::sync::mpsc::Sender<Msg>` (`platform.rs`) | `MicMonitor`/`DefaultInputDeviceMonitor` callback → detect worker | `Msg::Signal(bool)` / `Msg::DeviceChanged` / `Msg::Shutdown` (`platform.rs:24-28`) |
 | capture data plane | `rtrb::Producer<f32>` / `Consumer<f32>` (SPSC, wait-free) | `io_proc` → writer thread | interleaved f32 frames (mic channels first, then tap — the me/them contract). Ring sized `sample_rate · 8ch · RING_SECONDS` (`ring_capacity`, `capture.rs:134`, default 30 s, `:60`). |
-| detector → app | closure callback (`DetectorEvent`) | detect worker → `handle_detector_event` (`main.rs:356`) | `RecordingStarted` / `RecordingFinished{meta, audio_path}` / `RecordingDiscarded` / `Error` (`crates/corti-detect/src/lib.rs:43`) |
-| app → pipeline | `std::sync::mpsc::Sender<PipelineMsg>` (`main.rs:309`) | detector callback + webinar-finish thread → pipeline worker | `Process{meta, audio_path}` / `ReloadConfig` (`pipeline.rs:31`) |
+| detector → app | closure callback (`DetectorEvent`) | detect worker → `handle_detector_event` (`main.rs:368`) | `RecordingStarted` / `RecordingFinished{meta, audio_path}` / `RecordingDiscarded` / `Error` (`crates/corti-detect/src/lib.rs:43`) |
+| app → pipeline | `std::sync::mpsc::Sender<PipelineMsg>` (`main.rs:317`) | detector callback + webinar-finish thread + Queue-window Retry → pipeline worker | `Process{meta, audio_path}` / `Retry{id}` / `ReloadConfig` (`pipeline.rs:47`) |
 
 The two `mpsc` channels are control-plane (coarse start/stop events carrying file paths); the
 `rtrb` ring is the only data-plane carrier, and PCM lives in memory nowhere else — see
@@ -76,7 +82,7 @@ The detector is a managed Tauri singleton whose whole point is to keep the worke
 
 ```
 Tauri managed-state registry
-  └─ DetectorHandle(Mutex<Detector>)          main.rs:192 (managed :346) — Mutex is NEVER locked;
+  └─ DetectorHandle(Mutex<Detector>)          main.rs:196 (managed :358) — Mutex is NEVER locked;
        └─ Detector{ ctrl: Sender<Msg>,          it only makes the !Sync Detector Send+Sync so it
                     worker: JoinHandle }         can be managed. Drop → Msg::Shutdown + join
             └─ Worker (on the spawned thread)    (platform.rs:85).

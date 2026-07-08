@@ -2,8 +2,9 @@
 
 > **Stale — design-time snapshot.** Superseded by [docs/app.md](../docs/app.md); kept for design
 > rationale. AEC is called a "passthrough stub" (false — real `StreamingAec` is wired, ADR 0007); the
-> module list omits `cli`/`console`/`settings`/`stats` and the `app/ui/` React frontend; and the
-> crash-recovery / `resumable()` durability steps are deferred, not shipped.
+> module list omits `cli`/`console`/`settings`/`stats`/`jobs`/`queue_ui` and the `app/ui/` React frontend;
+> and the durability steps described below as deferred **shipped in #85** via `corti-jobs` (retry-with-backoff
+> + hourly retention sweep + startup job recovery), not the `resumable()`/`prune_done` design sketched here.
 
 The menu-bar app that ties everything together: a blinking record icon while capturing, and the
 detect → capture → (aec) → transcribe → vagus pipeline. **Built** ✅ — the crate is `app/` (`corti-app`,

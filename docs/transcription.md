@@ -1,12 +1,13 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against v0.8.0 + feat/pipeline-docs-and-streaming.
+> Verified against v0.8.0 + feat/pipeline-docs-and-streaming + #85 (durable-jobs stack).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
-`enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store but is used
-today only as a session-spanning **history record** — crash recovery is deliberately not wired
-(ADR 0007). Filing shells out to the external `vagus` CLI, the only subprocess in the note path.
+`enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store, and #85 added a
+`corti-jobs` layer on top of it for durable retry-with-backoff and an hourly retention sweep (see
+_The queue_ and _The pipeline worker_ below). Filing shells out to the external `vagus` CLI, the only
+subprocess in the note path.
 
 ## The `Transcriber` trait
 
@@ -89,12 +90,14 @@ id, so a resumed `Transcribing` job re-attaches to the same AWS job rather than 
 `start_job` tolerates the resulting `ConflictException` (`:46`). From the pipeline thread's view
 this is an ordinary blocking call.
 
-## The queue — history record, not crash recovery
+## The queue — durable store + background jobs
 
 `crates/corti-queue`: one SQLite DB in **WAL** at `~/.local/share/corti/queue.db` (override
-`$CORTI_DATA_DIR`, `src/lib.rs:21-23`; outside any vault, guardrail 5). One `recordings` row per
-recording mirrors `Job`; `job_id` (`:301`) is the recording filename stem, making everything
-idempotent on it.
+`$CORTI_DATA_DIR`; outside any vault, guardrail 5). One `recordings` row per recording mirrors `Job`;
+`job_id` is the recording filename stem, making everything idempotent on it. #85 added a
+`transcribe_secs` column (`src/lib.rs:56`) for the Recording Queue window's "transcribed 55 min in 30 s"
+line, and a v0→v1 migration (`:400`) that rewrites every stored timestamp to the fixed-width UTC `…Z`
+form so string ordering is chronological.
 
 `JobStatus` (`corti-core recording.rs:119`) is the state machine:
 
@@ -103,30 +106,48 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
                                                               ↘ Failed
 ```
 
-API the app uses: `enqueue` (`:118`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
-`set_status` (`:156`), `update` (`:173`, partial via SQL `COALESCE` — only `Some` fields change).
-`resumable()` (`:227`) and `prune_done()` (`:253`) **exist but are never called by the app.**
+API the app uses: `enqueue` (`:152`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
+`set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), plus #85's `retry_reset`
+(`:254`), `expired` (`:314`), `delete_terminal_older_than` (`:336`), and `all` (`:301`). `queue.jobs()`
+(`:129`) hands out a `corti_jobs::Jobs` borrowing the same live `Connection` for the background-job table.
 
-**Durability is deferred (ADR 0007).** `app/src/pipeline.rs:9-13` states crash recovery and
-retention are intentionally unimplemented: the pipeline runs in-process and a crash mid-call loses
-*that* call. The `Queue` is kept only so the tray `History ▸` submenu (issue #3) and `corti --list`
-survive restarts — startup `seed_history` (`pipeline.rs:167`) reads just the newest few jobs.
+**Durability is delivered by `corti-jobs` (#85), on top of the queue.** `crates/corti-jobs/src/lib.rs` is
+a small background-job layer sharing `queue.db`: kinds are strings with JSON payloads; `claim_due`
+(`:142`) marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
+(`:250`) can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
+pipeline seeds tray history (issue #3) and then calls `recover_running` on boot
+(`app/src/pipeline.rs:126`); `corti --list` and the tray `History ▸` submenu survive restarts. (A crash
+during a recording's *first* in-process attempt, before any failure schedules a retry job, still strands
+that row — durability is job-level, not a full sweep of non-terminal recordings.)
 
 ## The pipeline worker
 
 `app/src/pipeline.rs` — a single `corti-pipeline` thread, the sole `Queue` owner (rusqlite
-`Connection` is `Send`, not `Sync`). It drains `PipelineMsg::{Process, ReloadConfig}` (`:31`) from
-the `mpsc` channel serially. Per `Process` job (`transcribe_and_file`, `:198`):
+`Connection` is `Send`, not `Sync`). Its loop (`run`, `:87`) is a **tick**:
+`rx.recv_timeout(next_wake(..))` (`:195`) blocks for a new message or until the next background job is
+due (clamped to `MAX_IDLE_WAIT = 60 s`, `:44`), then `drain_due_jobs` (`:210`) claims and runs every due
+job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` (`:47`).
 
-1. `queue.update(Transcribing, transcribe_job = id)`;
-2. `transcribe::transcribe_recording` — offline AEC then `Backend::transcribe`, a **blocking** call
-   on this thread;
-3. `queue.set_status(PendingNote)` → `file_and_done` (`:272`);
-4. on success, delete the transient WAVs (`prune_transient`, `:344`) — the retention substitute for
-   the disabled `prune_done`.
+Per `Process` job, `transcribe_and_file` (`:413`): `queue.update(Transcribing)` →
+`transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on this
+thread) → `queue.update(PendingNote, transcribe_secs)` → `file_and_done` (`:485`); on success the
+transient WAVs are pruned (`prune_transient`). It returns `Result` instead of terminal-failing — a
+live-path error goes to `schedule_retry` (`:320`), which keeps the row at `PendingTranscription` and
+enqueues a durable `retry_transcription` job.
 
-`ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between
-jobs.
+**Retry with backoff.** `retry_transcription` (`app/src/jobs.rs:71`) re-runs `transcribe_and_file` from
+the capture audio (no transcript sidecar exists, so a `PendingNote` re-file re-transcribes too). Failed
+attempts back off `1 m → 2 m → … → 1 h` cap (`JOB_BACKOFF`, `pipeline.rs:37`) over `RETRY_MAX_ATTEMPTS =
+5` (`jobs.rs:23`); exhaustion terminal-fails the recording (`on_exhausted` → `fail`). The Recording Queue
+window's Retry button sends `PipelineMsg::Retry`, handled by `manual_retry` (`:266`).
+
+**Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
+`enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:135` (also fires at startup),
+deletes audio older than `retention_days` (config, default 7) plus the AEC sibling, then GCs terminal
+recording rows after 90 days and parked job rows after 30. Rows outlive the audio so history stays
+visible in the Recording Queue window.
+
+`ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 
 ## Filing to vagus
 
@@ -144,8 +165,8 @@ Homebrew/cargo locations (`discover`, `:37`), re-probed on each filing attempt s
 install works without relaunch.
 
 Ordering is crash-safe: `queue.update(note_path=…)` is persisted **before** `set_status(Done)`
-(`pipeline.rs:311-325`), so even without recovery a re-file can't duplicate a note. Any error →
-`fail` → `queue.fail` + tray `Failed`.
+(`file_and_done`, `pipeline.rs:485`), so a retry re-file can't duplicate a note. A transient error →
+`schedule_retry` / the retry job's backoff; only unrecoverable states go through `fail` → tray `Failed`.
 
 ## Shared types (`corti-core`)
 

@@ -12,7 +12,7 @@ Append-only decision log (Context / Decision / Consequences). Guardrails in
 | [0005](0005-streaming-compressed-capture.md) | Partly superseded by 0007 | streaming compressed capture: bounded-RAM disk writer; keep AEC offline (compression + 2-pass-offline AEC superseded; ring/writer design shipped) |
 | [0006](0006-distribution-unsigned-cask-tap.md) | Accepted | distribution: unsigned ad-hoc build via a private Homebrew cask tap |
 | [0006](0006-far-end-recording-notice-spike.md) | Proposed (spike) | far-end "recording in progress" notice — feasibility spike |
-| [0007](0007-streaming-aec-first.md) | Accepted (v0.8.0, #75) | streaming AEC-first pipeline; defer durability, calibration, compression |
+| [0007](0007-streaming-aec-first.md) | Accepted (v0.8.0, #75) | streaming AEC-first pipeline; defer durability, calibration, compression — *durability partially reversed by #85 (durable jobs + retry + retention returned via `corti-jobs`)* |
 | [0008](0008-live-streaming-transcript-in-process.md) | Proposed | live streaming transcript: first push-driven window, in-process transport |
 | [0009](0009-chunked-transcription-api.md) | Accepted | chunked/live transcription: pull-based sync core, batch refactored onto it |
 

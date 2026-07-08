@@ -9,8 +9,8 @@
 //!   each finished recording to the **pipeline worker** over a channel — it never blocks on transcription.
 //! - **Pipeline worker** is the sole owner of the `corti_queue::Queue` (rusqlite `Connection` is `Send` but
 //!   not `Sync`). It runs each recording through the pipeline serially on its own thread (transcription
-//!   blocks; guardrail 9 keeps it off the UI loop). The queue is a session-spanning record, not a resumable
-//!   store — crash recovery is deferred (ADR 0007).
+//!   blocks; guardrail 9 keeps it off the UI loop). The same thread also drains durable background jobs
+//!   (`corti-jobs`): transcribe/file retry with backoff and the hourly retention sweep (#85).
 //! - **Blink thread** toggles two template icons ~every 500 ms, marshalling AppKit calls to the main thread.
 
 // macOS-only by design — like the rest of the workspace, this compiles to a stub elsewhere.
@@ -325,8 +325,8 @@ pub(crate) mod imp {
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
-        // Pipeline worker (sole Queue owner). Seeds tray history from the queue, then drains the channel
-        // serially — no crash recovery (deferred, ADR 0007; the queue is a session-spanning record only).
+        // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned
+        // background jobs, then drains recordings + due durable jobs (retry/sweep) serially (#85).
         {
             let handle = app.handle().clone();
             let shared_cfg = shared_cfg.clone();
