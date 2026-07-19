@@ -52,7 +52,9 @@ impl GgmlAsr {
         let started = std::time::Instant::now();
         let model =
             Model::load(gguf).with_context(|| format!("loading GGUF model {}", gguf.display()))?;
-        let session = model.session().context("opening a transcribe.cpp session")?;
+        let session = model
+            .session()
+            .context("opening a transcribe.cpp session")?;
         tracing::info!(
             target: "corti::transcribe::local",
             model = "parakeet-ggml",
