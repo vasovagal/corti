@@ -110,6 +110,8 @@ impl Backend {
             diarize_far_end: self.cfg.local_diarize_far_end,
             embedding_model: self.cfg.local_embedding_model.clone(),
             diarize_threshold: self.cfg.local_diarize_threshold,
+            asr_engine: self.cfg.local_asr_engine.clone(),
+            ggml_model: self.cfg.local_ggml_model.clone(),
             // VAD/diarizer fine-tuning knobs are exposed for the benchmark harness and default to the
             // shipping constants; the app keeps them at default until a tuned default is adopted.
             ..LocalConfig::default()
