@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use corti_transcribe::segment::Word;
-use sherpa_onnx::{LinearResampler, OfflineRecognizer, VoiceActivityDetector};
+use sherpa_onnx::{LinearResampler, VoiceActivityDetector};
 
+use crate::asr::Asr;
 use crate::engine::{self, TARGET_RATE, VAD_WINDOW};
 
 /// Accumulates 16 kHz samples and releases them in whole [`VAD_WINDOW`]-sized windows, carrying the
@@ -64,10 +65,10 @@ impl WindowBuffer {
 /// spot and its words are queued. Drain queued words without blocking via [`poll_words`](Self::poll_words),
 /// and flush the trailing region with [`finish`](Self::finish).
 ///
-/// One `LiveTranscriber` handles one channel (its VAD is stateful); the [`OfflineRecognizer`] is shared —
+/// One `LiveTranscriber` handles one channel (its VAD is stateful); the [`Asr`] engine is shared —
 /// pass the same `Arc` to a second instance for the far-end channel.
 pub struct LiveTranscriber {
-    rec: Arc<OfflineRecognizer>,
+    rec: Arc<Asr>,
     vad: VoiceActivityDetector,
     /// Built lazily on the first non-16 kHz push and reused so resampling is continuous across pushes.
     resampler: Option<LinearResampler>,
@@ -80,10 +81,10 @@ pub struct LiveTranscriber {
 }
 
 impl LiveTranscriber {
-    /// Wrap a resident recognizer and a fresh (per-channel) Silero VAD. Build both via
-    /// [`engine::build_recognizer`]/[`engine::build_vad`], or use [`crate::LiveEngine`] to load once and spawn
+    /// Wrap a resident ASR engine and a fresh (per-channel) Silero VAD. Build them via
+    /// [`crate::Asr`]/[`engine::build_vad`], or use [`crate::LiveEngine`] to load once and spawn
     /// a transcriber per channel.
-    pub fn new(rec: Arc<OfflineRecognizer>, vad: VoiceActivityDetector) -> Self {
+    pub fn new(rec: Arc<Asr>, vad: VoiceActivityDetector) -> Self {
         Self {
             rec,
             vad,
@@ -223,19 +224,19 @@ impl LiveTranscriber {
 
 /// Pop every completed VAD region, decode it at its absolute offset, and append the words. Shared by `push`
 /// and `finish`; `seg.start()` is already the absolute sample index across all audio fed to this VAD.
-fn drain_regions(vad: &VoiceActivityDetector, rec: &OfflineRecognizer, out: &mut Vec<Word>) {
+fn drain_regions(vad: &VoiceActivityDetector, rec: &Asr, out: &mut Vec<Word>) {
     while let Some(seg) = vad.front() {
         let offset = seg.start() as f64 / TARGET_RATE as f64;
-        out.extend(engine::asr_segment(rec, seg.samples(), offset));
+        out.extend(rec.asr_segment(seg.samples(), offset));
         vad.pop();
     }
 }
 
-/// A resident local ASR engine: one loaded Parakeet recognizer plus the VAD parameters needed to spawn a
-/// fresh [`LiveTranscriber`] per channel. Each channel needs its own stateful VAD, but all channels share the
-/// single (thread-safe) recognizer. Build via [`crate::LocalTranscriber::live_engine`].
+/// A resident local ASR engine: one loaded recognizer ([`Asr`] — sherpa or ggml) plus the VAD parameters
+/// needed to spawn a fresh [`LiveTranscriber`] per channel. Each channel needs its own stateful VAD, but all
+/// channels share the single (thread-safe) recognizer. Build via [`crate::LocalTranscriber::live_engine`].
 pub struct LiveEngine {
-    rec: Arc<OfflineRecognizer>,
+    rec: Arc<Asr>,
     models: crate::models::Models,
     provider: String,
     vad_threshold: f32,
@@ -244,7 +245,7 @@ pub struct LiveEngine {
 
 impl LiveEngine {
     pub(crate) fn new(
-        rec: OfflineRecognizer,
+        rec: Asr,
         models: crate::models::Models,
         provider: String,
         vad_threshold: f32,
@@ -483,7 +484,9 @@ mod tests {
         let rate = spec.sample_rate;
 
         let m = models::discover(&dir, false, "titanet").expect("discover models");
-        let rec = Arc::new(engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"));
+        let rec = Arc::new(Asr::Sherpa(
+            engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"),
+        ));
 
         // Whole-channel push (the batch path).
         let mut whole = LiveTranscriber::new(
@@ -560,7 +563,9 @@ mod tests {
         );
 
         let m = models::discover(&dir, false, "titanet").expect("discover models");
-        let rec = Arc::new(engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"));
+        let rec = Arc::new(Asr::Sherpa(
+            engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"),
+        ));
         let mut live = LiveTranscriber::new(
             rec.clone(),
             engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"),

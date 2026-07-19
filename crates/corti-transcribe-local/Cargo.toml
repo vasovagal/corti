@@ -30,6 +30,11 @@ dirs = "6"
 tokio = { workspace = true, features = ["sync"], optional = true }
 futures-core = { workspace = true, optional = true }
 
+# GGML ASR spike (ADR 0011): the same Parakeet-TDT GGUF via transcribe.cpp — Metal on Apple Silicon by
+# default (crate feature `metal`, a no-op elsewhere). Compiles the vendored C++/ggml tree from source at
+# build time (needs CMake); only pulled in by the `ggml` feature.
+transcribe-cpp = { version = "0.1.3", optional = true }
+
 [features]
 # Signals that this build links a *CoreML-enabled* sherpa-onnx static lib (which you must supply via
 # SHERPA_ONNX_LIB_DIR / SHERPA_ONNX_ARCHIVE_DIR — the crates.io prebuilt has no CoreML execution provider).
@@ -42,6 +47,11 @@ coreml-lib = []
 # Async adapter: a `futures_core::Stream<Item = Vec<Word>>` over the sync `LiveTranscriber` (ADR 0009). OFF
 # by default — no tokio/futures in the default build; the core stays runtime-free (guardrail 9).
 stream = ["dep:tokio", "dep:futures-core"]
+
+# ADR 0011 spike: the transcribe.cpp (GGML/Metal) ASR engine, selected at runtime via
+# `LocalConfig::asr_engine = "ggml"`. OFF by default — the default build is byte-for-byte unchanged and
+# does not compile the C++ tree.
+ggml = ["dep:transcribe-cpp"]
 
 [dev-dependencies]
 # The transcribe_file example builds a RecordingMeta, which carries chrono timestamps.

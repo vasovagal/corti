@@ -92,6 +92,13 @@ struct ProcessArgs {
     /// Transducer blank penalty.
     #[arg(long)]
     asr_blank_penalty: Option<f32>,
+    /// ASR engine for speech regions: "sherpa" (default) or "ggml" (transcribe.cpp/Metal, ADR 0011;
+    /// needs a build with `--features ggml`).
+    #[arg(long, default_value = "sherpa")]
+    asr_engine: String,
+    /// GGUF path for --asr-engine ggml (default: <model_dir>/parakeet-tdt-0.6b-v3-Q8_0.gguf).
+    #[arg(long)]
+    ggml_model: Option<PathBuf>,
 
     // --- AEC knobs (used only with --aec) ---
     #[command(flatten)]
@@ -246,6 +253,8 @@ fn local_config(a: &ProcessArgs) -> LocalConfig {
         provider: a.provider.clone(),
         num_threads: a.threads,
         diarize_far_end: a.diarize,
+        asr_engine: a.asr_engine.clone(),
+        ggml_model: a.ggml_model.clone(),
         ..LocalConfig::default()
     };
     if let Some(d) = &a.model_dir {
@@ -299,6 +308,8 @@ fn local_config_json(c: &LocalConfig) -> serde_json::Value {
         "asr_decoding": c.asr_decoding,
         "asr_max_active_paths": c.asr_max_active_paths,
         "asr_blank_penalty": c.asr_blank_penalty,
+        "asr_engine": c.asr_engine,
+        "ggml_model": c.ggml_model.as_ref().map(|p| p.display().to_string()),
     })
 }
 

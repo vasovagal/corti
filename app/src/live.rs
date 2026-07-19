@@ -373,6 +373,8 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         model_dir: cfg.local_model_dir.clone(),
         provider: cfg.local_provider.clone(),
         num_threads: cfg.local_threads,
+        asr_engine: cfg.local_asr_engine.clone(),
+        ggml_model: cfg.local_ggml_model.clone(),
         // Far-end diarization never runs live: the tap channel is a single `Them`, like the batch
         // default and `corti-tap --live`. Everything else stays at the shipping defaults.
         ..LocalConfig::default()

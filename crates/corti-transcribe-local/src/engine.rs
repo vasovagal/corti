@@ -183,7 +183,7 @@ pub fn build_diarizer(
 ///
 /// [`LiveTranscriber`]: crate::LiveTranscriber
 pub fn transcribe_channel(
-    rec: Arc<OfflineRecognizer>,
+    rec: Arc<crate::Asr>,
     vad: VoiceActivityDetector,
     samples_16k: &[f32],
 ) -> Vec<Word> {

@@ -75,6 +75,18 @@ pub struct AppConfig {
     /// surfaced in the webview.
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_diarize_threshold: f32,
+    /// Which local ASR engine decodes speech regions (`CORTI_LOCAL_ASR_ENGINE` = `sherpa` | `ggml`,
+    /// default `sherpa`). `ggml` is the ADR 0011 spike (the same Parakeet-TDT as a GGUF via
+    /// transcribe.cpp, Metal on Apple Silicon) and needs a build with the `local-ggml` feature. An
+    /// env-only spike knob; not surfaced in the webview.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    #[serde(default = "default_asr_engine")]
+    pub local_asr_engine: String,
+    /// Explicit GGUF path for the `ggml` ASR engine (`CORTI_LOCAL_GGML_MODEL`); `None` ⇒
+    /// `<model dir>/parakeet-tdt-0.6b-v3-Q8_0.gguf`. Ignored by the `sherpa` engine.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_ggml_model: Option<PathBuf>,
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
@@ -121,6 +133,8 @@ impl Default for AppConfig {
             local_diarize_far_end: false,
             local_embedding_model: default_embedding_model(),
             local_diarize_threshold: 0.5,
+            local_asr_engine: default_asr_engine(),
+            local_ggml_model: None,
             aec_enabled: true,
             aec_filter_len: None,
             aec_mu: None,
@@ -192,6 +206,12 @@ impl AppConfig {
             .filter(|t| (0.0..=1.0).contains(t))
         {
             cfg.local_diarize_threshold = t;
+        }
+        if let Some(v) = env_non_empty("CORTI_LOCAL_ASR_ENGINE") {
+            cfg.local_asr_engine = v;
+        }
+        if let Some(v) = env_non_empty("CORTI_LOCAL_GGML_MODEL") {
+            cfg.local_ggml_model = Some(PathBuf::from(v));
         }
         if env_non_empty("CORTI_AEC").is_some() {
             cfg.aec_enabled = env_bool("CORTI_AEC", cfg.aec_enabled);
@@ -319,6 +339,8 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_LOCAL_DIARIZE", "local_diarize_far_end"),
         ("CORTI_LOCAL_EMBEDDING", "local_embedding_model"),
         ("CORTI_LOCAL_DIARIZE_THRESHOLD", "local_diarize_threshold"),
+        ("CORTI_LOCAL_ASR_ENGINE", "local_asr_engine"),
+        ("CORTI_LOCAL_GGML_MODEL", "local_ggml_model"),
         ("CORTI_AEC", "aec_enabled"),
         ("CORTI_RETENTION_DAYS", "retention_days"),
         ("CORTI_LIVE_FILING", "live_filing"),
@@ -351,6 +373,12 @@ fn parse_backend(s: Option<String>) -> BackendChoice {
 /// keep the two in lock-step.
 fn default_embedding_model() -> String {
     "titanet".to_string()
+}
+
+/// Default local ASR engine: sherpa-onnx, today's shipping path. A literal for the same
+/// compiles-without-`local` reason as [`default_embedding_model`].
+fn default_asr_engine() -> String {
+    "sherpa".to_string()
 }
 
 /// Default backend for this build: prefer the on-device `local` backend so a fresh install transcribes out
@@ -435,6 +463,8 @@ mod tests {
             local_diarize_far_end: true,
             local_embedding_model: "wespeaker-resnet34".into(),
             local_diarize_threshold: 0.7,
+            local_asr_engine: "ggml".into(),
+            local_ggml_model: Some(PathBuf::from("/tmp/models/parakeet.gguf")),
             aec_enabled: false,
             aec_filter_len: Some(8192),
             aec_mu: Some(0.5),

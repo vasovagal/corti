@@ -22,11 +22,15 @@ use corti_core::{DiarizedTranscript, RecordingMeta, Speaker};
 use corti_transcribe::Transcriber;
 use corti_transcribe::segment::{SEGMENT_GAP, diarize_words, merge_by_time, words_to_segments};
 
+mod asr;
 mod audio;
 mod engine;
+#[cfg(feature = "ggml")]
+pub mod ggml;
 mod live;
 pub mod models;
 
+pub use asr::Asr;
 pub use corti_transcribe::segment::Word;
 pub use live::{LiveEngine, LiveTranscriber};
 #[cfg(feature = "stream")]
@@ -80,6 +84,14 @@ pub struct LocalConfig {
     pub asr_max_active_paths: Option<i32>,
     /// Transducer blank penalty; higher discourages blank (fewer deletions, risks insertions). `None` keeps the default.
     pub asr_blank_penalty: Option<f32>,
+    /// Which engine decodes VAD speech regions: `"sherpa"` (default — today's shipping ONNX path) or
+    /// `"ggml"` (ADR 0011 spike — the same Parakeet-TDT-0.6B-v3 as a GGUF via transcribe.cpp, Metal on
+    /// Apple Silicon; requires a build with the `ggml` feature, else a clear runtime error). VAD and
+    /// far-end diarization stay on sherpa-onnx either way, so this knob isolates the ASR runtime.
+    pub asr_engine: String,
+    /// Explicit GGUF path for the `ggml` engine; `None` ⇒ `<model dir>/parakeet-tdt-0.6b-v3-Q8_0.gguf`
+    /// (see `ggml::DEFAULT_GGUF_FILE`). Ignored by the `sherpa` engine.
+    pub ggml_model: Option<PathBuf>,
 }
 
 impl Default for LocalConfig {
@@ -100,6 +112,8 @@ impl Default for LocalConfig {
             asr_decoding: None,
             asr_max_active_paths: None,
             asr_blank_penalty: None,
+            asr_engine: "sherpa".to_string(),
+            ggml_model: None,
         }
     }
 }
@@ -117,27 +131,57 @@ impl LocalTranscriber {
 
     /// Load the models + recognizer once and return a [`LiveEngine`] for driving chunked/live transcription
     /// (ADR 0009). The far-end diarization models are **not** required here — the live path attributes the
-    /// far end to a single `Them`, like the batch default — so only Parakeet + Silero VAD must be present.
-    /// Spawn one [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
+    /// far end to a single `Them`, like the batch default — so only the ASR engine + Silero VAD must be
+    /// present. Spawn one [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
     pub fn live_engine(&self) -> Result<LiveEngine> {
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
-        let m = models::discover(&dir, false, &self.cfg.embedding_model)?;
+        let wants_ggml = asr::wants_ggml(&self.cfg.asr_engine)?;
+        let m = models::discover_for(&dir, !wants_ggml, false, &self.cfg.embedding_model)?;
         let provider = resolve_provider(self.cfg.provider.as_str()).to_string();
-        let rec = engine::build_recognizer(
-            &m,
-            &provider,
-            self.cfg.num_threads,
-            self.cfg.asr_decoding.as_deref(),
-            self.cfg.asr_max_active_paths,
-            self.cfg.asr_blank_penalty,
-        )?;
+        let asr = self.build_asr(wants_ggml, &m, &provider, &dir)?;
         Ok(LiveEngine::new(
-            rec,
+            asr,
             m,
             provider,
             self.cfg.vad_threshold,
             self.cfg.vad_min_silence,
         ))
+    }
+
+    /// Build the runtime-selected ASR engine (the only engine-specific seam — see [`Asr`]). `wants_ggml`
+    /// comes from [`asr::wants_ggml`] so an unknown token has already errored by the time this runs.
+    fn build_asr(
+        &self,
+        wants_ggml: bool,
+        m: &models::Models,
+        provider: &str,
+        model_dir: &Path,
+    ) -> Result<Asr> {
+        if !wants_ggml {
+            return Ok(Asr::Sherpa(engine::build_recognizer(
+                m,
+                provider,
+                self.cfg.num_threads,
+                self.cfg.asr_decoding.as_deref(),
+                self.cfg.asr_max_active_paths,
+                self.cfg.asr_blank_penalty,
+            )?));
+        }
+        self.build_ggml_asr(model_dir)
+    }
+
+    #[cfg(feature = "ggml")]
+    fn build_ggml_asr(&self, model_dir: &Path) -> Result<Asr> {
+        let gguf = ggml::resolve_gguf(self.cfg.ggml_model.clone(), model_dir)?;
+        Ok(Asr::Ggml(ggml::GgmlAsr::load(&gguf)?))
+    }
+
+    #[cfg(not(feature = "ggml"))]
+    fn build_ggml_asr(&self, _model_dir: &Path) -> Result<Asr> {
+        anyhow::bail!(
+            "ASR engine `ggml` is not compiled into this build — rebuild with the `ggml` feature of \
+             corti-transcribe-local (ADR 0011)"
+        )
     }
 }
 
@@ -150,20 +194,19 @@ impl Transcriber for LocalTranscriber {
             "local transcription started"
         );
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
-        let m = models::discover(&dir, self.cfg.diarize_far_end, &self.cfg.embedding_model)?;
+        let wants_ggml = asr::wants_ggml(&self.cfg.asr_engine)?;
+        let m = models::discover_for(
+            &dir,
+            !wants_ggml,
+            self.cfg.diarize_far_end,
+            &self.cfg.embedding_model,
+        )?;
         let track = audio::read_two_track(audio)?;
         let provider = resolve_provider(self.cfg.provider.as_str());
         let threads = self.cfg.num_threads;
 
-        // One recognizer load per job, shared across both channels (and both `LiveTranscriber`s).
-        let rec = Arc::new(engine::build_recognizer(
-            &m,
-            provider,
-            threads,
-            self.cfg.asr_decoding.as_deref(),
-            self.cfg.asr_max_active_paths,
-            self.cfg.asr_blank_penalty,
-        )?);
+        // One ASR engine load per job, shared across both channels (and both `LiveTranscriber`s).
+        let rec = Arc::new(self.build_asr(wants_ggml, &m, provider, &dir)?);
         let mut segments = Vec::new();
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
