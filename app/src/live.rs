@@ -725,6 +725,8 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         diarize_far_end: cfg.local_diarize_far_end,
         embedding_model: cfg.local_embedding_model.clone(),
         diarize_threshold: cfg.local_diarize_threshold,
+        asr_engine: cfg.local_asr_engine.clone(),
+        ggml_model: cfg.local_ggml_model.clone(),
         ..LocalConfig::default()
     };
     let engine = LocalTranscriber::new(local_cfg)

@@ -85,3 +85,6 @@ ureq = { version = "2", optional = true }
 default = ["aws", "local"]
 aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:tokio"]
 local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
+# ADR 0011 spike: compile in the transcribe.cpp (GGML/Metal) ASR engine for the local backend, selected
+# at runtime with CORTI_LOCAL_ASR_ENGINE=ggml. Off by default (builds the vendored C++ tree; needs CMake).
+local-ggml = ["local", "corti-transcribe-local/ggml"]

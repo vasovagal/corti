@@ -77,6 +77,18 @@ pub fn resolve_dir(override_dir: Option<PathBuf>) -> Result<PathBuf> {
 /// only when `need_diarization` is set (far-end speaker splitting); the default path needs just Parakeet +
 /// VAD. `embedding_id` selects which speaker-embedding model to expect (see [`EMBEDDING_IDS`]).
 pub fn discover(dir: &Path, need_diarization: bool, embedding_id: &str) -> Result<Models> {
+    discover_for(dir, true, need_diarization, embedding_id)
+}
+
+/// [`discover`] with an explicit ASR-engine notion: `need_parakeet = false` (the `ggml` ASR engine, ADR
+/// 0011) skips the Parakeet ONNX files — the engine's GGUF is resolved separately by `ggml::resolve_gguf`
+/// — while Silero VAD (and the diarization models when enabled) are still validated here.
+pub fn discover_for(
+    dir: &Path,
+    need_parakeet: bool,
+    need_diarization: bool,
+    embedding_id: &str,
+) -> Result<Models> {
     let parakeet = dir.join(PARAKEET_DIR);
     let models = Models {
         parakeet_encoder: parakeet.join("encoder.int8.onnx"),
@@ -89,7 +101,7 @@ pub fn discover(dir: &Path, need_diarization: bool, embedding_id: &str) -> Resul
     };
 
     let missing: Vec<&Path> = models
-        .required(need_diarization)
+        .required(need_parakeet, need_diarization)
         .into_iter()
         .filter(|p| !p.exists())
         .collect();
@@ -117,16 +129,18 @@ pub fn discover(dir: &Path, need_diarization: bool, embedding_id: &str) -> Resul
 }
 
 impl Models {
-    /// The model files that must exist: always Parakeet + VAD; segmentation + embedding only when far-end
-    /// diarization is enabled.
-    fn required(&self, need_diarization: bool) -> Vec<&Path> {
-        let mut req = vec![
-            self.parakeet_encoder.as_path(),
-            self.parakeet_decoder.as_path(),
-            self.parakeet_joiner.as_path(),
-            self.parakeet_tokens.as_path(),
-            self.vad.as_path(),
-        ];
+    /// The model files that must exist: always VAD; the Parakeet ONNX set only for the sherpa ASR engine;
+    /// segmentation + embedding only when far-end diarization is enabled.
+    fn required(&self, need_parakeet: bool, need_diarization: bool) -> Vec<&Path> {
+        let mut req = vec![self.vad.as_path()];
+        if need_parakeet {
+            req.extend([
+                self.parakeet_encoder.as_path(),
+                self.parakeet_decoder.as_path(),
+                self.parakeet_joiner.as_path(),
+                self.parakeet_tokens.as_path(),
+            ]);
+        }
         if need_diarization {
             req.push(self.segmentation.as_path());
             req.push(self.embedding.as_path());
