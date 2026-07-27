@@ -48,7 +48,6 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     outputs:
-      release_id: ${{ steps.rel.outputs.id }}
       already_published: ${{ steps.rel.outputs.already_published }}
     steps:
       - name: Create or reuse draft release
@@ -61,9 +60,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
               --draft --title "$GITHUB_REF_NAME" --generate-notes
           fi
-          info=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --json databaseId,isDraft)
-          echo "id=$(jq -r .databaseId <<<"$info")" >> "$GITHUB_OUTPUT"
+          info=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft)
           if [ "$(jq -r .isDraft <<<"$info")" = false ]; then
             # A successful workflow re-run after publication is a no-op, not a rebuild of public assets.
             echo "already_published=true" >> "$GITHUB_OUTPUT"

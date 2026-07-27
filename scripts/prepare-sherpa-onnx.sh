@@ -46,8 +46,6 @@ if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
   exit 1
 fi
 
-echo "$EXPECTED_SHA256  $ARCHIVE_NAME" | (cd "$WORK" && shasum -a 256 --check -) >/dev/null
-
 tar -xjf "$ARCHIVE" -C "$WORK"
 EXTRACTED="$WORK/${ARCHIVE_NAME%.tar.bz2}"
 [[ -d "$EXTRACTED/lib" ]] || {
