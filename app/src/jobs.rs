@@ -23,9 +23,9 @@ pub(crate) const SWEEP_EXPIRED: &str = "sweep_expired";
 pub(crate) const RETRY_MAX_ATTEMPTS: u32 = 5;
 
 pub(crate) const SWEEP_PERIOD: Duration = Duration::from_secs(3600);
-/// Terminal recording **rows** are GC'd after this long — much longer than the (configurable) audio
-/// retention, so "Filed in brain" history stays visible for a quarter. Fixed: one less knob.
-const ROW_RETENTION_DAYS: i64 = 90;
+/// Minimum terminal-row lifetime. The actual horizon is the maximum of this and configured audio
+/// retention, because deleting the path-bearing row first would orphan longer-retained audio forever.
+const MIN_ROW_RETENTION_DAYS: i64 = 90;
 /// Parked `failed` background-job rows are debris after this long.
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
@@ -65,9 +65,33 @@ pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) {
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryAction {
+    Stale,
+    FileCheckpoint,
+    Transcribe,
+    MissingAudio,
+}
+
+fn retry_action(status: JobStatus, checkpoint_exists: bool, audio_exists: bool) -> RetryAction {
+    match status {
+        JobStatus::Done | JobStatus::Failed | JobStatus::Recording => RetryAction::Stale,
+        JobStatus::PendingNote if checkpoint_exists => RetryAction::FileCheckpoint,
+        JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote
+            if audio_exists =>
+        {
+            // `PendingNote` without a checkpoint is a legacy row: transcribe once to create one.
+            RetryAction::Transcribe
+        }
+        JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote => {
+            RetryAction::MissingAudio
+        }
+    }
+}
+
 /// Push a recording the rest of the way through the pipeline, from whatever state a failure or crash
-/// left it in. `Done`/`Failed`/missing rows complete silently: the work already happened or was
-/// superseded (idempotency).
+/// left it in. `PendingNote` means the transcript is durable and dispatches straight to filing. Legacy
+/// `PendingNote` rows without a checkpoint fall back to audio once for backward compatibility.
 fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
     let id = job.payload["id"]
         .as_str()
@@ -76,23 +100,19 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
         return Ok(()); // row deleted meanwhile — nothing to retry
     };
     let meta = row.meta();
-    match row.status {
-        // Terminal, or a live capture that isn't ours to touch: the job is stale.
-        JobStatus::Done | JobStatus::Failed | JobStatus::Recording => Ok(()),
-        // ADR 0007 keeps no transcript sidecar, so a `PendingNote` re-file has nothing to file from —
-        // re-run the whole transcribe→file path from the capture audio, same as a transcription retry.
-        JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote => {
-            if !row.audio_path.exists() {
-                // Retrying can't bring the file back: terminal-fail the recording, complete the job.
-                pipeline::fail(
-                    ctx,
-                    id,
-                    &meta,
-                    "audio file is gone — cannot transcribe".to_string(),
-                );
-                return Ok(());
-            }
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path)
+    let checkpoint_exists = crate::checkpoint::path_for(&row.audio_path).is_file();
+    match retry_action(row.status, checkpoint_exists, row.audio_path.exists()) {
+        RetryAction::Stale => Ok(()),
+        RetryAction::FileCheckpoint => pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path),
+        RetryAction::Transcribe => pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path),
+        RetryAction::MissingAudio => {
+            pipeline::fail(
+                ctx,
+                id,
+                &meta,
+                "audio file is gone — cannot transcribe".to_string(),
+            );
+            Ok(())
         }
     }
 }
@@ -102,8 +122,9 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
 /// past their much longer horizons. `retention_days` is read live from the shared config so a Settings
 /// change applies to the very next sweep.
 ///
-/// Format-agnostic (ADR 0007, lossless-WAV world): it deletes whatever path the queue row stores plus
-/// the AEC-cleaned sibling. There is no transcript sidecar to remove and no Opus era to reconcile.
+/// Format-agnostic (lossless-WAV world): it deletes whatever path the queue row stores, the AEC-cleaned
+/// sibling, and any leftover transcript checkpoint. The checkpoint normally disappears at completion;
+/// sweeping it here contains crash leftovers.
 fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
     let retention_days = i64::from(ctx.config.lock().unwrap().retention_days);
     let audio_cutoff = chrono::Local::now() - chrono::Duration::days(retention_days);
@@ -112,14 +133,19 @@ fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
     for row in ctx.queue.expired(audio_cutoff)? {
         // The recording itself (whatever path the row stores) and its AEC-cleaned sibling, when distinct.
         let audio = &row.audio_path;
-        for path in [audio.clone(), corti_capture::clean_wav_path(audio)] {
+        for path in [
+            audio.clone(),
+            corti_capture::clean_wav_path(audio),
+            crate::checkpoint::path_for(audio),
+        ] {
             if std::fs::remove_file(&path).is_ok() {
                 files += 1;
             }
         }
     }
 
-    let row_cutoff = chrono::Local::now() - chrono::Duration::days(ROW_RETENTION_DAYS);
+    let row_days = retention_days.max(MIN_ROW_RETENTION_DAYS);
+    let row_cutoff = chrono::Local::now() - chrono::Duration::days(row_days);
     let rows = ctx.queue.delete_terminal_older_than(row_cutoff)?;
     let job_rows = ctx.queue.jobs().delete_terminal_older_than(
         Utc::now() - chrono::Duration::days(FAILED_JOB_ROW_RETENTION_DAYS),
@@ -133,4 +159,62 @@ fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
         crate::tray::emit_queue_changed(&ctx.app, "sweep");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_dispatches_pending_note_to_checkpoint_only() {
+        assert_eq!(
+            retry_action(JobStatus::PendingNote, true, true),
+            RetryAction::FileCheckpoint
+        );
+        // The durable transcript is sufficient even if the raw audio is temporarily unavailable.
+        assert_eq!(
+            retry_action(JobStatus::PendingNote, true, false),
+            RetryAction::FileCheckpoint
+        );
+    }
+
+    #[test]
+    fn legacy_pending_note_falls_back_to_audio_once() {
+        assert_eq!(
+            retry_action(JobStatus::PendingNote, false, true),
+            RetryAction::Transcribe
+        );
+        assert_eq!(
+            retry_action(JobStatus::PendingNote, false, false),
+            RetryAction::MissingAudio
+        );
+    }
+
+    #[test]
+    fn transcription_states_still_require_audio() {
+        for status in [JobStatus::PendingTranscription, JobStatus::Transcribing] {
+            assert_eq!(
+                retry_action(status, true, true),
+                RetryAction::Transcribe,
+                "a stray checkpoint must not redefine {status:?}"
+            );
+            assert_eq!(
+                retry_action(status, false, false),
+                RetryAction::MissingAudio
+            );
+        }
+        assert_eq!(
+            retry_action(JobStatus::Done, true, true),
+            RetryAction::Stale
+        );
+    }
+
+    #[test]
+    fn row_retention_never_precedes_audio_retention() {
+        for retention_days in [1_i64, 7, 90, 91, 365] {
+            let row_days = retention_days.max(MIN_ROW_RETENTION_DAYS);
+            assert!(row_days >= retention_days);
+        }
+        assert_eq!(365_i64.max(MIN_ROW_RETENTION_DAYS), 365);
+    }
 }

@@ -6,9 +6,8 @@
 //! Keeping the two ends as separate tracks is what gives downstream code free "me vs. them" diarization and
 //! lets [`corti-aec`](../corti_aec) cancel speaker bleed from time-aligned signals. Under ADR 0007
 //! (streaming-AEC-first) the captured 2-track is the **AEC input**, written lossless (float, never
-//! quantized) so the adaptive filter sees bit-exact PCM. Both the captured 2-track and the cleaned sibling
-//! AEC produces are **transient**: the pipeline deletes them after transcription, since durability and
-//! retention are deferred. There is no longer a "raw tracks always preserved" invariant.
+//! quantized) so the adaptive filter sees bit-exact PCM. The captured raw recording is retained for the
+//! configured sweep; the cleaned sibling is a reproducible derivative removed after durable filing.
 
 use std::path::{Path, PathBuf};
 
@@ -60,9 +59,8 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
 /// track, so there is nothing to cancel — the caller transcribes the tap directly. This is an expected
 /// outcome, not an error. Any other channel count (0, or 3+) is a genuine error.
 ///
-/// The captured file is only read here, not modified; under ADR 0007 it is a **transient** intermediate that
-/// the pipeline deletes after transcription (along with this cleaned sibling) — there is no raw-retention
-/// invariant any more.
+/// The captured file is only read here, not modified. The pipeline retains it for the configured audio
+/// retention period; this reproducible cleaned sibling is removed after durable filing.
 pub fn write_clean_wav(
     raw_2track_wav: &Path,
     aec_cfg: &corti_aec::AecConfig,

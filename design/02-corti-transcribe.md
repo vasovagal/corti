@@ -30,7 +30,9 @@ Batch flow (`crates/corti-transcribe-aws/src/lib.rs`):
    directed to our own key (stays inside `aws-sdk-s3`, no extra HTTP client).
 4. Parse `results.channel_labels.channels[].items[]` (word + `start_time`/`end_time`, punctuation glued),
    group each channel into segments on a >1.5 s pause, then merge both channels sorted by time
-   (`src/parse.rs`, unit-tested). Best-effort delete the staged `.wav` + `.json` when done.
+   (`src/parse.rs`, unit-tested). One-shot calls clean staged objects after success; the durable app defers
+   cleanup until its local transcript checkpoint is persisted. Poll/fetch/parse failures retain output,
+   and a terminally failed stable Transcribe job is deleted before retry.
 
 **Config injection (not env):** the crate takes a caller-built `SdkConfig`
 (`AwsTranscriber::new(&sdk_config, AwsOptions { bucket, .. })`); the Tauri app runs the standard
@@ -55,7 +57,8 @@ after the call):
   "Version": "2012-10-17",
   "Statement": [
     { "Sid": "CortiTranscribeJobs", "Effect": "Allow",
-      "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"],
+      "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob",
+                 "transcribe:DeleteTranscriptionJob"],
       "Resource": "*" },
     { "Sid": "CortiStagedObjects", "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],

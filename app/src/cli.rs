@@ -309,7 +309,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         aec_enabled,
         resolved.skip_aec,
         &aec_cfg,
-        &resolved.id,
+        crate::transcribe::TranscriptionAttempt::fresh(&resolved.id),
         &resolved.meta,
         &resolved.audio,
     )
@@ -414,7 +414,7 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         aec_enabled,
         skip_aec,
         &aec_cfg,
-        &job_id,
+        crate::transcribe::TranscriptionAttempt::fresh(&job_id),
         &meta,
         input,
     )

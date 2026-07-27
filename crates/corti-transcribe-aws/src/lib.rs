@@ -35,7 +35,9 @@ pub struct AwsOptions {
     pub key_prefix: String,
     /// BCP-47 language code, e.g. `en-US`.
     pub language: String,
-    /// Delete the staged `.wav` and `.json` from S3 once transcription completes.
+    /// Delete the staged `.wav` and `.json` from S3 after a successful result. Failures retain both so a
+    /// stable job can be reattached. The app's durable pipeline sets this to `false` and calls
+    /// [`AwsTranscriber::cleanup_staged`] only after its local transcript checkpoint is durable.
     pub delete_after: bool,
     /// How often to poll job status.
     pub poll_interval: Duration,
@@ -91,6 +93,21 @@ impl AwsTranscriber {
         }
     }
 
+    /// Delete the stable job's staged input/output after a caller has durably persisted the transcript.
+    /// Both deletes are attempted; any failure is returned after the other object has also been tried.
+    pub fn cleanup_staged(&self, job_name: &str) -> Result<()> {
+        if self.opts.bucket.is_empty() {
+            bail!("AwsOptions.bucket is empty — set the S3 bucket to clean staged audio");
+        }
+        let job = sanitize(job_name);
+        let (in_key, out_key) = object_keys(&self.opts.key_prefix, &job);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime for AWS cleanup")?;
+        rt.block_on(self.cleanup_objects(&in_key, &out_key))
+    }
+
     /// The full async pipeline: re-encode → upload → start → poll → fetch → parse → clean up.
     async fn run(&self, audio: &Path) -> Result<DiarizedTranscript> {
         if self.opts.bucket.is_empty() {
@@ -113,8 +130,7 @@ impl AwsTranscriber {
             .unwrap_or(0);
         let stem = audio.file_stem().map(|s| s.to_string_lossy().into_owned());
         let job = resolve_job_name(self.opts.job_name.as_deref(), stem.as_deref(), suffix);
-        let in_key = format!("{}{job}.wav", self.opts.key_prefix);
-        let out_key = format!("{}{job}.json", self.opts.key_prefix);
+        let (in_key, out_key) = object_keys(&self.opts.key_prefix, &job);
 
         // 3. Upload, then drop the local temp regardless of what follows.
         let upload = self.upload(&pcm_path, &in_key).await;
@@ -128,10 +144,17 @@ impl AwsTranscriber {
         // 5. Poll, 6. fetch, 7. parse (channel-identified vs. single-speaker per `multichannel`).
         let result = self.await_result(&job, &out_key, multichannel).await;
 
-        // 8. Best-effort cleanup of staged objects.
-        if self.opts.delete_after {
-            self.delete(&in_key).await;
-            self.delete(&out_key).await;
+        // 8. Cleanup is success-only. Poll/fetch/read/parse failures retain the staged result so a stable
+        // job can reattach. The app disables this and explicitly cleans only after its local checkpoint.
+        if should_cleanup_staged(self.opts.delete_after, result.is_ok())
+            && let Err(e) = self.cleanup_objects(&in_key, &out_key).await
+        {
+            tracing::warn!(
+                target: "corti::transcribe::aws",
+                job,
+                error = %format!("{e:#}"),
+                "failed to clean up staged S3 objects"
+            );
         }
 
         result
@@ -259,6 +282,12 @@ impl AwsTranscriber {
                 Some(TranscriptionJobStatus::Failed) => {
                     let reason = tjob.failure_reason().unwrap_or("unknown reason");
                     tracing::error!(target: "corti::transcribe::aws", job, reason, "transcription job failed");
+                    // A failed stable job can never become successful. Remove the terminal job now so the
+                    // next retry can submit the same durable name afresh; staged objects remain until a
+                    // later successful checkpoint cleanup.
+                    self.delete_failed_job(job).await.with_context(|| {
+                        format!("deleting terminal AWS job {job} before retry (failure: {reason})")
+                    })?;
                     bail!("transcription job failed: {reason}");
                 }
                 // Queued / InProgress / None / future variants: keep waiting.
@@ -314,23 +343,49 @@ impl AwsTranscriber {
         }
     }
 
-    async fn delete(&self, key: &str) {
-        if let Err(e) = self
-            .s3
+    async fn delete_failed_job(&self, job: &str) -> Result<()> {
+        self.transcribe
+            .delete_transcription_job()
+            .transcription_job_name(job)
+            .send()
+            .await
+            .context("DeleteTranscriptionJob failed")?;
+        tracing::info!(
+            target: "corti::transcribe::aws",
+            job,
+            "deleted terminal transcription job so retry can start fresh"
+        );
+        Ok(())
+    }
+
+    async fn cleanup_objects(&self, in_key: &str, out_key: &str) -> Result<()> {
+        let input = self.delete(in_key).await;
+        let output = self.delete(out_key).await;
+        match (input, output) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Ok(())) => Err(a),
+            (Ok(()), Err(b)) => Err(b),
+            (Err(a), Err(b)) => {
+                anyhow::bail!("input cleanup failed: {a:#}; output cleanup failed: {b:#}")
+            }
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.s3
             .delete_object()
             .bucket(&self.opts.bucket)
             .key(key)
             .send()
             .await
-        {
-            tracing::warn!(
-                target: "corti::transcribe::aws",
-                bucket = %self.opts.bucket,
-                key,
-                error = %e,
-                "failed to clean up staged S3 object"
-            );
-        }
+            .with_context(|| format!("deleting s3://{}/{key}", self.opts.bucket))?;
+        tracing::info!(
+            target: "corti::transcribe::aws",
+            bucket = %self.opts.bucket,
+            key,
+            "deleted staged S3 object"
+        );
+        Ok(())
     }
 }
 
@@ -362,6 +417,14 @@ fn resolve_job_name(
             format!("{stem}-{unique_suffix:x}")
         }
     }
+}
+
+fn object_keys(prefix: &str, job: &str) -> (String, String) {
+    (format!("{prefix}{job}.wav"), format!("{prefix}{job}.json"))
+}
+
+fn should_cleanup_staged(delete_after: bool, result_succeeded: bool) -> bool {
+    delete_after && result_succeeded
 }
 
 /// Keep only characters AWS allows in a job name (`0-9a-zA-Z._-`); replace the rest with `-`.
@@ -414,5 +477,24 @@ mod tests {
         assert_eq!(resolve_job_name(None, Some("rec"), 0x1f), "rec-1f");
         assert_eq!(resolve_job_name(None, Some("a b"), 0x10), "a-b-10");
         assert_eq!(resolve_job_name(None, None, 0xab), "corti-job-ab");
+    }
+
+    #[test]
+    fn failed_results_never_trigger_staged_cleanup() {
+        assert!(!should_cleanup_staged(true, false));
+        assert!(!should_cleanup_staged(false, false));
+        assert!(!should_cleanup_staged(false, true));
+        assert!(should_cleanup_staged(true, true));
+    }
+
+    #[test]
+    fn stable_job_names_address_stable_cleanup_objects() {
+        assert_eq!(
+            object_keys("corti/", "recording-1"),
+            (
+                "corti/recording-1.wav".to_string(),
+                "corti/recording-1.json".to_string()
+            )
+        );
     }
 }

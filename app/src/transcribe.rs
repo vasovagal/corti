@@ -52,20 +52,20 @@ impl Backend {
         Self { cfg, kind }
     }
 
-    /// Transcribe a recording into a diarized transcript using the runtime-selected backend. `job_id` is
-    /// the durable recording id; AWS passes it as the stable `AwsOptions.job_name` so a resumed
-    /// `Transcribing` job re-attaches to the same AWS job instead of re-submitting (design/05-app-tauri.md).
+    /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
+    /// pipeline supplies `aws_job_name = Some(recording_id)` so retries reattach; explicit CLI runs pass
+    /// `None` so `--redo --aws` always creates a fresh AWS attempt.
     pub fn transcribe(
         &self,
-        job_id: &str,
+        aws_job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
     ) -> Result<DiarizedTranscript> {
-        // `job_id` is only used by the AWS arm; keep it referenced for builds without that feature.
-        let _ = job_id;
+        // The job name is only used by the AWS arm; keep it referenced for builds without that feature.
+        let _ = aws_job_name;
         match &self.kind {
             #[cfg(feature = "aws")]
-            BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), job_id, audio, meta),
+            BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), aws_job_name, audio, meta),
             #[cfg(feature = "local")]
             BackendKind::Local => self.transcribe_local(audio, meta),
             BackendKind::Unavailable(reason) => anyhow::bail!("{reason}"),
@@ -76,7 +76,7 @@ impl Backend {
     fn transcribe_aws(
         &self,
         sdk: Option<&aws_config::SdkConfig>,
-        job_id: &str,
+        job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
     ) -> Result<DiarizedTranscript> {
@@ -91,11 +91,44 @@ impl Backend {
             .context("no S3 bucket configured — export CORTI_AWS_BUCKET")?;
         let sdk = sdk.context("AWS SDK config unavailable (credential chain failed at startup)")?;
         let opts = AwsOptions {
-            job_name: Some(job_id.to_string()),
+            job_name: job_name.map(str::to_string),
+            // A durable stable job is cleaned only after the app checkpoint is persisted. One-shot CLI
+            // attempts keep the backend's success-only cleanup behavior.
+            delete_after: job_name.is_none(),
             language: self.cfg.language.clone(),
             ..AwsOptions::new(bucket)
         };
         AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
+    }
+
+    /// Best-effort caller hook for the durable boundary: after a successful AWS transcript has been written
+    /// to the local filing checkpoint, remove its stable staged objects. Other backends are no-ops.
+    pub fn cleanup_after_checkpoint(&self, job_id: &str) -> Result<()> {
+        let _ = job_id;
+        match &self.kind {
+            #[cfg(feature = "aws")]
+            BackendKind::Aws(sdk) => {
+                use anyhow::Context;
+                use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
+
+                let bucket = self
+                    .cfg
+                    .aws_bucket
+                    .clone()
+                    .context("no S3 bucket configured for checkpoint cleanup")?;
+                let sdk = sdk
+                    .as_deref()
+                    .context("AWS SDK config unavailable for checkpoint cleanup")?;
+                let opts = AwsOptions {
+                    delete_after: false,
+                    ..AwsOptions::new(bucket)
+                };
+                AwsTranscriber::new(sdk, opts).cleanup_staged(job_id)
+            }
+            #[cfg(feature = "local")]
+            BackendKind::Local => Ok(()),
+            BackendKind::Unavailable(_) => Ok(()),
+        }
     }
 
     #[cfg(feature = "local")]
@@ -118,6 +151,31 @@ impl Backend {
     }
 }
 
+/// Identifies one transcription invocation for diagnostics and AWS idempotency.
+#[derive(Clone, Copy)]
+pub struct TranscriptionAttempt<'a> {
+    id: &'a str,
+    aws_job_name: Option<&'a str>,
+}
+
+impl<'a> TranscriptionAttempt<'a> {
+    /// Durable pipeline attempt: AWS retries reattach to this stable recording id.
+    pub fn durable(id: &'a str) -> Self {
+        Self {
+            id,
+            aws_job_name: Some(id),
+        }
+    }
+
+    /// Explicit CLI attempt: keep the diagnostic id but mint a fresh AWS name.
+    pub fn fresh(id: &'a str) -> Self {
+        Self {
+            id,
+            aws_job_name: None,
+        }
+    }
+}
+
 /// Run offline AEC (unless `skip_aec`), then transcribe with the runtime-selected `backend`. This is the
 /// tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
@@ -134,7 +192,7 @@ pub fn transcribe_recording(
     aec_enabled: bool,
     skip_aec: bool,
     aec_cfg: &corti_aec::AecConfig,
-    id: &str,
+    attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
 ) -> Result<(DiarizedTranscript, PathBuf)> {
@@ -146,7 +204,7 @@ pub fn transcribe_recording(
             Ok(Some(clean)) => {
                 info!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = true,
                     input = %raw_audio.display(),
                     output = %clean.display(),
@@ -158,7 +216,7 @@ pub fn transcribe_recording(
                 // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
                 info!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = false,
                     input = %raw_audio.display(),
                     "tap-only recording — no mic track to clean; skipping AEC"
@@ -168,7 +226,7 @@ pub fn transcribe_recording(
             Err(e) => {
                 warn!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = false,
                     input = %raw_audio.display(),
                     error = %format!("{e:#}"),
@@ -181,7 +239,7 @@ pub fn transcribe_recording(
         raw_audio.to_path_buf()
     };
 
-    let transcript = backend.transcribe(id, &input, meta)?;
+    let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
     Ok((transcript, input))
 }
 

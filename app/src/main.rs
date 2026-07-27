@@ -17,6 +17,8 @@
 #[cfg(target_os = "macos")]
 mod activity;
 #[cfg(target_os = "macos")]
+mod checkpoint;
+#[cfg(target_os = "macos")]
 mod cli;
 #[cfg(target_os = "macos")]
 mod config;
