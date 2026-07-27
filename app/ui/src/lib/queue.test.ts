@@ -17,6 +17,7 @@ function dto(over: Partial<RecordingDto>): RecordingDto {
     note_path: "/brain/00-Inbox/zoom.md",
     note_exists: true,
     audio_exists: true,
+    recovery_exists: true,
     audio_bytes: 22_000_000,
     retry_pending: false,
     retry_attempts: null,
@@ -92,9 +93,19 @@ describe("rowState — the printer-queue truth table", () => {
     expect(s.action).toBe("retry");
   });
 
-  it("withdraws Retry once the sweep expired the audio", () => {
-    const s = rowState(dto({ status: "failed", error: "x", audio_exists: false }));
-    expect(s.label).toBe("Failed (audio expired)");
+  it("offers Retry from a checkpoint after raw audio expires", () => {
+    const s = rowState(
+      dto({ status: "failed", error: "filing failed", audio_exists: false, recovery_exists: true }),
+    );
+    expect(s.label).toContain("Could not transcribe");
+    expect(s.action).toBe("retry");
+  });
+
+  it("withdraws Retry once every recovery input expired", () => {
+    const s = rowState(
+      dto({ status: "failed", error: "x", audio_exists: false, recovery_exists: false }),
+    );
+    expect(s.label).toBe("Failed (recovery expired)");
     expect(s.action).toBeNull();
   });
 

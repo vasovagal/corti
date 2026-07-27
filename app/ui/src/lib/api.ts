@@ -193,6 +193,7 @@ export interface RecordingDto {
   note_path: string | null;
   note_exists: boolean;
   audio_exists: boolean;
+  recovery_exists: boolean;
   audio_bytes: number | null;
   retry_pending: boolean;
   retry_attempts: number | null;

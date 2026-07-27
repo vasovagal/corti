@@ -14,11 +14,13 @@ use corti_jobs::ClaimedJob;
 use corti_queue::Queue;
 use tracing::warn;
 
-use crate::checkpoint::FilingCheckpoint;
+use crate::checkpoint::{FilingCheckpoint, OwnedNote};
 use crate::pipeline::{self, Ctx};
 
 /// Re-run a recording that failed transcription/filing, with backoff. Payload: `{"id": "<stem>"}`.
 pub(crate) const RETRY_TRANSCRIPTION: &str = "retry_transcription";
+/// Privacy cleanup that survives transcription/filing exhaustion.
+pub(crate) const CLEANUP_AWS_STAGING: &str = "cleanup_aws_staging";
 /// The hourly retention sweep (periodic singleton; also fires at startup).
 pub(crate) const SWEEP_EXPIRED: &str = "sweep_expired";
 
@@ -33,11 +35,12 @@ const MIN_ROW_RETENTION_DAYS: i64 = 90;
 /// Parked `failed` background-job rows are debris after this long.
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
-pub(crate) fn retry_payload(id: &str, preferred_note: Option<&Path>) -> serde_json::Value {
+pub(crate) fn retry_payload(id: &str, preferred_note: Option<&OwnedNote>) -> serde_json::Value {
     match preferred_note {
-        Some(path) => serde_json::json!({
+        Some(note) => serde_json::json!({
             "id": id,
-            "preferred_note": path.to_string_lossy(),
+            "preferred_note": note.path.to_string_lossy(),
+            "note_canonical": note.canonical,
         }),
         None => serde_json::json!({ "id": id }),
     }
@@ -47,8 +50,18 @@ pub(crate) fn id_payload(id: &str) -> serde_json::Value {
     retry_payload(id, None)
 }
 
-fn preferred_note(payload: &serde_json::Value) -> Option<PathBuf> {
-    payload["preferred_note"].as_str().map(PathBuf::from)
+fn preferred_note(payload: &serde_json::Value) -> Option<OwnedNote> {
+    payload["preferred_note"].as_str().map(|path| OwnedNote {
+        path: PathBuf::from(path),
+        canonical: payload["note_canonical"].as_bool().unwrap_or(false),
+    })
+}
+
+fn cleanup_payload(id: &str, audio: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "audio_path": audio.to_string_lossy(),
+    })
 }
 
 /// Dispatch one claimed job by kind. An unrecognized kind fails with backoff so version skew surfaces
@@ -56,54 +69,77 @@ fn preferred_note(payload: &serde_json::Value) -> Option<PathBuf> {
 pub(crate) fn run(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
     match job.kind.as_str() {
         RETRY_TRANSCRIPTION => retry_transcription(ctx, job),
+        CLEANUP_AWS_STAGING => cleanup_aws_staging(ctx, job),
         SWEEP_EXPIRED => sweep_expired(ctx),
         other => anyhow::bail!("unknown job kind {other:?}"),
     }
 }
 
-/// A one-shot job ran out of attempts: surface the failure on the artifact it was working for.
-pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) {
+/// A transcription job ran out of attempts. The recording must become terminal before the caller parks
+/// the only active job; otherwise a failed SQLite write would strand nonterminal work forever.
+pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) -> Result<()> {
     if job.kind != RETRY_TRANSCRIPTION {
-        return;
+        return Ok(());
     }
     let Some(id) = job.payload["id"].as_str() else {
-        return;
+        return Ok(());
     };
-    let Ok(Some(row)) = ctx.queue.get(id) else {
-        return;
+    let Some(row) = ctx.queue.get(id)? else {
+        return Ok(());
     };
     if row.status.is_terminal() {
-        return;
+        return Ok(());
     }
-    let note_path = preferred_note(&job.payload);
+    let checkpoint_note = FilingCheckpoint::load(&row.audio_path)
+        .ok()
+        .and_then(|checkpoint| checkpoint.owned_note());
+    let note = checkpoint_note
+        .or_else(|| preferred_note(&job.payload))
+        .or_else(|| row.note_path.clone().map(OwnedNote::partial));
     pipeline::fail_with_note(
         ctx,
         id,
         &row.meta(),
         format!("gave up after {} attempts: {error}", job.attempts),
-        note_path.as_deref(),
-    );
+        note.as_ref(),
+    )?;
+    let terminal_row = ctx.queue.get(id)?.unwrap_or(row);
+    if let Err(cleanup_error) = enqueue_aws_cleanup(&ctx.queue, &terminal_row) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{cleanup_error:#}"),
+            "recording failed durably, but AWS cleanup scheduling will wait for the periodic sweep"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryAction {
     Stale,
     FileCheckpoint,
+    CompleteCanonicalNote,
     Transcribe,
     TranscribeLegacyPendingNote,
     MissingAudio,
 }
 
-fn retry_action(status: JobStatus, checkpoint_valid: bool, audio_exists: bool) -> RetryAction {
+fn retry_action(
+    status: JobStatus,
+    checkpoint_valid: bool,
+    canonical_completion: bool,
+    audio_exists: bool,
+) -> RetryAction {
     match status {
-        JobStatus::Done | JobStatus::Failed | JobStatus::Recording => RetryAction::Stale,
+        JobStatus::Done | JobStatus::Failed => RetryAction::Stale,
         // The checkpoint is the authoritative durable phase marker even when the immediately-following
         // SQLite transition failed or the process died before it. Never repeat ASR in that window.
-        JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote
-            if checkpoint_valid =>
-        {
-            RetryAction::FileCheckpoint
-        }
+        _ if checkpoint_valid => RetryAction::FileCheckpoint,
+        // Vagus already returned this path (or live filing finalized it). Only SQLite completion remains;
+        // neither a moved path nor missing raw audio permits another ASR/add-note side effect.
+        _ if canonical_completion => RetryAction::CompleteCanonicalNote,
+        JobStatus::Recording => RetryAction::Stale,
         JobStatus::PendingNote if audio_exists => {
             // Pre-checkpoint databases can contain PendingNote with only retained audio. Give that one
             // compatibility transcription a different stable AWS name: the old completed job may have had
@@ -135,7 +171,8 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
     };
     let meta = row.meta();
     let checkpoint_path = crate::checkpoint::path_for(&row.audio_path);
-    let checkpoint_valid = FilingCheckpoint::load(&row.audio_path).is_ok();
+    let checkpoint = FilingCheckpoint::load(&row.audio_path).ok();
+    let checkpoint_valid = checkpoint.is_some();
     if checkpoint_path.is_file() && !checkpoint_valid {
         warn!(
             target: "corti::pipeline",
@@ -144,22 +181,35 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
             "filing checkpoint is unreadable; retained audio will be transcribed again"
         );
     }
-    let action = retry_action(row.status, checkpoint_valid, row.audio_path.exists());
-    let preferred_note = preferred_note(&job.payload);
+    let checkpoint_note = checkpoint.as_ref().and_then(FilingCheckpoint::owned_note);
+    let payload_note = preferred_note(&job.payload);
+    // A checkpoint-owned path is newer than a retry payload. Only when the checkpoint has no path may a
+    // canonical payload bypass it for completion-only recovery.
+    let canonical_completion =
+        checkpoint_note.is_none() && payload_note.as_ref().is_some_and(|note| note.canonical);
+    let action = retry_action(
+        row.status,
+        checkpoint_valid && !canonical_completion,
+        canonical_completion,
+        row.audio_path.exists(),
+    );
+    let owned_note = checkpoint_note
+        .or_else(|| payload_note.clone())
+        .or_else(|| row.note_path.clone().map(OwnedNote::partial));
     if action != RetryAction::Stale
-        && let Some(note_path) = preferred_note.as_ref()
+        && let Some(note) = owned_note.as_ref()
     {
-        // The payload is the authority when the original recording-row write failed. Repair the row before
-        // every exit path, including missing audio/exhaustion, so terminal failure can close this note.
+        // Repair the row before every exit path, including missing audio/exhaustion. A newer checkpoint path
+        // wins over an older payload, so this write can never roll ownership backward.
         ctx.queue
             .update(
                 id,
                 corti_queue::JobUpdate {
-                    note_path: Some(note_path.clone()),
+                    note_path: Some(note.path.clone()),
                     ..Default::default()
                 },
             )
-            .context("persisting preferred live note from retry payload")?;
+            .context("persisting retry-owned note")?;
     }
     match action {
         RetryAction::Stale => Ok(()),
@@ -179,6 +229,15 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
             }
             pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path)
         }
+        RetryAction::CompleteCanonicalNote => pipeline::complete_canonical_note(
+            ctx,
+            id,
+            &meta,
+            &row.audio_path,
+            &owned_note
+                .context("canonical retry missing its note path")?
+                .path,
+        ),
         RetryAction::TranscribeLegacyPendingNote => {
             ctx.queue
                 .update(
@@ -189,32 +248,56 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     },
                 )
                 .context("persisting legacy recovery attempt name")?;
-            pipeline::transcribe_and_file(
-                ctx,
-                id,
-                &meta,
-                &row.audio_path,
-                preferred_note.as_deref(),
-            )
+            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
         }
-        RetryAction::Transcribe => pipeline::transcribe_and_file(
+        RetryAction::Transcribe => {
+            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
+        }
+        RetryAction::MissingAudio => pipeline::fail_with_note(
             ctx,
             id,
             &meta,
-            &row.audio_path,
-            preferred_note.as_deref(),
+            "audio file is gone — cannot transcribe".to_string(),
+            owned_note.as_ref(),
         ),
-        RetryAction::MissingAudio => {
-            pipeline::fail_with_note(
-                ctx,
-                id,
-                &meta,
-                "audio file is gone — cannot transcribe".to_string(),
-                preferred_note.as_deref(),
-            );
-            Ok(())
-        }
     }
+}
+
+fn enqueue_aws_cleanup(queue: &Queue, row: &corti_queue::Job) -> Result<()> {
+    if !row.status.is_terminal() || !crate::checkpoint::has_unresolved_aws_staging(&row.audio_path)
+    {
+        return Ok(());
+    }
+    queue.jobs().enqueue(
+        CLEANUP_AWS_STAGING,
+        &cleanup_payload(&row.id, &row.audio_path),
+        u32::MAX,
+        Utc::now(),
+    )?;
+    Ok(())
+}
+
+/// Ensure every terminal unresolved marker has an effectively non-exhausting cleanup owner. Called at
+/// startup and by the periodic sweep so a crash between terminal failure and enqueue cannot strand it.
+pub(crate) fn enqueue_terminal_aws_cleanup(queue: &Queue) -> Result<()> {
+    for row in queue.all()? {
+        enqueue_aws_cleanup(queue, &row)?;
+    }
+    Ok(())
+}
+
+fn cleanup_aws_staging(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
+    let audio = job.payload["audio_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .context("AWS cleanup payload missing audio path")?;
+    if let Some(id) = job.payload["id"].as_str()
+        && let Some(row) = ctx.queue.get(id)?
+        && !row.status.is_terminal()
+    {
+        return Ok(()); // a manual retry took ownership back before cleanup ran
+    }
+    pipeline::cleanup_aws_staging(ctx, &audio)
 }
 
 /// The retention sweep: delete expired **audio** (rows are kept — the Recording Queue's history,
@@ -226,6 +309,7 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
 /// sibling, and any leftover transcript checkpoint. The checkpoint normally disappears at completion;
 /// sweeping it here contains crash leftovers.
 fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
+    enqueue_terminal_aws_cleanup(&ctx.queue)?;
     let retention_days = i64::from(ctx.config.lock().unwrap().retention_days);
     // One instant defines both horizons. In particular, the row-GC set can never be a few milliseconds
     // larger than the artifact-deletion set at equal (90–365 day) retention.
@@ -268,6 +352,11 @@ fn sweep_recordings(
             files += remove_stale_checkpoint_temps(&row.id, &row.audio_path).0;
             continue;
         }
+        if crate::checkpoint::has_unresolved_aws_staging(&row.audio_path) {
+            // The local marker is the only durable address for cloud PHI. Keep the row, raw audio, and
+            // checkpoint until a cleanup job durably acknowledges deletion.
+            continue;
+        }
 
         let (removed, all_absent) = remove_recording_artifacts(&row.id, &row.audio_path);
         files += removed;
@@ -283,6 +372,7 @@ fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
         audio.to_path_buf(),
         corti_capture::clean_wav_path(audio),
         crate::checkpoint::path_for(audio),
+        crate::checkpoint::aws_staging_path_for(audio),
     ];
     let mut all_absent = true;
     match crate::checkpoint::temporary_paths(audio) {
@@ -369,12 +459,12 @@ mod tests {
             JobStatus::PendingNote,
         ] {
             assert_eq!(
-                retry_action(status, true, true),
+                retry_action(status, true, false, true),
                 RetryAction::FileCheckpoint
             );
             // The durable transcript is sufficient even if the raw audio is unavailable.
             assert_eq!(
-                retry_action(status, true, false),
+                retry_action(status, true, false, false),
                 RetryAction::FileCheckpoint
             );
         }
@@ -383,12 +473,12 @@ mod tests {
     #[test]
     fn legacy_pending_note_uses_a_new_stable_attempt() {
         assert_eq!(
-            retry_action(JobStatus::PendingNote, false, true),
+            retry_action(JobStatus::PendingNote, false, false, true),
             RetryAction::TranscribeLegacyPendingNote
         );
         assert_eq!(legacy_attempt_name("recording"), "recording-checkpoint-v1");
         assert_eq!(
-            retry_action(JobStatus::PendingNote, false, false),
+            retry_action(JobStatus::PendingNote, false, false, false),
             RetryAction::MissingAudio
         );
     }
@@ -396,16 +486,34 @@ mod tests {
     #[test]
     fn transcription_without_a_checkpoint_still_requires_audio() {
         for status in [JobStatus::PendingTranscription, JobStatus::Transcribing] {
-            assert_eq!(retry_action(status, false, true), RetryAction::Transcribe);
             assert_eq!(
-                retry_action(status, false, false),
+                retry_action(status, false, false, true),
+                RetryAction::Transcribe
+            );
+            assert_eq!(
+                retry_action(status, false, false, false),
                 RetryAction::MissingAudio
             );
         }
         assert_eq!(
-            retry_action(JobStatus::Done, true, true),
+            retry_action(JobStatus::Done, true, false, true),
             RetryAction::Stale
         );
+    }
+
+    #[test]
+    fn canonical_note_retries_completion_without_checkpoint_or_audio() {
+        for status in [
+            JobStatus::Recording,
+            JobStatus::PendingTranscription,
+            JobStatus::Transcribing,
+            JobStatus::PendingNote,
+        ] {
+            assert_eq!(
+                retry_action(status, false, true, false),
+                RetryAction::CompleteCanonicalNote
+            );
+        }
     }
 
     #[test]
@@ -444,24 +552,82 @@ mod tests {
     }
 
     #[test]
-    fn retry_payload_durably_carries_preferred_live_note() {
-        let path = Path::new("/vault/live note.md");
-        let payload = retry_payload("recording", Some(path));
+    fn retry_payload_durably_carries_note_provenance() {
+        let partial = OwnedNote::partial("/vault/live note.md");
+        let payload = retry_payload("recording", Some(&partial));
         assert_eq!(payload["id"], "recording");
-        assert_eq!(preferred_note(&payload).as_deref(), Some(path));
+        assert_eq!(preferred_note(&payload), Some(partial));
+
+        let canonical = OwnedNote::canonical("/vault/filed note.md");
+        let payload = retry_payload("recording", Some(&canonical));
+        assert_eq!(preferred_note(&payload), Some(canonical));
         assert_eq!(preferred_note(&id_payload("recording")), None);
     }
 
     #[test]
     fn live_preferred_note_with_checkpoint_retries_filing_only_without_audio() {
-        let path = Path::new("/vault/live note.md");
-        let payload = retry_payload("recording", Some(path));
-        assert_eq!(preferred_note(&payload).as_deref(), Some(path));
+        let note = OwnedNote::partial("/vault/live note.md");
+        let payload = retry_payload("recording", Some(&note));
+        assert_eq!(preferred_note(&payload), Some(note));
         assert_eq!(
-            retry_action(JobStatus::PendingTranscription, true, false),
+            retry_action(JobStatus::PendingTranscription, true, false, false),
             RetryAction::FileCheckpoint,
             "a live fallback path must not pull a durable checkpoint back across ASR"
         );
+    }
+
+    #[test]
+    fn unresolved_aws_owner_blocks_artifact_and_row_retention() {
+        let dir = test_dir("aws-owner-retention");
+        let audio = dir.join("recording.wav");
+        std::fs::write(&audio, b"raw").unwrap();
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta(audio.clone())).unwrap();
+        queue.set_status(&id, JobStatus::Failed).unwrap();
+        let staging = crate::checkpoint::AwsStaging {
+            bucket: "private".into(),
+            key_prefix: "corti/".into(),
+            job_name: id.clone(),
+            region: Some("us-east-1".into()),
+        };
+        staging.store(&audio).unwrap();
+
+        let future = Local::now() + chrono::Duration::days(366);
+        assert_eq!(sweep_recordings(&queue, 1, future).unwrap(), (0, 0));
+        assert!(audio.exists());
+        assert!(crate::checkpoint::aws_staging_path_for(&audio).exists());
+        assert!(queue.get(&id).unwrap().is_some());
+
+        crate::checkpoint::AwsStaging::remove(&audio).unwrap();
+        let (files, rows) = sweep_recordings(&queue, 1, future).unwrap();
+        assert_eq!((files, rows), (1, 1));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn terminal_aws_owner_gets_a_deduplicated_non_exhausting_cleanup_job() {
+        let dir = test_dir("aws-cleanup-job");
+        let audio = dir.join("recording.wav");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta(audio.clone())).unwrap();
+        queue.set_status(&id, JobStatus::Failed).unwrap();
+        crate::checkpoint::AwsStaging {
+            bucket: "private".into(),
+            key_prefix: "corti/".into(),
+            job_name: id,
+            region: None,
+        }
+        .store(&audio)
+        .unwrap();
+
+        enqueue_terminal_aws_cleanup(&queue).unwrap();
+        enqueue_terminal_aws_cleanup(&queue).unwrap();
+        let jobs = queue.jobs().active_for(CLEANUP_AWS_STAGING).unwrap();
+        assert_eq!(jobs.len(), 1);
+        let claimed = queue.jobs().claim_due(Utc::now()).unwrap().unwrap();
+        assert_eq!(claimed.kind, CLEANUP_AWS_STAGING);
+        assert_eq!(claimed.max_attempts, u32::MAX);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

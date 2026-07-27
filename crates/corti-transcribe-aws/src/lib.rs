@@ -35,9 +35,10 @@ pub struct AwsOptions {
     pub key_prefix: String,
     /// BCP-47 language code, e.g. `en-US`.
     pub language: String,
-    /// Delete the staged `.wav` and `.json` from S3 after a successful result. Failures retain both so a
-    /// stable job can be reattached. The app's durable pipeline sets this to `false` and calls
-    /// [`AwsTranscriber::cleanup_staged`] only after its local transcript checkpoint is durable.
+    /// Delete the staged `.wav` and `.json` from S3. Stable failed jobs retain both for reattachment;
+    /// unique one-shot jobs attempt cleanup on every outcome because their name cannot be rediscovered.
+    /// The app's durable pipeline sets this to `false` and calls [`AwsTranscriber::cleanup_staged`] only
+    /// after its local transcript checkpoint is durable.
     pub delete_after: bool,
     /// How often to poll job status.
     pub poll_interval: Duration,
@@ -140,46 +141,52 @@ impl AwsTranscriber {
         let job = resolve_job_name(self.opts.job_name.as_deref(), stem.as_deref(), suffix);
         let (in_key, out_key) = object_keys(&self.opts.key_prefix, &job);
 
-        let mut state = if self.opts.job_name.is_some() {
-            self.probe_stable_job(&job).await?
-        } else {
-            StableJobState::Missing
-        };
-        if state == StableJobState::Failed {
-            // A terminally failed name can never become reusable. Delete it now and submit the same stable
-            // name afresh in this attempt rather than spending one retry merely discovering the failure.
-            self.delete_terminal_job(&job).await?;
-            state = StableJobState::Missing;
+        let result = async {
+            let mut state = if self.opts.job_name.is_some() {
+                self.probe_stable_job(&job).await?
+            } else {
+                StableJobState::Missing
+            };
+            if state == StableJobState::Failed {
+                // A terminally failed name can never become reusable. Delete it now and submit the same stable
+                // name afresh in this attempt rather than spending one retry merely discovering the failure.
+                self.delete_terminal_job(&job).await?;
+                state = StableJobState::Missing;
+            }
+
+            let multichannel = if state == StableJobState::Reusable {
+                let (_, channels) = wav::layout(audio)?;
+                tracing::info!(
+                    target: "corti::transcribe::aws",
+                    job,
+                    "transcription job already exists — re-attaching without upload"
+                );
+                channels >= 2
+            } else {
+                // AWS accepts 16-bit PCM. Only a genuinely missing job pays the full decode/re-encode/upload
+                // cost; retries of queued/in-progress/completed jobs read the small WAV header above.
+                let (pcm_path, sample_rate, channels) = wav::to_pcm16_temp(audio)?;
+                let upload = self.upload(&pcm_path, &in_key).await;
+                let _ = std::fs::remove_file(&pcm_path);
+                upload?;
+                let multichannel = channels >= 2;
+                self.start_job(&job, &in_key, &out_key, sample_rate, multichannel)
+                    .await?;
+                multichannel
+            };
+
+            // Poll, fetch, parse (channel-identified vs. single-speaker per `multichannel`).
+            self.await_result(&job, &out_key, multichannel).await
         }
+        .await;
 
-        let multichannel = if state == StableJobState::Reusable {
-            let (_, channels) = wav::layout(audio)?;
-            tracing::info!(
-                target: "corti::transcribe::aws",
-                job,
-                "transcription job already exists — re-attaching without upload"
-            );
-            channels >= 2
-        } else {
-            // AWS accepts 16-bit PCM. Only a genuinely missing job pays the full decode/re-encode/upload
-            // cost; retries of queued/in-progress/completed jobs read the small WAV header above.
-            let (pcm_path, sample_rate, channels) = wav::to_pcm16_temp(audio)?;
-            let upload = self.upload(&pcm_path, &in_key).await;
-            let _ = std::fs::remove_file(&pcm_path);
-            upload?;
-            let multichannel = channels >= 2;
-            self.start_job(&job, &in_key, &out_key, sample_rate, multichannel)
-                .await?;
-            multichannel
-        };
-
-        // Poll, fetch, parse (channel-identified vs. single-speaker per `multichannel`).
-        let result = self.await_result(&job, &out_key, multichannel).await;
-
-        // Cleanup is success-only. Poll/fetch/read/parse failures retain the staged result so a stable job
-        // can reattach. The app disables this and explicitly cleans after its local checkpoint.
-        if should_cleanup_staged(self.opts.delete_after, result.is_ok())
-            && let Err(e) = self.cleanup_objects(&in_key, &out_key).await
+        // Stable jobs retain failed staging for reattachment. A fresh job has no durable owner or way to
+        // rediscover its unique name, so every outcome after keys are minted attempts privacy cleanup.
+        if should_cleanup_staged(
+            self.opts.delete_after,
+            self.opts.job_name.is_some(),
+            result.is_ok(),
+        ) && let Err(e) = self.cleanup_objects(&in_key, &out_key).await
         {
             tracing::warn!(
                 target: "corti::transcribe::aws",
@@ -504,8 +511,12 @@ fn object_keys(prefix: &str, job: &str) -> (String, String) {
     (format!("{prefix}{job}.wav"), format!("{prefix}{job}.json"))
 }
 
-fn should_cleanup_staged(delete_after: bool, result_succeeded: bool) -> bool {
-    delete_after && result_succeeded
+fn should_cleanup_staged(
+    delete_after: bool,
+    stable_job_name: bool,
+    result_succeeded: bool,
+) -> bool {
+    delete_after && (result_succeeded || !stable_job_name)
 }
 
 fn should_reset_terminal_job(stable_job_name: Option<&str>) -> bool {
@@ -582,11 +593,13 @@ mod tests {
     }
 
     #[test]
-    fn failed_results_never_trigger_staged_cleanup() {
-        assert!(!should_cleanup_staged(true, false));
-        assert!(!should_cleanup_staged(false, false));
-        assert!(!should_cleanup_staged(false, true));
-        assert!(should_cleanup_staged(true, true));
+    fn cleanup_policy_retains_only_failed_stable_attempts() {
+        assert!(!should_cleanup_staged(true, true, false));
+        assert!(should_cleanup_staged(true, false, false));
+        assert!(!should_cleanup_staged(false, false, false));
+        assert!(!should_cleanup_staged(false, false, true));
+        assert!(should_cleanup_staged(true, true, true));
+        assert!(should_cleanup_staged(true, false, true));
     }
 
     #[test]

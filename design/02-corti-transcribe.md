@@ -31,8 +31,9 @@ Batch flow (`crates/corti-transcribe-aws/src/lib.rs`):
    or parse failure retains the job/output; a completed job whose key is confirmed missing is reset.
 4. Parse `results.channel_labels.channels[].items[]` (word + `start_time`/`end_time`, punctuation glued),
    group each channel into segments on a >1.5 s pause, then merge both channels sorted by time
-   (`src/parse.rs`, unit-tested). One-shot calls clean staged objects after success; the durable app defers
-   cleanup until its local transcript checkpoint is persisted and retries cleanup before terminal filing.
+   (`src/parse.rs`, unit-tested). Unique one-shot calls attempt staged-object cleanup on every outcome; the
+   durable app publishes exact ownership before upload, defers cleanup until its local transcript checkpoint
+   is persisted, and keeps a separate cleanup job beyond terminal filing/transcription exhaustion.
 
 **Config injection (not env):** the crate takes a caller-built `SdkConfig`
 (`AwsTranscriber::new(&sdk_config, AwsOptions { bucket, .. })`); the Tauri app runs the standard
