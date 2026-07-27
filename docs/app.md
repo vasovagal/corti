@@ -170,10 +170,9 @@ queue: it pulls `list_recordings` and refetches on the coarse `queue-changed` ev
 (`tray::emit_queue_changed`), with Retry / Reveal-audio / Open-note actions.
 
 Each is a singleton (focus-if-exists). The app launches windowless with
-`ActivationPolicy::Accessory` (no Dock icon, set at `setup`). Opening any window flips to
-`ActivationPolicy::Regular` (`tray.rs:380` in `open_app_window`, `tray.rs:459` for the console) so it can
-take focus; on `WindowEvent::Destroyed`, `revert_activation_policy_if_no_windows` (`tray.rs:505`) drops
-back to `Accessory` once the last window closes.
+`ActivationPolicy::Accessory` (no Dock icon, set at `setup`). The shared `open_app_window` flips to
+`ActivationPolicy::Regular` so any utility window can take focus; on `WindowEvent::Destroyed`,
+`revert_activation_policy_if_no_windows` drops back to `Accessory` once the last window closes.
 
 ## Command surface — pull, plus one push
 
