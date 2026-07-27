@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Whole-file AEC adapter push size (frames). The WAV is still decoded in memory for now, but bounded
+/// pushes keep `StreamingAec`'s steady-state staging independent of call length (#97).
+const AEC_PUSH_FRAMES: usize = 16 * 1024;
+
 /// Where recordings are cached. Outside any vault, prunable. Override with `$CORTI_RECORDINGS_DIR`.
 pub fn recordings_dir() -> Result<PathBuf> {
     if let Some(d) = std::env::var_os("CORTI_RECORDINGS_DIR") {
@@ -100,7 +104,11 @@ pub fn write_clean_wav(
     // warms the filter and locks the mic↔far delay before the opening is emitted. This is the live path —
     // `cancel()` (full-length lookahead) is only the offline test/scoring shim.
     let mut aec = corti_aec::StreamingAec::new(spec.sample_rate, aec_cfg.clone());
-    let mut clean = aec.push(&mic, &tap);
+    let mut clean = Vec::with_capacity(mic.len());
+    for start in (0..mic.len()).step_by(AEC_PUSH_FRAMES) {
+        let end = (start + AEC_PUSH_FRAMES).min(mic.len());
+        clean.extend(aec.push(&mic[start..end], &tap[start..end]));
+    }
     clean.extend(aec.finish());
     clean.truncate(mic.len());
 
@@ -371,15 +379,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let raw = dir.join("rec.wav");
 
-        // Synthetic 2-track float WAV: ch0 = mic, ch1 = tap. A few hundred frames so the (single-block)
-        // AEC has something to chew on; exact values don't matter — we assert structure + tap preservation.
+        // Synthetic 2-track float WAV: ch0 = mic, ch1 = tap. Cross the adapter's bounded-push boundary;
+        // exact values don't matter — we assert structure + tap preservation across every slice.
         let spec = hound::WavSpec {
             channels: 2,
             sample_rate: 48_000,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
         };
-        let frames = 512usize;
+        let frames = AEC_PUSH_FRAMES + 257;
         let tap_in: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
         let mic_in: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.02).cos() * 0.2).collect();
         {

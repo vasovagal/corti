@@ -9,8 +9,8 @@
 //! in for the old offline 2-pass (warm-up convergence + an opening re-emit through the warm filter) and for
 //! a stable windowed delay-sync. It is bounded by `O(block + filter_state + lookahead)` regardless of call
 //! length. [`cancel`] is retained as a thin **offline shim** over `StreamingAec` (lookahead == the whole
-//! input), used by the tuning sweep, scoring, and the offline `write_clean_wav` path; every offline test
-//! exercises the streaming kernel through it.
+//! input), used by the tuning sweep and scoring; every offline test exercises the streaming kernel through
+//! it. Production `write_clean_wav` uses the configured fixed lookahead and bounded pushes.
 //!
 //! Implemented as an **overlap-save frequency-domain block adaptive filter** (FDAF) via `rustfft`: a
 //! single-partition, bin-wise normalized LMS update. Frequency-domain block processing is what keeps it fast
@@ -217,8 +217,8 @@ pub(crate) fn estimate_delay(mic: &[f32], far_end: &[f32], max_lag: usize) -> us
 /// whole input, pushes the entire call, and flushes. With `lookahead == n` the whole call is warm-up — the
 /// filter converges over the full input, then the buffered span is re-emitted through the warm filter — so
 /// this is the streaming analog of the old offline 2-pass and reproduces (meets-or-exceeds) its ERLE. Used
-/// by the tuning sweep, scoring, and the offline `write_clean_wav` path so they keep working verbatim; the
-/// live capture path uses [`StreamingAec`] directly with the tunable lookahead.
+/// by the tuning sweep and scoring so they keep working verbatim. Production `write_clean_wav` and the live
+/// path use [`StreamingAec`] with the tunable fixed lookahead instead.
 ///
 /// Uses `far_end` (the time-aligned tap of what the speakers played) as the echo reference. When `far_end`
 /// is silent or empty the output equals `mic` (nothing to cancel). The raw inputs are never mutated.
@@ -743,6 +743,48 @@ mod tests {
 
         let erle = tail_erle_db(&mic, &clean, sr);
         assert!(erle >= 12.0, "streaming tail ERLE {erle:.1} dB < 12 dB");
+    }
+
+    #[test]
+    fn one_large_push_matches_irregular_chunks_at_fixed_lookahead() {
+        // Regression for #97: caller chunk size must not redefine the configured warm-up. The old one-shot
+        // path buffered this entire input, while irregular pushes locked near the lookahead boundary, so
+        // they ran different convergence spans and produced different samples.
+        let sr = 48_000u32;
+        let n = 10_123usize;
+        let cfg = AecConfig {
+            filter_len: 64,
+            ..AecConfig::default()
+        };
+        let lookahead = 512usize; // already a whole number of filter blocks
+        let far = noise(n, 0.4, 97);
+        let mut room = vec![0.0f32; 24];
+        for (i, tap) in room.iter_mut().enumerate().skip(5) {
+            *tap = 0.12 * (-((i - 5) as f32) / 8.0).exp();
+        }
+        let echo = convolve(&far, &room);
+        let mic: Vec<f32> = echo
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v + 0.15 * (i as f32 * 0.013).sin())
+            .collect();
+
+        let one = drive_streaming(sr, &cfg, lookahead, &mic, &far, &[n]);
+        let irregular = drive_streaming(
+            sr,
+            &cfg,
+            lookahead,
+            &mic,
+            &far,
+            &[1, 17, 63, 64, 65, 511, 7, 1024],
+        );
+        assert_eq!(one.len(), n);
+        assert_eq!(irregular.len(), n);
+        assert_eq!(
+            one.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            irregular.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "fixed-lookahead output must be byte-identical across caller chunking"
+        );
     }
 
     #[test]
