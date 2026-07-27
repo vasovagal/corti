@@ -112,10 +112,11 @@ The app now drives the same path for detector recordings. `Detector::start_with_
 (`crates/corti-detect/src/platform.rs:70`) consults an app-supplied `LiveHook` (`platform.rs:37`) at every
 recording start; `AppLiveHook` (`app/src/live.rs:229`) returns a bounded tee (`TEE_BACKLOG = 256` chunks
 ≈ 22 s of slack, `live.rs:49`) when `live_filing` is on, the backend is local, and the models are on disk —
-otherwise `None` and the batch path runs unchanged. One `corti-live` std thread per recording
-(`session_thread`, `live.rs:330`) mirrors `corti-tap --live`'s chunk loop (`consume_chunks`, `live.rs:450`)
-and appends each closed segment to the vagus note as it lands. Filing semantics — lazy note creation, the
-`State:` line contract, fallback and crash recovery — are in
+otherwise `None` and the batch path runs unchanged. One `corti-live` std thread per recording mirrors
+`corti-tap --live`'s chunk loop and appends each closed segment to the vagus note as it lands. The detector
+delivers an ID-specific finish/discard verdict before its downstream event; finished handles remain keyed
+by ID for pipeline collection, and any tee drop quality-gates the result into lossless batch rewrite of the
+same note. Filing semantics — lazy note creation, the `State:` line contract, fallback and crash recovery — are in
 [transcription.md](transcription.md#live-inbox-filing-87); the write-authority amendment is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md).
 

@@ -4,6 +4,7 @@
 //! enough to re-find durable state (a recording id): handlers are idempotent re-dispatches over the
 //! `recordings` row, not bearers of state themselves, so replaying one after a crash is always safe.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,8 +30,22 @@ const ROW_RETENTION_DAYS: i64 = 90;
 /// Parked `failed` background-job rows are debris after this long.
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
+pub(crate) fn retry_payload(id: &str, preferred_note: Option<&Path>) -> serde_json::Value {
+    match preferred_note {
+        Some(path) => serde_json::json!({
+            "id": id,
+            "preferred_note": path.to_string_lossy(),
+        }),
+        None => serde_json::json!({ "id": id }),
+    }
+}
+
 pub(crate) fn id_payload(id: &str) -> serde_json::Value {
-    serde_json::json!({ "id": id })
+    retry_payload(id, None)
+}
+
+fn preferred_note(payload: &serde_json::Value) -> Option<PathBuf> {
+    payload["preferred_note"].as_str().map(PathBuf::from)
 }
 
 /// Dispatch one claimed job by kind. An unrecognized kind fails with backoff so version skew surfaces
@@ -57,6 +72,15 @@ pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) {
     if row.status.is_terminal() {
         return;
     }
+    if let Some(note_path) = preferred_note(&job.payload) {
+        let _ = ctx.queue.update(
+            id,
+            corti_queue::JobUpdate {
+                note_path: Some(note_path),
+                ..Default::default()
+            },
+        );
+    }
     pipeline::fail(
         ctx,
         id,
@@ -76,6 +100,7 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
         return Ok(()); // row deleted meanwhile — nothing to retry
     };
     let meta = row.meta();
+    let preferred_note = preferred_note(&job.payload);
     match row.status {
         // Terminal, or a live capture that isn't ours to touch: the job is stale.
         JobStatus::Done | JobStatus::Failed | JobStatus::Recording => Ok(()),
@@ -92,7 +117,13 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                 );
                 return Ok(());
             }
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path)
+            pipeline::transcribe_and_file(
+                ctx,
+                id,
+                &meta,
+                &row.audio_path,
+                preferred_note.as_deref(),
+            )
         }
     }
 }
@@ -133,4 +164,18 @@ fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
         crate::tray::emit_queue_changed(&ctx.app, "sweep");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_payload_durably_carries_preferred_live_note() {
+        let path = Path::new("/vault/live note.md");
+        let payload = retry_payload("recording", Some(path));
+        assert_eq!(payload["id"], "recording");
+        assert_eq!(preferred_note(&payload).as_deref(), Some(path));
+        assert_eq!(preferred_note(&id_payload("recording")), None);
+    }
 }

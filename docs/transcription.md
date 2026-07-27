@@ -176,19 +176,22 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
 - **Segment lines are byte-identical to batch's** (`DiarizedTranscript::to_markdown` over a single
   segment), appended in **finalize order** — which may interleave `Me`/`Them` differently than the
   batch `merge_by_time` timeline. Accepted; the finish-time tails *are* merged by start time.
-- **Finish.** On `RecordingFinished`, the pipeline's `Process` handler finalizes the session
-  (`LiveManager::finalize`, `app/src/live.rs:172`): AEC tail → `finish()` both transcribers → append
-  tails → flip the state line → the job goes **straight to `Done`** with the note path
-  (`live_filed`, `pipeline.rs:476`) — batch transcription skipped; `prune_transient` still runs (the
-  WAV was written normally — the tee is a tee). No new telemetry stage: live transcription happens
-  under `Recording`.
+- **Finish ownership and quality.** After the recorder closes its tee, the detector calls
+  `LiveHook::finished(meta)` before emitting `RecordingFinished`. `LiveManager::finish(id)` freezes the
+  dropped-chunk count and keeps the handle/outcome by ID while it flushes AEC and both transcriber tails.
+  The later `Process` calls `collect(id)`. Only a zero-drop result flips the state line and goes straight to
+  `Done`; any dropped chunk leaves `State: transcribing` and requires the lossless batch rewrite. A
+  collecting/finishing sentinel prevents a second model-backed session from overlapping the tail join.
 - **Fallback — no double notes, ever.** Factory ineligible (config off, non-local backend, models
-  missing), no note created (silent call), or any live-path error ⇒ the batch path runs unchanged,
-  except that `file_and_done` first checks the row's `note_path`: an existing partial live note is
-  **rewritten in place** (state line + full batch transcript, same inode — `rewrite_body`,
-  `note.rs:61`; branch at `pipeline.rs:826`) instead of filing a second note. #85's crash-recovery /
-  retry path flows through the same branch (non-terminal row + `note_path` → batch transcribe →
-  rewrite + flip). Webinar/manual captures have no live hook and always take the batch path.
+  missing), no note created (silent call), a live-path error, or a dropped tee chunk ⇒ batch runs. A
+  returned partial path is passed directly as the preferred rewrite target and also persisted in the retry
+  payload, so even a queue write/read failure cannot turn it into a fresh note. `rewrite_body` replaces the
+  body in place (same path/inode) and only then persists the path/`Done`. Webinar/manual captures have no
+  live hook and always take batch.
+- **Discard.** The detector similarly delivers `discarded(meta)` before `RecordingDiscarded`. The live
+  thread deletes its partial note; a detached reaper owns contained-failure outcomes. If unlink fails, the
+  path is reported to the pipeline for another attempt and then retained in a Failed row/closed note rather
+  than being forgotten at `State: transcribing`.
 - **Startup reaper.** A quit/crash mid-call can strand a row at `Recording` (created by the live
   note's mid-call persist). At startup the worker reaps them (`reap_recording_rows`,
   `app/src/pipeline.rs:623`): audio still on disk → reset to `PendingTranscription` + a due-now

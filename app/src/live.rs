@@ -19,7 +19,7 @@
 //! - finish freezes the tee's canonical dropped-chunk count, moves the handle into an ID-keyed collection,
 //!   and lets the thread flush both transcribers. The pipeline later [`LiveManager::collect`]s that exact ID;
 //! - discard transfers the handle to a non-blocking reaper that removes any partial note, including one
-//!   returned after a contained panic/failure.
+//!   returned after a contained panic/failure; persistent unlink failure is handed to the pipeline.
 //!
 //! A zero-drop finish flips the state line and reports [`LiveOutcome::Filed`]. Any drop still flushes tails
 //! but leaves `State: transcribing` and reports [`LiveOutcome::Fallback`], so the lossless WAV batch pass
@@ -121,11 +121,20 @@ struct Active {
     verdict_tx: Sender<Verdict>,
     handle: JoinHandle<LiveOutcome>,
     dropped: Arc<AtomicU64>,
+    discard_reporter: Option<DiscardReporter>,
+}
+
+struct DiscardReporter {
+    meta: RecordingMeta,
+    pipe_tx: Sender<PipelineMsg>,
 }
 
 enum AwaitingFinish {
     /// The live thread is flushing its transcriber tails.
     Running(JoinHandle<LiveOutcome>),
+    /// A collector moved the handle out to join without holding the manager mutex. Keep the single-model
+    /// gate closed until that join actually returns.
+    Collecting,
     /// The thread has been joined and its model/session state released.
     Ready(LiveOutcome),
 }
@@ -140,7 +149,9 @@ impl Inner {
             .iter()
             .filter_map(|(id, session)| match session {
                 AwaitingFinish::Running(handle) if handle.is_finished() => Some(id.clone()),
-                AwaitingFinish::Running(_) | AwaitingFinish::Ready(_) => None,
+                AwaitingFinish::Running(_)
+                | AwaitingFinish::Collecting
+                | AwaitingFinish::Ready(_) => None,
             })
             .collect();
         for id in finished {
@@ -153,9 +164,12 @@ impl Inner {
     }
 
     fn has_finishing_thread(&self) -> bool {
-        self.awaiting
-            .values()
-            .any(|session| matches!(session, AwaitingFinish::Running(_)))
+        self.awaiting.values().any(|session| {
+            matches!(
+                session,
+                AwaitingFinish::Running(_) | AwaitingFinish::Collecting
+            )
+        })
     }
 }
 
@@ -204,6 +218,10 @@ impl LiveManager {
             let id = corti_queue::job_id(&meta);
             let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict>();
             let dropped = pending.dropped.clone();
+            let discard_reporter = DiscardReporter {
+                meta: meta.clone(),
+                pipe_tx: pipe_tx.clone(),
+            };
             let thread = std::thread::Builder::new().name("corti-live".into()).spawn(
                 move || -> LiveOutcome {
                     session_thread(pending.rx, verdict_rx, meta, sample_rate, cfg, pipe_tx)
@@ -216,6 +234,7 @@ impl LiveManager {
                         verdict_tx,
                         handle,
                         dropped,
+                        discard_reporter: Some(discard_reporter),
                     };
                     let rejected = {
                         let mut inner = self.inner.lock().unwrap();
@@ -232,7 +251,7 @@ impl LiveManager {
                         // defensive. Never replace/drop an older recording's handle or outcome.
                         warn!(target: "corti::live", job_id = %id, "live-session slot changed before spawn — using batch path");
                         let _ = active.verdict_tx.send(Verdict::Discard);
-                        spawn_discard_reaper(id, active.handle);
+                        spawn_discard_reaper(id, active.handle, active.discard_reporter);
                     }
                 }
                 Err(e) => {
@@ -278,20 +297,49 @@ impl LiveManager {
     /// the pipeline worker; a newer active recording remains untouched. `None` means this recording did not
     /// have an eligible live session (or its finish verdict was never delivered).
     pub fn collect(&self, id: &str) -> Option<LiveOutcome> {
-        let session = {
+        enum Collection {
+            Join(JoinHandle<LiveOutcome>),
+            Ready(LiveOutcome),
+        }
+
+        let collection = {
             let mut inner = self.inner.lock().unwrap();
             inner.reap_completed();
-            inner.awaiting.remove(id)
-        }?;
-        Some(match session {
-            AwaitingFinish::Running(handle) => join_live_thread(handle),
-            AwaitingFinish::Ready(outcome) => outcome,
+            match inner.awaiting.get(id)? {
+                AwaitingFinish::Running(_) => {
+                    let previous = inner
+                        .awaiting
+                        .insert(id.to_string(), AwaitingFinish::Collecting);
+                    let Some(AwaitingFinish::Running(handle)) = previous else {
+                        unreachable!("entry changed while the manager mutex was held")
+                    };
+                    Collection::Join(handle)
+                }
+                AwaitingFinish::Collecting => return None,
+                AwaitingFinish::Ready(_) => {
+                    let Some(AwaitingFinish::Ready(outcome)) = inner.awaiting.remove(id) else {
+                        unreachable!("entry changed while the manager mutex was held")
+                    };
+                    Collection::Ready(outcome)
+                }
+            }
+        };
+
+        Some(match collection {
+            Collection::Ready(outcome) => outcome,
+            Collection::Join(handle) => {
+                let outcome = join_live_thread(handle);
+                let removed = self.inner.lock().unwrap().awaiting.remove(id);
+                debug_assert!(matches!(removed, Some(AwaitingFinish::Collecting)));
+                outcome
+            }
         })
     }
 
     /// Deliver a discard verdict and transfer the handle to a tiny detached reaper. Normal discard makes
     /// the session delete its own note; if the live thread had already failed/panicked and returned a
-    /// partial path, the reaper deletes that path too. The detector never blocks on decode/teardown.
+    /// partial path, the reaper deletes that path too (or reports failed cleanup to the pipeline). The
+    /// detector never blocks on decode/teardown.
     pub fn discard(&self, id: &str) {
         let active = {
             let mut inner = self.inner.lock().unwrap();
@@ -303,7 +351,7 @@ impl LiveManager {
         };
         info!(target: "corti::live", job_id = %id, "discarding live session");
         let _ = active.verdict_tx.send(Verdict::Discard);
-        spawn_discard_reaper(id.to_string(), active.handle);
+        spawn_discard_reaper(id.to_string(), active.handle, active.discard_reporter);
     }
 
     /// Whether a live note for `id` still belongs to a session that will be collected. Includes a
@@ -324,8 +372,13 @@ fn join_live_thread(handle: JoinHandle<LiveOutcome>) -> LiveOutcome {
     })
 }
 
-fn spawn_discard_reaper(id: String, handle: JoinHandle<LiveOutcome>) {
-    std::thread::Builder::new()
+fn spawn_discard_reaper(
+    id: String,
+    handle: JoinHandle<LiveOutcome>,
+    reporter: Option<DiscardReporter>,
+) {
+    let log_id = id.clone();
+    let spawned = std::thread::Builder::new()
         .name("corti-live-reap".into())
         .spawn(move || {
             let outcome = join_live_thread(handle);
@@ -338,17 +391,44 @@ fn spawn_discard_reaper(id: String, handle: JoinHandle<LiveOutcome>) {
                         "deleted partial live note while reaping discarded session"
                     ),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => warn!(
-                        target: "corti::live",
-                        job_id = %id,
-                        note_path = %path.display(),
-                        error = %e,
-                        "could not delete partial live note while reaping discarded session"
-                    ),
+                    Err(e) => {
+                        warn!(
+                            target: "corti::live",
+                            job_id = %id,
+                            note_path = %path.display(),
+                            error = %e,
+                            "could not delete partial live note while reaping discarded session"
+                        );
+                        if let Some(reporter) = reporter
+                            && reporter
+                                .pipe_tx
+                                .send(PipelineMsg::LiveDiscardCleanup {
+                                    meta: reporter.meta,
+                                    note_path: path,
+                                    error: e.to_string(),
+                                })
+                                .is_err()
+                        {
+                            warn!(
+                                target: "corti::live",
+                                job_id = %id,
+                                "pipeline unavailable; failed discard path could not be persisted"
+                            );
+                        }
+                    }
                 }
             }
-        })
-        .expect("spawning discarded live-session reaper");
+        });
+    if let Err(error) = spawned {
+        // This runs on the detector callback. Resource exhaustion must degrade to a detached session,
+        // never panic and terminate future call detection.
+        warn!(
+            target: "corti::live",
+            job_id = %log_id,
+            error = %error,
+            "could not spawn discarded-session reaper; detached live thread will finish independently"
+        );
+    }
 }
 
 /// The app-side factory the detector consults at every recording start (`corti_detect::LiveHook`).
@@ -577,7 +657,7 @@ fn run_session(
             )
         }
         Ok(Verdict::Discard) => {
-            writer.discard();
+            writer.discard()?;
             Ok(LiveOutcome::NoNote)
         }
         // Manager gone (app shutting down mid-call): leave whatever was written; don't flip.
@@ -830,21 +910,29 @@ impl<F: NoteFiler> NoteWriter<F> {
         Ok(())
     }
 
-    /// Delete the note (recording discarded). No-op when none was created.
-    fn discard(&mut self) {
-        if let Some(path) = self.note.take() {
-            match std::fs::remove_file(&path) {
-                Ok(()) => info!(
+    /// Delete the note (recording discarded). No-op when none was created. A failed unlink keeps the path
+    /// owned by the writer so `session_thread` returns it in `LiveOutcome::Fallback` for reaper/pipeline
+    /// cleanup instead of forgetting the only reference.
+    fn discard(&mut self) -> Result<()> {
+        let Some(path) = self.note.as_ref() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                info!(
                     target: "corti::live",
                     note_path = %path.display(),
                     "deleted live note of a discarded recording"
-                ),
-                Err(e) => warn!(
-                    target: "corti::live",
-                    note_path = %path.display(),
-                    error = %e,
-                    "could not delete the live note of a discarded recording"
-                ),
+                );
+                self.note = None;
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note = None;
+                Ok(())
+            }
+            Err(e) => {
+                Err(e).with_context(|| format!("deleting discarded live note {}", path.display()))
             }
         }
     }
@@ -1019,7 +1107,7 @@ mod tests {
             .unwrap();
         assert!(read(&note).ends_with("**[00:00] Me:** hello there\n\n**[01:03] Them:** hi\n\n"));
 
-        writer.discard();
+        writer.discard().unwrap();
         assert!(!note.exists(), "discard must delete the note file");
         assert!(writer.path().is_none());
     }
@@ -1225,6 +1313,7 @@ mod tests {
             verdict_tx,
             handle,
             dropped: Arc::new(AtomicU64::new(dropped_chunks)),
+            discard_reporter: None,
         });
         assert!(replaced.is_none());
     }
@@ -1251,6 +1340,52 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Collection moves a running handle out before joining it. The Collecting sentinel must keep the
+    /// single-model gate closed for that entire blocking join, not merely until `collect` takes the handle.
+    #[test]
+    fn collecting_join_keeps_single_model_gate_closed() {
+        use std::time::{Duration, Instant};
+
+        let manager = Arc::new(LiveManager::new());
+        let (finishing_tx, finishing_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_active(&manager, "a", 0, move |verdicts| {
+            assert!(matches!(verdicts.recv().unwrap(), Verdict::Finish(_)));
+            finishing_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            LiveOutcome::NoNote
+        });
+        manager.finish("a");
+        finishing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let collecting_manager = manager.clone();
+        let collector = std::thread::spawn(move || collecting_manager.collect("a"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(
+                manager.inner.lock().unwrap().awaiting.get("a"),
+                Some(AwaitingFinish::Collecting)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "collector never entered join");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let (blocked_tx, blocked_rx) = sync_channel(1);
+        assert!(
+            !manager.stash_pending(blocked_rx, Arc::new(AtomicU64::new(0))),
+            "a second model must not start while collection is joining A"
+        );
+        drop(blocked_tx);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            collector.join().unwrap(),
+            Some(LiveOutcome::NoNote)
+        ));
+        wait_for_model_slot(&manager);
     }
 
     /// Reproduce the serial-pipeline race: A receives its finish verdict but collection is blocked; after
@@ -1362,6 +1497,43 @@ mod tests {
             !note.exists(),
             "discard reaper left the partial note behind"
         );
+    }
+
+    #[test]
+    fn failed_discard_unlink_keeps_and_reports_the_path() {
+        use std::time::Duration;
+
+        let filer = TempFiler::new("discard-unlink-failure");
+        let blocked = filer.dir.join("blocked.md");
+        std::fs::create_dir(&blocked).unwrap(); // remove_file deterministically fails for a directory
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        writer.note = Some(blocked.clone());
+        assert!(writer.discard().is_err());
+        assert_eq!(writer.path(), Some(&blocked));
+
+        let (pipe_tx, pipe_rx) = std::sync::mpsc::channel();
+        let outcome_path = blocked.clone();
+        let handle = std::thread::spawn(move || LiveOutcome::Fallback {
+            reason: "discard unlink failed".to_string(),
+            note_path: Some(outcome_path),
+        });
+        spawn_discard_reaper(
+            "blocked".to_string(),
+            handle,
+            Some(DiscardReporter {
+                meta: meta(),
+                pipe_tx,
+            }),
+        );
+        let PipelineMsg::LiveDiscardCleanup {
+            note_path, error, ..
+        } = pipe_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("reaper did not hand the failed path to the pipeline");
+        };
+        assert_eq!(note_path, blocked);
+        assert!(!error.is_empty());
+        std::fs::remove_dir(blocked).unwrap();
     }
 
     /// The fallback decision: config-level eligibility.
