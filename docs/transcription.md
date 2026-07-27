@@ -211,9 +211,10 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
   checkpoint, rewrite the same path/inode, and never invoke ASR again. Missing-audio failure and exhaustion
   also retain/close the directly-owned path. Webinar/manual captures have no live hook and always take batch.
 - **Discard.** The detector similarly delivers `discarded(meta)` before `RecordingDiscarded`. The live
-  thread deletes its partial note; a detached reaper owns contained-failure outcomes. If unlink fails, the
-  path is reported to the pipeline for another attempt and then retained in a Failed row/closed note rather
-  than being forgotten at `State: transcribing`.
+  thread deletes its partial note; its reaper remains manager-owned and inside the one-model gate until
+  decode/drain and cleanup finish. If reaper spawn fails, the original handle/reporter are retained and the
+  pipeline performs the join. If unlink fails, the path is reported for another attempt and then retained in
+  a Failed row/closed note rather than being forgotten at `State: transcribing`.
 - **Startup reaper.** A quit/crash mid-call can strand a row at `Recording` (created by the live
   note's mid-call persist). At startup the worker reaps them (`reap_recording_rows`,
   `app/src/pipeline.rs:623`): audio still on disk → reset to `PendingTranscription` + a due-now

@@ -113,6 +113,9 @@ pub enum PipelineMsg {
     /// finish). The detector has already delivered the recording-specific discard verdict; close any
     /// queue row `LiveNoteCreated` made (the manager call remains idempotent defense-in-depth).
     LiveDiscarded { id: String },
+    /// The per-discard reaper could not be spawned. The manager still owns the live handle; join and clean
+    /// it on this pipeline thread, never on the detector callback.
+    LiveDiscardReap { id: String },
     /// A discarded-session unlink failed both in its note writer and detached reaper. Retry once on the
     /// pipeline and, if it still fails, durably retain/close the path instead of forgetting it.
     LiveDiscardCleanup {
@@ -396,6 +399,7 @@ pub fn run(
                 live_note_created(&ctx, &meta, note_path)
             }
             Ok(PipelineMsg::LiveDiscarded { id }) => live_discarded(&ctx, &id),
+            Ok(PipelineMsg::LiveDiscardReap { id }) => ctx.live.reap_unspawned_discard(&id),
             Ok(PipelineMsg::LiveDiscardCleanup {
                 meta,
                 note_path,
@@ -625,6 +629,14 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     tray::set_status(&ctx.app, format!("{phase} — {}…", row.owning_app));
 }
 
+fn retry_owned_note(
+    error_note: Option<OwnedNote>,
+    checkpoint_note: Option<OwnedNote>,
+    preferred_note: Option<OwnedNote>,
+) -> Option<OwnedNote> {
+    error_note.or(checkpoint_note).or(preferred_note)
+}
+
 /// A transcribe/file failure on the live path: record the error and durably schedule the next phase. The
 /// retry payload owns a live note path before any fallible recording-row update, so a SQLite failure cannot
 /// turn a later batch recovery into a second note.
@@ -636,7 +648,12 @@ fn schedule_retry(
     preferred_note: Option<&OwnedNote>,
 ) {
     let error_note = recovery_note_from_error(&err);
-    let preferred_note = error_note.as_ref().or(preferred_note);
+    let checkpoint_note = FilingCheckpoint::load(&meta.audio_path)
+        .ok()
+        .and_then(|checkpoint| checkpoint.owned_note());
+    // A structured note was just returned by the failed operation; otherwise the durable checkpoint is
+    // newer than the caller's original live path. Persist that authority in both job payload and row.
+    let preferred_note = retry_owned_note(error_note, checkpoint_note, preferred_note.cloned());
     let msg = format!("{err:#}");
     eprintln!("[corti] job {id} failed (will retry): {msg}");
     let retry_status = ctx
@@ -652,7 +669,7 @@ fn schedule_retry(
                 JobStatus::PendingTranscription
             }
         });
-    let payload = crate::jobs::retry_payload(id, preferred_note);
+    let payload = crate::jobs::retry_payload(id, preferred_note.as_ref());
     if let Err(e) = ctx.queue.jobs().enqueue(
         crate::jobs::RETRY_TRANSCRIPTION,
         &payload,
@@ -660,7 +677,7 @@ fn schedule_retry(
         Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
     ) {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
-        if let Err(fail_error) = fail_with_note(ctx, id, meta, msg, preferred_note) {
+        if let Err(fail_error) = fail_with_note(ctx, id, meta, msg, preferred_note.as_ref()) {
             eprintln!("[corti] cannot persist terminal failure for {id}: {fail_error:#}");
         }
         return;
@@ -670,7 +687,7 @@ fn schedule_retry(
         id,
         JobUpdate {
             status: Some(retry_status),
-            note_path: preferred_note.map(|note| note.path.clone()),
+            note_path: preferred_note.as_ref().map(|note| note.path.clone()),
             error: Some(msg.clone()),
             ..Default::default()
         },
@@ -835,6 +852,7 @@ fn live_note_history_status(existing: Option<JobStatus>) -> JobStatus {
 /// nothing dangles at `Recording`.
 fn live_discarded(ctx: &Ctx, id: &str) {
     ctx.live.discard(id);
+    ctx.live.reap_unspawned_discard(id);
     match ctx.queue.get(id) {
         Ok(Some(row)) if !row.status.is_terminal() => {
             let _ = ctx.queue.update(
@@ -1611,6 +1629,26 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(older).unwrap(), "older body");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn retry_ownership_prefers_new_side_effect_then_checkpoint_over_old_live_payload() {
+        let checkpoint = OwnedNote::canonical("/brain/moved-canonical.md");
+        let old_live = OwnedNote::partial("/brain/old-live.md");
+        assert_eq!(
+            retry_owned_note(None, Some(checkpoint.clone()), Some(old_live)),
+            Some(checkpoint)
+        );
+
+        let returned = OwnedNote::canonical("/brain/just-returned.md");
+        assert_eq!(
+            retry_owned_note(
+                Some(returned.clone()),
+                Some(OwnedNote::partial("/brain/checkpoint-partial.md")),
+                None,
+            ),
+            Some(returned)
+        );
     }
 
     #[test]

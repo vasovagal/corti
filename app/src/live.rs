@@ -20,13 +20,14 @@
 //! [`LiveHook`] delivers that verdict immediately, before its later pipeline message:
 //! - finish freezes the tee's canonical dropped-chunk count, moves the handle into an ID-keyed collection,
 //!   and lets the thread flush both transcribers. The pipeline later [`LiveManager::collect`]s that exact ID;
-//! - discard transfers the handle to a non-blocking reaper that removes any partial note, including one
-//!   returned after a contained panic/failure; persistent unlink failure is handed to the pipeline.
+//! - discard transfers the handle to a manager-owned non-blocking reaper that removes any partial note,
+//!   including one returned after a contained panic/failure. Discard remains inside the one-model gate; a
+//!   reaper spawn failure transfers joining to the pipeline without dropping the handle/reporter.
 //!
 //! A zero-drop finish flips the state line and reports [`LiveOutcome::Filed`]. Any drop still flushes tails
 //! but leaves `State: transcribing` and reports [`LiveOutcome::Fallback`], so the lossless WAV batch pass
-//! rewrites the same note. Completed finish handles are reaped to small outcomes; a new model session never
-//! overlaps an older one that is still flushing.
+//! rewrites the same note. Completed finish/discard handles are reaped before the gate opens; a new model
+//! session never overlaps an older one that is still flushing or draining after discard.
 //!
 //! Segments are appended in **finish order**, which may interleave `Me`/`Them` differently than the
 //! batch path's `merge_by_time` — accepted by design; the segment *lines* are byte-identical to
@@ -111,6 +112,9 @@ struct Inner {
     active: Option<Active>,
     /// Finish verdict delivered, awaiting collection by recording ID.
     awaiting: HashMap<String, AwaitingFinish>,
+    /// Discarded sessions remain manager-owned until their model thread and cleanup reaper finish. Keeping
+    /// them in the same gate prevents a second local model from loading while discard drains its tee.
+    discarding: HashMap<String, Discarding>,
 }
 
 struct Pending {
@@ -129,6 +133,22 @@ struct Active {
 struct DiscardReporter {
     meta: RecordingMeta,
     pipe_tx: Sender<PipelineMsg>,
+}
+
+struct DiscardWork {
+    id: String,
+    handle: JoinHandle<LiveOutcome>,
+    reporter: Option<DiscardReporter>,
+}
+
+enum Discarding {
+    /// Per-discard cleanup thread successfully spawned.
+    Reaper(JoinHandle<()>),
+    /// Reaper spawn failed; the original live handle/reporter stay owned until the pipeline or manager
+    /// performs the same cleanup.
+    Inline(DiscardWork),
+    /// The pipeline moved an inline fallback out to join. Keep the model gate closed until it returns.
+    Collecting,
 }
 
 enum AwaitingFinish {
@@ -163,6 +183,27 @@ impl Inner {
             self.awaiting
                 .insert(id, AwaitingFinish::Ready(join_live_thread(handle)));
         }
+
+        let discarded: Vec<String> = self
+            .discarding
+            .iter()
+            .filter_map(|(id, session)| match session {
+                Discarding::Reaper(handle) if handle.is_finished() => Some(id.clone()),
+                Discarding::Inline(work) if work.handle.is_finished() => Some(id.clone()),
+                Discarding::Reaper(_) | Discarding::Inline(_) | Discarding::Collecting => None,
+            })
+            .collect();
+        for id in discarded {
+            match self.discarding.remove(&id) {
+                Some(Discarding::Reaper(handle)) => {
+                    if handle.join().is_err() {
+                        warn!(target: "corti::live", job_id = %id, "discard reaper panicked");
+                    }
+                }
+                Some(Discarding::Inline(work)) => reap_discard_work(work),
+                Some(Discarding::Collecting) | None => {}
+            }
+        }
     }
 
     fn has_finishing_thread(&self) -> bool {
@@ -171,7 +212,7 @@ impl Inner {
                 session,
                 AwaitingFinish::Running(_) | AwaitingFinish::Collecting
             )
-        })
+        }) || !self.discarding.is_empty()
     }
 }
 
@@ -252,8 +293,9 @@ impl LiveManager {
                         // `stash_pending` reserved this slot on the same detector thread, so this is only
                         // defensive. Never replace/drop an older recording's handle or outcome.
                         warn!(target: "corti::live", job_id = %id, "live-session slot changed before spawn — using batch path");
-                        let _ = active.verdict_tx.send(Verdict::Discard);
-                        spawn_discard_reaper(id, active.handle, active.discard_reporter);
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.reap_completed();
+                        Self::park_discard(&mut inner, active);
                     }
                 }
                 Err(e) => {
@@ -265,6 +307,21 @@ impl LiveManager {
         {
             let _ = (meta, sample_rate, cfg, pending, pipe_tx);
         }
+    }
+
+    fn park_discard(inner: &mut Inner, active: Active) {
+        let id = active.id;
+        info!(target: "corti::live", job_id = %id, "discarding live session");
+        let _ = active.verdict_tx.send(Verdict::Discard);
+        let previous = inner.discarding.insert(
+            id.clone(),
+            spawn_discard_reaper(DiscardWork {
+                id,
+                handle: active.handle,
+                reporter: active.discard_reporter,
+            }),
+        );
+        debug_assert!(previous.is_none(), "recording ids must be unique");
     }
 
     /// Deliver a recording-specific finish verdict without joining. Called by the detector immediately
@@ -338,22 +395,35 @@ impl LiveManager {
         })
     }
 
-    /// Deliver a discard verdict and transfer the handle to a tiny detached reaper. Normal discard makes
-    /// the session delete its own note; if the live thread had already failed/panicked and returned a
-    /// partial path, the reaper deletes that path too (or reports failed cleanup to the pipeline). The
-    /// detector never blocks on decode/teardown.
+    /// Deliver a discard verdict and transfer the handle to manager-owned cleanup. Normal discard uses a
+    /// tiny reaper thread; if spawning it fails, the original handle/reporter remain in `Inline` for the
+    /// pipeline. Either state keeps the single-model gate closed without blocking the detector callback.
     pub fn discard(&self, id: &str) {
-        let active = {
-            let mut inner = self.inner.lock().unwrap();
-            inner.reap_completed();
-            inner.active.take_if(|active| active.id == id)
-        };
-        let Some(active) = active else {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_completed();
+        let Some(active) = inner.active.take_if(|active| active.id == id) else {
             return;
         };
-        info!(target: "corti::live", job_id = %id, "discarding live session");
-        let _ = active.verdict_tx.send(Verdict::Discard);
-        spawn_discard_reaper(id.to_string(), active.handle, active.discard_reporter);
+        Self::park_discard(&mut inner, active);
+    }
+
+    /// Pipeline fallback for the rare per-discard reaper spawn failure. Joining may block here (never on the
+    /// detector callback), while a `Collecting` sentinel keeps the model gate closed.
+    pub(crate) fn reap_unspawned_discard(&self, id: &str) {
+        let work = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.reap_completed();
+            let Some(Discarding::Inline(work)) = inner.discarding.remove(id) else {
+                return;
+            };
+            inner
+                .discarding
+                .insert(id.to_string(), Discarding::Collecting);
+            work
+        };
+        reap_discard_work(work);
+        let removed = self.inner.lock().unwrap().discarding.remove(id);
+        debug_assert!(matches!(removed, Some(Discarding::Collecting)));
     }
 
     /// Whether a live note for `id` still belongs to a session that will be collected. Includes a
@@ -374,62 +444,102 @@ fn join_live_thread(handle: JoinHandle<LiveOutcome>) -> LiveOutcome {
     })
 }
 
-fn spawn_discard_reaper(
-    id: String,
-    handle: JoinHandle<LiveOutcome>,
-    reporter: Option<DiscardReporter>,
-) {
-    let log_id = id.clone();
-    let spawned = std::thread::Builder::new()
-        .name("corti-live-reap".into())
-        .spawn(move || {
-            let outcome = join_live_thread(handle);
-            if let Some(path) = outcome.note_path().cloned() {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => info!(
+fn reap_discard_work(work: DiscardWork) {
+    let DiscardWork {
+        id,
+        handle,
+        reporter,
+    } = work;
+    let outcome = join_live_thread(handle);
+    if let Some(path) = outcome.note_path().cloned() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                target: "corti::live",
+                job_id = %id,
+                note_path = %path.display(),
+                "deleted partial live note while reaping discarded session"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    target: "corti::live",
+                    job_id = %id,
+                    note_path = %path.display(),
+                    error = %e,
+                    "could not delete partial live note while reaping discarded session"
+                );
+                if let Some(reporter) = reporter
+                    && reporter
+                        .pipe_tx
+                        .send(PipelineMsg::LiveDiscardCleanup {
+                            meta: reporter.meta,
+                            note_path: path,
+                            error: e.to_string(),
+                        })
+                        .is_err()
+                {
+                    warn!(
                         target: "corti::live",
                         job_id = %id,
-                        note_path = %path.display(),
-                        "deleted partial live note while reaping discarded session"
-                    ),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        warn!(
-                            target: "corti::live",
-                            job_id = %id,
-                            note_path = %path.display(),
-                            error = %e,
-                            "could not delete partial live note while reaping discarded session"
-                        );
-                        if let Some(reporter) = reporter
-                            && reporter
-                                .pipe_tx
-                                .send(PipelineMsg::LiveDiscardCleanup {
-                                    meta: reporter.meta,
-                                    note_path: path,
-                                    error: e.to_string(),
-                                })
-                                .is_err()
-                        {
-                            warn!(
-                                target: "corti::live",
-                                job_id = %id,
-                                "pipeline unavailable; failed discard path could not be persisted"
-                            );
-                        }
-                    }
+                        "pipeline unavailable; failed discard path could not be persisted"
+                    );
                 }
             }
-        });
-    if let Err(error) = spawned {
-        // This runs on the detector callback. Resource exhaustion must degrade to a detached session,
-        // never panic and terminate future call detection.
-        warn!(
-            target: "corti::live",
-            job_id = %log_id,
-            error = %error,
-            "could not spawn discarded-session reaper; detached live thread will finish independently"
-        );
+        }
+    }
+}
+
+fn spawn_discard_reaper(work: DiscardWork) -> Discarding {
+    spawn_discard_reaper_with(work, |run| {
+        std::thread::Builder::new()
+            .name("corti-live-reap".into())
+            .spawn(run)
+    })
+}
+
+fn spawn_discard_reaper_with(
+    work: DiscardWork,
+    launch: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>,
+) -> Discarding {
+    // `Builder::spawn` consumes and drops its closure on failure. Keep the actual ownership in a shared
+    // slot so the detector can recover it instead of detaching the live handle and losing its note path.
+    let log_id = work.id.clone();
+    let slot = Arc::new(Mutex::new(Some(work)));
+    let worker_slot = slot.clone();
+    match launch(Box::new(move || {
+        if let Some(work) = worker_slot.lock().unwrap().take() {
+            reap_discard_work(work);
+        }
+    })) {
+        Ok(handle) => Discarding::Reaper(handle),
+        Err(error) => {
+            warn!(
+                target: "corti::live",
+                job_id = %log_id,
+                error = %error,
+                "could not spawn discarded-session reaper; pipeline retains cleanup ownership"
+            );
+            let work = slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("failed spawn must return the unstarted discard work");
+            if let Some(reporter) = work.reporter.as_ref()
+                && reporter
+                    .pipe_tx
+                    .send(PipelineMsg::LiveDiscardReap {
+                        id: work.id.clone(),
+                    })
+                    .is_err()
+            {
+                warn!(
+                    target: "corti::live",
+                    job_id = %work.id,
+                    "pipeline unavailable; manager will retain failed reaper ownership"
+                );
+            }
+            Discarding::Inline(work)
+        }
     }
 }
 
@@ -1502,6 +1612,83 @@ mod tests {
     }
 
     #[test]
+    fn discarded_session_keeps_single_model_gate_closed_until_reaped() {
+        use std::time::Duration;
+
+        let manager = LiveManager::new();
+        let (draining_tx, draining_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        install_active(&manager, "discarded", 0, move |verdicts| {
+            assert!(matches!(verdicts.recv().unwrap(), Verdict::Discard));
+            draining_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            LiveOutcome::NoNote
+        });
+
+        manager.discard("discarded");
+        draining_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (blocked_tx, blocked_rx) = sync_channel(1);
+        assert!(
+            !manager.stash_pending(blocked_rx, Arc::new(AtomicU64::new(0))),
+            "discard draining must remain inside the one-model gate"
+        );
+        drop(blocked_tx);
+
+        release_tx.send(()).unwrap();
+        wait_for_model_slot(&manager);
+    }
+
+    #[test]
+    fn reaper_spawn_failure_retains_handle_and_reporter_for_pipeline_cleanup() {
+        use std::time::Duration;
+
+        let filer = TempFiler::new("discard-spawn-failure");
+        let blocked = filer.dir.join("blocked.md");
+        std::fs::create_dir(&blocked).unwrap();
+        let outcome_path = blocked.clone();
+        let handle = std::thread::spawn(move || LiveOutcome::Fallback {
+            reason: "contained failure".to_string(),
+            note_path: Some(outcome_path),
+        });
+        let (pipe_tx, pipe_rx) = std::sync::mpsc::channel();
+        let state = spawn_discard_reaper_with(
+            DiscardWork {
+                id: "spawn-failed".to_string(),
+                handle,
+                reporter: Some(DiscardReporter {
+                    meta: meta(),
+                    pipe_tx,
+                }),
+            },
+            |_| Err(std::io::Error::other("synthetic spawn exhaustion")),
+        );
+        assert!(matches!(state, Discarding::Inline(_)));
+        let PipelineMsg::LiveDiscardReap { id } =
+            pipe_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("pipeline did not receive failed reaper ownership")
+        };
+        assert_eq!(id, "spawn-failed");
+
+        let manager = LiveManager::new();
+        manager
+            .inner
+            .lock()
+            .unwrap()
+            .discarding
+            .insert("spawn-failed".to_string(), state);
+        manager.reap_unspawned_discard("spawn-failed");
+        let PipelineMsg::LiveDiscardCleanup { note_path, .. } =
+            pipe_rx.recv_timeout(Duration::from_secs(2)).unwrap()
+        else {
+            panic!("pipeline did not inherit failed reaper cleanup")
+        };
+        assert_eq!(note_path, blocked);
+        assert!(manager.inner.lock().unwrap().discarding.is_empty());
+        std::fs::remove_dir(blocked).unwrap();
+    }
+
+    #[test]
     fn failed_discard_unlink_keeps_and_reports_the_path() {
         use std::time::Duration;
 
@@ -1519,14 +1706,14 @@ mod tests {
             reason: "discard unlink failed".to_string(),
             note_path: Some(outcome_path),
         });
-        spawn_discard_reaper(
-            "blocked".to_string(),
+        let _reaper = spawn_discard_reaper(DiscardWork {
+            id: "blocked".to_string(),
             handle,
-            Some(DiscardReporter {
+            reporter: Some(DiscardReporter {
                 meta: meta(),
                 pipe_tx,
             }),
-        );
+        });
         let PipelineMsg::LiveDiscardCleanup {
             note_path, error, ..
         } = pipe_rx.recv_timeout(Duration::from_secs(2)).unwrap()

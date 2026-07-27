@@ -98,8 +98,9 @@ the newest few at startup (`seed_history`, `pipeline.rs:703`) with orphaned jobs
 detector delivers `finished(meta)` or `discarded(meta)` **before** emitting its downstream event.
 `LiveManager` keeps finish-delivered sessions by recording ID; at `Process` time the worker calls
 `collect(id)`, and only a zero-drop `Filed` result goes straight to `Done`. A lossy/error result carries
-its partial path into batch rewrite; a discard uses a detached reaper and reports persistent unlink
-failure back to the pipeline. Live telemetry adds no new stage — it remains `Recording` during the call.
+its partial path into batch rewrite; a discard stays in the single-model gate under a manager-owned reaper
+and reports persistent unlink failure back to the pipeline. Live telemetry adds no new stage — it remains
+`Recording` during the call.
 Errors the recording survives (for example a mic-monitor rebind) never deliver a terminal verdict. See
 [transcription.md](transcription.md#live-inbox-filing-87).
 

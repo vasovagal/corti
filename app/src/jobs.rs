@@ -57,6 +57,20 @@ fn preferred_note(payload: &serde_json::Value) -> Option<OwnedNote> {
     })
 }
 
+fn authoritative_note(
+    checkpoint: Option<OwnedNote>,
+    payload: Option<OwnedNote>,
+    row: Option<PathBuf>,
+) -> Option<OwnedNote> {
+    match (checkpoint, payload) {
+        (Some(checkpoint), _) if checkpoint.canonical => Some(checkpoint),
+        (_, Some(payload)) if payload.canonical => Some(payload),
+        (Some(checkpoint), _) => Some(checkpoint),
+        (None, Some(payload)) => Some(payload),
+        (None, None) => row.map(OwnedNote::partial),
+    }
+}
+
 fn cleanup_payload(id: &str, audio: &Path) -> serde_json::Value {
     serde_json::json!({
         "id": id,
@@ -93,9 +107,11 @@ pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) -> Result<(
     let checkpoint_note = FilingCheckpoint::load(&row.audio_path)
         .ok()
         .and_then(|checkpoint| checkpoint.owned_note());
-    let note = checkpoint_note
-        .or_else(|| preferred_note(&job.payload))
-        .or_else(|| row.note_path.clone().map(OwnedNote::partial));
+    let note = authoritative_note(
+        checkpoint_note,
+        preferred_note(&job.payload),
+        row.note_path.clone(),
+    );
     pipeline::fail_with_note(
         ctx,
         id,
@@ -183,19 +199,18 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
     }
     let checkpoint_note = checkpoint.as_ref().and_then(FilingCheckpoint::owned_note);
     let payload_note = preferred_note(&job.payload);
-    // A checkpoint-owned path is newer than a retry payload. Only when the checkpoint has no path may a
-    // canonical payload bypass it for completion-only recovery.
-    let canonical_completion =
-        checkpoint_note.is_none() && payload_note.as_ref().is_some_and(|note| note.canonical);
+    // Canonical ownership always beats a partial path. At equal provenance the checkpoint is newer than the
+    // retry payload; this prevents an old live payload from rolling a later checkpoint backward.
+    let owned_note =
+        authoritative_note(checkpoint_note.clone(), payload_note, row.note_path.clone());
+    let canonical_completion = owned_note.as_ref().is_some_and(|note| note.canonical)
+        && !checkpoint_note.as_ref().is_some_and(|note| note.canonical);
     let action = retry_action(
         row.status,
         checkpoint_valid && !canonical_completion,
         canonical_completion,
         row.audio_path.exists(),
     );
-    let owned_note = checkpoint_note
-        .or_else(|| payload_note.clone())
-        .or_else(|| row.note_path.clone().map(OwnedNote::partial));
     if action != RetryAction::Stale
         && let Some(note) = owned_note.as_ref()
     {
@@ -562,6 +577,39 @@ mod tests {
         let payload = retry_payload("recording", Some(&canonical));
         assert_eq!(preferred_note(&payload), Some(canonical));
         assert_eq!(preferred_note(&id_payload("recording")), None);
+    }
+
+    #[test]
+    fn canonical_provenance_wins_then_checkpoint_wins_equal_provenance() {
+        let checkpoint_canonical = OwnedNote::canonical("/brain/new-canonical.md");
+        let payload_partial = OwnedNote::partial("/brain/old-partial.md");
+        assert_eq!(
+            authoritative_note(
+                Some(checkpoint_canonical.clone()),
+                Some(payload_partial),
+                None,
+            ),
+            Some(checkpoint_canonical)
+        );
+
+        let checkpoint_partial = OwnedNote::partial("/brain/new-partial.md");
+        let payload_canonical = OwnedNote::canonical("/brain/returned-canonical.md");
+        assert_eq!(
+            authoritative_note(
+                Some(checkpoint_partial.clone()),
+                Some(payload_canonical.clone()),
+                None,
+            ),
+            Some(payload_canonical)
+        );
+        assert_eq!(
+            authoritative_note(
+                Some(checkpoint_partial.clone()),
+                Some(OwnedNote::partial("/brain/old-partial.md")),
+                None,
+            ),
+            Some(checkpoint_partial)
+        );
     }
 
     #[test]
