@@ -44,6 +44,29 @@ const JOB_BACKOFF: Backoff = Backoff {
 /// periodic job can fire when no message wakes the loop sooner.
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
+/// What the pipeline does with a collected live result. Only a zero-drop [`crate::live::LiveOutcome::Filed`] is
+/// canonical; every other result takes the lossless batch path, optionally retaining a partial note to
+/// rewrite in place.
+enum LiveResolution {
+    Filed(PathBuf),
+    Batch { fallback: Option<LiveFallback> },
+}
+
+struct LiveFallback {
+    reason: String,
+    note_path: Option<PathBuf>,
+}
+
+fn resolve_live(outcome: Option<crate::live::LiveOutcome>) -> LiveResolution {
+    match outcome {
+        Some(crate::live::LiveOutcome::Filed { note_path }) => LiveResolution::Filed(note_path),
+        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => LiveResolution::Batch {
+            fallback: Some(LiveFallback { reason, note_path }),
+        },
+        Some(crate::live::LiveOutcome::NoNote) | None => LiveResolution::Batch { fallback: None },
+    }
+}
+
 /// Work for the pipeline worker.
 pub enum PipelineMsg {
     /// A finished recording to push through transcribe → file → Done.
@@ -66,8 +89,8 @@ pub enum PipelineMsg {
         note_path: PathBuf,
     },
     /// #87: the recording ended without a `Process` (discarded as too short, or its capture failed to
-    /// finish). Tear down the live session — it deletes its own partial note — and close any queue
-    /// row `LiveNoteCreated` made.
+    /// finish). The detector has already delivered the recording-specific discard verdict; close any
+    /// queue row `LiveNoteCreated` made (the manager call remains idempotent defense-in-depth).
     LiveDiscarded { id: String },
 }
 
@@ -220,23 +243,21 @@ pub fn run(
                             "could not persist the recording end time"
                         );
                     }
-                    // #87: if a live session filed this recording as it happened, the job is already
-                    // done — batch transcription is skipped entirely. Any other live outcome (no
-                    // session, no note, error) falls back to today's batch path; a partial live note
-                    // is persisted first so `file_and_done` rewrites it instead of double-filing.
-                    match ctx.live.finalize(&id) {
-                        Some(crate::live::LiveOutcome::Filed { note_path }) => {
+                    // #87: the detector already delivered this recording's finish verdict before
+                    // queuing `Process`. Collect exactly that ID: a canonical, zero-drop live note skips
+                    // batch; every other outcome falls back to the lossless WAV. Persist a partial live
+                    // note first so `file_and_done` rewrites the same file instead of double-filing.
+                    match resolve_live(ctx.live.collect(&id)) {
+                        LiveResolution::Filed(note_path) => {
                             live_filed(&mut ctx, &id, &meta, &audio_path, note_path);
                         }
-                        live_result => {
-                            if let Some(crate::live::LiveOutcome::Failed { error, note_path }) =
-                                live_result
-                            {
+                        LiveResolution::Batch { fallback } => {
+                            if let Some(LiveFallback { reason, note_path }) = fallback {
                                 warn!(
                                     target: "corti::live",
                                     job_id = %id,
-                                    error = %error,
-                                    "live filing failed — falling back to batch transcription"
+                                    reason = %reason,
+                                    "live result is not canonical — falling back to batch transcription"
                                 );
                                 if let Some(partial) = note_path
                                     && let Err(e) = ctx.queue.update(
@@ -268,18 +289,18 @@ pub fn run(
                         error = %format!("{e:#}"),
                         "enqueue failed"
                     );
-                    // #87: still settle any live session so its note isn't stranded at
-                    // `State: transcribing` — with no queue row the outcome can only be logged.
-                    match ctx.live.finalize(&corti_queue::job_id(&meta)) {
+                    // #87: still collect this recording's already-delivered finish result so its model
+                    // session is released — with no queue row the outcome can only be logged.
+                    match ctx.live.collect(&corti_queue::job_id(&meta)) {
                         Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
                             target: "corti::live",
                             note_path = %note_path.display(),
                             "live note filed but its recording row could not be created"
                         ),
-                        Some(crate::live::LiveOutcome::Failed { error, .. }) => warn!(
+                        Some(crate::live::LiveOutcome::Fallback { reason, .. }) => warn!(
                             target: "corti::live",
-                            error = %error,
-                            "live session failed alongside the enqueue failure"
+                            reason = %reason,
+                            "live session required fallback alongside the enqueue failure"
                         ),
                         Some(crate::live::LiveOutcome::NoNote) | None => {}
                     }
@@ -504,16 +525,16 @@ fn live_filed(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Path, note:
 
 /// #87: persist a just-created live note's path. Mid-recording there is no queue row yet, so one is
 /// created (status `Recording` — truthful in the Queue window) **only while the session is still
-/// active**: the first segment can close while a discarded call's backlog drains, in which case
-/// `LiveDiscarded` already tore the session down and its Discard verdict will delete the note — a
-/// row created now would be a zombie. If the row already exists (the note was created during the
-/// finalize tail, after `Process` enqueued it — or the job even finished already) only `note_path`
+/// owned**: this includes a finish-delivered session awaiting ID-specific collection, because its tail
+/// can create the first note while `Process` waits behind another job. A discarded session is never
+/// accepted — its reaper deletes a late partial note, and creating a row would make a zombie. If the row
+/// already exists (the note was created during the finish tail after `Process` enqueued it) only `note_path`
 /// is recorded and the row's current status is preserved, never regressed.
 fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
     let id = corti_queue::job_id(meta);
     let (result, history_status) = match ctx.queue.get(&id) {
         Ok(None) => {
-            if !ctx.live.is_active(&id) {
+            if !ctx.live.accepts_note(&id) {
                 warn!(
                     target: "corti::live",
                     job_id = %id,
@@ -567,9 +588,9 @@ fn live_note_history_status(existing: Option<JobStatus>) -> JobStatus {
 }
 
 /// #87: a recording ended without a `Process` (discarded as too short, or its capture failed to
-/// finish). Tear down the live session — non-joining; the session deletes its own partial note —
-/// and terminally close a queue row `LiveNoteCreated` may have made, so nothing dangles at
-/// `Recording`.
+/// finish). The detector already delivered the non-joining discard verdict before this later pipeline
+/// message; repeat it idempotently, then terminally close a queue row `LiveNoteCreated` may have made so
+/// nothing dangles at `Recording`.
 fn live_discarded(ctx: &Ctx, id: &str) {
     ctx.live.discard(id);
     match ctx.queue.get(id) {
@@ -803,6 +824,29 @@ pub(crate) fn transcribe_and_file(
     result
 }
 
+/// Rewrite a queue-authoritative live note with the canonical batch body. `rewrite_body` truncates/writes
+/// the existing file rather than renaming over it, preserving both its path and inode. A missing/deleted
+/// note returns `None` so the caller can file a fresh one.
+fn rewrite_existing_note(
+    queue: &Queue,
+    id: &str,
+    meta: &RecordingMeta,
+    transcript: &DiarizedTranscript,
+) -> Result<Option<PathBuf>> {
+    let Some(existing) = queue
+        .get(id)
+        .ok()
+        .flatten()
+        .and_then(|row| row.note_path)
+        .filter(|path| path.exists())
+    else {
+        return Ok(None);
+    };
+    corti_vagus::note::rewrite_body(&existing, &corti_vagus::recording_body(meta, transcript))
+        .context("rewriting the existing note")?;
+    Ok(Some(existing))
+}
+
 /// File the transcript into vagus and mark the job `Done`. Returns `Err` on a filing failure so the caller
 /// can schedule a retry rather than terminally failing.
 fn file_and_done(
@@ -811,20 +855,9 @@ fn file_and_done(
     meta: &RecordingMeta,
     transcript: &DiarizedTranscript,
 ) -> Result<()> {
-    // #87: a note may already exist for this recording — a partial live note (live path failed
-    // mid-call), or a fully-filed one re-reached by a crash-recovery retry. Rewrite its body in place
-    // (same file, same inode) instead of filing a second note: the queue row's `note_path` is the
-    // no-double-notes authority. A recorded-but-deleted note falls through to a fresh filing.
-    if let Some(existing) = ctx
-        .queue
-        .get(id)
-        .ok()
-        .flatten()
-        .and_then(|row| row.note_path)
-        && existing.exists()
-    {
-        corti_vagus::note::rewrite_body(&existing, &corti_vagus::recording_body(meta, transcript))
-            .context("rewriting the existing note")?;
+    // #87: a note may already exist for this recording — a partial/non-canonical live note, or a
+    // fully-filed one re-reached by crash recovery. The queue's note_path is the no-double-notes authority.
+    if let Some(existing) = rewrite_existing_note(&ctx.queue, id, meta, transcript)? {
         info!(
             target: "corti::pipeline",
             job_id = %id,
@@ -952,7 +985,8 @@ pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corti_core::OwningApp;
+    use corti_core::{OwningApp, Speaker, TranscriptSegment};
+    use std::os::unix::fs::MetadataExt;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir =
@@ -1047,6 +1081,67 @@ mod tests {
 
         // Idempotent: nothing left at Recording.
         assert!(reap_recording_rows(&queue).is_empty());
+    }
+
+    /// A dropped live result is never accepted as Filed. Its existing note path is carried into the
+    /// batch branch, persisted, and rewritten canonically without changing the file/inode.
+    #[test]
+    fn dropped_live_result_routes_to_batch_and_rewrites_same_inode() {
+        let dir = test_dir("dropped-live-fallback");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let meta = meta(dir.join("recording.wav"));
+        let id = queue.enqueue(&meta).unwrap();
+        let note = dir.join("live.md");
+        std::fs::write(
+            &note,
+            format!(
+                "---\nsource: x\n---\n\n# T\n\n{}",
+                corti_vagus::live_initial_body(&meta)
+            ),
+        )
+        .unwrap();
+        let inode_before = std::fs::metadata(&note).unwrap().ino();
+
+        let resolution = resolve_live(Some(crate::live::LiveOutcome::Fallback {
+            reason: "live capture tee dropped 2 chunk(s)".to_string(),
+            note_path: Some(note.clone()),
+        }));
+        let LiveResolution::Batch {
+            fallback:
+                Some(LiveFallback {
+                    reason,
+                    note_path: Some(partial),
+                }),
+        } = resolution
+        else {
+            panic!("a dropped live result must take the batch branch");
+        };
+        assert!(reason.contains("dropped 2"));
+        queue
+            .update(
+                &id,
+                JobUpdate {
+                    note_path: Some(partial),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 0.0,
+            end: 1.0,
+            text: "canonical batch text".to_string(),
+        }]);
+        let rewritten = rewrite_existing_note(&queue, &id, &meta, &transcript)
+            .unwrap()
+            .expect("the persisted partial note must be rewritten");
+        assert_eq!(rewritten, note);
+        assert_eq!(std::fs::metadata(&note).unwrap().ino(), inode_before);
+        let content = std::fs::read_to_string(&note).unwrap();
+        assert!(content.contains("State: transcribed \n"), "got: {content}");
+        assert!(!content.contains("State: transcribing\n"));
+        assert!(content.contains("canonical batch text"));
     }
 
     /// #87: a late `LiveNoteCreated` must never regress an existing row's tray status (a short

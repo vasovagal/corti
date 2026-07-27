@@ -14,18 +14,23 @@
 //!
 //! ## Finish / discard
 //! The tee sender is dropped when the recorder stops, which ends the chunk loop; the thread then waits
-//! for an explicit verdict so a finished recording and a discarded one are never confused (live-path
-//! errors also park at the verdict wait, so the thread never outruns its recording):
-//! - the pipeline's `Process` handler calls [`LiveManager::finalize`] → finish both transcribers, append
-//!   the tails (merged by start time), flip the state line in place, report [`LiveOutcome::Filed`];
-//! - a discard (too short) or a failed capture finish sends `PipelineMsg::LiveDiscarded` →
-//!   [`LiveManager::discard`] delivers the verdict **without joining** and the thread deletes its own
-//!   partial note on the way out.
+//! for an explicit recording-specific verdict so a finish and discard are never confused. The detector's
+//! [`LiveHook`] delivers that verdict immediately, before its later pipeline message:
+//! - finish freezes the tee's canonical dropped-chunk count, moves the handle into an ID-keyed collection,
+//!   and lets the thread flush both transcribers. The pipeline later [`LiveManager::collect`]s that exact ID;
+//! - discard transfers the handle to a non-blocking reaper that removes any partial note, including one
+//!   returned after a contained panic/failure.
 //!
-//! Segments are appended in **finalize order**, which may interleave `Me`/`Them` differently than the
+//! A zero-drop finish flips the state line and reports [`LiveOutcome::Filed`]. Any drop still flushes tails
+//! but leaves `State: transcribing` and reports [`LiveOutcome::Fallback`], so the lossless WAV batch pass
+//! rewrites the same note. Completed finish handles are reaped to small outcomes; a new model session never
+//! overlaps an older one that is still flushing.
+//!
+//! Segments are appended in **finish order**, which may interleave `Me`/`Them` differently than the
 //! batch path's `merge_by_time` — accepted by design; the segment *lines* are byte-identical to
 //! `DiarizedTranscript::to_markdown`'s.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, sync_channel};
@@ -48,27 +53,50 @@ use crate::settings::SharedConfig;
 /// worker — plus decode bursts, before the lossy tee starts dropping (drops are counted, not fatal).
 const TEE_BACKLOG: usize = 256;
 
-/// How a live session ended, read by the pipeline worker at `Process` time.
+/// How a live session ended, collected by the pipeline worker at `Process` time.
+#[derive(Debug)]
 pub enum LiveOutcome {
     /// The note is fully written and its state line flipped — the job can go straight to `Done`.
     Filed { note_path: PathBuf },
     /// The session ran but never produced a segment, so no note was created — run the batch path.
     NoNote,
-    /// The live path errored; a partial note may exist (the batch path rewrites it, never double-files).
-    Failed {
-        error: String,
+    /// The live result is not canonical (decode failure, panic, or a lossy tee). Batch transcription must
+    /// rewrite `note_path` in place when one exists, never create a second note.
+    Fallback {
+        reason: String,
         note_path: Option<PathBuf>,
     },
 }
 
+impl LiveOutcome {
+    /// Any note the batch/discard path must take ownership of.
+    fn note_path(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Filed { note_path } => Some(note_path),
+            Self::Fallback { note_path, .. } => note_path.as_ref(),
+            Self::NoNote => None,
+        }
+    }
+}
+
+/// Capture-quality facts frozen when the recorder closes its tee. The detector delivers this verdict
+/// immediately, so a later pipeline backlog cannot make the live thread guess whether its transcript was
+/// lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinishQuality {
+    dropped_chunks: u64,
+}
+
 /// The finish/discard decision the session thread waits for after the tee disconnects.
 enum Verdict {
-    Finish,
+    Finish(FinishQuality),
     Discard,
 }
 
-/// Owns the (at most one) in-flight live session. Shared between the detector hook (attaches tees,
-/// spawns sessions) and the pipeline worker (finalizes or discards them).
+/// Owns live-session lifetimes. There is at most one model-backed capture actively consuming chunks;
+/// finished recordings move into an ID-keyed collection until the serial pipeline collects that exact
+/// result. Completed threads are collapsed to small [`LiveOutcome`] values, so their model sessions are
+/// released even while an older pipeline job blocks collection.
 pub struct LiveManager {
     inner: Mutex<Inner>,
 }
@@ -77,7 +105,10 @@ pub struct LiveManager {
 struct Inner {
     /// Tee receiver stashed between `LiveHook::attach` and `LiveHook::started`.
     pending: Option<Pending>,
+    /// The one session that may still consume capture chunks.
     active: Option<Active>,
+    /// Finish verdict delivered, awaiting collection by recording ID.
+    awaiting: HashMap<String, AwaitingFinish>,
 }
 
 struct Pending {
@@ -90,6 +121,42 @@ struct Active {
     verdict_tx: Sender<Verdict>,
     handle: JoinHandle<LiveOutcome>,
     dropped: Arc<AtomicU64>,
+}
+
+enum AwaitingFinish {
+    /// The live thread is flushing its transcriber tails.
+    Running(JoinHandle<LiveOutcome>),
+    /// The thread has been joined and its model/session state released.
+    Ready(LiveOutcome),
+}
+
+impl Inner {
+    /// Join only threads already known to be finished. `JoinHandle::is_finished` keeps this non-blocking
+    /// on the detector thread; storing the small outcome allows a newer recording to start before the
+    /// serial pipeline gets around to collecting the older ID.
+    fn reap_completed(&mut self) {
+        let finished: Vec<String> = self
+            .awaiting
+            .iter()
+            .filter_map(|(id, session)| match session {
+                AwaitingFinish::Running(handle) if handle.is_finished() => Some(id.clone()),
+                AwaitingFinish::Running(_) | AwaitingFinish::Ready(_) => None,
+            })
+            .collect();
+        for id in finished {
+            let Some(AwaitingFinish::Running(handle)) = self.awaiting.remove(&id) else {
+                continue;
+            };
+            self.awaiting
+                .insert(id, AwaitingFinish::Ready(join_live_thread(handle)));
+        }
+    }
+
+    fn has_finishing_thread(&self) -> bool {
+        self.awaiting
+            .values()
+            .any(|session| matches!(session, AwaitingFinish::Running(_)))
+    }
 }
 
 impl Default for LiveManager {
@@ -105,8 +172,17 @@ impl LiveManager {
         }
     }
 
-    fn stash_pending(&self, rx: Receiver<CaptureChunk>, dropped: Arc<AtomicU64>) {
-        self.inner.lock().unwrap().pending = Some(Pending { rx, dropped });
+    /// Reserve the one active-model slot for the tee being attached. A previous finished outcome does not
+    /// block a new call, but a previous thread still flushing does: two large local model sessions must not
+    /// overlap. Returns false without replacing any existing session.
+    fn stash_pending(&self, rx: Receiver<CaptureChunk>, dropped: Arc<AtomicU64>) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_completed();
+        if inner.pending.is_some() || inner.active.is_some() || inner.has_finishing_thread() {
+            return false;
+        }
+        inner.pending = Some(Pending { rx, dropped });
+        true
     }
 
     fn take_pending(&self) -> Option<Pending> {
@@ -135,22 +211,28 @@ impl LiveManager {
             );
             match thread {
                 Ok(handle) => {
-                    let stale = {
-                        let mut inner = self.inner.lock().unwrap();
-                        inner.active.replace(Active {
-                            id,
-                            verdict_tx,
-                            handle,
-                            dropped,
-                        })
+                    let active = Active {
+                        id: id.clone(),
+                        verdict_tx,
+                        handle,
+                        dropped,
                     };
-                    // Shouldn't happen (one detector recording at a time), but never leak a session.
-                    // Finish, never discard: the previous call's note must survive (its path was
-                    // persisted at creation, so the batch/rewrite paths still find it). Non-joining —
-                    // this runs on the detect worker, which must not block on a decode.
-                    if let Some(stale) = stale {
-                        warn!(target: "corti::live", job_id = %stale.id, "stale live session at spawn — finishing it detached");
-                        let _ = stale.verdict_tx.send(Verdict::Finish);
+                    let rejected = {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.reap_completed();
+                        if inner.active.is_none() && !inner.has_finishing_thread() {
+                            inner.active = Some(active);
+                            None
+                        } else {
+                            Some(active)
+                        }
+                    };
+                    if let Some(active) = rejected {
+                        // `stash_pending` reserved this slot on the same detector thread, so this is only
+                        // defensive. Never replace/drop an older recording's handle or outcome.
+                        warn!(target: "corti::live", job_id = %id, "live-session slot changed before spawn — using batch path");
+                        let _ = active.verdict_tx.send(Verdict::Discard);
+                        spawn_discard_reaper(id, active.handle);
                     }
                 }
                 Err(e) => {
@@ -164,65 +246,109 @@ impl LiveManager {
         }
     }
 
-    /// The recording finished: tell the session to finalize (finish transcribers, append tails, flip
-    /// the state line) and return how it ended. `None` when no live session exists for this id. This
-    /// is the only joining path: the tee sender died when the recorder stopped (before the triggering
-    /// `Process` was sent), so the thread is at (or heading to) its verdict wait and the join is
-    /// bounded by the final flush/decode. A panicked thread reports as a live-path failure.
-    pub fn finalize(&self, id: &str) -> Option<LiveOutcome> {
-        let active = self.take_active(id)?;
-        let dropped = active.dropped.load(Ordering::Relaxed);
-        if dropped > 0 {
+    /// Deliver a recording-specific finish verdict without joining. Called by the detector immediately
+    /// after capture closes the tee and before it emits `RecordingFinished`; the serial pipeline later
+    /// calls [`collect`](Self::collect) for this exact ID.
+    pub fn finish(&self, id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_completed();
+        let Some(active) = inner.active.take_if(|active| active.id == id) else {
+            return;
+        };
+        let dropped_chunks = active.dropped.load(Ordering::Relaxed);
+        if dropped_chunks > 0 {
             warn!(
                 target: "corti::live",
                 job_id = %id,
-                dropped_chunks = dropped,
-                "live tee dropped chunks (consumer fell behind) — the live transcript may have gaps"
+                dropped_chunks,
+                "live tee dropped chunks — finishing tails but requiring lossless batch fallback"
             );
         }
-        let _ = active.verdict_tx.send(Verdict::Finish);
-        Some(
-            active
-                .handle
-                .join()
-                .unwrap_or_else(|_| LiveOutcome::Failed {
-                    error: "live transcription thread panicked".to_string(),
-                    note_path: None,
-                }),
-        )
+        let _ = active
+            .verdict_tx
+            .send(Verdict::Finish(FinishQuality { dropped_chunks }));
+        let replaced = inner
+            .awaiting
+            .insert(id.to_string(), AwaitingFinish::Running(active.handle));
+        debug_assert!(replaced.is_none(), "recording ids must be unique");
+        inner.reap_completed();
     }
 
-    /// The recording was discarded (too short) or its capture failed to finish: tear the session
-    /// down. **Non-joining** — the verdict is delivered and the thread deletes its own note on the
-    /// way out, so the caller never blocks on a session that may still be mid-decode.
+    /// Collect the finished live result for exactly `id`. This is the only blocking join path and runs on
+    /// the pipeline worker; a newer active recording remains untouched. `None` means this recording did not
+    /// have an eligible live session (or its finish verdict was never delivered).
+    pub fn collect(&self, id: &str) -> Option<LiveOutcome> {
+        let session = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.reap_completed();
+            inner.awaiting.remove(id)
+        }?;
+        Some(match session {
+            AwaitingFinish::Running(handle) => join_live_thread(handle),
+            AwaitingFinish::Ready(outcome) => outcome,
+        })
+    }
+
+    /// Deliver a discard verdict and transfer the handle to a tiny detached reaper. Normal discard makes
+    /// the session delete its own note; if the live thread had already failed/panicked and returned a
+    /// partial path, the reaper deletes that path too. The detector never blocks on decode/teardown.
     pub fn discard(&self, id: &str) {
-        self.inner.lock().unwrap().pending.take(); // an un-started tee, if an abort raced oddly
-        if let Some(active) = self.take_active(id) {
-            info!(target: "corti::live", job_id = %id, "discarding live session (detached)");
-            let _ = active.verdict_tx.send(Verdict::Discard);
-        }
+        let active = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.reap_completed();
+            inner.active.take_if(|active| active.id == id)
+        };
+        let Some(active) = active else {
+            return;
+        };
+        info!(target: "corti::live", job_id = %id, "discarding live session");
+        let _ = active.verdict_tx.send(Verdict::Discard);
+        spawn_discard_reaper(id.to_string(), active.handle);
     }
 
-    /// Whether a live session for `id` is still active (not yet finalized or discarded). Guards the
-    /// `LiveNoteCreated` handler against creating a queue row for an already-torn-down session.
-    pub fn is_active(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .active
-            .as_ref()
-            .is_some_and(|a| a.id == id)
-    }
-
-    /// Take the active session out, if `id` matches.
-    fn take_active(&self, id: &str) -> Option<Active> {
+    /// Whether a live note for `id` still belongs to a session that will be collected. Includes a
+    /// finish-delivered session (not just the currently active capture), because its final flush may create
+    /// the first note while `Process` is waiting behind another pipeline job. Discarded sessions are false.
+    pub fn accepts_note(&self, id: &str) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        if inner.active.as_ref().is_some_and(|a| a.id == id) {
-            inner.active.take()
-        } else {
-            None
-        }
+        inner.reap_completed();
+        inner.active.as_ref().is_some_and(|active| active.id == id)
+            || inner.awaiting.contains_key(id)
     }
+}
+
+fn join_live_thread(handle: JoinHandle<LiveOutcome>) -> LiveOutcome {
+    handle.join().unwrap_or_else(|_| LiveOutcome::Fallback {
+        reason: "live transcription thread panicked".to_string(),
+        note_path: None,
+    })
+}
+
+fn spawn_discard_reaper(id: String, handle: JoinHandle<LiveOutcome>) {
+    std::thread::Builder::new()
+        .name("corti-live-reap".into())
+        .spawn(move || {
+            let outcome = join_live_thread(handle);
+            if let Some(path) = outcome.note_path().cloned() {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => info!(
+                        target: "corti::live",
+                        job_id = %id,
+                        note_path = %path.display(),
+                        "deleted partial live note while reaping discarded session"
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => warn!(
+                        target: "corti::live",
+                        job_id = %id,
+                        note_path = %path.display(),
+                        error = %e,
+                        "could not delete partial live note while reaping discarded session"
+                    ),
+                }
+            }
+        })
+        .expect("spawning discarded live-session reaper");
 }
 
 /// The app-side factory the detector consults at every recording start (`corti_detect::LiveHook`).
@@ -267,7 +393,14 @@ impl corti_detect::LiveHook for AppLiveHook {
         }
         let (tx, rx) = sync_channel::<CaptureChunk>(TEE_BACKLOG);
         let tee = CaptureTee::new(tx);
-        self.manager.stash_pending(rx, tee.dropped_counter());
+        if !self.manager.stash_pending(rx, tee.dropped_counter()) {
+            info!(
+                target: "corti::live",
+                app = %app.name,
+                "live filing skipped — the previous model session is still finishing"
+            );
+            return None;
+        }
         Some(tee)
     }
 
@@ -286,16 +419,24 @@ impl corti_detect::LiveHook for AppLiveHook {
         );
     }
 
+    fn finished(&self, meta: &RecordingMeta) {
+        self.manager.finish(&corti_queue::job_id(meta));
+    }
+
+    fn discarded(&self, meta: &RecordingMeta) {
+        self.manager.discard(&corti_queue::job_id(meta));
+    }
+
     fn aborted(&self) {
         self.manager.take_pending();
     }
 
     fn failed(&self, meta: &RecordingMeta) {
-        // Capture could not finish, so no `RecordingFinished`/`Process` will ever finalize this
-        // session — tear it down on the pipeline thread (which also owns any queue row to close).
-        let _ = self.pipe_tx.send(PipelineMsg::LiveDiscarded {
-            id: corti_queue::job_id(meta),
-        });
+        // Capture could not finish, so no `RecordingFinished`/`Process` will follow. Deliver the discard
+        // verdict here on the detector worker before asking the serial pipeline to close any queue row.
+        let id = corti_queue::job_id(meta);
+        self.manager.discard(&id);
+        let _ = self.pipe_tx.send(PipelineMsg::LiveDiscarded { id });
     }
 }
 
@@ -341,12 +482,12 @@ fn session_thread(
     }));
     match result {
         Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => LiveOutcome::Failed {
-            error: format!("{e:#}"),
+        Ok(Err(e)) => LiveOutcome::Fallback {
+            reason: format!("{e:#}"),
             note_path: writer.path().cloned(),
         },
-        Err(_) => LiveOutcome::Failed {
-            error: "live transcription panicked".to_string(),
+        Err(_) => LiveOutcome::Fallback {
+            reason: "live transcription panicked".to_string(),
             note_path: writer.path().cloned(),
         },
     }
@@ -421,7 +562,7 @@ fn run_session(
     };
 
     match verdict_rx.recv() {
-        Ok(Verdict::Finish) => {
+        Ok(Verdict::Finish(quality)) => {
             let p = parts?;
             consumed?;
             finish_session(
@@ -431,6 +572,7 @@ fn run_session(
                 p.them,
                 p.mic_seg,
                 p.them_seg,
+                quality,
                 writer,
             )
         }
@@ -493,8 +635,10 @@ fn append_closed<F: NoteFiler>(
     Ok(())
 }
 
-/// Finalize: AEC tail into the mic transcriber, finish both channels, append the remaining segments
-/// merged by start time, then flip the note's state line in place.
+/// Finish the AEC/transcriber tails and append remaining segments merged by start time. The state line is
+/// flipped only when the detector's terminal quality verdict says the bounded tee was lossless; any drop
+/// leaves the note visibly `transcribing` for the canonical batch rewrite.
+#[allow(clippy::too_many_arguments)] // explicit channel/segment state keeps this model-free test seam small
 fn finish_session<C: LiveChannel, F: NoteFiler>(
     sample_rate: u32,
     mut aec: Option<StreamingAec>,
@@ -502,6 +646,7 @@ fn finish_session<C: LiveChannel, F: NoteFiler>(
     mut them: C,
     mut mic_seg: Segmenter,
     mut them_seg: Segmenter,
+    quality: FinishQuality,
     writer: &mut NoteWriter<F>,
 ) -> Result<LiveOutcome> {
     if let Some(aec) = aec.take() {
@@ -521,7 +666,7 @@ fn finish_session<C: LiveChannel, F: NoteFiler>(
         writer.append_segment(&segment)?;
     }
     match writer.path().cloned() {
-        Some(note_path) => {
+        Some(note_path) if quality.dropped_chunks == 0 => {
             corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
             info!(
                 target: "corti::live",
@@ -530,6 +675,13 @@ fn finish_session<C: LiveChannel, F: NoteFiler>(
             );
             Ok(LiveOutcome::Filed { note_path })
         }
+        Some(note_path) => Ok(LiveOutcome::Fallback {
+            reason: format!(
+                "live capture tee dropped {} chunk(s)",
+                quality.dropped_chunks
+            ),
+            note_path: Some(note_path),
+        }),
         None => Ok(LiveOutcome::NoNote),
     }
 }
@@ -936,8 +1088,17 @@ mod tests {
             "got: {mid_call}"
         );
 
-        let outcome =
-            finish_session(48_000, aec, mic, them, mic_seg, them_seg, &mut writer).unwrap();
+        let outcome = finish_session(
+            48_000,
+            aec,
+            mic,
+            them,
+            mic_seg,
+            them_seg,
+            FinishQuality { dropped_chunks: 0 },
+            &mut writer,
+        )
+        .unwrap();
         let LiveOutcome::Filed { note_path } = outcome else {
             panic!("expected Filed");
         };
@@ -959,6 +1120,51 @@ mod tests {
             "state flipped"
         );
         assert!(!final_content.contains("State: transcribing"));
+    }
+
+    /// A lossy tee still flushes decoder tails, but the result is non-canonical: the note stays visibly
+    /// transcribing and its existing path is returned for the batch rewrite.
+    #[test]
+    fn dropped_chunks_flush_tails_without_flipping_state() {
+        let filer = TempFiler::new("dropped");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        writer
+            .append_segment(&TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: 0.0,
+                end: 0.5,
+                text: "live prefix".into(),
+            })
+            .unwrap();
+
+        let mic = Scripted::new(vec![], vec![word(2.0, 2.5, "flushed tail")]);
+        let them = Scripted::new(vec![], vec![]);
+        let outcome = finish_session(
+            48_000,
+            None,
+            mic,
+            them,
+            Segmenter::new(Speaker::Me),
+            Segmenter::new(Speaker::Other("Them".into())),
+            FinishQuality { dropped_chunks: 3 },
+            &mut writer,
+        )
+        .unwrap();
+
+        let LiveOutcome::Fallback {
+            reason,
+            note_path: Some(note_path),
+        } = outcome
+        else {
+            panic!("a dropped tee must require fallback");
+        };
+        assert_eq!(note_path, note);
+        assert!(reason.contains("3 chunk"), "got: {reason}");
+        let content = read(&note);
+        assert!(content.contains("**[00:02] Me:** flushed tail"));
+        assert!(content.contains("State: transcribing\n"));
+        assert!(!content.contains("State: transcribed \n"));
     }
 
     /// A session with no speech at all creates no note and reports `NoNote` (⇒ batch path).
@@ -991,49 +1197,170 @@ mod tests {
             &mut writer,
         )
         .unwrap();
-        let outcome =
-            finish_session(48_000, aec, mic, them, mic_seg, them_seg, &mut writer).unwrap();
+        let outcome = finish_session(
+            48_000,
+            aec,
+            mic,
+            them,
+            mic_seg,
+            them_seg,
+            FinishQuality { dropped_chunks: 0 },
+            &mut writer,
+        )
+        .unwrap();
         assert!(matches!(outcome, LiveOutcome::NoNote));
         assert!(!note.exists());
     }
 
-    /// `is_active` guards the `LiveNoteCreated` handler: only a matching, not-yet-torn-down session
-    /// counts; `discard` (non-joining) clears it and still delivers the Discard verdict to the thread.
-    #[test]
-    fn is_active_matches_only_live_sessions_and_discard_is_non_joining() {
-        use std::time::Duration;
-
-        let m = LiveManager::new();
-        assert!(!m.is_active("a"));
-
-        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict>();
-        let (probe_tx, probe_rx) = std::sync::mpsc::channel::<&'static str>();
-        let handle = std::thread::spawn(move || {
-            let got = match verdict_rx.recv() {
-                Ok(Verdict::Discard) => "discard",
-                Ok(Verdict::Finish) => "finish",
-                Err(_) => "none",
-            };
-            let _ = probe_tx.send(got);
-            LiveOutcome::NoNote
-        });
-        m.inner.lock().unwrap().active = Some(Active {
-            id: "a".into(),
+    fn install_active(
+        manager: &LiveManager,
+        id: &str,
+        dropped_chunks: u64,
+        run: impl FnOnce(Receiver<Verdict>) -> LiveOutcome + Send + 'static,
+    ) {
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || run(verdict_rx));
+        let replaced = manager.inner.lock().unwrap().active.replace(Active {
+            id: id.to_string(),
             verdict_tx,
             handle,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(dropped_chunks)),
+        });
+        assert!(replaced.is_none());
+    }
+
+    /// Poll the same reservation gate `AppLiveHook::attach` uses. Success also proves every older finishing
+    /// handle was reaped to a small outcome; clear the synthetic pending reservation before installing the
+    /// next test session.
+    fn wait_for_model_slot(manager: &LiveManager) {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (tx, rx) = sync_channel(1);
+            let dropped = Arc::new(AtomicU64::new(0));
+            if manager.stash_pending(rx, dropped) {
+                drop(tx);
+                manager.take_pending();
+                return;
+            }
+            drop(tx);
+            assert!(
+                Instant::now() < deadline,
+                "live model slot never became free"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Reproduce the serial-pipeline race: A receives its finish verdict but collection is blocked; after
+    /// A's thread finishes, B starts. Collecting A by ID must neither finish nor remove B, and A is
+    /// collectable exactly once.
+    #[test]
+    fn delayed_a_collection_does_not_disturb_active_b() {
+        use std::time::Duration;
+
+        let dir = TempFiler::new("delayed-a-b").dir;
+        let note_a = dir.join("a.md");
+        std::fs::write(&note_a, "A").unwrap();
+        let manager = LiveManager::new();
+        let (a_finishing_tx, a_finishing_rx) = std::sync::mpsc::channel();
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::channel();
+        let note_for_a = note_a.clone();
+        install_active(&manager, "a", 0, move |verdicts| {
+            assert!(matches!(
+                verdicts.recv().unwrap(),
+                Verdict::Finish(FinishQuality { dropped_chunks: 0 })
+            ));
+            a_finishing_tx.send(()).unwrap();
+            release_a_rx.recv().unwrap();
+            LiveOutcome::Filed {
+                note_path: note_for_a,
+            }
         });
 
-        assert!(m.is_active("a"));
-        assert!(!m.is_active("b"));
-        m.discard("b"); // wrong id: session untouched
-        assert!(m.is_active("a"));
+        manager.finish("a");
+        a_finishing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(manager.accepts_note("a"));
 
-        m.discard("a"); // returns without joining; the verdict still reaches the thread
-        assert!(!m.is_active("a"));
-        assert_eq!(
-            probe_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "discard"
+        // A is genuinely still flushing: the manager must refuse a second live model.
+        let (blocked_tx, blocked_rx) = sync_channel(1);
+        assert!(!manager.stash_pending(blocked_rx, Arc::new(AtomicU64::new(0))));
+        drop(blocked_tx);
+
+        // Once A has returned, the reservation reaps its handle to a Ready outcome, allowing B to start
+        // even though A's serial pipeline Process remains blocked.
+        release_a_tx.send(()).unwrap();
+        wait_for_model_slot(&manager);
+        install_active(&manager, "b", 0, |verdicts| {
+            assert!(matches!(verdicts.recv().unwrap(), Verdict::Discard));
+            LiveOutcome::NoNote
+        });
+        assert!(manager.accepts_note("b"));
+
+        let Some(LiveOutcome::Filed { note_path }) = manager.collect("a") else {
+            panic!("A's own filed outcome must survive until collection");
+        };
+        assert_eq!(note_path, note_a);
+        assert!(
+            manager.accepts_note("b"),
+            "collecting A must leave B active"
+        );
+        assert!(manager.collect("a").is_none(), "A must be collected once");
+        assert_eq!(read(&note_a), "A", "A must still have exactly its one note");
+        manager.discard("b");
+    }
+
+    /// More than one finish can wait behind the serial pipeline. Outcomes are retained and collected by
+    /// their own IDs rather than overwritten by whichever recording finished most recently.
+    #[test]
+    fn multiple_delayed_finishes_are_collected_by_id() {
+        let manager = LiveManager::new();
+        for id in ["a", "b", "c"] {
+            let path = PathBuf::from(format!("/tmp/{id}.md"));
+            install_active(&manager, id, 0, move |verdicts| {
+                assert!(matches!(verdicts.recv().unwrap(), Verdict::Finish(_)));
+                LiveOutcome::Filed { note_path: path }
+            });
+            manager.finish(id);
+            wait_for_model_slot(&manager);
+        }
+
+        for id in ["b", "a", "c"] {
+            let Some(LiveOutcome::Filed { note_path }) = manager.collect(id) else {
+                panic!("missing outcome for {id}");
+            };
+            assert_eq!(note_path, PathBuf::from(format!("/tmp/{id}.md")));
+        }
+    }
+
+    /// A live thread can fail before it consumes the later Discard verdict. The detached reaper must still
+    /// join that completed handle and remove the partial note path carried by its fallback outcome.
+    #[test]
+    fn discard_reaper_removes_partial_note_from_failed_session() {
+        use std::time::{Duration, Instant};
+
+        let filer = TempFiler::new("discard-failed");
+        let note = filer.note();
+        std::fs::write(&note, "partial").unwrap();
+        let manager = LiveManager::new();
+        let failed_note = note.clone();
+        install_active(&manager, "failed", 0, move |_verdicts| {
+            LiveOutcome::Fallback {
+                reason: "contained panic".to_string(),
+                note_path: Some(failed_note),
+            }
+        });
+
+        manager.discard("failed");
+        assert!(!manager.accepts_note("failed"));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while note.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !note.exists(),
+            "discard reaper left the partial note behind"
         );
     }
 

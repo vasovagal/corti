@@ -42,6 +42,13 @@ pub trait LiveHook: Send + 'static {
     /// Capture started with the tee attached: the definitive meta (with `audio_path`) plus the capture
     /// sample rate (to size a resampler/AEC). Only called when [`attach`](Self::attach) returned `Some`.
     fn started(&self, meta: &RecordingMeta, sample_rate: u32);
+    /// The recording finished successfully. Called after the recorder has closed the tee and before the
+    /// matching [`DetectorEvent::RecordingFinished`] is emitted, so a recording-specific live verdict is
+    /// never delayed behind the serial pipeline.
+    fn finished(&self, _meta: &RecordingMeta) {}
+    /// The recording was discarded below the keep threshold. Called after the recorder closes the tee and
+    /// before [`DetectorEvent::RecordingDiscarded`] is emitted.
+    fn discarded(&self, _meta: &RecordingMeta) {}
     /// [`attach`](Self::attach) returned `Some` but the recorder failed to start — discard any pending
     /// live state; `started` will not be called.
     fn aborted(&self);
@@ -120,6 +127,32 @@ impl Drop for Detector {
             let _ = worker.join();
         }
     }
+}
+
+/// Deliver the live finish verdict and only then expose the terminal event to downstream work. Kept as a
+/// small model/HAL-free seam so the ordering contract has a deterministic regression test.
+fn deliver_finished(
+    live: Option<&dyn LiveHook>,
+    meta: RecordingMeta,
+    audio_path: std::path::PathBuf,
+    emit: impl FnOnce(DetectorEvent),
+) {
+    if let Some(hook) = live {
+        hook.finished(&meta);
+    }
+    emit(DetectorEvent::RecordingFinished { meta, audio_path });
+}
+
+/// Deliver the live discard verdict before exposing the corresponding terminal event.
+fn deliver_discarded(
+    live: Option<&dyn LiveHook>,
+    meta: RecordingMeta,
+    emit: impl FnOnce(DetectorEvent),
+) {
+    if let Some(hook) = live {
+        hook.discarded(&meta);
+    }
+    emit(DetectorEvent::RecordingDiscarded { meta });
 }
 
 /// Create a [`MicMonitor`] bound to the current default input device that forwards transitions as
@@ -288,7 +321,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                         "call ended — recording discarded (below keep threshold)"
                     );
                     recorder.discard();
-                    self.emit(DetectorEvent::RecordingDiscarded { meta });
+                    deliver_discarded(self.live.as_deref(), meta, |event| self.emit(event));
                     return;
                 }
                 match recorder.finish() {
@@ -306,7 +339,11 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             path = %audio_path.display(),
                             "call ended — recording kept"
                         );
-                        self.emit(DetectorEvent::RecordingFinished { meta, audio_path });
+                        // Deliver the recording-specific live verdict before the event callback can queue
+                        // `Process` behind unrelated serial pipeline work.
+                        deliver_finished(self.live.as_deref(), meta, audio_path, |event| {
+                            self.emit(event);
+                        });
                     }
                     Err(e) => {
                         // The recording is over but produced nothing to process: let the live hook
@@ -330,5 +367,78 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
 
     fn emit(&self, event: DetectorEvent) {
         (self.on_event)(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use corti_core::OwningApp;
+
+    use super::*;
+
+    struct OrderedHook(Arc<Mutex<Vec<&'static str>>>);
+
+    impl LiveHook for OrderedHook {
+        fn attach(&self, _app: &OwningApp) -> Option<corti_capture::CaptureTee> {
+            None
+        }
+
+        fn started(&self, _meta: &RecordingMeta, _sample_rate: u32) {}
+
+        fn finished(&self, _meta: &RecordingMeta) {
+            self.0.lock().unwrap().push("finish verdict");
+        }
+
+        fn discarded(&self, _meta: &RecordingMeta) {
+            self.0.lock().unwrap().push("discard verdict");
+        }
+
+        fn aborted(&self) {}
+
+        fn failed(&self, _meta: &RecordingMeta) {}
+    }
+
+    fn meta() -> RecordingMeta {
+        RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
+            audio_path: PathBuf::from("/tmp/corti-ordering.wav"),
+        }
+    }
+
+    #[test]
+    fn terminal_live_verdict_precedes_downstream_event() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let hook = OrderedHook(order.clone());
+
+        let finish_order = order.clone();
+        deliver_finished(
+            Some(&hook),
+            meta(),
+            PathBuf::from("/tmp/corti-ordering.wav"),
+            move |event| {
+                assert!(matches!(event, DetectorEvent::RecordingFinished { .. }));
+                finish_order.lock().unwrap().push("finished event");
+            },
+        );
+        let discard_order = order.clone();
+        deliver_discarded(Some(&hook), meta(), move |event| {
+            assert!(matches!(event, DetectorEvent::RecordingDiscarded { .. }));
+            discard_order.lock().unwrap().push("discarded event");
+        });
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            [
+                "finish verdict",
+                "finished event",
+                "discard verdict",
+                "discarded event"
+            ]
+        );
     }
 }

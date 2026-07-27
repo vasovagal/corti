@@ -427,9 +427,9 @@ pub(crate) mod imp {
                     None,
                 );
                 tray::set_status(app, "Discarded — too short".to_string());
-                // #87: tear down any live session for this recording (it deletes its own partial
-                // note). Handled on the pipeline thread — it owns the queue row LiveNoteCreated may
-                // have made.
+                // #87: the detector's LiveHook already delivered this ID's discard verdict before
+                // emitting the event. The later serial-pipeline message only closes a queue row
+                // LiveNoteCreated may have made (and repeats manager discard idempotently).
                 let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id });
             }
             DetectorEvent::Error(e) => {

@@ -2,8 +2,10 @@
 //!
 //! Watches the mic-in-use signal (`corti_coreaudio::MicMonitor`), debounces transitions, attributes the
 //! owning app + PID (`corti_coreaudio::mic_owner`), and drives a `corti_capture::Recorder`, emitting a
-//! [`DetectorEvent`] when a recording starts or finishes. See `design/01-corti-detect.md` for the full
-//! design (state machine, debounce/coalesce, thread model).
+//! [`DetectorEvent`] when a recording starts or finishes. An installed [`LiveHook`] receives the
+//! recording-specific finish/discard verdict before the matching terminal event, so downstream serial
+//! work cannot delay live-session teardown. See `design/01-corti-detect.md` for the full design (state
+//! machine, debounce/coalesce, thread model).
 //!
 //! The timing logic lives in the platform-independent [`machine`] module (unit-tested without any HAL);
 //! the macOS [`Detector`] wires it to the CoreAudio listeners on a worker thread. The HAL callback runs
