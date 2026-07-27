@@ -185,8 +185,9 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
 - **Fallback — no double notes, ever.** Factory ineligible (config off, non-local backend, models
   missing), no note created (silent call), a live-path error, or a dropped tee chunk ⇒ batch runs. A
   returned partial path is passed directly as the preferred rewrite target and also persisted in the retry
-  payload, so even a queue write/read failure cannot turn it into a fresh note. `rewrite_body` replaces the
-  body in place (same path/inode) and only then persists the path/`Done`. Webinar/manual captures have no
+  payload. The handler repairs row ownership before transcription, missing-audio failure, or exhaustion, so
+  a queue write/read failure cannot turn it into a fresh note. `rewrite_body` replaces the body in place
+  (same path/inode) and only then persists the path/`Done`. Webinar/manual captures have no
   live hook and always take batch.
 - **Discard.** The detector similarly delivers `discarded(meta)` before `RecordingDiscarded`. The live
   thread deletes its partial note; a detached reaper owns contained-failure outcomes. If unlink fails, the

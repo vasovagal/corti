@@ -1,8 +1,8 @@
 //! Background job kinds and handlers — what the pipeline worker's drain loop actually runs.
 //!
-//! Kinds are plain strings persisted in queue.db's `jobs` table (see `corti-jobs`). Payloads carry just
-//! enough to re-find durable state (a recording id): handlers are idempotent re-dispatches over the
-//! `recordings` row, not bearers of state themselves, so replaying one after a crash is always safe.
+//! Kinds are plain strings persisted in queue.db's `jobs` table (see `corti-jobs`). Payloads normally carry
+//! a recording id; a live fallback also carries its preferred note until the recording row confirms
+//! ownership. Handlers remain idempotent re-dispatches over durable state.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -72,20 +72,13 @@ pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) {
     if row.status.is_terminal() {
         return;
     }
-    if let Some(note_path) = preferred_note(&job.payload) {
-        let _ = ctx.queue.update(
-            id,
-            corti_queue::JobUpdate {
-                note_path: Some(note_path),
-                ..Default::default()
-            },
-        );
-    }
-    pipeline::fail(
+    let note_path = preferred_note(&job.payload);
+    pipeline::fail_with_note(
         ctx,
         id,
         &row.meta(),
         format!("gave up after {} attempts: {error}", job.attempts),
+        note_path.as_deref(),
     );
 }
 
@@ -107,13 +100,26 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
         // ADR 0007 keeps no transcript sidecar, so a `PendingNote` re-file has nothing to file from —
         // re-run the whole transcribe→file path from the capture audio, same as a transcription retry.
         JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote => {
+            if let Some(note_path) = preferred_note.as_ref() {
+                // Repair the row before every exit path. If this write fails, return to backoff with the
+                // payload still intact rather than terminally forgetting the only note reference.
+                ctx.queue
+                    .update(
+                        id,
+                        corti_queue::JobUpdate {
+                            note_path: Some(note_path.clone()),
+                            ..Default::default()
+                        },
+                    )
+                    .context("persisting preferred live note from retry payload")?;
+            }
             if !row.audio_path.exists() {
-                // Retrying can't bring the file back: terminal-fail the recording, complete the job.
-                pipeline::fail(
+                pipeline::fail_with_note(
                     ctx,
                     id,
                     &meta,
                     "audio file is gone — cannot transcribe".to_string(),
+                    preferred_note.as_deref(),
                 );
                 return Ok(());
             }

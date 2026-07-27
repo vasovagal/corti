@@ -336,7 +336,7 @@ pub fn run(
                         }
                         Some(crate::live::LiveOutcome::NoNote) | None => {}
                     }
-                    // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
+                    // No durable row exists for terminal failure handling — reset here so
                     // the diagram doesn't sit on Transcribing forever.
                     set_stage(&ctx.app, Stage::Idle);
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
@@ -507,7 +507,7 @@ fn schedule_retry(
     );
     if let Err(e) = enqueue {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
-        fail(ctx, id, meta, msg);
+        fail_with_note(ctx, id, meta, msg, preferred_note);
         return;
     }
     // The job payload is already durable and carries the preferred note path. A simultaneous recording-row
@@ -1081,19 +1081,43 @@ fn prune_transient(raw: &Path, used: &Path) {
     }
 }
 
-/// Terminally fail a recording and surface it in the tray (both the status line and its history
-/// entry). Reserved for unrecoverable states — transient errors go through [`schedule_retry`] /
-/// the retry job's backoff instead.
-pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
+/// Terminally fail a recording and surface it in the tray. A directly-owned fallback note can be supplied
+/// when its earlier row write failed; path + Failed then land in one SQL statement before the note is
+/// forgotten.
+pub(crate) fn fail_with_note(
+    ctx: &Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    msg: String,
+    preferred_note: Option<&Path>,
+) {
     error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
-    // #87: a partial live note for this recording may still read `State: transcribing`; the batch
-    // pass that would have rewritten it is never coming, so close it out.
-    if let Ok(Some(row)) = ctx.queue.get(id)
-        && let Some(note) = row.note_path
-    {
-        close_out_note(&note, &msg);
+    let note_path = preferred_note.map(Path::to_path_buf).or_else(|| {
+        ctx.queue
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.note_path)
+    });
+    if let Some(note) = note_path.as_ref() {
+        close_out_note(note, &msg);
     }
-    let _ = ctx.queue.fail(id, &msg);
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            status: Some(JobStatus::Failed),
+            note_path: note_path.clone(),
+            error: Some(msg.clone()),
+            ..Default::default()
+        },
+    ) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "could not persist terminal recording failure"
+        );
+    }
     set_stage(&ctx.app, Stage::Idle);
     tray::update_history(
         &ctx.app,
@@ -1101,7 +1125,7 @@ pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
         JobStatus::Failed,
         None,
         Some(msg.clone()),
-        None,
+        note_path,
     );
     tray::set_status(&ctx.app, format!("⚠ {} — {msg}", meta.owning_app.name));
 }
