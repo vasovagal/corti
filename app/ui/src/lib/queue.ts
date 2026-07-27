@@ -41,6 +41,11 @@ export function rowState(r: RecordingDto): RowState {
     case "transcribing":
       return { label: "Transcribing…", tone: "progress", action: null };
     case "pending_note":
+      // The transcript checkpoint is durable; only vagus/queue completion is backing off.
+      if (r.retry_pending && r.error) {
+        const attempt = r.retry_attempts ? ` (attempt ${r.retry_attempts}/5)` : "";
+        return { label: `Will retry filing${attempt}: ${r.error}`, tone: "progress", action: null };
+      }
       return { label: "Filing note…", tone: "progress", action: null };
     case "done": {
       if (r.note_path && r.note_exists) {

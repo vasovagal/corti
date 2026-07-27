@@ -6,14 +6,11 @@
 //! dedicated thread keeps it off the Tauri UI loop (guardrail 9). Jobs run serially — fine, since
 //! transcription is inherently sequential and a second call simply waits in the channel.
 //!
-//! ## Durability deferred (ADR 0007), with in-session retry
-//! Crash recovery and retention are intentionally not implemented: the pipeline runs in-process and a crash
-//! or quit mid-call loses *that* call. The `Queue` is kept as a session-spanning record so the tray history
-//! (issue #3) and `corti --list` still work across restarts. What *is* implemented is transient-failure
-//! retry: a transcription/filing failure on the live path doesn't terminally fail — it records the error,
-//! keeps the row at `PendingTranscription` ("will retry"), and schedules a durable `retry_transcription`
-//! background job with backoff (see `crate::jobs`). The captured audio is the only input, so retry is only
-//! possible while it's still on disk (a transcription failure keeps it; once transcribed it is pruned).
+//! ## Durable post-ASR filing boundary
+//! A successful backend result is atomically checkpointed beside the retained raw recording before the row
+//! enters `PendingNote`. Filing retries load that small checkpoint and never rerun ASR; transcription retries
+//! still use the raw audio. The hourly sweep is the only raw-audio deletion authority. Startup narrowly
+//! recovers every valid post-ASR checkpoint; broader first-attempt reconciliation remains deferred.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,13 +19,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use corti_core::{DiarizedTranscript, JobStatus, RecordingMeta};
+use corti_core::{JobStatus, RecordingMeta};
 use corti_jobs::{Backoff, ClaimedJob, FailOutcome};
 use corti_queue::{Job, JobUpdate, Queue};
 use corti_vagus::Vagus;
 use tauri::AppHandle;
 use tracing::{error, info, warn};
 
+use crate::checkpoint::{FilingCheckpoint, path_for as checkpoint_path};
 use crate::imp::{HISTORY_LIMIT, HistoryEntry, Stage, set_stage};
 use crate::settings::SharedConfig;
 use crate::transcribe::Backend;
@@ -44,9 +42,9 @@ const JOB_BACKOFF: Backoff = Backoff {
 /// periodic job can fire when no message wakes the loop sooner.
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
-/// What the pipeline does with a collected live result. Only a zero-drop [`crate::live::LiveOutcome::Filed`] is
-/// canonical; every other result takes the lossless batch path, optionally retaining a partial note to
-/// rewrite in place.
+/// What the pipeline does with a collected live result. Only a zero-drop
+/// [`crate::live::LiveOutcome::Filed`] is canonical; every other result takes the lossless batch path,
+/// optionally retaining a partial note to rewrite in place.
 enum LiveResolution {
     Filed(PathBuf),
     Batch { fallback: Option<LiveFallback> },
@@ -175,6 +173,23 @@ pub fn run(
         Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
         Err(e) => eprintln!("[corti] cannot recover background jobs: {e:#}"),
     }
+    // Narrow first-attempt recovery at the new durable boundary: if the checkpoint exists, ASR is already
+    // done regardless of whether the adjacent PendingNote write committed. Other first-attempt states
+    // remain outside this PR's startup-reconciliation scope.
+    for row in recover_filing_checkpoints(&ctx.queue) {
+        eprintln!(
+            "[corti] recovering durable filing checkpoint for {}",
+            row.id
+        );
+        tray::update_history(
+            &ctx.app,
+            &row.id,
+            JobStatus::PendingNote,
+            None,
+            row.error,
+            row.note_path,
+        );
+    }
     // #87: revive/close out rows stranded at `Recording` by a quit or crash mid-call. Without this
     // they sit non-terminal forever, their notes stay at `State: transcribing`, and the retention
     // sweep (which only matches terminal rows) never reclaims their audio.
@@ -254,10 +269,14 @@ pub fn run(
                     // #87: the detector already delivered this recording's finish verdict before
                     // queuing `Process`. Collect exactly that ID: a canonical, zero-drop live note skips
                     // batch; every other outcome falls back to the lossless WAV. Persist a partial live
-                    // note first so `file_and_done` rewrites the same file instead of double-filing.
+                    // note first so the post-ASR checkpoint owns the same rewrite target.
                     match resolve_live(ctx.live.collect(&id)) {
                         LiveResolution::Filed(note_path) => {
-                            live_filed(&mut ctx, &id, &meta, &audio_path, note_path);
+                            if let Err(e) =
+                                live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
+                            {
+                                schedule_retry(&ctx, &id, &meta, e, Some(&note_path));
+                            }
                         }
                         LiveResolution::Batch { fallback } => {
                             let preferred_note = if let Some(LiveFallback { reason, note_path }) =
@@ -313,7 +332,7 @@ pub fn run(
                         "enqueue failed"
                     );
                     // #87: still collect this recording's already-delivered finish result so its model
-                    // session is released — with no queue row the outcome can only be logged.
+                    // session is released — with no queue row the outcome can only be logged/closed.
                     match ctx.live.collect(&corti_queue::job_id(&meta)) {
                         Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
                             target: "corti::live",
@@ -336,7 +355,7 @@ pub fn run(
                         }
                         Some(crate::live::LiveOutcome::NoNote) | None => {}
                     }
-                    // No durable row exists for terminal failure handling — reset here so
+                    // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
                     // the diagram doesn't sit on Transcribing forever.
                     set_stage(&ctx.app, Stage::Idle);
                     tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
@@ -412,6 +431,9 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
             match ctx.queue.jobs().fail(job, &msg, &JOB_BACKOFF) {
                 Ok(FailOutcome::Rescheduled { next_run_at }) => {
                     eprintln!("[corti]   will retry at {next_run_at}");
+                    if job.kind == crate::jobs::RETRY_TRANSCRIPTION {
+                        record_retry_backoff(ctx, job, &msg);
+                    }
                 }
                 Ok(FailOutcome::Exhausted) => {
                     eprintln!("[corti]   out of attempts — parked as failed");
@@ -430,9 +452,54 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
     }
 }
 
-/// The Queue window's Retry button. Only a `Failed` recording with its audio still on disk qualifies
-/// (the UI greys the button out otherwise, but it can race the pipeline/sweep — re-check here, on the
-/// thread that owns the truth). Old failed-job debris is cleared so the fresh enqueue gets a clean
+fn retry_status(row: &Job, audio: &Path) -> JobStatus {
+    if row.status == JobStatus::PendingNote || FilingCheckpoint::load(audio).is_ok() {
+        JobStatus::PendingNote
+    } else {
+        JobStatus::PendingTranscription
+    }
+}
+
+/// Reflect a durable retry job's backoff on the recording row. A filing failure remains `PendingNote`
+/// because its checkpoint is the recovery input; a transcription failure returns to
+/// `PendingTranscription`. This keeps the Queue window truthful while no attempt is actively running.
+fn record_retry_backoff(ctx: &Ctx, job: &ClaimedJob, error: &str) {
+    let Some(id) = job.payload["id"].as_str() else {
+        return;
+    };
+    let Ok(Some(row)) = ctx.queue.get(id) else {
+        return;
+    };
+    if row.status.is_terminal() {
+        return;
+    }
+    let status = retry_status(&row, &row.audio_path);
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            status: Some(status),
+            error: Some(error.to_string()),
+            ..Default::default()
+        },
+    ) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "could not reflect retry backoff on recording"
+        );
+        return;
+    }
+    tray::update_history(&ctx.app, id, status, None, Some(error.to_string()), None);
+    tray::set_status(
+        &ctx.app,
+        format!("⚠ {} — will retry: {error}", row.owning_app),
+    );
+}
+
+/// The Queue window's Retry button. A `Failed` recording qualifies while either raw audio or a filing
+/// checkpoint survives (the UI normally keys on retained raw audio; re-check here on the owner thread).
+/// Old failed-job debris is cleared so the fresh enqueue gets a clean
 /// slate and a full attempt budget; the loop drains due jobs right after this message, so the retry
 /// starts immediately.
 fn manual_retry(ctx: &mut Ctx, id: &str) {
@@ -450,18 +517,24 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     if row.status != JobStatus::Failed {
         return; // already moving again (raced a resume/retry) — nothing to do
     }
-    if !row.audio_path.exists() {
+    let has_checkpoint = checkpoint_path(&row.audio_path).is_file();
+    if !row.audio_path.exists() && !has_checkpoint {
         tray::set_status(
             &ctx.app,
-            "⚠ can't retry — the audio has already expired".to_string(),
+            "⚠ can't retry — the recovery files have already expired".to_string(),
         );
         return;
     }
+    let retry_status = if has_checkpoint {
+        JobStatus::PendingNote
+    } else {
+        JobStatus::PendingTranscription
+    };
     let _ = ctx.queue.jobs().delete_failed(
         crate::jobs::RETRY_TRANSCRIPTION,
         &crate::jobs::id_payload(id),
     );
-    if let Err(e) = ctx.queue.retry_reset(id) {
+    if let Err(e) = ctx.queue.retry_reset_to(id, retry_status) {
         eprintln!("[corti] cannot reset {id} for retry: {e:#}");
         return;
     }
@@ -474,21 +547,18 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
         return;
     }
-    tray::update_history(
-        &ctx.app,
-        id,
-        JobStatus::PendingTranscription,
-        None,
-        None,
-        None,
-    );
-    tray::set_status(&ctx.app, format!("Retrying — {}…", row.owning_app));
+    tray::update_history(&ctx.app, id, retry_status, None, None, None);
+    let phase = if retry_status == JobStatus::PendingNote {
+        "Retrying filing"
+    } else {
+        "Retrying"
+    };
+    tray::set_status(&ctx.app, format!("{phase} — {}…", row.owning_app));
 }
 
-/// A transcribe/file failure on the live path: don't terminal-fail — record the error, keep the row at
-/// `PendingTranscription` ("will retry" in the UI), and schedule the durable retry job at the first
-/// backoff step. If even that can't be persisted, fall back to a terminal failure so the recording is
-/// never silently stuck.
+/// A transcribe/file failure on the live path: record the error and durably schedule the next phase. The
+/// retry payload owns a live note path before any fallible recording-row update, so a SQLite failure cannot
+/// turn a later batch recovery into a second note.
 fn schedule_retry(
     ctx: &Ctx,
     id: &str,
@@ -498,24 +568,35 @@ fn schedule_retry(
 ) {
     let msg = format!("{err:#}");
     eprintln!("[corti] job {id} failed (will retry): {msg}");
+    let retry_status = ctx
+        .queue
+        .get(id)
+        .ok()
+        .flatten()
+        .map(|row| retry_status(&row, &meta.audio_path))
+        .unwrap_or_else(|| {
+            if FilingCheckpoint::load(&meta.audio_path).is_ok() {
+                JobStatus::PendingNote
+            } else {
+                JobStatus::PendingTranscription
+            }
+        });
     let payload = crate::jobs::retry_payload(id, preferred_note);
-    let enqueue = ctx.queue.jobs().enqueue(
+    if let Err(e) = ctx.queue.jobs().enqueue(
         crate::jobs::RETRY_TRANSCRIPTION,
         &payload,
         crate::jobs::RETRY_MAX_ATTEMPTS,
         Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
-    );
-    if let Err(e) = enqueue {
+    ) {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
         fail_with_note(ctx, id, meta, msg, preferred_note);
         return;
     }
-    // The job payload is already durable and carries the preferred note path. A simultaneous recording-row
-    // write failure therefore cannot erase the no-double-note authority; the retry can repair it later.
+    // The retry job is already durable. A row update failure must not terminally fail and invalidate it.
     if let Err(e) = ctx.queue.update(
         id,
         JobUpdate {
-            status: Some(JobStatus::PendingTranscription),
+            status: Some(retry_status),
             note_path: preferred_note.map(Path::to_path_buf),
             error: Some(msg.clone()),
             ..Default::default()
@@ -528,53 +609,56 @@ fn schedule_retry(
             "retry job persisted but recording backoff state could not be updated"
         );
     }
-    tray::update_history(
-        &ctx.app,
-        id,
-        JobStatus::PendingTranscription,
-        None,
-        Some(msg.clone()),
-        None,
-    );
+    tray::update_history(&ctx.app, id, retry_status, None, Some(msg.clone()), None);
     tray::set_status(
         &ctx.app,
         format!("⚠ {} — will retry: {msg}", meta.owning_app.name),
     );
-    // The attempt is over; the recording now waits in backoff until the retry job fires. Nothing is
-    // actively running, so the diagram returns to Idle.
     set_stage(&ctx.app, Stage::Idle);
 }
 
 /// #87 happy path: the live session already wrote the whole note and flipped its state line, so the
-/// job goes straight to `Done` — batch transcription is skipped. The WAV was still written by the
-/// capture writer (the tee is a tee), so the transient prune runs exactly as on the batch path.
-fn live_filed(ctx: &mut Ctx, id: &str, meta: &RecordingMeta, audio: &Path, note: PathBuf) {
+/// job goes straight to `Done` and batch transcription is skipped. Completion is one fallible SQL update;
+/// raw audio remains under the configured retention policy and is also the fallback if completion fails.
+fn live_filed(
+    ctx: &mut Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    audio: &Path,
+    note: &Path,
+) -> Result<()> {
     info!(
         target: "corti::pipeline",
         job_id = %id,
         note_path = %note.display(),
+        audio_path = %audio.display(),
         "note filed live during the recording — skipping batch transcription"
     );
-    prune_transient(audio, &corti_capture::clean_wav_path(audio));
-    // Same crash-safe ordering as file_and_done: persist note_path first, then mark Done.
-    if let Err(e) = ctx.queue.update(
+    // The note can first be created during the final live flush, after its asynchronous
+    // `LiveNoteCreated` message. The caller keeps this path in the retry payload if either write fails.
+    ctx.queue
+        .update(
+            id,
+            JobUpdate {
+                note_path: Some(note.to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .context("persisting live note path before completion")?;
+    ctx.queue
+        .complete_with_note(id, note)
+        .context("persisting live note completion")?;
+    tray::update_history(
+        &ctx.app,
         id,
-        JobUpdate {
-            note_path: Some(note.clone()),
-            ..Default::default()
-        },
-    ) {
-        warn!(
-            target: "corti::pipeline",
-            job_id = %id,
-            error = %format!("{e:#}"),
-            "live note filed but could not persist note_path"
-        );
-    }
-    let _ = ctx.queue.set_status(id, JobStatus::Done);
-    tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(note));
+        JobStatus::Done,
+        None,
+        None,
+        Some(note.to_path_buf()),
+    );
     set_stage(&ctx.app, Stage::Idle);
     tray::set_status(&ctx.app, format!("✓ Filed — {}", meta.note_title()));
+    Ok(())
 }
 
 /// #87: persist a just-created live note's path. Mid-recording there is no queue row yet, so one is
@@ -730,6 +814,52 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     );
 }
 
+/// At startup, schedule only rows that have crossed the durable post-ASR boundary. This intentionally
+/// does not broaden into reconciliation of every first-attempt state: a valid checkpoint is the proof that
+/// filing alone is safe, even if the row still says Transcribing because the adjacent write failed.
+fn recover_filing_checkpoints(queue: &Queue) -> Vec<Job> {
+    let rows = match queue.resumable() {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("[corti] cannot scan for durable filing checkpoints: {err:#}");
+            return Vec::new();
+        }
+    };
+    let mut recovered = Vec::new();
+    for row in rows.into_iter().filter(|row| {
+        matches!(
+            row.status,
+            JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote
+        ) && FilingCheckpoint::load(&row.audio_path).is_ok()
+    }) {
+        // Enqueue first. If the following status repair fails, the handler still recognizes the checkpoint
+        // from any nonterminal transcription state and promotes it itself.
+        let enqueued = queue.jobs().enqueue(
+            crate::jobs::RETRY_TRANSCRIPTION,
+            &crate::jobs::id_payload(&row.id),
+            crate::jobs::RETRY_MAX_ATTEMPTS,
+            Utc::now(),
+        );
+        let promoted = enqueued.and_then(|_| {
+            queue.update(
+                &row.id,
+                JobUpdate {
+                    status: Some(JobStatus::PendingNote),
+                    ..Default::default()
+                },
+            )
+        });
+        match promoted {
+            Ok(()) => recovered.push(row),
+            Err(err) => eprintln!(
+                "[corti] cannot resume filing checkpoint for {}: {err:#}",
+                row.id
+            ),
+        }
+    }
+    recovered
+}
+
 /// Outcome of reaping one row stranded at `Recording`.
 enum Reaped {
     /// Audio still on disk — reset to `PendingTranscription` with a due-now durable retry (which
@@ -854,9 +984,9 @@ fn history_entry_from_job(job: &Job) -> HistoryEntry {
     }
 }
 
-/// Transcribe `audio`, then file it. Used for both fresh recordings and retry-job re-runs. Errors are
-/// returned to the caller — the live path schedules the durable retry, the retry job applies its backoff
-/// — never terminally failed here.
+/// Transcribe `audio`, durably checkpoint the backend result, then file it. Used for fresh recordings
+/// and transcription retry-job runs. Once `PendingNote` is committed, later retries use
+/// [`file_checkpoint`] and never invoke the backend again.
 pub(crate) fn transcribe_and_file(
     ctx: &mut Ctx,
     id: &str,
@@ -864,18 +994,40 @@ pub(crate) fn transcribe_and_file(
     audio: &Path,
     preferred_note: Option<&Path>,
 ) -> Result<()> {
-    // Record the stable Transcribe job name + advance to Transcribing before transcribing.
+    // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
+    // transition failed (or the process died between them). Treat it as authoritative from every dispatch
+    // path, including a duplicate first-attempt Process message.
+    if FilingCheckpoint::load(audio).is_ok() {
+        ctx.queue
+            .update(
+                id,
+                JobUpdate {
+                    status: Some(JobStatus::PendingNote),
+                    ..Default::default()
+                },
+            )
+            .context("promoting durable checkpoint to PendingNote")?;
+        return file_checkpoint(ctx, id, meta, audio);
+    }
+
+    // Reuse the persisted stable Transcribe name across retries. Legacy PendingNote recovery writes a new
+    // compatibility name first; ordinary recordings default to their id.
+    let transcribe_job = ctx
+        .queue
+        .get(id)
+        .context("reading transcription attempt")?
+        .and_then(|row| row.transcribe_job)
+        .unwrap_or_else(|| id.to_string());
     ctx.queue
         .update(
             id,
             JobUpdate {
                 status: Some(JobStatus::Transcribing),
-                transcribe_job: Some(id.to_string()),
+                transcribe_job: Some(transcribe_job.clone()),
                 ..Default::default()
             },
         )
         .context("queue update before transcribe")?;
-    // An attempt is now actively running — both the live path and a retry job land here.
     set_stage(&ctx.app, Stage::Transcribing);
     tray::set_status(
         &ctx.app,
@@ -883,31 +1035,40 @@ pub(crate) fn transcribe_and_file(
     );
     tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
-    // Run the shared transcription core: AEC (speaker-bleed removal) → backend. The pipeline's input is the
-    // lossless 2-track capture, so `skip_aec` is false; a tap-only recording is handled inside (`Ok(None)`).
-    // Only a real transcription failure returns `Err` here. On failure we keep the capture audio so the
-    // durable retry job can re-run it (the lossless 2-track on disk is the only copy).
+    // Run AEC + backend from the retained raw recording. Pipeline AWS attempts use the row's stable name;
+    // one-shot CLI calls deliberately pass no stable name.
     let t0 = std::time::Instant::now();
     let transcribed = crate::transcribe::transcribe_recording(
         &ctx.backend,
         ctx.aec_enabled,
         false,
         &ctx.aec_config,
-        id,
+        crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
         meta,
         audio,
     );
-    // Record the wall-clock of the transcribe (AEC + backend) stage on both success and failure. For the
-    // AWS backend this is poll-sleep I/O-wait; for local it is CPU — the backend label distinguishes them.
     ctx.stats
         .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
     let transcribe_secs = t0.elapsed().as_secs_f64();
-    let (transcript, input) = transcribed.context("transcription failed")?;
-    // ADR 0007 (no retention): the capture audio is a **transient** intermediate, kept only long enough to
-    // transcribe. Delete it — and the cleaned sibling AEC produced, when distinct — now that the transcript
-    // is in hand. (Only reached on success; a transcription failure above returns early and keeps the audio
-    // so the retry job can re-run it.)
-    prune_transient(audio, &input);
+    let (transcript, _input) = transcribed.context("transcription failed")?;
+
+    // A partial live note may already exist. The recording-scoped outcome is authoritative when supplied:
+    // checkpoint it directly so a second queue read failure cannot lose ownership after expensive ASR.
+    let note_path = match preferred_note {
+        Some(path) => Some(path.to_path_buf()),
+        None => ctx
+            .queue
+            .get(id)
+            .context("reading recording before checkpoint")?
+            .and_then(|row| row.note_path),
+    };
+    let aws_staging = ctx
+        .backend
+        .aws_staging_for_checkpoint(&transcribe_job)
+        .context("describing staged AWS objects for checkpoint")?;
+    FilingCheckpoint::new(transcript, note_path, aws_staging)
+        .store(audio)
+        .context("persisting transcript checkpoint")?;
 
     ctx.queue
         .update(
@@ -919,169 +1080,180 @@ pub(crate) fn transcribe_and_file(
             },
         )
         .context("queue set PendingNote")?;
+
+    file_checkpoint(ctx, id, meta, audio)
+}
+
+/// Load a durable transcript checkpoint and run only the filing stage. On success the raw recording stays
+/// under retention, while the reproducible clean WAV and checkpoint are removed.
+pub(crate) fn file_checkpoint(
+    ctx: &mut Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    audio: &Path,
+) -> Result<()> {
+    let mut checkpoint = FilingCheckpoint::load(audio).context("loading transcript checkpoint")?;
     set_stage(&ctx.app, Stage::Filing);
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
-    // File stage (vagus filing). No backend dimension; label "vagus".
+    tray::set_status(&ctx.app, format!("Filing note — {}…", meta.owning_app.name));
+
+    // Cloud objects stopped being recovery inputs once the checkpoint was durable, but their privacy
+    // cleanup is not best-effort. Use the checkpoint's original bucket/prefix/name even if runtime settings
+    // now select local transcription, then durably clear the marker so later filing retries need no AWS.
+    if let Some(staging) = checkpoint.aws_staging.clone() {
+        ctx.backend
+            .cleanup_after_checkpoint(&staging)
+            .context("cleaning staged AWS objects after checkpoint")?;
+        checkpoint.aws_staging = None;
+        checkpoint
+            .store(audio)
+            .context("persisting completed AWS cleanup in checkpoint")?;
+    }
+
     let tf = std::time::Instant::now();
-    let result = file_and_done(ctx, id, meta, &transcript, preferred_note);
+    let result = file_and_done(ctx, id, meta, audio, &mut checkpoint);
     ctx.stats.record_stage("file", tf.elapsed(), "vagus");
+    if result.is_ok() {
+        cleanup_completed_artifacts(audio);
+    }
     result
 }
 
-/// Rewrite a queue-authoritative live note with the canonical batch body. `rewrite_body` truncates/writes
-/// the existing file rather than renaming over it, preserving both its path and inode. A missing/deleted
-/// note returns `None` so the caller can file a fresh one.
-fn rewrite_existing_note(
-    queue: &Queue,
-    id: &str,
+/// Rewrite an existing live note from the durable checkpoint. The checkpoint path wins over the row so a
+/// filing retry remains recording-scoped even if a later row read/write failed. Rewriting preserves the
+/// note's path and inode; a missing path returns `None` so normal vagus filing can create a replacement.
+fn rewrite_checkpoint_note(
     meta: &RecordingMeta,
-    transcript: &DiarizedTranscript,
-    preferred_note: Option<&Path>,
+    checkpoint: &FilingCheckpoint,
+    queued_note: Option<PathBuf>,
 ) -> Result<Option<PathBuf>> {
-    let preferred = preferred_note
+    let existing = checkpoint
+        .note_path
+        .clone()
         .filter(|path| path.exists())
-        .map(Path::to_path_buf);
-    let queued = if preferred.is_none() {
-        queue
-            .get(id)
-            .context("reading recording before existing-note rewrite")?
-            .and_then(|row| row.note_path)
-            .filter(|path| path.exists())
-    } else {
-        None
-    };
-    let Some(existing) = preferred.or(queued) else {
+        .or_else(|| queued_note.filter(|path| path.exists()));
+    let Some(existing) = existing else {
         return Ok(None);
     };
-    corti_vagus::note::rewrite_body(&existing, &corti_vagus::recording_body(meta, transcript))
-        .context("rewriting the existing note")?;
+    corti_vagus::note::rewrite_body(
+        &existing,
+        &corti_vagus::recording_body(meta, &checkpoint.transcript),
+    )
+    .context("rewriting the existing note")?;
     Ok(Some(existing))
 }
 
-/// File the transcript into vagus and mark the job `Done`. Returns `Err` on a filing failure so the caller
-/// can schedule a retry rather than terminally failing.
+/// File the checkpointed transcript and atomically commit `note_path + Done`. The checkpoint is updated
+/// with a newly returned note path before the SQL completion attempt, so a queue failure retries the same
+/// note rather than invoking `vagus add-note` again.
 fn file_and_done(
     ctx: &mut Ctx,
     id: &str,
     meta: &RecordingMeta,
-    transcript: &DiarizedTranscript,
-    preferred_note: Option<&Path>,
+    audio: &Path,
+    checkpoint: &mut FilingCheckpoint,
 ) -> Result<()> {
-    // #87: a note may already exist for this recording — a partial/non-canonical live note, or a
-    // fully-filed one re-reached by crash recovery. The queue's note_path is the no-double-notes authority.
-    if let Some(existing) = rewrite_existing_note(&ctx.queue, id, meta, transcript, preferred_note)?
-    {
+    let queued_note = ctx
+        .queue
+        .get(id)
+        .context("reading recording before filing")?
+        .and_then(|row| row.note_path);
+
+    let note = if let Some(existing) = rewrite_checkpoint_note(meta, checkpoint, queued_note)? {
         info!(
             target: "corti::pipeline",
             job_id = %id,
             note_path = %existing.display(),
             "batch transcript rewrote the existing note in place"
         );
-        ctx.queue
-            .update(
-                id,
-                JobUpdate {
-                    note_path: Some(existing.clone()),
-                    ..Default::default()
-                },
-            )
-            .context("persisting rewritten live note path")?;
-        ctx.queue
-            .set_status(id, JobStatus::Done)
-            .context("marking rewritten live note Done")?;
-        let title = meta.note_title();
-        tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(existing));
-        set_stage(&ctx.app, Stage::Idle);
-        tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
-        return Ok(());
-    }
-
-    // Startup discovery may have failed only because vagus wasn't installed yet — `brew install vagus`
-    // mid-session is the expected fix, and a tray app shouldn't need a relaunch to notice. Retry once
-    // per filing attempt: one `vagus --version` spawn, only on the filing path of a concluded recording,
-    // so effectively free. A fresh failure replaces the cached error so the tray always reports current
-    // reality, not the state at app launch.
-    if ctx.vagus.is_err() {
-        ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
-        if let Ok(v) = &ctx.vagus {
-            info!(
-                target: "corti::pipeline",
-                bin = %v.bin().display(),
-                "vagus now available — filing enabled"
-            );
+        existing
+    } else {
+        // Startup discovery may have failed only because vagus was not installed yet. Re-probe on every
+        // filing attempt so installing it during backoff does not require relaunching Corti.
+        if ctx.vagus.is_err() {
+            ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
+            if let Ok(v) = &ctx.vagus {
+                info!(
+                    target: "corti::pipeline",
+                    bin = %v.bin().display(),
+                    "vagus now available — filing enabled"
+                );
+            }
         }
-    }
-    let vagus = match &ctx.vagus {
-        Ok(v) => v,
-        Err(e) => anyhow::bail!("vagus unavailable: {e}"),
+        let vagus = match &ctx.vagus {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!("vagus unavailable: {e}"),
+        };
+        let note = vagus
+            .file_recording(meta, &checkpoint.transcript)
+            .context("filing note failed")?;
+        info!(
+            target: "corti::pipeline",
+            job_id = %id,
+            note_path = %note.display(),
+            "note filed"
+        );
+        note
     };
 
-    let note = vagus
-        .file_recording(meta, transcript)
-        .context("filing note failed")?;
-    info!(
-        target: "corti::pipeline",
-        job_id = %id,
-        note_path = %note.display(),
-        "note filed"
-    );
+    checkpoint.note_path = Some(note.clone());
+    let checkpoint_write = checkpoint
+        .store(audio)
+        .context("persisting returned note path in transcript checkpoint");
+    let completion = ctx
+        .queue
+        .complete_with_note(id, &note)
+        .context("persisting note path and Done status");
 
-    // Record the note path first (so a crash here doesn't re-file), then mark Done.
-    if let Err(e) = ctx.queue.update(
-        id,
-        JobUpdate {
-            note_path: Some(note.clone()),
-            ..Default::default()
-        },
-    ) {
-        warn!(
+    match (checkpoint_write, completion) {
+        (Ok(()), Ok(())) => {}
+        // The database is the durable authority once this succeeds; a checkpoint rewrite failure is no
+        // longer dangerous and the successful cleanup below removes the stale checkpoint.
+        (Err(e), Ok(())) => warn!(
             target: "corti::pipeline",
             job_id = %id,
             error = %format!("{e:#}"),
-            "note filed but could not persist note_path"
-        );
+            "recording completed but returned note path was not refreshed in checkpoint"
+        ),
+        (Ok(()), Err(e)) => return Err(e),
+        (Err(checkpoint_err), Err(queue_err)) => {
+            return Err(anyhow::anyhow!(
+                "checkpointing returned note path failed: {checkpoint_err:#}; queue completion failed: {queue_err:#}"
+            ));
+        }
     }
-    let _ = ctx.queue.set_status(id, JobStatus::Done);
 
     let title = meta.note_title();
-    tray::update_history(
-        &ctx.app,
-        id,
-        JobStatus::Done,
-        None,
-        None,
-        Some(note.clone()),
-    );
+    tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(note));
     set_stage(&ctx.app, Stage::Idle);
     tray::set_status(&ctx.app, format!("✓ Filed — {title}"));
     Ok(())
 }
 
-/// Delete the transient capture audio (and the AEC-cleaned sibling, when distinct) after a successful
-/// transcription. ADR 0007 defers retention: the captured audio exists only to be transcribed, so once the
-/// transcript is filed there is nothing left to keep. Best-effort — a leftover file is a disk nuisance, not
-/// a correctness problem, so failures are only logged.
-fn prune_transient(raw: &Path, used: &Path) {
-    for p in [used, raw] {
-        if p.exists() {
-            match std::fs::remove_file(p) {
-                Ok(()) => info!(
-                    target: "corti::pipeline",
-                    path = %p.display(),
-                    "pruned transient capture audio"
-                ),
-                Err(e) => warn!(
-                    target: "corti::pipeline",
-                    path = %p.display(),
-                    error = %e,
-                    "could not remove transient capture audio"
-                ),
-            }
+/// Completion cleanup has one authority: keep the raw recording for the configured sweep, but remove
+/// reproducible/transient derivatives. Failures are logged and the sweep retries all of these paths later.
+fn cleanup_completed_artifacts(raw: &Path) {
+    for path in [corti_capture::clean_wav_path(raw), checkpoint_path(raw)] {
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                target: "corti::pipeline",
+                path = %path.display(),
+                "removed completed pipeline derivative"
+            ),
+            Err(e) => warn!(
+                target: "corti::pipeline",
+                path = %path.display(),
+                error = %e,
+                "could not remove completed pipeline derivative"
+            ),
         }
     }
 }
 
-/// Terminally fail a recording and surface it in the tray. A directly-owned fallback note can be supplied
+/// Terminally fail a recording and surface it in the tray. A directly-owned live note can be supplied
 /// when its earlier row write failed; path + Failed then land in one SQL statement before the note is
 /// forgotten.
 pub(crate) fn fail_with_note(
@@ -1133,7 +1305,7 @@ pub(crate) fn fail_with_note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corti_core::{OwningApp, Speaker, TranscriptSegment};
+    use corti_core::{DiarizedTranscript, OwningApp, Speaker, TranscriptSegment};
     use std::os::unix::fs::MetadataExt;
 
     fn test_dir(name: &str) -> PathBuf {
@@ -1151,6 +1323,170 @@ mod tests {
             owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
             audio_path: audio,
         }
+    }
+
+    #[test]
+    fn startup_recovers_only_valid_post_asr_checkpoints() {
+        let dir = test_dir("checkpoint-startup-recovery");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+
+        let add = |name: &str, status: JobStatus, checkpoint: bool| {
+            let audio = dir.join(format!("{name}.wav"));
+            std::fs::write(&audio, b"raw").unwrap();
+            let id = queue.enqueue(&meta(audio.clone())).unwrap();
+            queue.set_status(&id, status).unwrap();
+            if checkpoint {
+                FilingCheckpoint::new(DiarizedTranscript::new(Vec::new()), None, None)
+                    .store(&audio)
+                    .unwrap();
+            }
+            id
+        };
+        let transcribing = add("transcribing", JobStatus::Transcribing, true);
+        let pending_note = add("pending-note", JobStatus::PendingNote, true);
+        let no_checkpoint = add("no-checkpoint", JobStatus::Transcribing, false);
+        let done = add("done", JobStatus::Done, true);
+
+        let mut recovered = recover_filing_checkpoints(&queue)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        recovered.sort();
+        let mut expected = vec![transcribing.clone(), pending_note.clone()];
+        expected.sort();
+        assert_eq!(recovered, expected);
+        for id in [&transcribing, &pending_note] {
+            assert_eq!(
+                queue.get(id).unwrap().unwrap().status,
+                JobStatus::PendingNote
+            );
+        }
+        assert_eq!(
+            queue.get(&no_checkpoint).unwrap().unwrap().status,
+            JobStatus::Transcribing
+        );
+        assert_eq!(queue.get(&done).unwrap().unwrap().status, JobStatus::Done);
+        assert_eq!(
+            queue
+                .jobs()
+                .active_for(crate::jobs::RETRY_TRANSCRIPTION)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Active-job deduplication makes the startup scan idempotent.
+        assert_eq!(recover_filing_checkpoints(&queue).len(), 2);
+        assert_eq!(
+            queue
+                .jobs()
+                .active_for(crate::jobs::RETRY_TRANSCRIPTION)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn completion_cleanup_retains_raw_and_removes_only_derivatives() {
+        let dir = test_dir("completion-cleanup");
+        let raw = dir.join("recording.wav");
+        let clean = corti_capture::clean_wav_path(&raw);
+        let checkpoint = checkpoint_path(&raw);
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::write(&clean, b"clean").unwrap();
+        std::fs::write(&checkpoint, b"checkpoint").unwrap();
+
+        cleanup_completed_artifacts(&raw);
+
+        assert!(raw.exists(), "raw audio belongs to the retention sweep");
+        assert!(!clean.exists(), "clean WAV is reproducible");
+        assert!(
+            !checkpoint.exists(),
+            "Done no longer needs a filing checkpoint"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Cross-feature regression: a dropped live result owns its partial note directly; once batch ASR
+    /// crosses the durable checkpoint, filing can recover with no raw audio and rewrites that exact inode.
+    #[test]
+    fn dropped_live_fallback_retries_from_checkpoint_and_rewrites_same_inode() {
+        let dir = test_dir("dropped-live-checkpoint");
+        let raw = dir.join("recording.wav");
+        let meta = meta(raw.clone());
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta).unwrap();
+        let note = dir.join("live.md");
+        std::fs::write(
+            &note,
+            format!(
+                "---\nsource: x\n---\n\n# T\n\n{}",
+                corti_vagus::live_initial_body(&meta)
+            ),
+        )
+        .unwrap();
+        let inode_before = std::fs::metadata(&note).unwrap().ino();
+
+        let LiveResolution::Batch {
+            fallback:
+                Some(LiveFallback {
+                    reason,
+                    note_path: Some(preferred_note),
+                }),
+        } = resolve_live(Some(crate::live::LiveOutcome::Fallback {
+            reason: "live capture tee dropped 2 chunk(s)".to_string(),
+            note_path: Some(note.clone()),
+        }))
+        else {
+            panic!("a dropped live result must take the batch path");
+        };
+        assert!(reason.contains("dropped 2"));
+        queue
+            .update(
+                &id,
+                JobUpdate {
+                    note_path: Some(preferred_note.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 0.0,
+            end: 1.0,
+            text: "canonical batch text".to_string(),
+        }]);
+        FilingCheckpoint::new(transcript, Some(preferred_note), None)
+            .store(&raw)
+            .unwrap();
+        queue.set_status(&id, JobStatus::PendingNote).unwrap();
+        assert!(!raw.exists(), "filing recovery must not require raw audio");
+
+        let mut checkpoint = FilingCheckpoint::load(&raw).unwrap();
+        let queued_note = queue.get(&id).unwrap().unwrap().note_path;
+        let rewritten = rewrite_checkpoint_note(&meta, &checkpoint, queued_note)
+            .unwrap()
+            .expect("checkpoint must retain the live rewrite target");
+        assert_eq!(rewritten, note);
+        assert_eq!(std::fs::metadata(&note).unwrap().ino(), inode_before);
+        let content = std::fs::read_to_string(&note).unwrap();
+        assert!(content.contains("State: transcribed \n"), "got: {content}");
+        assert!(content.contains("canonical batch text"), "got: {content}");
+
+        checkpoint.note_path = Some(rewritten.clone());
+        checkpoint.store(&raw).unwrap();
+        queue.complete_with_note(&id, &rewritten).unwrap();
+        let done = queue.get(&id).unwrap().unwrap();
+        assert_eq!(done.status, JobStatus::Done);
+        assert_eq!(done.note_path.as_deref(), Some(note.as_path()));
+
+        cleanup_completed_artifacts(&raw);
+        assert!(!checkpoint_path(&raw).exists());
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// #87 startup reaper: a `Recording` row with audio on disk is revived (PendingTranscription +
@@ -1229,62 +1565,6 @@ mod tests {
 
         // Idempotent: nothing left at Recording.
         assert!(reap_recording_rows(&queue).is_empty());
-    }
-
-    /// A dropped live result is never accepted as Filed. Its existing note path is carried directly into
-    /// the batch branch and rewritten canonically without changing the file/inode, even if queue persistence
-    /// did not land first.
-    #[test]
-    fn dropped_live_result_routes_to_batch_and_rewrites_same_inode() {
-        let dir = test_dir("dropped-live-fallback");
-        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
-        let meta = meta(dir.join("recording.wav"));
-        let id = queue.enqueue(&meta).unwrap();
-        let note = dir.join("live.md");
-        std::fs::write(
-            &note,
-            format!(
-                "---\nsource: x\n---\n\n# T\n\n{}",
-                corti_vagus::live_initial_body(&meta)
-            ),
-        )
-        .unwrap();
-        let inode_before = std::fs::metadata(&note).unwrap().ino();
-
-        let resolution = resolve_live(Some(crate::live::LiveOutcome::Fallback {
-            reason: "live capture tee dropped 2 chunk(s)".to_string(),
-            note_path: Some(note.clone()),
-        }));
-        let LiveResolution::Batch {
-            fallback:
-                Some(LiveFallback {
-                    reason,
-                    note_path: Some(partial),
-                }),
-        } = resolution
-        else {
-            panic!("a dropped live result must take the batch branch");
-        };
-        assert!(reason.contains("dropped 2"));
-        // Simulate the reviewed failure: the queue write did not land. The in-memory/persisted-retry
-        // preferred path must still be sufficient to rewrite this exact note.
-        assert_eq!(queue.get(&id).unwrap().unwrap().note_path, None);
-
-        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
-            speaker: Speaker::Me,
-            start: 0.0,
-            end: 1.0,
-            text: "canonical batch text".to_string(),
-        }]);
-        let rewritten = rewrite_existing_note(&queue, &id, &meta, &transcript, Some(&partial))
-            .unwrap()
-            .expect("the persisted partial note must be rewritten");
-        assert_eq!(rewritten, note);
-        assert_eq!(std::fs::metadata(&note).unwrap().ino(), inode_before);
-        let content = std::fs::read_to_string(&note).unwrap();
-        assert!(content.contains("State: transcribed \n"), "got: {content}");
-        assert!(!content.contains("State: transcribing\n"));
-        assert!(content.contains("canonical batch text"));
     }
 
     /// #87: a late `LiveNoteCreated` must never regress an existing row's tray status (a short

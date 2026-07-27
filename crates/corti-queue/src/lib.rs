@@ -206,6 +206,32 @@ impl Queue {
         Ok(())
     }
 
+    /// Atomically persist the filed note path and transition the recording to `Done` in one SQL update.
+    /// A failure leaves both fields unchanged, so callers must not report success or delete recovery inputs.
+    pub fn complete_with_note(&self, id: &str, note_path: &Path) -> Result<()> {
+        let done = status_to_string(JobStatus::Done);
+        let note = note_path.to_string_lossy().into_owned();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE recordings
+                 SET note_path = ?2, status = ?3, error = NULL, updated_at = ?4
+                 WHERE id = ?1",
+                params![id, note, done, fmt_dt(Local::now())],
+            )
+            .context("completing recording with note")?;
+        if n == 0 {
+            bail!("no recording with id {id}");
+        }
+        tracing::debug!(
+            target: "corti::queue",
+            job_id = %id,
+            note_path = %note_path.display(),
+            "complete_with_note"
+        );
+        Ok(())
+    }
+
     /// Apply a partial [`JobUpdate`] atomically (only `Some` fields change; `updated_at` always bumps).
     pub fn update(&self, id: &str, fields: JobUpdate) -> Result<()> {
         let status = fields.status.map(status_to_string);
@@ -253,10 +279,15 @@ impl Queue {
         Ok(())
     }
 
-    /// Reset a `Failed` recording for a (manual) retry: status back to `PendingTranscription` with the
-    /// error **cleared** — the COALESCE-based [`update`](Queue::update) can't NULL a field, hence the
-    /// dedicated method. Errors if the row isn't currently `Failed` (the UI races the pipeline).
-    pub fn retry_reset(&self, id: &str) -> Result<()> {
+    /// Reset a `Failed` recording for a manual retry, clearing its error. `PendingNote` is permitted when
+    /// a durable filing checkpoint survived; all other retries restart at `PendingTranscription`.
+    pub fn retry_reset_to(&self, id: &str, status: JobStatus) -> Result<()> {
+        if !matches!(
+            status,
+            JobStatus::PendingTranscription | JobStatus::PendingNote
+        ) {
+            bail!("manual retry cannot reset to {status:?}");
+        }
         let n = self
             .conn
             .execute(
@@ -264,7 +295,7 @@ impl Queue {
                  WHERE id = ?1 AND status = ?4",
                 params![
                     id,
-                    status_to_string(JobStatus::PendingTranscription),
+                    status_to_string(status),
                     fmt_dt(Local::now()),
                     status_to_string(JobStatus::Failed),
                 ],
@@ -274,6 +305,11 @@ impl Queue {
             bail!("no Failed recording with id {id}");
         }
         Ok(())
+    }
+
+    /// Backward-compatible transcription retry reset.
+    pub fn retry_reset(&self, id: &str) -> Result<()> {
+        self.retry_reset_to(id, JobStatus::PendingTranscription)
     }
 
     /// Mark a job `Failed` with an error message (convenience over [`update`](Queue::update)).
@@ -334,10 +370,30 @@ impl Queue {
         raws.into_iter().map(raw_to_job).collect()
     }
 
+    /// Delete one terminal (`Done` | `Failed`) row after its caller has confirmed that every associated
+    /// artifact is absent. Non-terminal rows are never touched. Returns whether a row was deleted.
+    pub fn delete_terminal(&self, id: &str) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM recordings WHERE id = ?1 AND status IN (?2, ?3)",
+                params![
+                    id,
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                ],
+            )
+            .context("deleting terminal recording")?;
+        Ok(deleted > 0)
+    }
+
     /// Row GC: delete terminal (`Done` | `Failed`) rows last updated before `older_than`. Bounds
     /// queue.db and the Recording Queue's history list on a much longer horizon than the audio
     /// retention (90 days vs ~7), so "Filed in brain" history stays useful for a quarter. Returns how
     /// many rows went; non-terminal rows are never touched.
+    ///
+    /// Retention code that owns artifacts should prefer [`Queue::delete_terminal`] after confirming those
+    /// paths are absent. This bulk helper remains available to queue-only callers with no artifact contract.
     pub fn delete_terminal_older_than(&self, older_than: DateTime<Local>) -> Result<usize> {
         self.conn
             .execute(
@@ -622,6 +678,54 @@ mod tests {
     }
 
     #[test]
+    fn complete_with_note_is_one_atomic_transition() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
+        q.set_status(&id, JobStatus::PendingNote).unwrap();
+
+        // Force the one completion statement to abort. Neither note_path nor status may leak through.
+        q.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_done BEFORE UPDATE ON recordings
+                 WHEN NEW.status = 'done'
+                 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            q.complete_with_note(&id, Path::new("/vault/note.md"))
+                .is_err()
+        );
+        let unchanged = q.get(&id).unwrap().unwrap();
+        assert_eq!(unchanged.status, JobStatus::PendingNote);
+        assert_eq!(unchanged.note_path, None);
+
+        // The live pipeline records a just-returned note path before this completion statement. If Done is
+        // the write that fails, that recovery reference survives for the batch rewrite.
+        q.update(
+            &id,
+            JobUpdate {
+                note_path: Some(PathBuf::from("/vault/note.md")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            q.complete_with_note(&id, Path::new("/vault/note.md"))
+                .is_err()
+        );
+        let recoverable = q.get(&id).unwrap().unwrap();
+        assert_eq!(recoverable.status, JobStatus::PendingNote);
+        assert_eq!(recoverable.note_path, Some(PathBuf::from("/vault/note.md")));
+
+        q.conn.execute_batch("DROP TRIGGER reject_done").unwrap();
+        q.complete_with_note(&id, Path::new("/vault/note.md"))
+            .unwrap();
+        let completed = q.get(&id).unwrap().unwrap();
+        assert_eq!(completed.status, JobStatus::Done);
+        assert_eq!(completed.note_path, Some(PathBuf::from("/vault/note.md")));
+    }
+
+    #[test]
     fn partial_update_leaves_other_fields_intact() {
         let q = Queue::memory();
         let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
@@ -731,6 +835,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn delete_terminal_removes_only_terminal_rows() {
+        let q = Queue::memory();
+        let done = q.enqueue(&meta("/cache/done.ogg", "us.zoom.xos")).unwrap();
+        let pending = q
+            .enqueue(&meta("/cache/pending.ogg", "us.zoom.xos"))
+            .unwrap();
+        q.set_status(&done, JobStatus::Done).unwrap();
+
+        assert!(q.delete_terminal(&done).unwrap());
+        assert!(q.get(&done).unwrap().is_none());
+        assert!(!q.delete_terminal(&pending).unwrap());
+        assert!(q.get(&pending).unwrap().is_some());
     }
 
     #[test]
@@ -871,17 +990,20 @@ CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
     }
 
     #[test]
-    fn retry_reset_requires_failed_and_clears_error() {
+    fn retry_reset_requires_failed_clears_error_and_accepts_filing_state() {
         let q = Queue::memory();
         let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
         // Not Failed yet ⇒ refuses (the UI can race the pipeline).
         assert!(q.retry_reset(&id).is_err());
 
         q.fail(&id, "boom").unwrap();
-        q.retry_reset(&id).unwrap();
+        q.retry_reset_to(&id, JobStatus::PendingNote).unwrap();
         let job = q.get(&id).unwrap().unwrap();
-        assert_eq!(job.status, JobStatus::PendingTranscription);
+        assert_eq!(job.status, JobStatus::PendingNote);
         assert_eq!(job.error, None);
+
+        q.fail(&id, "again").unwrap();
+        assert!(q.retry_reset_to(&id, JobStatus::Done).is_err());
     }
 
     #[test]

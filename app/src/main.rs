@@ -17,6 +17,8 @@
 #[cfg(target_os = "macos")]
 mod activity;
 #[cfg(target_os = "macos")]
+mod checkpoint;
+#[cfg(target_os = "macos")]
 mod cli;
 #[cfg(target_os = "macos")]
 mod config;
@@ -327,8 +329,8 @@ pub(crate) mod imp {
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
-        // Live-filing sessions (#87): shared between the detector hook (spawns them) and the pipeline
-        // worker (finalizes/discards them).
+        // Live-filing sessions (#87): the detector hook owns spawn/terminal verdict delivery; the
+        // pipeline collects recording-scoped outcomes and owns durable fallback cleanup.
         let live_manager = Arc::new(crate::live::LiveManager::new());
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned

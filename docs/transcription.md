@@ -87,11 +87,15 @@ audio (issue #18); it stays off by default.
 ## AWS backend
 
 `crates/corti-transcribe-aws`. Implements the same sync trait (`src/lib.rs:338`) by building a
-private `new_current_thread` tokio runtime (`:339`) and `block_on`-ing an upload → start → poll →
-fetch → parse against the async SDK. `AwsOptions.job_name` (`:49`) is set to the durable recording
-id, so a resumed `Transcribing` job re-attaches to the same AWS job rather than resubmitting;
-`start_job` tolerates the resulting `ConflictException` (`:46`). From the pipeline thread's view
-this is an ordinary blocking call.
+private `new_current_thread` tokio runtime and `block_on`-ing an attach-or-upload → start → poll →
+fetch → parse flow against the async SDK. `AwsOptions.job_name` is the stable name persisted on the
+recording row, so a retry probes AWS first and re-attaches without re-encoding or uploading the full call.
+A terminally failed job is deleted so the stable name can start a fresh attempt. Transient poll/fetch/parse
+failures retain staged objects; a completed stable job whose output is confirmed missing is reset. A
+successful durable-pipeline result checkpoints its exact bucket/prefix/job/region before cleanup. That
+ownership survives a backend or bucket setting change; cleanup completion is persisted before filing, and a
+cleanup failure keeps `PendingNote` for retry. Fresh `--redo --aws` attempts neither reuse nor delete a
+terminal job name. From the pipeline thread's view this remains an ordinary blocking call.
 
 ## The queue — durable store + background jobs
 
@@ -109,20 +113,25 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
                                                               ↘ Failed
 ```
 
+`PendingNote` has a durable meaning: `<recording-stem>.transcript.json` was atomically written beside the
+raw recording and contains a versioned `DiarizedTranscript`, an optional existing/returned note path, and
+any exact AWS staging location still awaiting deletion. Only cloud cleanup (when marked) and filing remain.
+
 API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
-`set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), plus #85's `retry_reset`
-(`:259`), `expired` (`:319`), `delete_terminal_older_than` (`:341`), and `all` (`:306`). `queue.jobs()`
-(`:132`) hands out a `corti_jobs::Jobs` borrowing the same live `Connection` for the background-job table.
+`set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), `retry_reset`, `all`,
+and per-row terminal deletion after artifact cleanup. `queue.jobs()` hands out a `corti_jobs::Jobs`
+borrowing the same live `Connection` for the background-job table.
 
 **Durability is delivered by `corti-jobs` (#85), on top of the queue.** `crates/corti-jobs/src/lib.rs` is
 a small background-job layer sharing `queue.db`: kinds are strings with JSON payloads; `claim_due`
 (`:142`) marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
 (`:250`) can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
-pipeline seeds tray history (issue #3) and then calls `recover_running` on boot
-(`app/src/pipeline.rs:142`); `corti --list` and the tray `History ▸` submenu survive restarts. (A crash
-during a recording's *first* in-process attempt, before any failure schedules a retry job, still strands
-that row — durability is job-level, not a full sweep of non-terminal recordings. Rows stranded at
-`Recording` are the exception: #87's startup reaper revives or fails them — see §Live inbox filing.)
+pipeline seeds tray history and then calls `recover_running` on boot; `corti --list` and the tray
+`History ▸` submenu survive restarts. It also scans for valid filing checkpoints and schedules them
+immediately, including the checkpoint-written/`PendingNote`-write-failed window. A crash during a
+recording's *first* in-process attempt **before** the post-ASR checkpoint can still strand that row — this
+is not a full sweep of non-terminal recordings. Rows stranded at `Recording` are the other narrow
+exception: #87's startup reaper revives or fails them — see §Live inbox filing.
 
 ## The pipeline worker
 
@@ -132,24 +141,28 @@ that row — durability is job-level, not a full sweep of non-terminal recording
 due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) claims and runs every due
 job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
 
-Per `Process` job, `transcribe_and_file` (`:736`): `queue.update(Transcribing)` →
+Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` →
 `transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on this
-thread) → `queue.update(PendingNote, transcribe_secs)` → `file_and_done` (`:808`); on success the
-transient WAVs are pruned (`prune_transient`). It returns `Result` instead of terminal-failing — a
-live-path error goes to `schedule_retry` (`:434`), which keeps the row at `PendingTranscription` and
-enqueues a durable `retry_transcription` job.
+thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` → clean
+AWS staging (when applicable) → file. Cloud cleanup errors propagate and retry from the checkpoint.
+Completion is one `Queue::complete_with_note` SQL update for `note_path + Done`; errors propagate before
+any success UI. On durable success the clean WAV and checkpoint are removed, while raw audio remains for
+the configured retention sweep.
 
-**Retry with backoff.** `retry_transcription` (`app/src/jobs.rs:71`) re-runs `transcribe_and_file` from
-the capture audio (no transcript sidecar exists, so a `PendingNote` re-file re-transcribes too). Failed
-attempts back off `1 m → 2 m → … → 1 h` cap (`JOB_BACKOFF`, `pipeline.rs:38`) over `RETRY_MAX_ATTEMPTS =
-5` (`jobs.rs:23`); exhaustion terminal-fails the recording (`on_exhausted` → `fail`). The Recording Queue
-window's Retry button sends `PipelineMsg::Retry`, handled by `manual_retry` (`:380`).
+**Retry with backoff.** A valid checkpoint is authoritative in any nonterminal transcription state, so a
+failed/crashed adjacent `PendingNote` write cannot repeat ASR. Without one, `PendingTranscription` and
+`Transcribing` run ASR from retained raw audio; `PendingNote` is a legacy row and falls back once using a
+new persisted stable AWS name. Failed attempts back off
+`1 m → 2 m → … → 1 h` cap over `RETRY_MAX_ATTEMPTS = 5`; filing backoff remains visibly `PendingNote`,
+while transcription backoff returns to `PendingTranscription`. Exhaustion terminal-fails the recording.
+The Recording Queue window's Retry button starts a fresh manual attempt budget.
 
 **Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
 `enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:175` (also fires at startup),
-deletes audio older than `retention_days` (config, default 7) plus the AEC sibling, then GCs terminal
-recording rows after 90 days and parked job rows after 30. Rows outlive the audio so history stays
-visible in the Recording Queue window.
+deletes raw audio older than `retention_days` (config, default 7), plus clean/checkpoint leftovers and
+crash-left atomic-write temps, then GCs terminal recording rows after `max(90, retention_days)` days and
+parked job rows after 30. One timestamp defines both horizons, and a failed artifact deletion retains the
+path-bearing row for a later sweep.
 
 `ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 
@@ -179,16 +192,17 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
 - **Finish ownership and quality.** After the recorder closes its tee, the detector calls
   `LiveHook::finished(meta)` before emitting `RecordingFinished`. `LiveManager::finish(id)` freezes the
   dropped-chunk count and keeps the handle/outcome by ID while it flushes AEC and both transcriber tails.
-  The later `Process` calls `collect(id)`. Only a zero-drop result flips the state line and goes straight to
-  `Done`; any dropped chunk leaves `State: transcribing` and requires the lossless batch rewrite. A
-  collecting/finishing sentinel prevents a second model-backed session from overlapping the tail join.
-- **Fallback — no double notes, ever.** Factory ineligible (config off, non-local backend, models
-  missing), no note created (silent call), a live-path error, or a dropped tee chunk ⇒ batch runs. A
-  returned partial path is passed directly as the preferred rewrite target and also persisted in the retry
-  payload. The handler repairs row ownership before transcription, missing-audio failure, or exhaustion, so
-  a queue write/read failure cannot turn it into a fresh note. `rewrite_body` replaces the body in place
-  (same path/inode) and only then persists the path/`Done`. Webinar/manual captures have no
-  live hook and always take batch.
+  The later `Process` calls `collect(id)`. Only a zero-drop result flips the state line and skips batch;
+  its `note_path + Done` completion is one fallible SQL update, and raw audio remains revealable until
+  retention expiry. A collecting/finishing sentinel prevents a second model-backed session from
+  overlapping the tail join. Live work adds no telemetry stage; it remains under `Recording`.
+- **Fallback — no double notes, no repeated ASR after checkpoint.** Factory ineligible (config off,
+  non-local backend, models missing), no note created (silent call), a live-path error, or a dropped tee
+  chunk ⇒ batch runs from the lossless WAV. A returned partial path is passed directly as the preferred
+  rewrite target and persisted in the retry payload before fallible row repair. Successful batch ASR puts
+  that path and transcript in the post-ASR checkpoint; subsequent filing/completion retries load the
+  checkpoint, rewrite the same path/inode, and never invoke ASR again. Missing-audio failure and exhaustion
+  also retain/close the directly-owned path. Webinar/manual captures have no live hook and always take batch.
 - **Discard.** The detector similarly delivers `discarded(meta)` before `RecordingDiscarded`. The live
   thread deletes its partial note; a detached reaper owns contained-failure outcomes. If unlink fails, the
   path is reported to the pipeline for another attempt and then retained in a Failed row/closed note rather
@@ -215,10 +229,11 @@ vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
 Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
 
-Ordering is crash-safe: `queue.update(note_path=…)` is persisted **before** `set_status(Done)`
-(`file_and_done`, `pipeline.rs:808`), and a re-file that finds a persisted note rewrites it in place
-(#87) rather than duplicating it. A transient error → `schedule_retry` / the retry job's backoff;
-only unrecoverable states go through `fail` → tray `Failed`.
+After `vagus add-note` returns, its path is first added to the local checkpoint, then
+`Queue::complete_with_note` atomically persists `note_path + Done`. A completion failure leaves the row at
+`PendingNote`; retry reloads the checkpoint and rewrites the same note in place instead of invoking ASR or
+creating a second note. The irreducible process-death window while the external `vagus` process creates a
+note but before Corti receives its returned path is not claimed as exactly-once.
 
 ## Shared types (`corti-core`)
 

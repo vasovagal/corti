@@ -110,12 +110,13 @@ the pipeline calls `corti_capture::write_clean_wav(raw_2track_wav, &AecConfig)`
 cleanly, no sibling written (`:76`).
 
 `StreamingAec` (`crates/corti-aec/src/streaming.rs`) is overlap-save FDAF: block hop = `filter_len`
-(default 8192 ≈ 170 ms @ 48 kHz, `lib.rs:35`), FFT size `2·hop`. A tunable lookahead window
-(`CORTI_AEC_LOOKAHEAD_SECS`, default 5 s) warms the filter and locks the room delay
-(`estimate_delay`, `lib.rs:126`) before emitting. Its API is chunk-in/chunk-out —
-`push(&mic,&far) -> Vec<f32>` / `finish() -> Vec<f32>` — with the invariant that total-emitted ==
-total-pushed (not per-call). `cancel(mic,far,sr,cfg)` (`lib.rs:229`) is a thin offline shim with
-lookahead == whole input.
+(default 8192 ≈ 170 ms @ 48 kHz), FFT size `2·hop`. A tunable lookahead window
+(`CORTI_AEC_LOOKAHEAD_SECS`, default 5 s) warms the filter and locks the room delay before emitting.
+Its API is chunk-in/chunk-out — `push(&mic,&far) -> Vec<f32>` / `finish() -> Vec<f32>` — with the
+invariant that total-emitted == total-pushed (not per-call). The cleaned sibling is a reproducible
+pipeline derivative: it remains available during a filing retry and is removed after durable `Done`;
+the raw recording is retained until the configured sweep. `cancel(mic,far,sr,cfg)` remains the
+intentional full-input-lookahead scoring shim.
 
 **Why post-capture today:** relocating `StreamingAec::push()` into the writer thread (so `me` is
 cleaned live) is unbuilt — issue #74, the hard blocker for live transcription (ADR 0008). Until it

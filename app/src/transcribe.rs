@@ -11,6 +11,7 @@ use anyhow::Result;
 use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
+use crate::checkpoint::AwsStaging;
 use crate::config::{AppConfig, BackendChoice};
 
 /// The transcription backend, built once at worker startup.
@@ -52,20 +53,20 @@ impl Backend {
         Self { cfg, kind }
     }
 
-    /// Transcribe a recording into a diarized transcript using the runtime-selected backend. `job_id` is
-    /// the durable recording id; AWS passes it as the stable `AwsOptions.job_name` so a resumed
-    /// `Transcribing` job re-attaches to the same AWS job instead of re-submitting (design/05-app-tauri.md).
+    /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
+    /// pipeline supplies the stable name persisted on the recording row so retries reattach; explicit CLI
+    /// runs pass `None` so `--redo --aws` always creates a fresh AWS attempt.
     pub fn transcribe(
         &self,
-        job_id: &str,
+        aws_job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
     ) -> Result<DiarizedTranscript> {
-        // `job_id` is only used by the AWS arm; keep it referenced for builds without that feature.
-        let _ = job_id;
+        // The job name is only used by the AWS arm; keep it referenced for builds without that feature.
+        let _ = aws_job_name;
         match &self.kind {
             #[cfg(feature = "aws")]
-            BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), job_id, audio, meta),
+            BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), aws_job_name, audio, meta),
             #[cfg(feature = "local")]
             BackendKind::Local => self.transcribe_local(audio, meta),
             BackendKind::Unavailable(reason) => anyhow::bail!("{reason}"),
@@ -76,7 +77,7 @@ impl Backend {
     fn transcribe_aws(
         &self,
         sdk: Option<&aws_config::SdkConfig>,
-        job_id: &str,
+        job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
     ) -> Result<DiarizedTranscript> {
@@ -91,11 +92,71 @@ impl Backend {
             .context("no S3 bucket configured — export CORTI_AWS_BUCKET")?;
         let sdk = sdk.context("AWS SDK config unavailable (credential chain failed at startup)")?;
         let opts = AwsOptions {
-            job_name: Some(job_id.to_string()),
+            job_name: job_name.map(str::to_string),
+            // A durable stable job is cleaned only after the app checkpoint is persisted. One-shot CLI
+            // attempts keep the backend's success-only cleanup behavior.
+            delete_after: job_name.is_none(),
             language: self.cfg.language.clone(),
             ..AwsOptions::new(bucket)
         };
         AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
+    }
+
+    /// Describe any cloud staging owned by the just-completed durable attempt. The checkpoint, rather than
+    /// mutable current settings, becomes the cleanup authority.
+    pub fn aws_staging_for_checkpoint(&self, job_name: &str) -> Result<Option<AwsStaging>> {
+        let _ = job_name;
+        match &self.kind {
+            #[cfg(feature = "aws")]
+            BackendKind::Aws(sdk) => {
+                use anyhow::Context;
+                use corti_transcribe_aws::AwsOptions;
+
+                let bucket = self
+                    .cfg
+                    .aws_bucket
+                    .clone()
+                    .context("no S3 bucket configured for checkpoint cleanup")?;
+                let sdk = sdk
+                    .as_deref()
+                    .context("AWS SDK config unavailable for checkpoint cleanup")?;
+                let opts = AwsOptions::new(bucket.clone());
+                Ok(Some(AwsStaging {
+                    bucket,
+                    key_prefix: opts.key_prefix,
+                    job_name: job_name.to_string(),
+                    region: sdk.region().map(|region| region.as_ref().to_string()),
+                }))
+            }
+            #[cfg(feature = "local")]
+            BackendKind::Local => Ok(None),
+            BackendKind::Unavailable(_) => Ok(None),
+        }
+    }
+
+    /// Remove the exact staged objects recorded by the durable checkpoint. This intentionally does not use
+    /// the currently selected backend or bucket: users may switch to local transcription (or change buckets)
+    /// while a filing retry is waiting. Cleanup completion is persisted by the caller before filing resumes.
+    pub fn cleanup_after_checkpoint(&self, staging: &AwsStaging) -> Result<()> {
+        let _ = staging;
+        #[cfg(feature = "aws")]
+        {
+            use anyhow::Context;
+            use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
+
+            let sdk = build_sdk_config_for_region(&self.cfg, staging.region.as_deref())
+                .context("AWS SDK config unavailable for checkpoint cleanup")?;
+            let opts = AwsOptions {
+                key_prefix: staging.key_prefix.clone(),
+                delete_after: false,
+                ..AwsOptions::new(staging.bucket.clone())
+            };
+            AwsTranscriber::new(&sdk, opts).cleanup_staged(&staging.job_name)
+        }
+        #[cfg(not(feature = "aws"))]
+        anyhow::bail!(
+            "checkpoint requires AWS staged-object cleanup, but this build has no AWS backend"
+        )
     }
 
     #[cfg(feature = "local")]
@@ -118,6 +179,33 @@ impl Backend {
     }
 }
 
+/// Identifies one transcription invocation for diagnostics and AWS idempotency.
+#[derive(Clone, Copy)]
+pub struct TranscriptionAttempt<'a> {
+    id: &'a str,
+    aws_job_name: Option<&'a str>,
+}
+
+impl<'a> TranscriptionAttempt<'a> {
+    /// Durable pipeline attempt: AWS retries reattach to the stable name persisted on the recording row.
+    /// Ordinarily this is `id`; legacy `PendingNote` compatibility recovery uses a new name so it cannot
+    /// reattach to an old completed job whose output predates checkpoint-safe cleanup.
+    pub fn durable_named(id: &'a str, aws_job_name: &'a str) -> Self {
+        Self {
+            id,
+            aws_job_name: Some(aws_job_name),
+        }
+    }
+
+    /// Explicit CLI attempt: keep the diagnostic id but mint a fresh AWS name.
+    pub fn fresh(id: &'a str) -> Self {
+        Self {
+            id,
+            aws_job_name: None,
+        }
+    }
+}
+
 /// Run offline AEC (unless `skip_aec`), then transcribe with the runtime-selected `backend`. This is the
 /// tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
@@ -134,7 +222,7 @@ pub fn transcribe_recording(
     aec_enabled: bool,
     skip_aec: bool,
     aec_cfg: &corti_aec::AecConfig,
-    id: &str,
+    attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
 ) -> Result<(DiarizedTranscript, PathBuf)> {
@@ -146,7 +234,7 @@ pub fn transcribe_recording(
             Ok(Some(clean)) => {
                 info!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = true,
                     input = %raw_audio.display(),
                     output = %clean.display(),
@@ -158,7 +246,7 @@ pub fn transcribe_recording(
                 // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
                 info!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = false,
                     input = %raw_audio.display(),
                     "tap-only recording — no mic track to clean; skipping AEC"
@@ -168,7 +256,7 @@ pub fn transcribe_recording(
             Err(e) => {
                 warn!(
                     target: "corti::transcribe",
-                    job_id = %id,
+                    job_id = %attempt.id,
                     aec = false,
                     input = %raw_audio.display(),
                     error = %format!("{e:#}"),
@@ -181,7 +269,7 @@ pub fn transcribe_recording(
         raw_audio.to_path_buf()
     };
 
-    let transcript = backend.transcribe(id, &input, meta)?;
+    let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
     Ok((transcript, input))
 }
 
@@ -227,10 +315,25 @@ pub(crate) fn configure_loader(cfg: &AppConfig) -> aws_config::ConfigLoader {
 /// `block_on` panics there. Async callers await `configure_loader(cfg).load()` directly instead.
 #[cfg(feature = "aws")]
 fn build_sdk_config(cfg: &AppConfig) -> Option<aws_config::SdkConfig> {
+    build_sdk_config_for_region(cfg, None)
+}
+
+/// Build an SDK config for cleanup, pinning the checkpoint's original region after applying the normal
+/// credential/profile chain. This keeps a later region-setting change from addressing the old bucket with
+/// the wrong regional client.
+#[cfg(feature = "aws")]
+fn build_sdk_config_for_region(
+    cfg: &AppConfig,
+    region: Option<&str>,
+) -> Option<aws_config::SdkConfig> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| error!(target: "corti::transcribe", error = %e, "could not build tokio runtime for AWS config"))
         .ok()?;
-    Some(rt.block_on(configure_loader(cfg).load()))
+    let mut loader = configure_loader(cfg);
+    if let Some(region) = region.filter(|region| !region.is_empty()) {
+        loader = loader.region(aws_config::Region::new(region.to_string()));
+    }
+    Some(rt.block_on(loader.load()))
 }

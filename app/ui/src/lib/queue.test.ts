@@ -41,7 +41,7 @@ describe("rowState — the printer-queue truth table", () => {
     });
   });
 
-  it("marks a backing-off transient failure as will-retry, not failed", () => {
+  it("marks a backing-off transcription failure as will-retry, not failed", () => {
     const s = rowState(
       dto({
         status: "pending_transcription",
@@ -51,6 +51,20 @@ describe("rowState — the printer-queue truth table", () => {
       }),
     );
     expect(s.label).toBe("Will retry (attempt 2/5): transcription failed: connection reset");
+    expect(s.tone).toBe("progress");
+    expect(s.action).toBeNull();
+  });
+
+  it("keeps a backing-off filing failure at the durable PendingNote checkpoint", () => {
+    const s = rowState(
+      dto({
+        status: "pending_note",
+        error: "vagus unavailable",
+        retry_pending: true,
+        retry_attempts: 1,
+      }),
+    );
+    expect(s.label).toBe("Will retry filing (attempt 1/5): vagus unavailable");
     expect(s.tone).toBe("progress");
     expect(s.action).toBeNull();
   });
