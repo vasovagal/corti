@@ -5,9 +5,9 @@ description: >
     - sccache (mozilla-actions/sccache-action, GitHub Actions cache backend) caches rustc invocations.
       The repo's .cargo/config.toml already sets `rustc-wrapper = "sccache"`; this action installs sccache
       on the runner and enables the GHA backend so that wrapper works here exactly as it does locally.
-    - Swatinem/rust-cache caches the cargo home (registry index + crate sources) AND dependency
-      build-script outputs (target/.../build/*) — which is what covers corti-transcribe-local's
-      sherpa-onnx-sys prebuilt download (fetched via ureq into its OUT_DIR; sccache does not cache that).
+    - Swatinem/rust-cache caches the cargo home (registry index + crate sources) and dependency
+      build-script outputs. Release builds do not trust a restored sherpa native download: release.yml
+      verifies the pinned archive itself and exports SHERPA_ONNX_LIB_DIR before Cargo runs offline.
   No `ort` cache step (unlike vagus): corti has no `ort`.
 
 inputs:
@@ -58,7 +58,7 @@ runs:
           echo "CARGO_INCREMENTAL=0"
         } >> "$GITHUB_ENV"
 
-    - name: Rust cache (cargo home + dependency build-script outputs; covers the sherpa-onnx prebuilt)
+    - name: Rust cache (cargo home + dependency build-script outputs)
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       with:
         shared-key: ${{ inputs.cache-key }}

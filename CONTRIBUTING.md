@@ -109,9 +109,10 @@ cargo run -p corti-queue --example inspect                     # inspect the dur
 
 - **CI** (`ci.yml`) runs on `macos-26` only — `corti-coreaudio`'s bindings link CoreAudio
   and don't build elsewhere.
-- **Release** (`release.yml`) is tag-triggered (`v*`): it builds + bundles the `.app`,
-  uploads `.dmg` + `.app.zip` to the GitHub release, and bumps the private Homebrew cask.
-  `warm-cache.yml` pre-seeds the build cache.
+- **Release** (`release.yml`) is tag-triggered (`v*`): it creates a draft, verifies the pinned native
+  input and signed app bundle, uploads only `.dmg` + `.app.zip`, then publishes. The shared Homebrew cask
+  is regenerated and pushed manually per `CLAUDE.md`; CI never writes the tap. `warm-cache.yml` pre-seeds
+  the build cache.
 
 See [`design/adr/`](./design/adr) for the rationale (distribution, signing, backend
 selection, AEC) and [`design/STATUS.md`](./design/STATUS.md) for current state.
