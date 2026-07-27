@@ -1,8 +1,8 @@
 //! Background job kinds and handlers — what the pipeline worker's drain loop actually runs.
 //!
-//! Kinds are plain strings persisted in queue.db's `jobs` table (see `corti-jobs`). Payloads carry just
-//! enough to re-find durable state (a recording id): handlers are idempotent re-dispatches over the
-//! `recordings` row, not bearers of state themselves, so replaying one after a crash is always safe.
+//! Kinds are plain strings persisted in queue.db's `jobs` table (see `corti-jobs`). Payloads normally carry
+//! a recording id; a live fallback also carries its preferred note path until the recording row confirms
+//! ownership. Handlers remain idempotent re-dispatches over durable state.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,8 +33,22 @@ const MIN_ROW_RETENTION_DAYS: i64 = 90;
 /// Parked `failed` background-job rows are debris after this long.
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
+pub(crate) fn retry_payload(id: &str, preferred_note: Option<&Path>) -> serde_json::Value {
+    match preferred_note {
+        Some(path) => serde_json::json!({
+            "id": id,
+            "preferred_note": path.to_string_lossy(),
+        }),
+        None => serde_json::json!({ "id": id }),
+    }
+}
+
 pub(crate) fn id_payload(id: &str) -> serde_json::Value {
-    serde_json::json!({ "id": id })
+    retry_payload(id, None)
+}
+
+fn preferred_note(payload: &serde_json::Value) -> Option<PathBuf> {
+    payload["preferred_note"].as_str().map(PathBuf::from)
 }
 
 /// Dispatch one claimed job by kind. An unrecognized kind fails with backoff so version skew surfaces
@@ -61,11 +75,13 @@ pub(crate) fn on_exhausted(ctx: &Ctx, job: &ClaimedJob, error: &str) {
     if row.status.is_terminal() {
         return;
     }
-    pipeline::fail(
+    let note_path = preferred_note(&job.payload);
+    pipeline::fail_with_note(
         ctx,
         id,
         &row.meta(),
         format!("gave up after {} attempts: {error}", job.attempts),
+        note_path.as_deref(),
     );
 }
 
@@ -128,7 +144,24 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
             "filing checkpoint is unreadable; retained audio will be transcribed again"
         );
     }
-    match retry_action(row.status, checkpoint_valid, row.audio_path.exists()) {
+    let action = retry_action(row.status, checkpoint_valid, row.audio_path.exists());
+    let preferred_note = preferred_note(&job.payload);
+    if action != RetryAction::Stale
+        && let Some(note_path) = preferred_note.as_ref()
+    {
+        // The payload is the authority when the original recording-row write failed. Repair the row before
+        // every exit path, including missing audio/exhaustion, so terminal failure can close this note.
+        ctx.queue
+            .update(
+                id,
+                corti_queue::JobUpdate {
+                    note_path: Some(note_path.clone()),
+                    ..Default::default()
+                },
+            )
+            .context("persisting preferred live note from retry payload")?;
+    }
+    match action {
         RetryAction::Stale => Ok(()),
         RetryAction::FileCheckpoint => {
             // Repair the row when the checkpoint rename won the race with a failed/crashed PendingNote
@@ -395,6 +428,15 @@ mod tests {
         assert!(queue.get(&id).unwrap().is_none());
         drop(queue);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn retry_payload_durably_carries_preferred_live_note() {
+        let path = Path::new("/vault/live note.md");
+        let payload = retry_payload("recording", Some(path));
+        assert_eq!(payload["id"], "recording");
+        assert_eq!(preferred_note(&payload).as_deref(), Some(path));
+        assert_eq!(preferred_note(&id_payload("recording")), None);
     }
 
     #[test]

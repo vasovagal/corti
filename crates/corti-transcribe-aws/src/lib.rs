@@ -338,12 +338,15 @@ impl AwsTranscriber {
                 Some(TranscriptionJobStatus::Failed) => {
                     let reason = tjob.failure_reason().unwrap_or("unknown reason");
                     tracing::error!(target: "corti::transcribe::aws", job, reason, "transcription job failed");
-                    // A failed stable job can never become successful. Remove the terminal job now so the
-                    // next retry can submit the same durable name afresh; staged objects remain until a
-                    // later successful checkpoint cleanup.
-                    self.delete_terminal_job(job).await.with_context(|| {
-                        format!("deleting terminal AWS job {job} before retry (failure: {reason})")
-                    })?;
+                    // Only a stable durable name must be freed for retry. A fresh CLI/example attempt will
+                    // mint another name and must not acquire an unnecessary DeleteTranscriptionJob grant.
+                    if should_reset_terminal_job(self.opts.job_name.as_deref()) {
+                        self.delete_terminal_job(job).await.with_context(|| {
+                            format!(
+                                "deleting terminal AWS job {job} before retry (failure: {reason})"
+                            )
+                        })?;
+                    }
                     bail!("transcription job failed: {reason}");
                 }
                 // Queued / InProgress / None / future variants: keep waiting.
@@ -383,11 +386,13 @@ impl AwsTranscriber {
                     .as_service_error()
                     .is_some_and(|service| service.is_no_such_key()) =>
             {
-                self.delete_terminal_job(job).await.with_context(|| {
-                    format!("deleting completed AWS job {job} whose output is missing")
-                })?;
+                if should_reset_terminal_job(self.opts.job_name.as_deref()) {
+                    self.delete_terminal_job(job).await.with_context(|| {
+                        format!("deleting completed AWS job {job} whose output is missing")
+                    })?;
+                }
                 bail!(
-                    "completed transcription output s3://{}/{out_key} is missing; reset job for retry",
+                    "completed transcription output s3://{}/{out_key} is missing",
                     self.opts.bucket
                 );
             }
@@ -503,6 +508,10 @@ fn should_cleanup_staged(delete_after: bool, result_succeeded: bool) -> bool {
     delete_after && result_succeeded
 }
 
+fn should_reset_terminal_job(stable_job_name: Option<&str>) -> bool {
+    stable_job_name.is_some()
+}
+
 /// Keep only characters AWS allows in a job name (`0-9a-zA-Z._-`); replace the rest with `-`.
 fn sanitize(s: &str) -> String {
     s.chars()
@@ -578,6 +587,12 @@ mod tests {
         assert!(!should_cleanup_staged(false, false));
         assert!(!should_cleanup_staged(false, true));
         assert!(should_cleanup_staged(true, true));
+    }
+
+    #[test]
+    fn only_stable_attempts_delete_terminal_jobs_for_reuse() {
+        assert!(should_reset_terminal_job(Some("recording")));
+        assert!(!should_reset_terminal_job(None));
     }
 
     #[test]

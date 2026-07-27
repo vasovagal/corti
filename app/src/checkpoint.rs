@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 
+/// The exact AWS staging location that still needs privacy cleanup after the transcript is durable.
+/// Keeping this in the checkpoint prevents a backend/bucket switch from silently forgetting old objects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AwsStaging {
+    pub(crate) bucket: String,
+    pub(crate) key_prefix: String,
+    pub(crate) job_name: String,
+    pub(crate) region: Option<String>,
+}
+
 /// The durable boundary between transcription and filing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct FilingCheckpoint {
@@ -22,14 +32,21 @@ pub(crate) struct FilingCheckpoint {
     pub(crate) transcript: DiarizedTranscript,
     /// Existing partial live note, or the path returned by `vagus add-note` before queue completion.
     pub(crate) note_path: Option<PathBuf>,
+    /// Present only for an AWS transcript whose staged input/output have not yet been deleted.
+    pub(crate) aws_staging: Option<AwsStaging>,
 }
 
 impl FilingCheckpoint {
-    pub(crate) fn new(transcript: DiarizedTranscript, note_path: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        transcript: DiarizedTranscript,
+        note_path: Option<PathBuf>,
+        aws_staging: Option<AwsStaging>,
+    ) -> Self {
         Self {
             version: VERSION,
             transcript,
             note_path,
+            aws_staging,
         }
     }
 
@@ -166,6 +183,12 @@ mod tests {
                 text: "durable words".into(),
             }]),
             note,
+            Some(AwsStaging {
+                bucket: "old-bucket".into(),
+                key_prefix: "corti/".into(),
+                job_name: "recording".into(),
+                region: Some("us-east-1".into()),
+            }),
         )
     }
 
@@ -184,6 +207,12 @@ mod tests {
         let expected = checkpoint(Some(dir.join("note.md")));
         expected.store(&audio).unwrap();
         assert_eq!(FilingCheckpoint::load(&audio).unwrap(), expected);
+
+        // Once staged-object deletion succeeds, clearing that ownership must itself survive a filing retry.
+        let mut cleaned = expected.clone();
+        cleaned.aws_staging = None;
+        cleaned.store(&audio).unwrap();
+        assert_eq!(FilingCheckpoint::load(&audio).unwrap(), cleaned);
         assert!(!temp_path(&path_for(&audio)).exists());
         std::fs::remove_dir_all(dir).ok();
     }
@@ -195,7 +224,7 @@ mod tests {
         let path = path_for(&audio);
         std::fs::write(
             &path,
-            r#"{"version":999,"transcript":{"segments":[]},"note_path":null}"#,
+            r#"{"version":999,"transcript":{"segments":[]},"note_path":null,"aws_staging":null}"#,
         )
         .unwrap();
         let err = FilingCheckpoint::load(&audio).unwrap_err().to_string();

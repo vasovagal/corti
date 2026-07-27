@@ -91,10 +91,11 @@ private `new_current_thread` tokio runtime and `block_on`-ing an attach-or-uploa
 fetch → parse flow against the async SDK. `AwsOptions.job_name` is the stable name persisted on the
 recording row, so a retry probes AWS first and re-attaches without re-encoding or uploading the full call.
 A terminally failed job is deleted so the stable name can start a fresh attempt. Transient poll/fetch/parse
-failures retain staged objects; a completed job whose output is confirmed missing is reset. A successful
-durable-pipeline result is cleaned after the app persists its local filing checkpoint, and cleanup failure
-keeps `PendingNote` so deletion is retried. Explicit `--redo --aws` runs use a fresh attempt name. From the
-pipeline thread's view this remains an ordinary blocking call.
+failures retain staged objects; a completed stable job whose output is confirmed missing is reset. A
+successful durable-pipeline result checkpoints its exact bucket/prefix/job/region before cleanup. That
+ownership survives a backend or bucket setting change; cleanup completion is persisted before filing, and a
+cleanup failure keeps `PendingNote` for retry. Fresh `--redo --aws` attempts neither reuse nor delete a
+terminal job name. From the pipeline thread's view this remains an ordinary blocking call.
 
 ## The queue — durable store + background jobs
 
@@ -113,8 +114,8 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
 ```
 
 `PendingNote` has a durable meaning: `<recording-stem>.transcript.json` was atomically written beside the
-raw recording and contains a versioned `DiarizedTranscript` plus an optional existing/returned note path.
-Only filing remains.
+raw recording and contains a versioned `DiarizedTranscript`, an optional existing/returned note path, and
+any exact AWS staging location still awaiting deletion. Only cloud cleanup (when marked) and filing remain.
 
 API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
 `set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), `retry_reset`, `all`,

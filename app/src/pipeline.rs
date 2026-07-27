@@ -236,19 +236,21 @@ pub fn run(
                         );
                     }
                     // #87: if a live session filed this recording as it happened, the job is already
-                    // done — batch transcription is skipped entirely. Any other live outcome (no
-                    // session, no note, error) falls back to today's batch path; a partial live note
-                    // is persisted first so `file_and_done` rewrites it instead of double-filing.
+                    // done — batch transcription is skipped entirely. Any other live outcome falls back to
+                    // batch, but its note path remains owned directly and in any durable retry payload.
                     match ctx.live.finalize(&id) {
                         Some(crate::live::LiveOutcome::Filed { note_path }) => {
-                            if let Err(e) = live_filed(&mut ctx, &id, &meta, &audio_path, note_path)
+                            if let Err(e) =
+                                live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
                             {
-                                schedule_retry(&ctx, &id, &meta, e);
+                                schedule_retry(&ctx, &id, &meta, e, Some(&note_path));
                             }
                         }
                         live_result => {
-                            if let Some(crate::live::LiveOutcome::Failed { error, note_path }) =
-                                live_result
+                            let preferred_note = if let Some(crate::live::LiveOutcome::Failed {
+                                error,
+                                note_path,
+                            }) = live_result
                             {
                                 warn!(
                                     target: "corti::live",
@@ -256,25 +258,32 @@ pub fn run(
                                     error = %error,
                                     "live filing failed — falling back to batch transcription"
                                 );
-                                if let Some(partial) = note_path
-                                    && let Err(e) = ctx.queue.update(
-                                        &id,
-                                        JobUpdate {
-                                            note_path: Some(partial),
-                                            ..Default::default()
-                                        },
-                                    )
-                                {
-                                    warn!(
-                                        target: "corti::live",
-                                        job_id = %id,
-                                        error = %format!("{e:#}"),
-                                        "could not persist the partial live note path"
-                                    );
-                                }
+                                note_path
+                            } else {
+                                None
+                            };
+                            if let Some(partial) = preferred_note.as_ref()
+                                && let Err(e) = ctx.queue.update(
+                                    &id,
+                                    JobUpdate {
+                                        note_path: Some(partial.clone()),
+                                        ..Default::default()
+                                    },
+                                )
+                            {
+                                // Do not transcribe with an untracked live note. The retry payload keeps
+                                // ownership even though this recording-row write failed.
+                                schedule_retry(
+                                    &ctx,
+                                    &id,
+                                    &meta,
+                                    anyhow::anyhow!("persisting partial live note path: {e:#}"),
+                                    Some(partial),
+                                );
+                                continue;
                             }
                             if let Err(e) = transcribe_and_file(&mut ctx, &id, &meta, &audio_path) {
-                                schedule_retry(&ctx, &id, &meta, e);
+                                schedule_retry(&ctx, &id, &meta, e, preferred_note.as_deref());
                             }
                         }
                     }
@@ -497,10 +506,16 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     tray::set_status(&ctx.app, format!("{phase} — {}…", row.owning_app));
 }
 
-/// A transcribe/file failure on the live path: don't terminal-fail — record the error and schedule the
-/// durable retry job at the first backoff step. Filing failures preserve `PendingNote` so the checkpoint,
-/// not ASR, is retried; every earlier failure returns to `PendingTranscription`.
-fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error) {
+/// A transcribe/file failure on the live path: record the error and durably schedule the next phase. The
+/// retry payload owns a live note path before any fallible recording-row update, so a SQLite failure cannot
+/// turn a later batch recovery into a second note.
+fn schedule_retry(
+    ctx: &Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    err: anyhow::Error,
+    preferred_note: Option<&Path>,
+) {
     let msg = format!("{err:#}");
     eprintln!("[corti] job {id} failed (will retry): {msg}");
     let retry_status = ctx
@@ -516,32 +531,39 @@ fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error)
                 JobStatus::PendingTranscription
             }
         });
-    let update = ctx.queue.update(
+    let payload = crate::jobs::retry_payload(id, preferred_note);
+    if let Err(e) = ctx.queue.jobs().enqueue(
+        crate::jobs::RETRY_TRANSCRIPTION,
+        &payload,
+        crate::jobs::RETRY_MAX_ATTEMPTS,
+        Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
+    ) {
+        eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
+        fail_with_note(ctx, id, meta, msg, preferred_note);
+        return;
+    }
+    // The retry job is already durable. A row update failure must not terminally fail and invalidate it.
+    if let Err(e) = ctx.queue.update(
         id,
         JobUpdate {
             status: Some(retry_status),
+            note_path: preferred_note.map(Path::to_path_buf),
             error: Some(msg.clone()),
             ..Default::default()
         },
-    );
-    let enqueue = ctx.queue.jobs().enqueue(
-        crate::jobs::RETRY_TRANSCRIPTION,
-        &crate::jobs::id_payload(id),
-        crate::jobs::RETRY_MAX_ATTEMPTS,
-        Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
-    );
-    if let Err(e) = update.and(enqueue.map(|_| ())) {
-        eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
-        fail(ctx, id, meta, msg);
-        return;
+    ) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "retry job persisted but recording backoff state could not be updated"
+        );
     }
     tray::update_history(&ctx.app, id, retry_status, None, Some(msg.clone()), None);
     tray::set_status(
         &ctx.app,
         format!("⚠ {} — will retry: {msg}", meta.owning_app.name),
     );
-    // The attempt is over; the recording now waits in backoff until the retry job fires. Nothing is
-    // actively running, so the diagram returns to Idle.
     set_stage(&ctx.app, Stage::Idle);
 }
 
@@ -553,7 +575,7 @@ fn live_filed(
     id: &str,
     meta: &RecordingMeta,
     audio: &Path,
-    note: PathBuf,
+    note: &Path,
 ) -> Result<()> {
     info!(
         target: "corti::pipeline",
@@ -563,22 +585,27 @@ fn live_filed(
         "note filed live during the recording — skipping batch transcription"
     );
     // The note can first be created during the final live flush, after its asynchronous
-    // `LiveNoteCreated` message. Persist the returned path synchronously before the fallible Done update so
-    // a completion failure/crash still lets batch recovery rewrite this exact note instead of creating a
-    // second one.
+    // `LiveNoteCreated` message. The caller keeps this path in the retry payload if either write fails.
     ctx.queue
         .update(
             id,
             JobUpdate {
-                note_path: Some(note.clone()),
+                note_path: Some(note.to_path_buf()),
                 ..Default::default()
             },
         )
         .context("persisting live note path before completion")?;
     ctx.queue
-        .complete_with_note(id, &note)
+        .complete_with_note(id, note)
         .context("persisting live note completion")?;
-    tray::update_history(&ctx.app, id, JobStatus::Done, None, None, Some(note));
+    tray::update_history(
+        &ctx.app,
+        id,
+        JobStatus::Done,
+        None,
+        None,
+        Some(note.to_path_buf()),
+    );
     set_stage(&ctx.app, Stage::Idle);
     tray::set_status(&ctx.app, format!("✓ Filed — {}", meta.note_title()));
     Ok(())
@@ -932,7 +959,11 @@ pub(crate) fn transcribe_and_file(
         .get(id)
         .context("reading recording before checkpoint")?
         .and_then(|row| row.note_path);
-    FilingCheckpoint::new(transcript, note_path)
+    let aws_staging = ctx
+        .backend
+        .aws_staging_for_checkpoint(&transcribe_job)
+        .context("describing staged AWS objects for checkpoint")?;
+    FilingCheckpoint::new(transcript, note_path, aws_staging)
         .store(audio)
         .context("persisting transcript checkpoint")?;
 
@@ -964,17 +995,17 @@ pub(crate) fn file_checkpoint(
     tray::set_status(&ctx.app, format!("Filing note — {}…", meta.owning_app.name));
 
     // Cloud objects stopped being recovery inputs once the checkpoint was durable, but their privacy
-    // cleanup is not best-effort: keep PendingNote/checkpoint and retry this idempotent deletion before
-    // allowing terminal completion.
-    let aws_job_name = ctx
-        .queue
-        .get(id)
-        .context("reading transcription attempt before cloud cleanup")?
-        .and_then(|row| row.transcribe_job)
-        .unwrap_or_else(|| id.to_string());
-    ctx.backend
-        .cleanup_after_checkpoint(&aws_job_name)
-        .context("cleaning staged AWS objects after checkpoint")?;
+    // cleanup is not best-effort. Use the checkpoint's original bucket/prefix/name even if runtime settings
+    // now select local transcription, then durably clear the marker so later filing retries need no AWS.
+    if let Some(staging) = checkpoint.aws_staging.clone() {
+        ctx.backend
+            .cleanup_after_checkpoint(&staging)
+            .context("cleaning staged AWS objects after checkpoint")?;
+        checkpoint.aws_staging = None;
+        checkpoint
+            .store(audio)
+            .context("persisting completed AWS cleanup in checkpoint")?;
+    }
 
     let tf = std::time::Instant::now();
     let result = file_and_done(ctx, id, meta, audio, &mut checkpoint);
@@ -1105,19 +1136,43 @@ fn cleanup_completed_artifacts(raw: &Path) {
     }
 }
 
-/// Terminally fail a recording and surface it in the tray (both the status line and its history
-/// entry). Reserved for unrecoverable states — transient errors go through [`schedule_retry`] /
-/// the retry job's backoff instead.
-pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
+/// Terminally fail a recording and surface it in the tray. A directly-owned live note can be supplied
+/// when its earlier row write failed; path + Failed then land in one SQL statement before the note is
+/// forgotten.
+pub(crate) fn fail_with_note(
+    ctx: &Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    msg: String,
+    preferred_note: Option<&Path>,
+) {
     error!(target: "corti::pipeline", job_id = %id, error = %msg, "job failed");
-    // #87: a partial live note for this recording may still read `State: transcribing`; the batch
-    // pass that would have rewritten it is never coming, so close it out.
-    if let Ok(Some(row)) = ctx.queue.get(id)
-        && let Some(note) = row.note_path
-    {
-        close_out_note(&note, &msg);
+    let note_path = preferred_note.map(Path::to_path_buf).or_else(|| {
+        ctx.queue
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|row| row.note_path)
+    });
+    if let Some(note) = note_path.as_ref() {
+        close_out_note(note, &msg);
     }
-    let _ = ctx.queue.fail(id, &msg);
+    if let Err(e) = ctx.queue.update(
+        id,
+        JobUpdate {
+            status: Some(JobStatus::Failed),
+            note_path: note_path.clone(),
+            error: Some(msg.clone()),
+            ..Default::default()
+        },
+    ) {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            error = %format!("{e:#}"),
+            "could not persist terminal recording failure"
+        );
+    }
     set_stage(&ctx.app, Stage::Idle);
     tray::update_history(
         &ctx.app,
@@ -1125,9 +1180,14 @@ pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
         JobStatus::Failed,
         None,
         Some(msg.clone()),
-        None,
+        note_path,
     );
     tray::set_status(&ctx.app, format!("⚠ {} — {msg}", meta.owning_app.name));
+}
+
+/// Terminal failure without an additional directly-owned live path.
+pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
+    fail_with_note(ctx, id, meta, msg, None);
 }
 
 #[cfg(test)]
@@ -1163,7 +1223,7 @@ mod tests {
             let id = queue.enqueue(&meta(audio.clone())).unwrap();
             queue.set_status(&id, status).unwrap();
             if checkpoint {
-                FilingCheckpoint::new(DiarizedTranscript::new(Vec::new()), None)
+                FilingCheckpoint::new(DiarizedTranscript::new(Vec::new()), None, None)
                     .store(&audio)
                     .unwrap();
             }

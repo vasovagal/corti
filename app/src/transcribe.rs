@@ -11,6 +11,7 @@ use anyhow::Result;
 use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
+use crate::checkpoint::AwsStaging;
 use crate::config::{AppConfig, BackendChoice};
 
 /// The transcription backend, built once at worker startup.
@@ -101,16 +102,15 @@ impl Backend {
         AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
     }
 
-    /// Caller hook for the durable boundary: after a successful AWS transcript has been written to the
-    /// local filing checkpoint, remove its stable staged objects. The pipeline propagates failures and
-    /// retries this idempotently from `PendingNote`; other backends are no-ops.
-    pub fn cleanup_after_checkpoint(&self, aws_job_name: &str) -> Result<()> {
-        let _ = aws_job_name;
+    /// Describe any cloud staging owned by the just-completed durable attempt. The checkpoint, rather than
+    /// mutable current settings, becomes the cleanup authority.
+    pub fn aws_staging_for_checkpoint(&self, job_name: &str) -> Result<Option<AwsStaging>> {
+        let _ = job_name;
         match &self.kind {
             #[cfg(feature = "aws")]
             BackendKind::Aws(sdk) => {
                 use anyhow::Context;
-                use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
+                use corti_transcribe_aws::AwsOptions;
 
                 let bucket = self
                     .cfg
@@ -120,16 +120,43 @@ impl Backend {
                 let sdk = sdk
                     .as_deref()
                     .context("AWS SDK config unavailable for checkpoint cleanup")?;
-                let opts = AwsOptions {
-                    delete_after: false,
-                    ..AwsOptions::new(bucket)
-                };
-                AwsTranscriber::new(sdk, opts).cleanup_staged(aws_job_name)
+                let opts = AwsOptions::new(bucket.clone());
+                Ok(Some(AwsStaging {
+                    bucket,
+                    key_prefix: opts.key_prefix,
+                    job_name: job_name.to_string(),
+                    region: sdk.region().map(|region| region.as_ref().to_string()),
+                }))
             }
             #[cfg(feature = "local")]
-            BackendKind::Local => Ok(()),
-            BackendKind::Unavailable(_) => Ok(()),
+            BackendKind::Local => Ok(None),
+            BackendKind::Unavailable(_) => Ok(None),
         }
+    }
+
+    /// Remove the exact staged objects recorded by the durable checkpoint. This intentionally does not use
+    /// the currently selected backend or bucket: users may switch to local transcription (or change buckets)
+    /// while a filing retry is waiting. Cleanup completion is persisted by the caller before filing resumes.
+    pub fn cleanup_after_checkpoint(&self, staging: &AwsStaging) -> Result<()> {
+        let _ = staging;
+        #[cfg(feature = "aws")]
+        {
+            use anyhow::Context;
+            use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
+
+            let sdk = build_sdk_config_for_region(&self.cfg, staging.region.as_deref())
+                .context("AWS SDK config unavailable for checkpoint cleanup")?;
+            let opts = AwsOptions {
+                key_prefix: staging.key_prefix.clone(),
+                delete_after: false,
+                ..AwsOptions::new(staging.bucket.clone())
+            };
+            AwsTranscriber::new(&sdk, opts).cleanup_staged(&staging.job_name)
+        }
+        #[cfg(not(feature = "aws"))]
+        anyhow::bail!(
+            "checkpoint requires AWS staged-object cleanup, but this build has no AWS backend"
+        )
     }
 
     #[cfg(feature = "local")]
@@ -288,10 +315,25 @@ pub(crate) fn configure_loader(cfg: &AppConfig) -> aws_config::ConfigLoader {
 /// `block_on` panics there. Async callers await `configure_loader(cfg).load()` directly instead.
 #[cfg(feature = "aws")]
 fn build_sdk_config(cfg: &AppConfig) -> Option<aws_config::SdkConfig> {
+    build_sdk_config_for_region(cfg, None)
+}
+
+/// Build an SDK config for cleanup, pinning the checkpoint's original region after applying the normal
+/// credential/profile chain. This keeps a later region-setting change from addressing the old bucket with
+/// the wrong regional client.
+#[cfg(feature = "aws")]
+fn build_sdk_config_for_region(
+    cfg: &AppConfig,
+    region: Option<&str>,
+) -> Option<aws_config::SdkConfig> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| error!(target: "corti::transcribe", error = %e, "could not build tokio runtime for AWS config"))
         .ok()?;
-    Some(rt.block_on(configure_loader(cfg).load()))
+    let mut loader = configure_loader(cfg);
+    if let Some(region) = region.filter(|region| !region.is_empty()) {
+        loader = loader.region(aws_config::Region::new(region.to_string()));
+    }
+    Some(rt.block_on(loader.load()))
 }
