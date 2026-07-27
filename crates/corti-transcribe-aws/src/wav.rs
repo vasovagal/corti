@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Read only the WAV header fields needed when reattaching to an existing AWS job. Unlike
+/// [`to_pcm16_temp`], this does not decode or copy the recording.
+pub fn layout(input: &Path) -> Result<(u32, u16)> {
+    let reader = hound::WavReader::open(input)
+        .with_context(|| format!("opening {} for WAV layout", input.display()))?;
+    let spec = reader.spec();
+    Ok((spec.sample_rate, spec.channels))
+}
+
 /// Read the float (or int) WAV at `input` and write a 16-bit PCM copy to a temp file, preserving channel
 /// count and sample rate. Returns the temp path, the sample rate, and the channel count. Caller deletes the
 /// temp file.
@@ -83,6 +92,7 @@ mod tests {
             w.finalize().unwrap();
         }
 
+        assert_eq!(layout(&src).unwrap(), (48_000, 2));
         let (out, rate, channels) = to_pcm16_temp(&src).unwrap();
         assert_eq!(rate, 48_000);
         assert_eq!(channels, 2);

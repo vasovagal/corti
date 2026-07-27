@@ -87,13 +87,14 @@ audio (issue #18); it stays off by default.
 ## AWS backend
 
 `crates/corti-transcribe-aws`. Implements the same sync trait (`src/lib.rs:338`) by building a
-private `new_current_thread` tokio runtime (`:339`) and `block_on`-ing an upload → start → poll →
-fetch → parse against the async SDK. `AwsOptions.job_name` (`:49`) is set to the durable recording
-id, so a resumed `Transcribing` job re-attaches to the same AWS job rather than resubmitting. A terminally
-failed job is deleted so the stable name can start a fresh attempt. Failed poll/fetch/parse attempts retain staged objects;
-a successful durable-pipeline result is cleaned only after the app has persisted its local filing checkpoint.
-Explicit `--redo --aws` runs use a fresh attempt name. From the pipeline thread's view this remains an
-ordinary blocking call.
+private `new_current_thread` tokio runtime and `block_on`-ing an attach-or-upload → start → poll →
+fetch → parse flow against the async SDK. `AwsOptions.job_name` is the stable name persisted on the
+recording row, so a retry probes AWS first and re-attaches without re-encoding or uploading the full call.
+A terminally failed job is deleted so the stable name can start a fresh attempt. Transient poll/fetch/parse
+failures retain staged objects; a completed job whose output is confirmed missing is reset. A successful
+durable-pipeline result is cleaned after the app persists its local filing checkpoint, and cleanup failure
+keeps `PendingNote` so deletion is retried. Explicit `--redo --aws` runs use a fresh attempt name. From the
+pipeline thread's view this remains an ordinary blocking call.
 
 ## The queue — durable store + background jobs
 
@@ -116,19 +117,20 @@ raw recording and contains a versioned `DiarizedTranscript` plus an optional exi
 Only filing remains.
 
 API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
-`set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), plus #85's `retry_reset`
-(`:259`), `expired` (`:319`), `delete_terminal_older_than` (`:341`), and `all` (`:306`). `queue.jobs()`
-(`:132`) hands out a `corti_jobs::Jobs` borrowing the same live `Connection` for the background-job table.
+`set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), `retry_reset`, `all`,
+and per-row terminal deletion after artifact cleanup. `queue.jobs()` hands out a `corti_jobs::Jobs`
+borrowing the same live `Connection` for the background-job table.
 
 **Durability is delivered by `corti-jobs` (#85), on top of the queue.** `crates/corti-jobs/src/lib.rs` is
 a small background-job layer sharing `queue.db`: kinds are strings with JSON payloads; `claim_due`
 (`:142`) marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
 (`:250`) can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
-pipeline seeds tray history (issue #3) and then calls `recover_running` on boot
-(`app/src/pipeline.rs:142`); `corti --list` and the tray `History ▸` submenu survive restarts. (A crash
-during a recording's *first* in-process attempt, before any failure schedules a retry job, still strands
-that row — durability is job-level, not a full sweep of non-terminal recordings. Rows stranded at
-`Recording` are the exception: #87's startup reaper revives or fails them — see §Live inbox filing.)
+pipeline seeds tray history and then calls `recover_running` on boot; `corti --list` and the tray
+`History ▸` submenu survive restarts. It also scans for valid filing checkpoints and schedules them
+immediately, including the checkpoint-written/`PendingNote`-write-failed window. A crash during a
+recording's *first* in-process attempt **before** the post-ASR checkpoint can still strand that row — this
+is not a full sweep of non-terminal recordings. Rows stranded at `Recording` are the other narrow
+exception: #87's startup reaper revives or fails them — see §Live inbox filing.
 
 ## The pipeline worker
 
@@ -140,23 +142,26 @@ job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-
 
 Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` →
 `transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on this
-thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` → file.
+thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` → clean
+AWS staging (when applicable) → file. Cloud cleanup errors propagate and retry from the checkpoint.
 Completion is one `Queue::complete_with_note` SQL update for `note_path + Done`; errors propagate before
 any success UI. On durable success the clean WAV and checkpoint are removed, while raw audio remains for
 the configured retention sweep.
 
-**Retry with backoff.** `retry_transcription` dispatches by state: `PendingTranscription`/`Transcribing`
-run ASR from retained raw audio; `PendingNote` loads the checkpoint and runs filing only. A legacy
-`PendingNote` row without a checkpoint falls back to audio once. Failed attempts back off
+**Retry with backoff.** A valid checkpoint is authoritative in any nonterminal transcription state, so a
+failed/crashed adjacent `PendingNote` write cannot repeat ASR. Without one, `PendingTranscription` and
+`Transcribing` run ASR from retained raw audio; `PendingNote` is a legacy row and falls back once using a
+new persisted stable AWS name. Failed attempts back off
 `1 m → 2 m → … → 1 h` cap over `RETRY_MAX_ATTEMPTS = 5`; filing backoff remains visibly `PendingNote`,
 while transcription backoff returns to `PendingTranscription`. Exhaustion terminal-fails the recording.
 The Recording Queue window's Retry button starts a fresh manual attempt budget.
 
 **Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
 `enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:175` (also fires at startup),
-deletes raw audio older than `retention_days` (config, default 7), plus any clean/checkpoint leftovers,
-then GCs terminal recording rows after `max(90, retention_days)` days and parked job rows after 30. The
-path-bearing row can therefore never disappear before its configured audio-expiry horizon.
+deletes raw audio older than `retention_days` (config, default 7), plus clean/checkpoint leftovers and
+crash-left atomic-write temps, then GCs terminal recording rows after `max(90, retention_days)` days and
+parked job rows after 30. One timestamp defines both horizons, and a failed artifact deletion retains the
+path-bearing row for a later sweep.
 
 `ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 

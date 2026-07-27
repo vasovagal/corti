@@ -53,8 +53,8 @@ impl Backend {
     }
 
     /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
-    /// pipeline supplies `aws_job_name = Some(recording_id)` so retries reattach; explicit CLI runs pass
-    /// `None` so `--redo --aws` always creates a fresh AWS attempt.
+    /// pipeline supplies the stable name persisted on the recording row so retries reattach; explicit CLI
+    /// runs pass `None` so `--redo --aws` always creates a fresh AWS attempt.
     pub fn transcribe(
         &self,
         aws_job_name: Option<&str>,
@@ -101,10 +101,11 @@ impl Backend {
         AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
     }
 
-    /// Best-effort caller hook for the durable boundary: after a successful AWS transcript has been written
-    /// to the local filing checkpoint, remove its stable staged objects. Other backends are no-ops.
-    pub fn cleanup_after_checkpoint(&self, job_id: &str) -> Result<()> {
-        let _ = job_id;
+    /// Caller hook for the durable boundary: after a successful AWS transcript has been written to the
+    /// local filing checkpoint, remove its stable staged objects. The pipeline propagates failures and
+    /// retries this idempotently from `PendingNote`; other backends are no-ops.
+    pub fn cleanup_after_checkpoint(&self, aws_job_name: &str) -> Result<()> {
+        let _ = aws_job_name;
         match &self.kind {
             #[cfg(feature = "aws")]
             BackendKind::Aws(sdk) => {
@@ -123,7 +124,7 @@ impl Backend {
                     delete_after: false,
                     ..AwsOptions::new(bucket)
                 };
-                AwsTranscriber::new(sdk, opts).cleanup_staged(job_id)
+                AwsTranscriber::new(sdk, opts).cleanup_staged(aws_job_name)
             }
             #[cfg(feature = "local")]
             BackendKind::Local => Ok(()),
@@ -159,11 +160,13 @@ pub struct TranscriptionAttempt<'a> {
 }
 
 impl<'a> TranscriptionAttempt<'a> {
-    /// Durable pipeline attempt: AWS retries reattach to this stable recording id.
-    pub fn durable(id: &'a str) -> Self {
+    /// Durable pipeline attempt: AWS retries reattach to the stable name persisted on the recording row.
+    /// Ordinarily this is `id`; legacy `PendingNote` compatibility recovery uses a new name so it cannot
+    /// reattach to an old completed job whose output predates checkpoint-safe cleanup.
+    pub fn durable_named(id: &'a str, aws_job_name: &'a str) -> Self {
         Self {
             id,
-            aws_job_name: Some(id),
+            aws_job_name: Some(aws_job_name),
         }
     }
 

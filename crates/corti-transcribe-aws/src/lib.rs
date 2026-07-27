@@ -43,7 +43,7 @@ pub struct AwsOptions {
     pub poll_interval: Duration,
     /// Give up (and error) if the job hasn't finished within this long.
     pub max_wait: Duration,
-    /// Stable Transcribe job name (the caller's recording id). When set, the AWS job and its staged S3
+    /// Stable Transcribe job name (normally the caller's recording id). When set, the AWS job and staged S3
     /// objects use this name verbatim (sanitized), so a crash mid-transcribe re-attaches to the *same* job
     /// on resume — `start` tolerates the resulting `ConflictException` and falls through to polling, instead
     /// of paying to submit a fresh job. When `None`, a unique-per-attempt name is minted (the original
@@ -82,6 +82,22 @@ pub struct AwsTranscriber {
     opts: AwsOptions,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableJobState {
+    Missing,
+    Reusable,
+    Failed,
+}
+
+fn classify_existing_job(status: Option<&TranscriptionJobStatus>) -> StableJobState {
+    if status == Some(&TranscriptionJobStatus::Failed) {
+        StableJobState::Failed
+    } else {
+        // Queued, in-progress, completed, absent status, and future status variants all name a real job.
+        StableJobState::Reusable
+    }
+}
+
 impl AwsTranscriber {
     /// Build the S3 + Transcribe clients from a caller-provided `SdkConfig` (the app runs the credential
     /// chain and handles/logs any failures building it).
@@ -108,22 +124,14 @@ impl AwsTranscriber {
         rt.block_on(self.cleanup_objects(&in_key, &out_key))
     }
 
-    /// The full async pipeline: re-encode → upload → start → poll → fetch → parse → clean up.
+    /// The full async pipeline: attach-or-stage → poll → fetch → parse → clean up.
     async fn run(&self, audio: &Path) -> Result<DiarizedTranscript> {
         if self.opts.bucket.is_empty() {
             bail!("AwsOptions.bucket is empty — set the S3 bucket to stage audio in");
         }
 
-        // 1. Re-encode the float WAV to 16-bit PCM (what AWS Transcribe accepts). The channel count decides
-        //    whether we ask for channel identification: 2-track mic+tap ⇒ yes; 1-track tap-only ⇒ no
-        //    (AWS rejects channel identification on mono audio).
-        let (pcm_path, sample_rate, channels) = wav::to_pcm16_temp(audio)?;
-        let multichannel = channels >= 2;
-
-        // 2. Job name + object keys. A caller-supplied `job_name` (the recording id) makes the job and its
-        //    staged S3 keys STABLE so a resumed `Transcribing` job re-attaches to the same AWS job; without
-        //    one, a unique-per-attempt name avoids colliding with a still-retained AWS job whose staged
-        //    output we may have already deleted. (See `resolve_job_name`.)
+        // A caller-supplied `job_name` makes the job and staged keys stable. Resolve it before touching the
+        // full WAV so retries can probe and reattach without first re-encoding/re-uploading the whole call.
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -132,20 +140,44 @@ impl AwsTranscriber {
         let job = resolve_job_name(self.opts.job_name.as_deref(), stem.as_deref(), suffix);
         let (in_key, out_key) = object_keys(&self.opts.key_prefix, &job);
 
-        // 3. Upload, then drop the local temp regardless of what follows.
-        let upload = self.upload(&pcm_path, &in_key).await;
-        let _ = std::fs::remove_file(&pcm_path);
-        upload?;
+        let mut state = if self.opts.job_name.is_some() {
+            self.probe_stable_job(&job).await?
+        } else {
+            StableJobState::Missing
+        };
+        if state == StableJobState::Failed {
+            // A terminally failed name can never become reusable. Delete it now and submit the same stable
+            // name afresh in this attempt rather than spending one retry merely discovering the failure.
+            self.delete_terminal_job(&job).await?;
+            state = StableJobState::Missing;
+        }
 
-        // 4. Start the job (idempotent on ConflictException).
-        self.start_job(&job, &in_key, &out_key, sample_rate, multichannel)
-            .await?;
+        let multichannel = if state == StableJobState::Reusable {
+            let (_, channels) = wav::layout(audio)?;
+            tracing::info!(
+                target: "corti::transcribe::aws",
+                job,
+                "transcription job already exists — re-attaching without upload"
+            );
+            channels >= 2
+        } else {
+            // AWS accepts 16-bit PCM. Only a genuinely missing job pays the full decode/re-encode/upload
+            // cost; retries of queued/in-progress/completed jobs read the small WAV header above.
+            let (pcm_path, sample_rate, channels) = wav::to_pcm16_temp(audio)?;
+            let upload = self.upload(&pcm_path, &in_key).await;
+            let _ = std::fs::remove_file(&pcm_path);
+            upload?;
+            let multichannel = channels >= 2;
+            self.start_job(&job, &in_key, &out_key, sample_rate, multichannel)
+                .await?;
+            multichannel
+        };
 
-        // 5. Poll, 6. fetch, 7. parse (channel-identified vs. single-speaker per `multichannel`).
+        // Poll, fetch, parse (channel-identified vs. single-speaker per `multichannel`).
         let result = self.await_result(&job, &out_key, multichannel).await;
 
-        // 8. Cleanup is success-only. Poll/fetch/read/parse failures retain the staged result so a stable
-        // job can reattach. The app disables this and explicitly cleans only after its local checkpoint.
+        // Cleanup is success-only. Poll/fetch/read/parse failures retain the staged result so a stable job
+        // can reattach. The app disables this and explicitly cleans after its local checkpoint.
         if should_cleanup_staged(self.opts.delete_after, result.is_ok())
             && let Err(e) = self.cleanup_objects(&in_key, &out_key).await
         {
@@ -158,6 +190,30 @@ impl AwsTranscriber {
         }
 
         result
+    }
+
+    async fn probe_stable_job(&self, job: &str) -> Result<StableJobState> {
+        let response = self
+            .transcribe
+            .get_transcription_job()
+            .transcription_job_name(job)
+            .send()
+            .await;
+        match response {
+            Ok(response) => Ok(classify_existing_job(
+                response
+                    .transcription_job()
+                    .and_then(|job| job.transcription_job_status()),
+            )),
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(|service| service.is_not_found_exception()) =>
+            {
+                Ok(StableJobState::Missing)
+            }
+            Err(err) => Err(err).context("probing stable Transcribe job"),
+        }
     }
 
     async fn upload(&self, pcm_path: &Path, key: &str) -> Result<()> {
@@ -285,7 +341,7 @@ impl AwsTranscriber {
                     // A failed stable job can never become successful. Remove the terminal job now so the
                     // next retry can submit the same durable name afresh; staged objects remain until a
                     // later successful checkpoint cleanup.
-                    self.delete_failed_job(job).await.with_context(|| {
+                    self.delete_terminal_job(job).await.with_context(|| {
                         format!("deleting terminal AWS job {job} before retry (failure: {reason})")
                     })?;
                     bail!("transcription job failed: {reason}");
@@ -309,19 +365,39 @@ impl AwsTranscriber {
             }
         }
 
-        // Completed: fetch the JSON we directed to our own bucket/key and parse it.
-        let obj = self
+        // Completed: fetch the JSON we directed to our own bucket/key and parse it. A transient fetch
+        // failure leaves the completed job/output untouched for cheap reattachment. A modeled NoSuchKey is
+        // different: the output is confirmed unavailable (possible for pre-checkpoint legacy jobs), so
+        // remove only the terminal job and let the next retry submit the same stable name afresh.
+        let fetched = self
             .s3
             .get_object()
             .bucket(&self.opts.bucket)
             .key(out_key)
             .send()
-            .await
-            .map_err(|e| {
-                tracing::error!(target: "corti::transcribe::aws", bucket = %self.opts.bucket, key = out_key, error = %e, "fetching transcript failed");
-                e
-            })
-            .with_context(|| format!("fetching transcript s3://{}/{out_key}", self.opts.bucket))?;
+            .await;
+        let obj = match fetched {
+            Ok(obj) => obj,
+            Err(err)
+                if err
+                    .as_service_error()
+                    .is_some_and(|service| service.is_no_such_key()) =>
+            {
+                self.delete_terminal_job(job).await.with_context(|| {
+                    format!("deleting completed AWS job {job} whose output is missing")
+                })?;
+                bail!(
+                    "completed transcription output s3://{}/{out_key} is missing; reset job for retry",
+                    self.opts.bucket
+                );
+            }
+            Err(err) => {
+                tracing::error!(target: "corti::transcribe::aws", bucket = %self.opts.bucket, key = out_key, error = %err, "fetching transcript failed");
+                return Err(err).with_context(|| {
+                    format!("fetching transcript s3://{}/{out_key}", self.opts.bucket)
+                });
+            }
+        };
         let bytes = obj
             .body
             .collect()
@@ -343,7 +419,7 @@ impl AwsTranscriber {
         }
     }
 
-    async fn delete_failed_job(&self, job: &str) -> Result<()> {
+    async fn delete_terminal_job(&self, job: &str) -> Result<()> {
         self.transcribe
             .delete_transcription_job()
             .transcription_job_name(job)
@@ -400,7 +476,7 @@ impl Transcriber for AwsTranscriber {
 }
 
 /// Resolve the Transcribe job name (which also names the staged S3 objects). A caller-supplied `job_name`
-/// (the durable recording id) is used verbatim — sanitized — so a resumed job re-attaches to the same AWS
+/// (normally the durable recording id) is used verbatim — sanitized — so a resumed job re-attaches to the same AWS
 /// job and re-fetches the same output key. Otherwise a unique-per-attempt name is minted from the audio
 /// stem plus a nanosecond suffix. AWS job names must match `0-9a-zA-Z._-`, hence [`sanitize`].
 fn resolve_job_name(
@@ -477,6 +553,23 @@ mod tests {
         assert_eq!(resolve_job_name(None, Some("rec"), 0x1f), "rec-1f");
         assert_eq!(resolve_job_name(None, Some("a b"), 0x10), "a-b-10");
         assert_eq!(resolve_job_name(None, None, 0xab), "corti-job-ab");
+    }
+
+    #[test]
+    fn stable_job_probe_skips_staging_unless_missing_or_failed() {
+        assert_eq!(
+            classify_existing_job(Some(&TranscriptionJobStatus::Completed)),
+            StableJobState::Reusable
+        );
+        assert_eq!(
+            classify_existing_job(Some(&TranscriptionJobStatus::InProgress)),
+            StableJobState::Reusable
+        );
+        assert_eq!(
+            classify_existing_job(Some(&TranscriptionJobStatus::Failed)),
+            StableJobState::Failed
+        );
+        assert_eq!(classify_existing_job(None), StableJobState::Reusable);
     }
 
     #[test]

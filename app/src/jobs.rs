@@ -4,13 +4,17 @@
 //! enough to re-find durable state (a recording id): handlers are idempotent re-dispatches over the
 //! `recordings` row, not bearers of state themselves, so replaying one after a crash is always safe.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use corti_core::JobStatus;
 use corti_jobs::ClaimedJob;
+use corti_queue::Queue;
+use tracing::warn;
 
+use crate::checkpoint::FilingCheckpoint;
 use crate::pipeline::{self, Ctx};
 
 /// Re-run a recording that failed transcription/filing, with backoff. Payload: `{"id": "<stem>"}`.
@@ -70,23 +74,37 @@ enum RetryAction {
     Stale,
     FileCheckpoint,
     Transcribe,
+    TranscribeLegacyPendingNote,
     MissingAudio,
 }
 
-fn retry_action(status: JobStatus, checkpoint_exists: bool, audio_exists: bool) -> RetryAction {
+fn retry_action(status: JobStatus, checkpoint_valid: bool, audio_exists: bool) -> RetryAction {
     match status {
         JobStatus::Done | JobStatus::Failed | JobStatus::Recording => RetryAction::Stale,
-        JobStatus::PendingNote if checkpoint_exists => RetryAction::FileCheckpoint,
+        // The checkpoint is the authoritative durable phase marker even when the immediately-following
+        // SQLite transition failed or the process died before it. Never repeat ASR in that window.
         JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote
-            if audio_exists =>
+            if checkpoint_valid =>
         {
-            // `PendingNote` without a checkpoint is a legacy row: transcribe once to create one.
+            RetryAction::FileCheckpoint
+        }
+        JobStatus::PendingNote if audio_exists => {
+            // Pre-checkpoint databases can contain PendingNote with only retained audio. Give that one
+            // compatibility transcription a different stable AWS name: the old completed job may have had
+            // its output deleted by the previous cleanup policy.
+            RetryAction::TranscribeLegacyPendingNote
+        }
+        JobStatus::PendingTranscription | JobStatus::Transcribing if audio_exists => {
             RetryAction::Transcribe
         }
         JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote => {
             RetryAction::MissingAudio
         }
     }
+}
+
+fn legacy_attempt_name(id: &str) -> String {
+    format!("{id}-checkpoint-v1")
 }
 
 /// Push a recording the rest of the way through the pipeline, from whatever state a failure or crash
@@ -100,10 +118,46 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
         return Ok(()); // row deleted meanwhile — nothing to retry
     };
     let meta = row.meta();
-    let checkpoint_exists = crate::checkpoint::path_for(&row.audio_path).is_file();
-    match retry_action(row.status, checkpoint_exists, row.audio_path.exists()) {
+    let checkpoint_path = crate::checkpoint::path_for(&row.audio_path);
+    let checkpoint_valid = FilingCheckpoint::load(&row.audio_path).is_ok();
+    if checkpoint_path.is_file() && !checkpoint_valid {
+        warn!(
+            target: "corti::pipeline",
+            job_id = %id,
+            checkpoint = %checkpoint_path.display(),
+            "filing checkpoint is unreadable; retained audio will be transcribed again"
+        );
+    }
+    match retry_action(row.status, checkpoint_valid, row.audio_path.exists()) {
         RetryAction::Stale => Ok(()),
-        RetryAction::FileCheckpoint => pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path),
+        RetryAction::FileCheckpoint => {
+            // Repair the row when the checkpoint rename won the race with a failed/crashed PendingNote
+            // update. If this write fails, the retry remains recoverable from the checkpoint.
+            if row.status != JobStatus::PendingNote {
+                ctx.queue
+                    .update(
+                        id,
+                        corti_queue::JobUpdate {
+                            status: Some(JobStatus::PendingNote),
+                            ..Default::default()
+                        },
+                    )
+                    .context("promoting recovered checkpoint to PendingNote")?;
+            }
+            pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path)
+        }
+        RetryAction::TranscribeLegacyPendingNote => {
+            ctx.queue
+                .update(
+                    id,
+                    corti_queue::JobUpdate {
+                        transcribe_job: Some(legacy_attempt_name(id)),
+                        ..Default::default()
+                    },
+                )
+                .context("persisting legacy recovery attempt name")?;
+            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path)
+        }
         RetryAction::Transcribe => pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path),
         RetryAction::MissingAudio => {
             pipeline::fail(
@@ -127,28 +181,12 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
 /// sweeping it here contains crash leftovers.
 fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
     let retention_days = i64::from(ctx.config.lock().unwrap().retention_days);
-    let audio_cutoff = chrono::Local::now() - chrono::Duration::days(retention_days);
-
-    let mut files = 0usize;
-    for row in ctx.queue.expired(audio_cutoff)? {
-        // The recording itself (whatever path the row stores) and its AEC-cleaned sibling, when distinct.
-        let audio = &row.audio_path;
-        for path in [
-            audio.clone(),
-            corti_capture::clean_wav_path(audio),
-            crate::checkpoint::path_for(audio),
-        ] {
-            if std::fs::remove_file(&path).is_ok() {
-                files += 1;
-            }
-        }
-    }
-
-    let row_days = retention_days.max(MIN_ROW_RETENTION_DAYS);
-    let row_cutoff = chrono::Local::now() - chrono::Duration::days(row_days);
-    let rows = ctx.queue.delete_terminal_older_than(row_cutoff)?;
+    // One instant defines both horizons. In particular, the row-GC set can never be a few milliseconds
+    // larger than the artifact-deletion set at equal (90–365 day) retention.
+    let now = Local::now();
+    let (files, rows) = sweep_recordings(&ctx.queue, retention_days, now)?;
     let job_rows = ctx.queue.jobs().delete_terminal_older_than(
-        Utc::now() - chrono::Duration::days(FAILED_JOB_ROW_RETENTION_DAYS),
+        now.with_timezone(&Utc) - chrono::Duration::days(FAILED_JOB_ROW_RETENTION_DAYS),
     )?;
 
     if files + rows + job_rows > 0 {
@@ -161,29 +199,148 @@ fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+/// Delete recording artifacts and then, on the longer history horizon, their terminal rows. A row is
+/// retained whenever any path cannot be removed so a later sweep still knows what to retry. Non-terminal
+/// rows retain their audio, but stale atomic-write temps are always safe to remove once retention expires:
+/// only the canonical checkpoint name is ever a recovery input.
+fn sweep_recordings(
+    queue: &Queue,
+    retention_days: i64,
+    now: DateTime<Local>,
+) -> Result<(usize, usize)> {
+    let audio_cutoff = now - chrono::Duration::days(retention_days);
+    let row_cutoff = now - chrono::Duration::days(retention_days.max(MIN_ROW_RETENTION_DAYS));
+    let mut files = 0usize;
+    let mut rows = 0usize;
+
+    for row in queue.all()? {
+        if row.updated_at >= audio_cutoff {
+            continue;
+        }
+
+        if !row.status.is_terminal() {
+            files += remove_stale_checkpoint_temps(&row.id, &row.audio_path).0;
+            continue;
+        }
+
+        let (removed, all_absent) = remove_recording_artifacts(&row.id, &row.audio_path);
+        files += removed;
+        if row.updated_at < row_cutoff && all_absent && queue.delete_terminal(&row.id)? {
+            rows += 1;
+        }
+    }
+    Ok((files, rows))
+}
+
+fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
+    let mut paths = vec![
+        audio.to_path_buf(),
+        corti_capture::clean_wav_path(audio),
+        crate::checkpoint::path_for(audio),
+    ];
+    let mut all_absent = true;
+    match crate::checkpoint::temporary_paths(audio) {
+        Ok(temps) => paths.extend(temps),
+        Err(err) => {
+            all_absent = false;
+            warn!(
+                target: "corti::retention",
+                job_id = %id,
+                error = %err,
+                "could not inspect temporary transcript checkpoints; retaining recording row"
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let (removed, paths_absent) = remove_paths(id, paths);
+    (removed, all_absent && paths_absent)
+}
+
+fn remove_stale_checkpoint_temps(id: &str, audio: &Path) -> (usize, bool) {
+    match crate::checkpoint::temporary_paths(audio) {
+        Ok(paths) => remove_paths(id, paths),
+        Err(err) => {
+            warn!(
+                target: "corti::retention",
+                job_id = %id,
+                error = %err,
+                "could not inspect stale temporary transcript checkpoints"
+            );
+            (0, false)
+        }
+    }
+}
+
+fn remove_paths(id: &str, paths: Vec<PathBuf>) -> (usize, bool) {
+    let mut removed = 0usize;
+    let mut all_absent = true;
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                all_absent = false;
+                warn!(
+                    target: "corti::retention",
+                    job_id = %id,
+                    path = %path.display(),
+                    error = %err,
+                    "could not remove expired recording artifact; retaining recording row"
+                );
+            }
+        }
+    }
+    (removed, all_absent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corti_core::{OwningApp, RecordingMeta};
 
-    #[test]
-    fn retry_dispatches_pending_note_to_checkpoint_only() {
-        assert_eq!(
-            retry_action(JobStatus::PendingNote, true, true),
-            RetryAction::FileCheckpoint
-        );
-        // The durable transcript is sufficient even if the raw audio is temporarily unavailable.
-        assert_eq!(
-            retry_action(JobStatus::PendingNote, true, false),
-            RetryAction::FileCheckpoint
-        );
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("corti-jobs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn meta(audio_path: PathBuf) -> RecordingMeta {
+        RecordingMeta {
+            started_at: Local::now(),
+            ended_at: Some(Local::now()),
+            owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
+            audio_path,
+        }
     }
 
     #[test]
-    fn legacy_pending_note_falls_back_to_audio_once() {
+    fn any_valid_checkpoint_dispatches_to_filing_only() {
+        for status in [
+            JobStatus::PendingTranscription,
+            JobStatus::Transcribing,
+            JobStatus::PendingNote,
+        ] {
+            assert_eq!(
+                retry_action(status, true, true),
+                RetryAction::FileCheckpoint
+            );
+            // The durable transcript is sufficient even if the raw audio is unavailable.
+            assert_eq!(
+                retry_action(status, true, false),
+                RetryAction::FileCheckpoint
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pending_note_uses_a_new_stable_attempt() {
         assert_eq!(
             retry_action(JobStatus::PendingNote, false, true),
-            RetryAction::Transcribe
+            RetryAction::TranscribeLegacyPendingNote
         );
+        assert_eq!(legacy_attempt_name("recording"), "recording-checkpoint-v1");
         assert_eq!(
             retry_action(JobStatus::PendingNote, false, false),
             RetryAction::MissingAudio
@@ -191,13 +348,9 @@ mod tests {
     }
 
     #[test]
-    fn transcription_states_still_require_audio() {
+    fn transcription_without_a_checkpoint_still_requires_audio() {
         for status in [JobStatus::PendingTranscription, JobStatus::Transcribing] {
-            assert_eq!(
-                retry_action(status, true, true),
-                RetryAction::Transcribe,
-                "a stray checkpoint must not redefine {status:?}"
-            );
+            assert_eq!(retry_action(status, false, true), RetryAction::Transcribe);
             assert_eq!(
                 retry_action(status, false, false),
                 RetryAction::MissingAudio
@@ -216,5 +369,52 @@ mod tests {
             assert!(row_days >= retention_days);
         }
         assert_eq!(365_i64.max(MIN_ROW_RETENTION_DAYS), 365);
+    }
+
+    #[test]
+    fn failed_artifact_deletion_retains_path_bearing_row() {
+        let dir = test_dir("unlink-failure");
+        let audio = dir.join("blocked.wav");
+        // `remove_file` cannot unlink a directory: a deterministic stand-in for permission/I/O failure.
+        std::fs::create_dir(&audio).unwrap();
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta(audio.clone())).unwrap();
+        queue.set_status(&id, JobStatus::Done).unwrap();
+        let future = Local::now() + chrono::Duration::days(366);
+
+        let (_, rows) = sweep_recordings(&queue, 365, future).unwrap();
+        assert_eq!(rows, 0);
+        assert!(
+            queue.get(&id).unwrap().is_some(),
+            "path must remain retryable"
+        );
+
+        std::fs::remove_dir(&audio).unwrap();
+        let (_, rows) = sweep_recordings(&queue, 365, future).unwrap();
+        assert_eq!(rows, 1);
+        assert!(queue.get(&id).unwrap().is_none());
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stale_checkpoint_temp_is_swept_from_nonterminal_row() {
+        let dir = test_dir("stale-checkpoint-temp");
+        let audio = dir.join("recording.wav");
+        std::fs::write(&audio, b"raw").unwrap();
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta(audio.clone())).unwrap();
+        let checkpoint = crate::checkpoint::path_for(&audio);
+        let stale = PathBuf::from(format!("{}.tmp-12345", checkpoint.display()));
+        std::fs::write(&stale, b"plaintext transcript").unwrap();
+
+        let (files, rows) =
+            sweep_recordings(&queue, 1, Local::now() + chrono::Duration::days(2)).unwrap();
+        assert_eq!((files, rows), (1, 0));
+        assert!(!stale.exists());
+        assert!(audio.exists(), "nonterminal recovery audio must remain");
+        assert!(queue.get(&id).unwrap().is_some());
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

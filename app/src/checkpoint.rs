@@ -112,6 +112,38 @@ fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Temporary checkpoint files left by a process death before the atomic rename.
+///
+/// These are never recovery inputs: only the canonical path returned by [`path_for`] is published. The
+/// retention sweep discovers every PID-suffixed sibling so plaintext transcript debris cannot outlive its
+/// recording row.
+pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let checkpoint = path_for(audio);
+    let parent = checkpoint
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = checkpoint.file_name() else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{}.tmp-", file_name.to_string_lossy());
+
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +203,21 @@ mod tests {
             err.contains("unsupported filing checkpoint version 999"),
             "{err}"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn discovers_all_pid_suffixed_temporary_checkpoints() {
+        let dir = dir("temporary-paths");
+        let audio = dir.join("recording.wav");
+        let checkpoint = path_for(&audio);
+        let stale_a = PathBuf::from(format!("{}.tmp-12", checkpoint.display()));
+        let stale_b = PathBuf::from(format!("{}.tmp-34", checkpoint.display()));
+        std::fs::write(&stale_b, b"b").unwrap();
+        std::fs::write(&stale_a, b"a").unwrap();
+        std::fs::write(dir.join("other.transcript.json.tmp-12"), b"other").unwrap();
+
+        assert_eq!(temporary_paths(&audio).unwrap(), vec![stale_a, stale_b]);
         std::fs::remove_dir_all(dir).ok();
     }
 }

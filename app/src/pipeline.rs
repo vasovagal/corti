@@ -9,8 +9,8 @@
 //! ## Durable post-ASR filing boundary
 //! A successful backend result is atomically checkpointed beside the retained raw recording before the row
 //! enters `PendingNote`. Filing retries load that small checkpoint and never rerun ASR; transcription retries
-//! still use the raw audio. The hourly sweep is the only raw-audio deletion authority. Full reconciliation
-//! of every first-attempt nonterminal row remains deferred, but durable retry jobs survive restarts.
+//! still use the raw audio. The hourly sweep is the only raw-audio deletion authority. Startup narrowly
+//! recovers every valid post-ASR checkpoint; broader first-attempt reconciliation remains deferred.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -141,6 +141,23 @@ pub fn run(
         Ok(0) => {}
         Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
         Err(e) => eprintln!("[corti] cannot recover background jobs: {e:#}"),
+    }
+    // Narrow first-attempt recovery at the new durable boundary: if the checkpoint exists, ASR is already
+    // done regardless of whether the adjacent PendingNote write committed. Other first-attempt states
+    // remain outside this PR's startup-reconciliation scope.
+    for row in recover_filing_checkpoints(&ctx.queue) {
+        eprintln!(
+            "[corti] recovering durable filing checkpoint for {}",
+            row.id
+        );
+        tray::update_history(
+            &ctx.app,
+            &row.id,
+            JobStatus::PendingNote,
+            None,
+            row.error,
+            row.note_path,
+        );
     }
     // #87: revive/close out rows stranded at `Recording` by a quit or crash mid-call. Without this
     // they sit non-terminal forever, their notes stay at `State: transcribing`, and the retention
@@ -376,6 +393,14 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
     }
 }
 
+fn retry_status(row: &Job, audio: &Path) -> JobStatus {
+    if row.status == JobStatus::PendingNote || FilingCheckpoint::load(audio).is_ok() {
+        JobStatus::PendingNote
+    } else {
+        JobStatus::PendingTranscription
+    }
+}
+
 /// Reflect a durable retry job's backoff on the recording row. A filing failure remains `PendingNote`
 /// because its checkpoint is the recovery input; a transcription failure returns to
 /// `PendingTranscription`. This keeps the Queue window truthful while no attempt is actively running.
@@ -389,11 +414,7 @@ fn record_retry_backoff(ctx: &Ctx, job: &ClaimedJob, error: &str) {
     if row.status.is_terminal() {
         return;
     }
-    let status = if row.status == JobStatus::PendingNote {
-        JobStatus::PendingNote
-    } else {
-        JobStatus::PendingTranscription
-    };
+    let status = retry_status(&row, &row.audio_path);
     if let Err(e) = ctx.queue.update(
         id,
         JobUpdate {
@@ -487,9 +508,14 @@ fn schedule_retry(ctx: &Ctx, id: &str, meta: &RecordingMeta, err: anyhow::Error)
         .get(id)
         .ok()
         .flatten()
-        .filter(|row| row.status == JobStatus::PendingNote)
-        .map(|_| JobStatus::PendingNote)
-        .unwrap_or(JobStatus::PendingTranscription);
+        .map(|row| retry_status(&row, &meta.audio_path))
+        .unwrap_or_else(|| {
+            if FilingCheckpoint::load(&meta.audio_path).is_ok() {
+                JobStatus::PendingNote
+            } else {
+                JobStatus::PendingTranscription
+            }
+        });
     let update = ctx.queue.update(
         id,
         JobUpdate {
@@ -536,6 +562,19 @@ fn live_filed(
         audio_path = %audio.display(),
         "note filed live during the recording — skipping batch transcription"
     );
+    // The note can first be created during the final live flush, after its asynchronous
+    // `LiveNoteCreated` message. Persist the returned path synchronously before the fallible Done update so
+    // a completion failure/crash still lets batch recovery rewrite this exact note instead of creating a
+    // second one.
+    ctx.queue
+        .update(
+            id,
+            JobUpdate {
+                note_path: Some(note.clone()),
+                ..Default::default()
+            },
+        )
+        .context("persisting live note path before completion")?;
     ctx.queue
         .complete_with_note(id, &note)
         .context("persisting live note completion")?;
@@ -647,6 +686,52 @@ fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
         aec = if ctx.aec_enabled { "on" } else { "off" },
         "settings saved — backend reloaded"
     );
+}
+
+/// At startup, schedule only rows that have crossed the durable post-ASR boundary. This intentionally
+/// does not broaden into reconciliation of every first-attempt state: a valid checkpoint is the proof that
+/// filing alone is safe, even if the row still says Transcribing because the adjacent write failed.
+fn recover_filing_checkpoints(queue: &Queue) -> Vec<Job> {
+    let rows = match queue.resumable() {
+        Ok(rows) => rows,
+        Err(err) => {
+            eprintln!("[corti] cannot scan for durable filing checkpoints: {err:#}");
+            return Vec::new();
+        }
+    };
+    let mut recovered = Vec::new();
+    for row in rows.into_iter().filter(|row| {
+        matches!(
+            row.status,
+            JobStatus::PendingTranscription | JobStatus::Transcribing | JobStatus::PendingNote
+        ) && FilingCheckpoint::load(&row.audio_path).is_ok()
+    }) {
+        // Enqueue first. If the following status repair fails, the handler still recognizes the checkpoint
+        // from any nonterminal transcription state and promotes it itself.
+        let enqueued = queue.jobs().enqueue(
+            crate::jobs::RETRY_TRANSCRIPTION,
+            &crate::jobs::id_payload(&row.id),
+            crate::jobs::RETRY_MAX_ATTEMPTS,
+            Utc::now(),
+        );
+        let promoted = enqueued.and_then(|_| {
+            queue.update(
+                &row.id,
+                JobUpdate {
+                    status: Some(JobStatus::PendingNote),
+                    ..Default::default()
+                },
+            )
+        });
+        match promoted {
+            Ok(()) => recovered.push(row),
+            Err(err) => eprintln!(
+                "[corti] cannot resume filing checkpoint for {}: {err:#}",
+                row.id
+            ),
+        }
+    }
+    recovered
 }
 
 /// Outcome of reaping one row stranded at `Recording`.
@@ -782,13 +867,36 @@ pub(crate) fn transcribe_and_file(
     meta: &RecordingMeta,
     audio: &Path,
 ) -> Result<()> {
-    // Record the stable Transcribe job name + advance to Transcribing before transcribing.
+    // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
+    // transition failed (or the process died between them). Treat it as authoritative from every dispatch
+    // path, including a duplicate first-attempt Process message.
+    if FilingCheckpoint::load(audio).is_ok() {
+        ctx.queue
+            .update(
+                id,
+                JobUpdate {
+                    status: Some(JobStatus::PendingNote),
+                    ..Default::default()
+                },
+            )
+            .context("promoting durable checkpoint to PendingNote")?;
+        return file_checkpoint(ctx, id, meta, audio);
+    }
+
+    // Reuse the persisted stable Transcribe name across retries. Legacy PendingNote recovery writes a new
+    // compatibility name first; ordinary recordings default to their id.
+    let transcribe_job = ctx
+        .queue
+        .get(id)
+        .context("reading transcription attempt")?
+        .and_then(|row| row.transcribe_job)
+        .unwrap_or_else(|| id.to_string());
     ctx.queue
         .update(
             id,
             JobUpdate {
                 status: Some(JobStatus::Transcribing),
-                transcribe_job: Some(id.to_string()),
+                transcribe_job: Some(transcribe_job.clone()),
                 ..Default::default()
             },
         )
@@ -800,7 +908,7 @@ pub(crate) fn transcribe_and_file(
     );
     tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
-    // Run AEC + backend from the retained raw recording. Pipeline AWS attempts use the stable recording id;
+    // Run AEC + backend from the retained raw recording. Pipeline AWS attempts use the row's stable name;
     // one-shot CLI calls deliberately pass no stable name.
     let t0 = std::time::Instant::now();
     let transcribed = crate::transcribe::transcribe_recording(
@@ -808,7 +916,7 @@ pub(crate) fn transcribe_and_file(
         ctx.aec_enabled,
         false,
         &ctx.aec_config,
-        crate::transcribe::TranscriptionAttempt::durable(id),
+        crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
         meta,
         audio,
     );
@@ -839,17 +947,6 @@ pub(crate) fn transcribe_and_file(
         )
         .context("queue set PendingNote")?;
 
-    // Both the transcript file and its `PendingNote` meaning are now durable. AWS staged objects are no
-    // longer recovery inputs; cleanup is best-effort and never rolls back the checkpoint.
-    if let Err(e) = ctx.backend.cleanup_after_checkpoint(id) {
-        warn!(
-            target: "corti::transcribe",
-            job_id = %id,
-            error = %format!("{e:#}"),
-            "transcript checkpointed but AWS staged-object cleanup failed"
-        );
-    }
-
     file_checkpoint(ctx, id, meta, audio)
 }
 
@@ -865,6 +962,19 @@ pub(crate) fn file_checkpoint(
     set_stage(&ctx.app, Stage::Filing);
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
     tray::set_status(&ctx.app, format!("Filing note — {}…", meta.owning_app.name));
+
+    // Cloud objects stopped being recovery inputs once the checkpoint was durable, but their privacy
+    // cleanup is not best-effort: keep PendingNote/checkpoint and retry this idempotent deletion before
+    // allowing terminal completion.
+    let aws_job_name = ctx
+        .queue
+        .get(id)
+        .context("reading transcription attempt before cloud cleanup")?
+        .and_then(|row| row.transcribe_job)
+        .unwrap_or_else(|| id.to_string());
+    ctx.backend
+        .cleanup_after_checkpoint(&aws_job_name)
+        .context("cleaning staged AWS objects after checkpoint")?;
 
     let tf = std::time::Instant::now();
     let result = file_and_done(ctx, id, meta, audio, &mut checkpoint);
@@ -1023,7 +1133,7 @@ pub(crate) fn fail(ctx: &Ctx, id: &str, meta: &RecordingMeta, msg: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corti_core::OwningApp;
+    use corti_core::{DiarizedTranscript, OwningApp};
 
     fn test_dir(name: &str) -> PathBuf {
         let dir =
@@ -1040,6 +1150,70 @@ mod tests {
             owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
             audio_path: audio,
         }
+    }
+
+    #[test]
+    fn startup_recovers_only_valid_post_asr_checkpoints() {
+        let dir = test_dir("checkpoint-startup-recovery");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+
+        let add = |name: &str, status: JobStatus, checkpoint: bool| {
+            let audio = dir.join(format!("{name}.wav"));
+            std::fs::write(&audio, b"raw").unwrap();
+            let id = queue.enqueue(&meta(audio.clone())).unwrap();
+            queue.set_status(&id, status).unwrap();
+            if checkpoint {
+                FilingCheckpoint::new(DiarizedTranscript::new(Vec::new()), None)
+                    .store(&audio)
+                    .unwrap();
+            }
+            id
+        };
+        let transcribing = add("transcribing", JobStatus::Transcribing, true);
+        let pending_note = add("pending-note", JobStatus::PendingNote, true);
+        let no_checkpoint = add("no-checkpoint", JobStatus::Transcribing, false);
+        let done = add("done", JobStatus::Done, true);
+
+        let mut recovered = recover_filing_checkpoints(&queue)
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        recovered.sort();
+        let mut expected = vec![transcribing.clone(), pending_note.clone()];
+        expected.sort();
+        assert_eq!(recovered, expected);
+        for id in [&transcribing, &pending_note] {
+            assert_eq!(
+                queue.get(id).unwrap().unwrap().status,
+                JobStatus::PendingNote
+            );
+        }
+        assert_eq!(
+            queue.get(&no_checkpoint).unwrap().unwrap().status,
+            JobStatus::Transcribing
+        );
+        assert_eq!(queue.get(&done).unwrap().unwrap().status, JobStatus::Done);
+        assert_eq!(
+            queue
+                .jobs()
+                .active_for(crate::jobs::RETRY_TRANSCRIPTION)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Active-job deduplication makes the startup scan idempotent.
+        assert_eq!(recover_filing_checkpoints(&queue).len(), 2);
+        assert_eq!(
+            queue
+                .jobs()
+                .active_for(crate::jobs::RETRY_TRANSCRIPTION)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

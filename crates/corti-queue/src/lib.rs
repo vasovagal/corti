@@ -370,10 +370,30 @@ impl Queue {
         raws.into_iter().map(raw_to_job).collect()
     }
 
+    /// Delete one terminal (`Done` | `Failed`) row after its caller has confirmed that every associated
+    /// artifact is absent. Non-terminal rows are never touched. Returns whether a row was deleted.
+    pub fn delete_terminal(&self, id: &str) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM recordings WHERE id = ?1 AND status IN (?2, ?3)",
+                params![
+                    id,
+                    status_to_string(JobStatus::Done),
+                    status_to_string(JobStatus::Failed),
+                ],
+            )
+            .context("deleting terminal recording")?;
+        Ok(deleted > 0)
+    }
+
     /// Row GC: delete terminal (`Done` | `Failed`) rows last updated before `older_than`. Bounds
     /// queue.db and the Recording Queue's history list on a much longer horizon than the audio
     /// retention (90 days vs ~7), so "Filed in brain" history stays useful for a quarter. Returns how
     /// many rows went; non-terminal rows are never touched.
+    ///
+    /// Retention code that owns artifacts should prefer [`Queue::delete_terminal`] after confirming those
+    /// paths are absent. This bulk helper remains available to queue-only callers with no artifact contract.
     pub fn delete_terminal_older_than(&self, older_than: DateTime<Local>) -> Result<usize> {
         self.conn
             .execute(
@@ -679,6 +699,24 @@ mod tests {
         assert_eq!(unchanged.status, JobStatus::PendingNote);
         assert_eq!(unchanged.note_path, None);
 
+        // The live pipeline records a just-returned note path before this completion statement. If Done is
+        // the write that fails, that recovery reference survives for the batch rewrite.
+        q.update(
+            &id,
+            JobUpdate {
+                note_path: Some(PathBuf::from("/vault/note.md")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            q.complete_with_note(&id, Path::new("/vault/note.md"))
+                .is_err()
+        );
+        let recoverable = q.get(&id).unwrap().unwrap();
+        assert_eq!(recoverable.status, JobStatus::PendingNote);
+        assert_eq!(recoverable.note_path, Some(PathBuf::from("/vault/note.md")));
+
         q.conn.execute_batch("DROP TRIGGER reject_done").unwrap();
         q.complete_with_note(&id, Path::new("/vault/note.md"))
             .unwrap();
@@ -797,6 +835,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn delete_terminal_removes_only_terminal_rows() {
+        let q = Queue::memory();
+        let done = q.enqueue(&meta("/cache/done.ogg", "us.zoom.xos")).unwrap();
+        let pending = q
+            .enqueue(&meta("/cache/pending.ogg", "us.zoom.xos"))
+            .unwrap();
+        q.set_status(&done, JobStatus::Done).unwrap();
+
+        assert!(q.delete_terminal(&done).unwrap());
+        assert!(q.get(&done).unwrap().is_none());
+        assert!(!q.delete_terminal(&pending).unwrap());
+        assert!(q.get(&pending).unwrap().is_some());
     }
 
     #[test]
