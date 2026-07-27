@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "local"), allow(dead_code))]
+
 //! Live inbox filing (issue #87, ADR 0010): transcribe a detector recording **while it records** and
 //! append finalized segments to the vagus inbox note as they land, so `tail -f` on the note shows the
 //! conversation arriving and the end-of-call batch spike disappears.

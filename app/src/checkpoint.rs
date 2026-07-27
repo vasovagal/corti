@@ -14,15 +14,82 @@ use corti_core::DiarizedTranscript;
 use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
+const AWS_STAGING_VERSION: u32 = 1;
 
-/// The exact AWS staging location that still needs privacy cleanup after the transcript is durable.
-/// Keeping this in the checkpoint prevents a backend/bucket switch from silently forgetting old objects.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A note path whose ownership must survive a retry. Partial live notes may be rewritten/replaced; canonical
+/// notes were already returned by vagus (or finalized live) and need completion only, even after they move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedNote {
+    pub(crate) path: PathBuf,
+    pub(crate) canonical: bool,
+}
+
+impl OwnedNote {
+    pub(crate) fn partial(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            canonical: false,
+        }
+    }
+
+    pub(crate) fn canonical(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            canonical: true,
+        }
+    }
+}
+
+/// The exact AWS staging location that still needs privacy cleanup. Before ASR completes this is stored in
+/// a separate marker; after ASR it is also carried by the transcript checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AwsStaging {
     pub(crate) bucket: String,
     pub(crate) key_prefix: String,
     pub(crate) job_name: String,
     pub(crate) region: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AwsStagingMarker {
+    version: u32,
+    staging: AwsStaging,
+}
+
+impl AwsStaging {
+    /// Publish cloud ownership before upload/start can create remote artifacts.
+    pub(crate) fn store(&self, audio: &Path) -> Result<()> {
+        atomic_store_json(
+            &aws_staging_path_for(audio),
+            &AwsStagingMarker {
+                version: AWS_STAGING_VERSION,
+                staging: self.clone(),
+            },
+            "AWS staging marker",
+        )
+    }
+
+    pub(crate) fn load(audio: &Path) -> Result<Self> {
+        let path = aws_staging_path_for(audio);
+        let marker: AwsStagingMarker = load_json(&path, "AWS staging marker")?;
+        if marker.version != AWS_STAGING_VERSION {
+            bail!(
+                "unsupported AWS staging marker version {} in {} (expected {})",
+                marker.version,
+                path.display(),
+                AWS_STAGING_VERSION
+            );
+        }
+        Ok(marker.staging)
+    }
+
+    pub(crate) fn remove(audio: &Path) -> Result<()> {
+        match std::fs::remove_file(aws_staging_path_for(audio)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).context("removing AWS staging marker"),
+        }
+    }
 }
 
 /// The durable boundary between transcription and filing.
@@ -32,6 +99,10 @@ pub(crate) struct FilingCheckpoint {
     pub(crate) transcript: DiarizedTranscript,
     /// Existing partial live note, or the path returned by `vagus add-note` before queue completion.
     pub(crate) note_path: Option<PathBuf>,
+    /// `true` once the note body is canonical. Completion retries must trust this path even if vagus has
+    /// reorganized it out of the inbox; absence is not permission to invoke `add-note` again.
+    #[serde(default)]
+    pub(crate) note_canonical: bool,
     /// Present only for an AWS transcript whose staged input/output have not yet been deleted.
     pub(crate) aws_staging: Option<AwsStaging>,
 }
@@ -46,61 +117,31 @@ impl FilingCheckpoint {
             version: VERSION,
             transcript,
             note_path,
+            note_canonical: false,
             aws_staging,
         }
     }
 
+    pub(crate) fn owned_note(&self) -> Option<OwnedNote> {
+        self.note_path.clone().map(|path| OwnedNote {
+            path,
+            canonical: self.note_canonical,
+        })
+    }
+
+    pub(crate) fn set_canonical_note(&mut self, path: PathBuf) {
+        self.note_path = Some(path);
+        self.note_canonical = true;
+    }
+
     /// Atomically replace the checkpoint beside `audio` and fsync the file before publishing it.
     pub(crate) fn store(&self, audio: &Path) -> Result<()> {
-        let path = path_for(audio);
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating checkpoint directory {}", parent.display()))?;
-
-        let bytes = serde_json::to_vec(self).context("serializing filing checkpoint")?;
-        let tmp = temp_path(&path);
-        let write_result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)
-                .with_context(|| format!("creating temporary checkpoint {}", tmp.display()))?;
-            file.write_all(&bytes)
-                .with_context(|| format!("writing temporary checkpoint {}", tmp.display()))?;
-            file.sync_all()
-                .with_context(|| format!("syncing temporary checkpoint {}", tmp.display()))?;
-            std::fs::rename(&tmp, &path).with_context(|| {
-                format!(
-                    "publishing filing checkpoint {} -> {}",
-                    tmp.display(),
-                    path.display()
-                )
-            })?;
-            // Best-effort directory sync closes the rename durability window on filesystems that support it.
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
-            Ok(())
-        })();
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        write_result
+        atomic_store_json(&path_for(audio), self, "filing checkpoint")
     }
 
     pub(crate) fn load(audio: &Path) -> Result<Self> {
         let path = path_for(audio);
-        let mut bytes = Vec::new();
-        File::open(&path)
-            .with_context(|| format!("opening filing checkpoint {}", path.display()))?
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("reading filing checkpoint {}", path.display()))?;
-        let checkpoint: Self = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing filing checkpoint {}", path.display()))?;
+        let checkpoint: Self = load_json(&path, "filing checkpoint")?;
         if checkpoint.version != VERSION {
             bail!(
                 "unsupported filing checkpoint version {} in {} (expected {})",
@@ -115,12 +156,77 @@ impl FilingCheckpoint {
 
 /// `<recording-stem>.transcript.json`, beside the raw recording.
 pub(crate) fn path_for(audio: &Path) -> PathBuf {
+    sibling_path(audio, "transcript")
+}
+
+/// `<recording-stem>.aws-staging.json`, published before a durable cloud attempt starts.
+pub(crate) fn aws_staging_path_for(audio: &Path) -> PathBuf {
+    sibling_path(audio, "aws-staging")
+}
+
+fn sibling_path(audio: &Path, kind: &str) -> PathBuf {
     let stem = audio
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "recording".to_string());
-    audio.with_file_name(format!("{stem}.transcript.json"))
+    audio.with_file_name(format!("{stem}.{kind}.json"))
+}
+
+/// Conservative retention gate: an unreadable canonical checkpoint might be the last copy of an AWS owner,
+/// so preserve it just like an explicit pre-ASR marker rather than trading a small local leak for cloud PHI.
+pub(crate) fn has_unresolved_aws_staging(audio: &Path) -> bool {
+    if aws_staging_path_for(audio).is_file() {
+        return true;
+    }
+    match FilingCheckpoint::load(audio) {
+        Ok(checkpoint) => checkpoint.aws_staging.is_some(),
+        Err(_) => path_for(audio).is_file(),
+    }
+}
+
+fn atomic_store_json<T: Serialize + ?Sized>(path: &Path, value: &T, label: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating {label} directory {}", parent.display()))?;
+
+    let bytes = serde_json::to_vec(value).with_context(|| format!("serializing {label}"))?;
+    let tmp = temp_path(path);
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("creating temporary {label} {}", tmp.display()))?;
+        file.write_all(&bytes)
+            .with_context(|| format!("writing temporary {label} {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing temporary {label} {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!("publishing {label} {} -> {}", tmp.display(), path.display())
+        })?;
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+fn load_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .with_context(|| format!("opening {label} {}", path.display()))?
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {label} {}", path.display()))
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -139,13 +245,17 @@ pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
     let parent = checkpoint
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let Some(file_name) = checkpoint.file_name() else {
-        return Ok(Vec::new());
-    };
-    let prefix = format!("{}.tmp-", file_name.to_string_lossy());
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let prefixes: Vec<String> = [checkpoint, aws_staging_path_for(audio)]
+        .into_iter()
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| format!("{}.tmp-", name.to_string_lossy()))
+        })
+        .collect();
 
-    let entries = match std::fs::read_dir(parent) {
+    let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
@@ -153,7 +263,11 @@ pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+        let name = entry.file_name();
+        if prefixes
+            .iter()
+            .any(|prefix| name.to_string_lossy().starts_with(prefix))
+        {
             paths.push(entry.path());
         }
     }
@@ -204,9 +318,11 @@ mod tests {
     fn atomically_round_trips_transcript_and_note_path() {
         let dir = dir("roundtrip");
         let audio = dir.join("recording.wav");
-        let expected = checkpoint(Some(dir.join("note.md")));
+        let mut expected = checkpoint(Some(dir.join("note.md")));
+        expected.set_canonical_note(dir.join("note.md"));
         expected.store(&audio).unwrap();
         assert_eq!(FilingCheckpoint::load(&audio).unwrap(), expected);
+        assert!(expected.owned_note().unwrap().canonical);
 
         // Once staged-object deletion succeeds, clearing that ownership must itself survive a filing retry.
         let mut cleaned = expected.clone();
@@ -214,6 +330,21 @@ mod tests {
         cleaned.store(&audio).unwrap();
         assert_eq!(FilingCheckpoint::load(&audio).unwrap(), cleaned);
         assert!(!temp_path(&path_for(&audio)).exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pre_asr_aws_staging_marker_round_trips_and_gates_retention() {
+        let dir = dir("aws-staging");
+        let audio = dir.join("recording.wav");
+        let staging = checkpoint(None).aws_staging.unwrap();
+
+        staging.store(&audio).unwrap();
+        assert_eq!(AwsStaging::load(&audio).unwrap(), staging);
+        assert!(has_unresolved_aws_staging(&audio));
+        AwsStaging::remove(&audio).unwrap();
+        assert!(!aws_staging_path_for(&audio).exists());
+        assert!(!has_unresolved_aws_staging(&audio));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -242,11 +373,15 @@ mod tests {
         let checkpoint = path_for(&audio);
         let stale_a = PathBuf::from(format!("{}.tmp-12", checkpoint.display()));
         let stale_b = PathBuf::from(format!("{}.tmp-34", checkpoint.display()));
+        let stale_aws = PathBuf::from(format!("{}.tmp-56", aws_staging_path_for(&audio).display()));
         std::fs::write(&stale_b, b"b").unwrap();
         std::fs::write(&stale_a, b"a").unwrap();
+        std::fs::write(&stale_aws, b"aws").unwrap();
         std::fs::write(dir.join("other.transcript.json.tmp-12"), b"other").unwrap();
 
-        assert_eq!(temporary_paths(&audio).unwrap(), vec![stale_a, stale_b]);
+        let mut expected = vec![stale_a, stale_b, stale_aws];
+        expected.sort();
+        assert_eq!(temporary_paths(&audio).unwrap(), expected);
         std::fs::remove_dir_all(dir).ok();
     }
 }

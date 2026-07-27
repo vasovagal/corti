@@ -94,7 +94,7 @@ impl Backend {
         let opts = AwsOptions {
             job_name: job_name.map(str::to_string),
             // A durable stable job is cleaned only after the app checkpoint is persisted. One-shot CLI
-            // attempts keep the backend's success-only cleanup behavior.
+            // attempts have no reattachment owner, so the backend attempts cleanup on every outcome.
             delete_after: job_name.is_none(),
             language: self.cfg.language.clone(),
             ..AwsOptions::new(bucket)
@@ -102,9 +102,9 @@ impl Backend {
         AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
     }
 
-    /// Describe any cloud staging owned by the just-completed durable attempt. The checkpoint, rather than
-    /// mutable current settings, becomes the cleanup authority.
-    pub fn aws_staging_for_checkpoint(&self, job_name: &str) -> Result<Option<AwsStaging>> {
+    /// Describe the exact cloud staging a durable attempt will own. The pipeline persists this before the
+    /// backend can upload, then carries the same identity into its post-ASR checkpoint.
+    pub fn aws_staging_for_attempt(&self, job_name: &str) -> Result<Option<AwsStaging>> {
         let _ = job_name;
         match &self.kind {
             #[cfg(feature = "aws")]

@@ -59,14 +59,14 @@ export function rowState(r: RecordingDto): RowState {
       return { label: "Done", tone: "ok", action: null };
     }
     case "failed":
-      if (r.audio_exists) {
+      if (r.recovery_exists) {
         return {
           label: `Could not transcribe ${call}: ${r.error ?? "unknown error"}`,
           tone: "error",
           action: "retry",
         };
       }
-      return { label: "Failed (audio expired)", tone: "error", action: null };
+      return { label: "Failed (recovery expired)", tone: "error", action: null };
     default:
       return { label: r.status, tone: "info", action: null };
   }

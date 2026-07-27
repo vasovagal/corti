@@ -90,12 +90,14 @@ audio (issue #18); it stays off by default.
 private `new_current_thread` tokio runtime and `block_on`-ing an attach-or-upload → start → poll →
 fetch → parse flow against the async SDK. `AwsOptions.job_name` is the stable name persisted on the
 recording row, so a retry probes AWS first and re-attaches without re-encoding or uploading the full call.
-A terminally failed job is deleted so the stable name can start a fresh attempt. Transient poll/fetch/parse
-failures retain staged objects; a completed stable job whose output is confirmed missing is reset. A
-successful durable-pipeline result checkpoints its exact bucket/prefix/job/region before cleanup. That
-ownership survives a backend or bucket setting change; cleanup completion is persisted before filing, and a
-cleanup failure keeps `PendingNote` for retry. Fresh `--redo --aws` attempts neither reuse nor delete a
-terminal job name. From the pipeline thread's view this remains an ordinary blocking call.
+A terminally failed job is deleted so the stable name can start a fresh attempt. Before upload/start, the
+app atomically publishes `<recording-stem>.aws-staging.json` with the exact bucket/prefix/job/region; transient
+poll/fetch/parse failures therefore retain both staged objects **and their durable owner**. A successful
+result carries the same identity into the transcript checkpoint. Backend/bucket/region changes first clean
+the old marker, cleanup completion is persisted before filing, and terminal pipeline exhaustion hands any
+remaining marker to a separate effectively non-exhausting cleanup job. Fresh `--redo --aws` attempts use
+unique names and attempt S3 cleanup on failure as well as success because they have no reattachment owner.
+From the pipeline thread's view this remains an ordinary blocking call.
 
 ## The queue — durable store + background jobs
 
@@ -114,8 +116,10 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
 ```
 
 `PendingNote` has a durable meaning: `<recording-stem>.transcript.json` was atomically written beside the
-raw recording and contains a versioned `DiarizedTranscript`, an optional existing/returned note path, and
-any exact AWS staging location still awaiting deletion. Only cloud cleanup (when marked) and filing remain.
+raw recording and contains a versioned `DiarizedTranscript`, an optional existing/returned note path plus
+partial/canonical provenance, and any exact AWS staging location still awaiting deletion. A canonical path
+means vagus/live filing already completed the note body, so only SQLite completion remains even if the path
+has moved. Only cloud cleanup (when marked) and filing/completion remain.
 
 API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
 `set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), `retry_reset`, `all`,
@@ -141,10 +145,10 @@ exception: #87's startup reaper revives or fails them — see §Live inbox filin
 due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) claims and runs every due
 job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
 
-Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` →
-`transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on this
-thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` → clean
-AWS staging (when applicable) → file. Cloud cleanup errors propagate and retry from the checkpoint.
+Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` → publish any exact pre-ASR AWS
+owner → `transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on
+this thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` →
+clean AWS staging (when applicable) → file. Cloud cleanup errors propagate and retry from the checkpoint.
 Completion is one `Queue::complete_with_note` SQL update for `note_path + Done`; errors propagate before
 any success UI. On durable success the clean WAV and checkpoint are removed, while raw audio remains for
 the configured retention sweep.
@@ -154,15 +158,18 @@ failed/crashed adjacent `PendingNote` write cannot repeat ASR. Without one, `Pen
 `Transcribing` run ASR from retained raw audio; `PendingNote` is a legacy row and falls back once using a
 new persisted stable AWS name. Failed attempts back off
 `1 m → 2 m → … → 1 h` cap over `RETRY_MAX_ATTEMPTS = 5`; filing backoff remains visibly `PendingNote`,
-while transcription backoff returns to `PendingTranscription`. Exhaustion terminal-fails the recording.
-The Recording Queue window's Retry button starts a fresh manual attempt budget.
+while transcription backoff returns to `PendingTranscription`. Exhaustion persists the recording's terminal
+state before parking its job; unresolved AWS cleanup continues under its own durable job. The Recording
+Queue window's Retry button starts a fresh manual attempt budget and remains available when raw audio is
+gone but a validated filing checkpoint survives.
 
 **Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
 `enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:175` (also fires at startup),
 deletes raw audio older than `retention_days` (config, default 7), plus clean/checkpoint leftovers and
 crash-left atomic-write temps, then GCs terminal recording rows after `max(90, retention_days)` days and
 parked job rows after 30. One timestamp defines both horizons, and a failed artifact deletion retains the
-path-bearing row for a later sweep.
+path-bearing row for a later sweep. A row/checkpoint with unresolved AWS staging is never swept or GCed:
+the exact cloud address remains until deletion is acknowledged.
 
 `ReloadConfig` (sent by the Settings screen on save) rebuilds the backend + AEC toggle between jobs.
 
@@ -224,11 +231,13 @@ vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
 Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
 
-After `vagus add-note` returns, its path is first added to the local checkpoint, then
+After `vagus add-note` returns, its path is marked canonical in the local checkpoint, then
 `Queue::complete_with_note` atomically persists `note_path + Done`. A completion failure leaves the row at
-`PendingNote`; retry reloads the checkpoint and rewrites the same note in place instead of invoking ASR or
-creating a second note. The irreducible process-death window while the external `vagus` process creates a
-note but before Corti receives its returned path is not claimed as exactly-once.
+`PendingNote`; retry performs completion only and trusts the canonical path even when vagus has moved it.
+If both local writes fail, a structured error transfers the path/provenance into the durable retry payload;
+job rescheduling persists that replacement payload in the same SQL settlement. The irreducible process-death
+window while the external `vagus` process creates a note but before Corti receives its returned path is not
+claimed as exactly-once.
 
 ## Shared types (`corti-core`)
 

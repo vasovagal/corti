@@ -213,9 +213,17 @@ impl<'c> Jobs<'c> {
             self.conn
                 .execute(
                     "UPDATE jobs SET state = 'pending', attempts = COALESCE(?4, attempts),
-                                     last_error = ?2, next_run_at = ?3, updated_at = ?5
+                                     last_error = ?2, next_run_at = ?3, updated_at = ?5,
+                                     payload = ?6
                      WHERE id = ?1",
-                    params![job.id, error, fmt_utc(next), attempts, fmt_utc(now)],
+                    params![
+                        job.id,
+                        error,
+                        fmt_utc(next),
+                        attempts,
+                        fmt_utc(now),
+                        job.payload.to_string()
+                    ],
                 )
                 .context("rescheduling failed job")?;
             Ok(())
@@ -236,13 +244,42 @@ impl<'c> Jobs<'c> {
             None => {
                 self.conn
                     .execute(
-                        "UPDATE jobs SET state = 'failed', last_error = ?2, updated_at = ?3 WHERE id = ?1",
-                        params![job.id, error, fmt_utc(now)],
+                        "UPDATE jobs SET state = 'failed', last_error = ?2, updated_at = ?3,
+                                         payload = ?4 WHERE id = ?1",
+                        params![job.id, error, fmt_utc(now), job.payload.to_string()],
                     )
                     .context("parking exhausted job")?;
                 Ok(FailOutcome::Exhausted)
             }
         }
+    }
+
+    /// Requeue a claimed one-shot even after its nominal attempt budget. Used when the artifact's terminal
+    /// state could not be persisted: parking the only active job first would violate durability.
+    pub fn reschedule(
+        &self,
+        job: &ClaimedJob,
+        error: &str,
+        backoff: &Backoff,
+    ) -> Result<DateTime<Utc>> {
+        let now = Utc::now();
+        let next = now
+            + chrono::Duration::from_std(backoff.delay(job.attempts))
+                .unwrap_or(chrono::Duration::MAX);
+        self.conn
+            .execute(
+                "UPDATE jobs SET state = 'pending', last_error = ?2, next_run_at = ?3,
+                                 updated_at = ?4, payload = ?5 WHERE id = ?1",
+                params![
+                    job.id,
+                    error,
+                    fmt_utc(next),
+                    fmt_utc(now),
+                    job.payload.to_string()
+                ],
+            )
+            .context("rescheduling unsettled job")?;
+        Ok(next)
     }
 
     /// Startup crash recovery: anything still `running` was orphaned by a crash — make it due now.
@@ -453,6 +490,40 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn failure_settlement_persists_replacement_payload_and_can_reschedule_exhaustion() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        jobs.enqueue("retry", &json!({"id": "x"}), 1, Utc::now())
+            .unwrap();
+        let mut claimed = jobs.claim_due(Utc::now()).unwrap().unwrap();
+        claimed.payload = json!({"id": "x", "preferred_note": "/brain/note.md"});
+
+        let next = jobs
+            .reschedule(&claimed, "terminal write failed", &BACKOFF)
+            .unwrap();
+        let recovered = jobs
+            .claim_due(next + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.payload, claimed.payload);
+        assert_eq!(
+            jobs.fail(&recovered, "still broken", &BACKOFF).unwrap(),
+            FailOutcome::Exhausted
+        );
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM jobs WHERE id = ?1",
+                params![recovered.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+            claimed.payload
+        );
     }
 
     #[test]
