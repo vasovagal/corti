@@ -100,7 +100,8 @@ pub struct StreamingAec {
     // ---- warm-up / lookahead state machine ----
     warming: bool,
     lookahead_samples: usize,
-    /// Buffered raw (un-delayed) opening, bounded by `lookahead_samples + b`.
+    /// Buffered raw (un-delayed) opening, bounded by `lookahead_samples` even when a caller supplies the
+    /// whole recording in one `push`.
     warm_mic: Vec<f32>,
     warm_far: Vec<f32>,
     /// `W` snapshot taken at end of warm-up; the suppression reference for the re-emitted opening.
@@ -185,16 +186,28 @@ impl StreamingAec {
         let mut out = Vec::new();
 
         if self.warming {
-            self.warm_mic.extend_from_slice(mic);
-            self.warm_far.extend_from_slice(far);
+            // Consume only the prefix that belongs to the configured opening. Treating the caller's whole
+            // slice atomically made a one-shot batch call redefine a five-second lookahead as "the whole
+            // recording", so every sample was run through both convergence and re-emission.
+            let needed = self.lookahead_samples.saturating_sub(self.warm_mic.len());
+            let opening = needed.min(mic.len());
+            self.warm_mic.extend_from_slice(&mic[..opening]);
+            self.warm_far.extend_from_slice(&far[..opening]);
+            debug_assert!(self.warm_mic.len() <= self.lookahead_samples);
             if self.warm_mic.len() >= self.lookahead_samples {
                 self.lock_and_emit_opening(&mut out);
             }
-            self.emitted += out.len();
-            return out;
+            if self.warming {
+                // This chunk ended before the opening filled; all of it is now in the bounded warm buffer.
+                self.emitted += out.len();
+                return out;
+            }
+            // The same push may contain steady-state audio after the exact opening prefix. Process that
+            // remainder now rather than dropping it or making chunk boundaries observable.
+            self.stream_steady(&mic[opening..], &far[opening..], &mut out);
+        } else {
+            self.stream_steady(mic, far, &mut out);
         }
-
-        self.stream_steady(mic, far, &mut out);
         self.emitted += out.len();
         out
     }
@@ -305,29 +318,44 @@ impl StreamingAec {
         self.warming = false;
     }
 
-    /// Steady-state streaming: prepend any pending sub-block input, process whole blocks with the live
-    /// adapting filter, buffer the `< b` remainder.
+    /// Steady-state streaming: fill any pending sub-block, process whole blocks with the live adapting
+    /// filter, and retain only the `< b` tail. Never concatenate the caller's entire slice into staging —
+    /// even a one-shot whole-call push keeps only bounded filter/pending state.
     fn stream_steady(&mut self, mic: &[f32], far: &[f32], out: &mut Vec<f32>) {
-        let mut mic_buf = std::mem::take(&mut self.pend_mic);
-        let mut far_buf = std::mem::take(&mut self.pend_far);
-        mic_buf.extend_from_slice(mic);
-        far_buf.extend_from_slice(far);
-
-        let whole = mic_buf.len() / self.b;
-        let span = whole * self.b;
+        debug_assert_eq!(mic.len(), far.len());
         let suppress = self.cfg.suppress_residual > 0.0;
+        let mut pos = 0usize;
 
-        for k in 0..whole {
-            let lo = k * self.b;
-            // Copy out of the buffers to avoid borrowing self immutably + mutably at once.
-            let mic_blk: Vec<f32> = mic_buf[lo..lo + self.b].to_vec();
-            let far_blk: Vec<f32> = far_buf[lo..lo + self.b].to_vec();
-            let block = self.process_block(&mic_blk, &far_blk, true, suppress, SuppressW::Live);
-            out.extend_from_slice(&block);
+        // Complete a partial block left by the previous push before reading aligned blocks directly from
+        // this slice. `pend_*` stays strictly smaller than b between calls.
+        if !self.pend_mic.is_empty() {
+            let take = (self.b - self.pend_mic.len()).min(mic.len());
+            self.pend_mic.extend_from_slice(&mic[..take]);
+            self.pend_far.extend_from_slice(&far[..take]);
+            pos = take;
+            if self.pend_mic.len() == self.b {
+                let mic_blk = std::mem::take(&mut self.pend_mic);
+                let far_blk = std::mem::take(&mut self.pend_far);
+                let block = self.process_block(&mic_blk, &far_blk, true, suppress, SuppressW::Live);
+                out.extend_from_slice(&block);
+            }
         }
 
-        self.pend_mic.extend_from_slice(&mic_buf[span..]);
-        self.pend_far.extend_from_slice(&far_buf[span..]);
+        while mic.len() - pos >= self.b {
+            let block = self.process_block(
+                &mic[pos..pos + self.b],
+                &far[pos..pos + self.b],
+                true,
+                suppress,
+                SuppressW::Live,
+            );
+            out.extend_from_slice(&block);
+            pos += self.b;
+        }
+
+        self.pend_mic.extend_from_slice(&mic[pos..]);
+        self.pend_far.extend_from_slice(&far[pos..]);
+        debug_assert!(self.pend_mic.len() < self.b);
     }
 
     /// Single source of truth for the per-block FDAF math: overlap-save FFT, `Y = X⊙W`, `e = d − y`,
