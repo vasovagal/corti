@@ -1,20 +1,19 @@
 name: release
 
-# LAWS §3: a tag is a vote of confidence — this workflow does ONLY tag-specific work (build, bundle,
-# publish). It never re-runs the PR matrix. The Homebrew cask is updated MANUALLY post-release (see the
-# NOTE at the bottom — CI never writes the tap). §18: one workflow per release event, fanned by
-# `needs:` only on real dependencies. §19: re-run-safe at every step. Distribution is UNSIGNED: no Apple
-# secrets in the env, so tauri-action uses Tauri's default ad-hoc signing.
+# LAWS §3: a tag is a vote of confidence — this workflow does only tag-specific build/bundle/publication.
+# The release stays draft until authenticated native inputs and the finished app bundle pass their gates.
+# Homebrew remains a manual post-release step (note at bottom). Distribution is explicitly ad-hoc signed;
+# signingIdentity "-" is versioned in tauri.conf.json rather than inferred from absent Apple secrets.
 on:
   push:
     tags: ["v*"]
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false # §19: never cancel a half-finished release
+  cancel-in-progress: false
 
 permissions:
-  contents: write # create the release + upload assets in THIS repo (GITHUB_TOKEN)
+  contents: write
 
 jobs:
   check:
@@ -25,9 +24,8 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - id: v
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT" # §7: version lives in the tag
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      # §7: the tag is the single source of truth. Fail the release unless all three mirrors agree.
       - name: Version-sync gate (tag == Cargo.toml == tauri.conf.json == app/ui/package.json)
         env:
           VERSION: ${{ steps.v.outputs.version }}
@@ -50,31 +48,35 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     outputs:
-      release_id: ${{ steps.rel.outputs.id }}
+      already_published: ${{ steps.rel.outputs.already_published }}
     steps:
-      - name: Create release if absent (idempotent; §19), capture its numeric id for tauri-action
+      - name: Create or reuse draft release
         id: rel
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-                 --title "$GITHUB_REF_NAME" --generate-notes
-          id=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)
-          echo "id=$id" >> "$GITHUB_OUTPUT"
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          info=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft)
+          if [ "$(jq -r .isDraft <<<"$info")" = false ]; then
+            # A successful workflow re-run after publication is a no-op, not a rebuild of public assets.
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: [check, create-release]
-    # LAWS §1: corti is single-arch (aarch64-apple-darwin) → ONE macOS runner, no build matrix, no manifest
-    # fan-in. macos-26 mirrors ci.yml + warm-cache.yml so the shared build cache was produced identically.
+    if: needs.create-release.outputs.already_published != 'true'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: ./.github/actions/rust-setup
         with:
-          # MUST equal warm-cache.yml's shared-key so the main-seeded cache restores here.
           cache-key: rel-aarch64-apple-darwin
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -83,35 +85,83 @@ jobs:
           cache: npm
           cache-dependency-path: app/ui/package-lock.json
 
-      # Install the frontend deps so tauri-action's beforeBuildCommand (`npm run build` in ui) can run.
-      - name: Frontend deps
+      - name: Frontend dependencies
         working-directory: app/ui
         run: npm ci
 
-      # Build + bundle the .app and .dmg and upload the .dmg to the release create-release made. tauri-action
-      # runs beforeBuildCommand itself. UNSIGNED: no APPLE_* secrets in env → Tauri's default ad-hoc signing.
-      # No `args: --target …` — .cargo/config.toml already pins aarch64-apple-darwin.
-      - name: Build + bundle (ad-hoc signed) and upload to the release
+      - name: Fetch locked Cargo graph
+        run: cargo fetch --locked
+
+      - name: Prepare hash-pinned sherpa-onnx native library
+        run: |
+          set -euo pipefail
+          lib_dir=$(scripts/prepare-sherpa-onnx.sh "$RUNNER_TEMP/sherpa-onnx")
+          echo "SHERPA_ONNX_LIB_DIR=$lib_dir" >> "$GITHUB_ENV"
+
+      # No releaseId/tagName: tauri-action builds only and cannot upload its automatic .app.tar.gz.
+      # Cargo runs offline and must consume SHERPA_ONNX_LIB_DIR; signing is explicit in config and env.
+      - name: Build app and DMG offline (explicit ad-hoc signature)
         uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # action-v0.6.2
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          APPLE_SIGNING_IDENTITY: "-"
+          CARGO_NET_OFFLINE: "true"
         with:
           projectPath: app
-          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --ci --bundles app,dmg -- --locked
 
-      # Second asset: a zipped .app (the dmg is the primary). ditto preserves bundle symlinks + xattrs. The
-      # bundle is under the triple subdir because .cargo/config.toml sets [build] target = aarch64-apple-darwin.
-      - name: Zip the .app and upload (re-run safe)
+      - name: Verify app bundle contract
+        run: |
+          set -euo pipefail
+          APP="target/aarch64-apple-darwin/release/bundle/macos/Corti.app"
+          scripts/verify-release-bundle.sh "$APP"
+
+      - name: Create and upload only the intended assets
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
           APP="target/aarch64-apple-darwin/release/bundle/macos/Corti.app"
-          ZIP="Corti_${VERSION}_aarch64.app.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-          gh release upload "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+          DMG_DIR="target/aarch64-apple-darwin/release/bundle/dmg"
+          count=$(find "$DMG_DIR" -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')
+          [ "$count" -eq 1 ] || { echo "::error::expected one DMG, found $count"; exit 1; }
+          built_dmg=$(find "$DMG_DIR" -maxdepth 1 -type f -name '*.dmg' -print)
+          dmg="Corti_${VERSION}_aarch64.dmg"
+          zip="Corti_${VERSION}_aarch64.app.zip"
+          cp "$built_dmg" "$dmg"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$zip"
 
-# NOTE: the Homebrew cask is NOT updated by CI. After a release publishes, a human regenerates
-# Casks/corti.rb via scripts/render-cask.sh and commits it to the shared tap vasovagal/homebrew-tap
-# (no PAT, no cross-repo push). See design/adr/0006 + the breadcrumb in CLAUDE.md.
+          # A failed/re-run draft may have partial assets. Start from an empty draft, then upload exactly two.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | while IFS= read -r asset; do
+              [ -z "$asset" ] || gh release delete-asset "$GITHUB_REF_NAME" "$asset" \
+                --repo "$GITHUB_REPOSITORY" --yes
+            done
+          gh release upload "$GITHUB_REF_NAME" "$dmg" "$zip" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  publish:
+    needs: [check, create-release, build]
+    if: needs.create-release.outputs.already_published != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify assets and publish draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          actual=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | LC_ALL=C sort)
+          expected=$(printf '%s\n' \
+            "Corti_${VERSION}_aarch64.app.zip" \
+            "Corti_${VERSION}_aarch64.dmg" | LC_ALL=C sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::release assets do not match the two-file contract"
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual"
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
+# NOTE: CI never updates Homebrew. After publication, regenerate Casks/corti.rb with
+# scripts/render-cask.sh and commit it to vasovagal/homebrew-tap (CLAUDE.md; ADR 0006).
