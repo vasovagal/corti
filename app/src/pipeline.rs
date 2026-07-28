@@ -42,6 +42,29 @@ const JOB_BACKOFF: Backoff = Backoff {
 /// periodic job can fire when no message wakes the loop sooner.
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
 
+/// What the pipeline does with a collected live result. Only a zero-drop
+/// [`crate::live::LiveOutcome::Filed`] is canonical; every other result takes the lossless batch path,
+/// optionally retaining a partial note to rewrite in place.
+enum LiveResolution {
+    Filed(PathBuf),
+    Batch { fallback: Option<LiveFallback> },
+}
+
+struct LiveFallback {
+    reason: String,
+    note_path: Option<PathBuf>,
+}
+
+fn resolve_live(outcome: Option<crate::live::LiveOutcome>) -> LiveResolution {
+    match outcome {
+        Some(crate::live::LiveOutcome::Filed { note_path }) => LiveResolution::Filed(note_path),
+        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => LiveResolution::Batch {
+            fallback: Some(LiveFallback { reason, note_path }),
+        },
+        Some(crate::live::LiveOutcome::NoNote) | None => LiveResolution::Batch { fallback: None },
+    }
+}
+
 /// An external note side effect succeeded, but neither local durability authority accepted its canonical
 /// path. Carry it to the caller so the retry job can persist ownership instead of invoking vagus again.
 #[derive(Debug)]
@@ -87,9 +110,19 @@ pub enum PipelineMsg {
         note_path: PathBuf,
     },
     /// #87: the recording ended without a `Process` (discarded as too short, or its capture failed to
-    /// finish). Tear down the live session — it deletes its own partial note — and close any queue
-    /// row `LiveNoteCreated` made.
+    /// finish). The detector has already delivered the recording-specific discard verdict; close any
+    /// queue row `LiveNoteCreated` made (the manager call remains idempotent defense-in-depth).
     LiveDiscarded { id: String },
+    /// The per-discard reaper could not be spawned. The manager still owns the live handle; join and clean
+    /// it on this pipeline thread, never on the detector callback.
+    LiveDiscardReap { id: String },
+    /// A discarded-session unlink failed both in its note writer and detached reaper. Retry once on the
+    /// pipeline and, if it still fails, durably retain/close the path instead of forgetting it.
+    LiveDiscardCleanup {
+        meta: RecordingMeta,
+        note_path: PathBuf,
+        error: String,
+    },
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -112,7 +145,8 @@ pub(crate) struct Ctx {
     /// The live runtime config — the retention sweep reads `retention_days` from here on every run, so
     /// a Settings change applies to the next sweep without any reload plumbing.
     pub(crate) config: SharedConfig,
-    /// #87: the live-filing sessions the detector hook spawns; the worker finalizes (or discards) them.
+    /// #87: recording-scoped live sessions. The detector delivers terminal verdicts; the worker collects
+    /// finished IDs and owns any last-resort discard cleanup.
     pub(crate) live: Arc<crate::live::LiveManager>,
 }
 
@@ -261,11 +295,12 @@ pub fn run(
                             "could not persist the recording end time"
                         );
                     }
-                    // #87: if a live session filed this recording as it happened, the job is already
-                    // done — batch transcription is skipped entirely. Any other live outcome falls back to
-                    // batch, but its note path remains owned directly and in any durable retry payload.
-                    match ctx.live.finalize(&id) {
-                        Some(crate::live::LiveOutcome::Filed { note_path }) => {
+                    // #87: the detector already delivered this recording's finish verdict before
+                    // queuing `Process`. Collect exactly that ID: a canonical, zero-drop live note skips
+                    // batch; every other outcome falls back to the lossless WAV. Persist a partial live
+                    // note first so the post-ASR checkpoint owns the same rewrite target.
+                    match resolve_live(ctx.live.collect(&id)) {
+                        LiveResolution::Filed(note_path) => {
                             if let Err(e) =
                                 live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
                             {
@@ -273,17 +308,15 @@ pub fn run(
                                 schedule_retry(&ctx, &id, &meta, e, Some(&note));
                             }
                         }
-                        live_result => {
-                            let preferred_note = if let Some(crate::live::LiveOutcome::Failed {
-                                error,
-                                note_path,
-                            }) = live_result
+                        LiveResolution::Batch { fallback } => {
+                            let preferred_note = if let Some(LiveFallback { reason, note_path }) =
+                                fallback
                             {
                                 warn!(
                                     target: "corti::live",
                                     job_id = %id,
-                                    error = %error,
-                                    "live filing failed — falling back to batch transcription"
+                                    reason = %reason,
+                                    "live result is not canonical — falling back to batch transcription"
                                 );
                                 note_path
                             } else {
@@ -298,8 +331,8 @@ pub fn run(
                                     },
                                 )
                             {
-                                // Do not transcribe with an untracked live note. The retry payload keeps
-                                // ownership even though this recording-row write failed.
+                                // Do not start batch with an untracked live note. The durable retry payload
+                                // carries the path even when this queue write is exactly what failed.
                                 let note = OwnedNote::partial(partial);
                                 schedule_retry(
                                     &ctx,
@@ -310,8 +343,14 @@ pub fn run(
                                 );
                                 continue;
                             }
-                            if let Err(e) = transcribe_and_file(&mut ctx, &id, &meta, &audio_path) {
-                                let preferred_note = preferred_note.map(OwnedNote::partial);
+                            let preferred_note = preferred_note.map(OwnedNote::partial);
+                            if let Err(e) = transcribe_and_file(
+                                &mut ctx,
+                                &id,
+                                &meta,
+                                &audio_path,
+                                preferred_note.as_ref(),
+                            ) {
                                 schedule_retry(&ctx, &id, &meta, e, preferred_note.as_ref());
                             }
                         }
@@ -324,19 +363,28 @@ pub fn run(
                         error = %format!("{e:#}"),
                         "enqueue failed"
                     );
-                    // #87: still settle any live session so its note isn't stranded at
-                    // `State: transcribing` — with no queue row the outcome can only be logged.
-                    match ctx.live.finalize(&corti_queue::job_id(&meta)) {
+                    // #87: still collect this recording's already-delivered finish result so its model
+                    // session is released — with no queue row the outcome can only be logged/closed.
+                    match ctx.live.collect(&corti_queue::job_id(&meta)) {
                         Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
                             target: "corti::live",
                             note_path = %note_path.display(),
                             "live note filed but its recording row could not be created"
                         ),
-                        Some(crate::live::LiveOutcome::Failed { error, .. }) => warn!(
-                            target: "corti::live",
-                            error = %error,
-                            "live session failed alongside the enqueue failure"
-                        ),
+                        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => {
+                            warn!(
+                                target: "corti::live",
+                                reason = %reason,
+                                note_path = ?note_path,
+                                "live session required fallback alongside the enqueue failure"
+                            );
+                            if let Some(note_path) = note_path {
+                                close_out_note(
+                                    &note_path,
+                                    "queue enqueue failed before canonical batch fallback",
+                                );
+                            }
+                        }
                         Some(crate::live::LiveOutcome::NoNote) | None => {}
                     }
                     // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
@@ -351,6 +399,12 @@ pub fn run(
                 live_note_created(&ctx, &meta, note_path)
             }
             Ok(PipelineMsg::LiveDiscarded { id }) => live_discarded(&ctx, &id),
+            Ok(PipelineMsg::LiveDiscardReap { id }) => ctx.live.reap_unspawned_discard(&id),
+            Ok(PipelineMsg::LiveDiscardCleanup {
+                meta,
+                note_path,
+                error,
+            }) => live_discard_cleanup(&ctx, &meta, &note_path, &error),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
@@ -575,6 +629,14 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     tray::set_status(&ctx.app, format!("{phase} — {}…", row.owning_app));
 }
 
+fn retry_owned_note(
+    error_note: Option<OwnedNote>,
+    checkpoint_note: Option<OwnedNote>,
+    preferred_note: Option<OwnedNote>,
+) -> Option<OwnedNote> {
+    error_note.or(checkpoint_note).or(preferred_note)
+}
+
 /// A transcribe/file failure on the live path: record the error and durably schedule the next phase. The
 /// retry payload owns a live note path before any fallible recording-row update, so a SQLite failure cannot
 /// turn a later batch recovery into a second note.
@@ -586,7 +648,12 @@ fn schedule_retry(
     preferred_note: Option<&OwnedNote>,
 ) {
     let error_note = recovery_note_from_error(&err);
-    let preferred_note = error_note.as_ref().or(preferred_note);
+    let checkpoint_note = FilingCheckpoint::load(&meta.audio_path)
+        .ok()
+        .and_then(|checkpoint| checkpoint.owned_note());
+    // A structured note was just returned by the failed operation; otherwise the durable checkpoint is
+    // newer than the caller's original live path. Persist that authority in both job payload and row.
+    let preferred_note = retry_owned_note(error_note, checkpoint_note, preferred_note.cloned());
     let msg = format!("{err:#}");
     eprintln!("[corti] job {id} failed (will retry): {msg}");
     let retry_status = ctx
@@ -602,7 +669,7 @@ fn schedule_retry(
                 JobStatus::PendingTranscription
             }
         });
-    let payload = crate::jobs::retry_payload(id, preferred_note);
+    let payload = crate::jobs::retry_payload(id, preferred_note.as_ref());
     if let Err(e) = ctx.queue.jobs().enqueue(
         crate::jobs::RETRY_TRANSCRIPTION,
         &payload,
@@ -610,7 +677,7 @@ fn schedule_retry(
         Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
     ) {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
-        if let Err(fail_error) = fail_with_note(ctx, id, meta, msg, preferred_note) {
+        if let Err(fail_error) = fail_with_note(ctx, id, meta, msg, preferred_note.as_ref()) {
             eprintln!("[corti] cannot persist terminal failure for {id}: {fail_error:#}");
         }
         return;
@@ -620,7 +687,7 @@ fn schedule_retry(
         id,
         JobUpdate {
             status: Some(retry_status),
-            note_path: preferred_note.map(|note| note.path.clone()),
+            note_path: preferred_note.as_ref().map(|note| note.path.clone()),
             error: Some(msg.clone()),
             ..Default::default()
         },
@@ -717,16 +784,16 @@ pub(crate) fn complete_canonical_note(
 
 /// #87: persist a just-created live note's path. Mid-recording there is no queue row yet, so one is
 /// created (status `Recording` — truthful in the Queue window) **only while the session is still
-/// active**: the first segment can close while a discarded call's backlog drains, in which case
-/// `LiveDiscarded` already tore the session down and its Discard verdict will delete the note — a
-/// row created now would be a zombie. If the row already exists (the note was created during the
-/// finalize tail, after `Process` enqueued it — or the job even finished already) only `note_path`
+/// owned**: this includes a finish-delivered session awaiting ID-specific collection, because its tail
+/// can create the first note while `Process` waits behind another job. A discarded session is never
+/// accepted — its reaper deletes a late partial note, and creating a row would make a zombie. If the row
+/// already exists (the note was created during the finish tail after `Process` enqueued it) only `note_path`
 /// is recorded and the row's current status is preserved, never regressed.
 fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
     let id = corti_queue::job_id(meta);
     let (result, history_status) = match ctx.queue.get(&id) {
         Ok(None) => {
-            if !ctx.live.is_active(&id) {
+            if !ctx.live.accepts_note(&id) {
                 warn!(
                     target: "corti::live",
                     job_id = %id,
@@ -780,11 +847,12 @@ fn live_note_history_status(existing: Option<JobStatus>) -> JobStatus {
 }
 
 /// #87: a recording ended without a `Process` (discarded as too short, or its capture failed to
-/// finish). Tear down the live session — non-joining; the session deletes its own partial note —
-/// and terminally close a queue row `LiveNoteCreated` may have made, so nothing dangles at
-/// `Recording`.
+/// finish). The detector already delivered the non-joining discard verdict before this later pipeline
+/// message; repeat it idempotently, then terminally close a queue row `LiveNoteCreated` may have made so
+/// nothing dangles at `Recording`.
 fn live_discarded(ctx: &Ctx, id: &str) {
     ctx.live.discard(id);
+    ctx.live.reap_unspawned_discard(id);
     match ctx.queue.get(id) {
         Ok(Some(row)) if !row.status.is_terminal() => {
             let _ = ctx.queue.update(
@@ -798,6 +866,55 @@ fn live_discarded(ctx: &Ctx, id: &str) {
             tray::emit_queue_changed(&ctx.app, id);
         }
         _ => {}
+    }
+}
+
+/// Last-resort ownership for a discarded note that could not be unlinked on the live or reaper thread.
+/// Retry once here; a persistent failure becomes a path-bearing Failed row and a closed/annotated note,
+/// never an unreferenced `State: transcribing` artifact.
+fn live_discard_cleanup(ctx: &Ctx, meta: &RecordingMeta, note_path: &Path, previous_error: &str) {
+    let id = corti_queue::job_id(meta);
+    match std::fs::remove_file(note_path) {
+        Ok(()) => info!(
+            target: "corti::live",
+            job_id = %id,
+            note_path = %note_path.display(),
+            "pipeline retry deleted discarded live note"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let reason =
+                format!("discarded live note could not be deleted: {e} (reaper: {previous_error})");
+            let persisted = ctx.queue.enqueue(meta).and_then(|id| {
+                let row = ctx
+                    .queue
+                    .get(&id)?
+                    .context("discard cleanup row disappeared")?;
+                if row.status == JobStatus::Done {
+                    return Ok(());
+                }
+                ctx.queue.update(
+                    &id,
+                    JobUpdate {
+                        status: Some(JobStatus::Failed),
+                        note_path: Some(note_path.to_path_buf()),
+                        error: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                )
+            });
+            if let Err(persist_error) = persisted {
+                warn!(
+                    target: "corti::live",
+                    job_id = %id,
+                    note_path = %note_path.display(),
+                    error = %format!("{persist_error:#}"),
+                    "could not persist failed discarded-note cleanup"
+                );
+            }
+            close_out_note(note_path, &reason);
+            tray::emit_queue_changed(&ctx.app, &id);
+        }
     }
 }
 
@@ -1079,6 +1196,7 @@ pub(crate) fn transcribe_and_file(
     id: &str,
     meta: &RecordingMeta,
     audio: &Path,
+    preferred_note: Option<&OwnedNote>,
 ) -> Result<()> {
     // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
     // transition failed (or the process died between them). Treat it as authoritative from every dispatch
@@ -1143,14 +1261,27 @@ pub(crate) fn transcribe_and_file(
     let transcribe_secs = t0.elapsed().as_secs_f64();
     let (transcript, _input) = transcribed.context("transcription failed")?;
 
-    // A partial live note may already exist. Put it in the checkpoint too, so filing idempotency does not
-    // depend on a second successful queue read after this boundary.
-    let note_path = ctx
-        .queue
-        .get(id)
-        .context("reading recording before checkpoint")?
-        .and_then(|row| row.note_path);
-    FilingCheckpoint::new(transcript, note_path, aws_staging)
+    // A recording-scoped live outcome is authoritative when supplied: checkpoint it directly so a second
+    // queue read failure cannot lose ownership after expensive ASR. Row-only paths are legacy partials.
+    let owned_note = match preferred_note {
+        Some(note) => Some(note.clone()),
+        None => ctx
+            .queue
+            .get(id)
+            .context("reading recording before checkpoint")?
+            .and_then(|row| row.note_path.map(OwnedNote::partial)),
+    };
+    let mut checkpoint = FilingCheckpoint::new(
+        transcript,
+        owned_note.as_ref().map(|note| note.path.clone()),
+        aws_staging,
+    );
+    if let Some(note) = owned_note
+        && note.canonical
+    {
+        checkpoint.set_canonical_note(note.path);
+    }
+    checkpoint
         .store(audio)
         .context("persisting transcript checkpoint")?;
 
@@ -1391,7 +1522,8 @@ pub(crate) fn fail_with_note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corti_core::{DiarizedTranscript, OwningApp};
+    use corti_core::{DiarizedTranscript, OwningApp, Speaker, TranscriptSegment};
+    use std::os::unix::fs::MetadataExt;
 
     fn test_dir(name: &str) -> PathBuf {
         let dir =
@@ -1500,6 +1632,26 @@ mod tests {
     }
 
     #[test]
+    fn retry_ownership_prefers_new_side_effect_then_checkpoint_over_old_live_payload() {
+        let checkpoint = OwnedNote::canonical("/brain/moved-canonical.md");
+        let old_live = OwnedNote::partial("/brain/old-live.md");
+        assert_eq!(
+            retry_owned_note(None, Some(checkpoint.clone()), Some(old_live)),
+            Some(checkpoint)
+        );
+
+        let returned = OwnedNote::canonical("/brain/just-returned.md");
+        assert_eq!(
+            retry_owned_note(
+                Some(returned.clone()),
+                Some(OwnedNote::partial("/brain/checkpoint-partial.md")),
+                None,
+            ),
+            Some(returned)
+        );
+    }
+
+    #[test]
     fn dual_write_error_carries_the_returned_canonical_path() {
         let note = OwnedNote::canonical("/brain/00-Inbox/returned.md");
         let error = anyhow::Error::new(OwnedNoteError {
@@ -1527,6 +1679,85 @@ mod tests {
             !checkpoint.exists(),
             "Done no longer needs a filing checkpoint"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Cross-feature regression: a dropped live result owns its partial note directly; once batch ASR
+    /// crosses the durable checkpoint, filing can recover with no raw audio and rewrites that exact inode.
+    #[test]
+    fn dropped_live_fallback_retries_from_checkpoint_and_rewrites_same_inode() {
+        let dir = test_dir("dropped-live-checkpoint");
+        let raw = dir.join("recording.wav");
+        let meta = meta(raw.clone());
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta).unwrap();
+        let note = dir.join("live.md");
+        std::fs::write(
+            &note,
+            format!(
+                "---\nsource: x\n---\n\n# T\n\n{}",
+                corti_vagus::live_initial_body(&meta)
+            ),
+        )
+        .unwrap();
+        let inode_before = std::fs::metadata(&note).unwrap().ino();
+
+        let LiveResolution::Batch {
+            fallback:
+                Some(LiveFallback {
+                    reason,
+                    note_path: Some(preferred_note),
+                }),
+        } = resolve_live(Some(crate::live::LiveOutcome::Fallback {
+            reason: "live capture tee dropped 2 chunk(s)".to_string(),
+            note_path: Some(note.clone()),
+        }))
+        else {
+            panic!("a dropped live result must take the batch path");
+        };
+        assert!(reason.contains("dropped 2"));
+        queue
+            .update(
+                &id,
+                JobUpdate {
+                    note_path: Some(preferred_note.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 0.0,
+            end: 1.0,
+            text: "canonical batch text".to_string(),
+        }]);
+        FilingCheckpoint::new(transcript, Some(preferred_note), None)
+            .store(&raw)
+            .unwrap();
+        queue.set_status(&id, JobStatus::PendingNote).unwrap();
+        assert!(!raw.exists(), "filing recovery must not require raw audio");
+
+        let mut checkpoint = FilingCheckpoint::load(&raw).unwrap();
+        let queued_note = queue.get(&id).unwrap().unwrap().note_path;
+        let rewritten = rewrite_checkpoint_note(&meta, &checkpoint, queued_note)
+            .unwrap()
+            .expect("checkpoint must retain the live rewrite target");
+        assert_eq!(rewritten, note);
+        assert_eq!(std::fs::metadata(&note).unwrap().ino(), inode_before);
+        let content = std::fs::read_to_string(&note).unwrap();
+        assert!(content.contains("State: transcribed \n"), "got: {content}");
+        assert!(content.contains("canonical batch text"), "got: {content}");
+
+        checkpoint.set_canonical_note(rewritten.clone());
+        checkpoint.store(&raw).unwrap();
+        queue.complete_with_note(&id, &rewritten).unwrap();
+        let done = queue.get(&id).unwrap().unwrap();
+        assert_eq!(done.status, JobStatus::Done);
+        assert_eq!(done.note_path.as_deref(), Some(note.as_path()));
+
+        cleanup_completed_artifacts(&raw);
+        assert!(!checkpoint_path(&raw).exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

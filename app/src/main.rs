@@ -329,8 +329,8 @@ pub(crate) mod imp {
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
-        // Live-filing sessions (#87): shared between the detector hook (spawns them) and the pipeline
-        // worker (finalizes/discards them).
+        // Live-filing sessions (#87): the detector hook owns spawn/terminal verdict delivery; the
+        // pipeline collects recording-scoped outcomes and owns durable fallback cleanup.
         let live_manager = Arc::new(crate::live::LiveManager::new());
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned
@@ -429,9 +429,9 @@ pub(crate) mod imp {
                     None,
                 );
                 tray::set_status(app, "Discarded — too short".to_string());
-                // #87: tear down any live session for this recording (it deletes its own partial
-                // note). Handled on the pipeline thread — it owns the queue row LiveNoteCreated may
-                // have made.
+                // #87: the detector's LiveHook already delivered this ID's discard verdict before
+                // emitting the event. The later serial-pipeline message only closes a queue row
+                // LiveNoteCreated may have made (and repeats manager discard idempotently).
                 let _ = pipe_tx.send(PipelineMsg::LiveDiscarded { id });
             }
             DetectorEvent::Error(e) => {

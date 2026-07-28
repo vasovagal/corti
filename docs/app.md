@@ -30,9 +30,9 @@ Transient / not app-owned:
   `PipelineMsg::Process`, exits.
 - **`corti-capture-writer`** — one per recording, inside `CaptureSession`; streams the 2-track WAV.
 - **`corti-live`** — one per live-eligible detector recording (#87, `app/src/live.rs`); drains the
-  bounded capture tee, transcribes as the call runs, and appends segments to the vagus note. Spawned
-  by the detector's `LiveHook`, finalized/discarded by the pipeline thread — see
-  [transcription.md](transcription.md#live-inbox-filing-87).
+  bounded capture tee, transcribes as the call runs, and appends segments to the vagus note. The detector's
+  `LiveHook` delivers its recording-specific finish/discard verdict before the later pipeline event; the
+  pipeline only collects the finished ID — see [transcription.md](transcription.md#live-inbox-filing-87).
 - **CoreAudio HAL callback threads** — `MicMonitor` listeners; they only `tx.send(Msg::…)` and never
   touch capture (guardrail 9).
 
@@ -93,14 +93,15 @@ hourly sweep enforces retention; the queue rows still back tray history and `cor
 the newest few at startup (`seed_history`, `pipeline.rs:703`) with orphaned jobs recovered
 (`recover_running`, `pipeline.rs:142`).
 
-#87 layers **live inbox filing** onto this handoff: `Detector::start_with_live_hook` (`main.rs:366`)
-carries an `AppLiveHook` (`app/src/live.rs:237`) that spawns a per-recording `corti-live` thread when
-eligible; at `Process` time the worker asks `LiveManager::finalize` first, and a live-filed note sends
-the job straight to `Done` (batch skipped). Live telemetry adds **no new stage** — during the call the
-stage stays `Recording` (the How window's `recording` flag already covers it). A discard (too short)
-or a capture that fails to finish sends `PipelineMsg::LiveDiscarded` so the session is torn down on the
-pipeline thread without joining (the session deletes its own partial note); errors the recording
-survives (e.g. a mic-monitor rebind) never touch it. See
+#87 layers **live inbox filing** onto this handoff: `Detector::start_with_live_hook` carries an
+`AppLiveHook` that spawns a per-recording `corti-live` thread when eligible. On capture termination the
+detector delivers `finished(meta)` or `discarded(meta)` **before** emitting its downstream event.
+`LiveManager` keeps finish-delivered sessions by recording ID; at `Process` time the worker calls
+`collect(id)`, and only a zero-drop `Filed` result goes straight to `Done`. A lossy/error result carries
+its partial path into batch rewrite; a discard stays in the single-model gate under a manager-owned reaper
+and reports persistent unlink failure back to the pipeline. Live telemetry adds no new stage — it remains
+`Recording` during the call.
+Errors the recording survives (for example a mic-monitor rebind) never deliver a terminal verdict. See
 [transcription.md](transcription.md#live-inbox-filing-87).
 
 ## Tray
