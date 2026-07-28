@@ -287,10 +287,22 @@ pub(crate) mod imp {
             .build(tauri::generate_context!())
             .context("building the tauri app")?;
 
-        // Keep the (windowless) event loop alive. Exit only ever comes from the tray's Quit item
-        // (`app_handle.exit(0)`), so there is nothing to veto here.
-        app.run(|_app, _event| {});
+        // Tray-agent policy: closing the final utility window (and other user-driven/Cmd-Q requests) emits
+        // `ExitRequested { code: None }`; veto it so Corti returns to menu-bar-only mode. The tray's explicit
+        // `app.exit(0)` carries `Some(0)` and is still allowed to terminate the process.
+        app.run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event
+                && should_prevent_implicit_exit(code)
+            {
+                api.prevent_exit();
+            }
+        });
         Ok(())
+    }
+
+    /// Menu-bar agents ignore user-driven implicit exits; only explicit programmatic exit codes terminate.
+    fn should_prevent_implicit_exit(code: Option<i32>) -> bool {
+        code.is_none()
     }
 
     /// All fallible startup wiring, in dependency order. Runs on the main thread (Tauri's setup hook).
@@ -626,4 +638,16 @@ pub(crate) mod imp {
         }
     }
     impl std::error::Error for SetupError {}
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::should_prevent_implicit_exit;
+
+        #[test]
+        fn implicit_exit_is_vetoed_but_tray_exit_is_allowed() {
+            assert!(should_prevent_implicit_exit(None));
+            assert!(!should_prevent_implicit_exit(Some(0)));
+            assert!(!should_prevent_implicit_exit(Some(1)));
+        }
+    }
 }

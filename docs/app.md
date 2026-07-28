@@ -5,9 +5,10 @@
 > into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
 The app is a windowless macOS menu-bar agent. One OS process; no `#[tokio::main]` — it runs on
-Tauri's own event loop (`app.run(|_,_| {})`, `app/src/main.rs:290`). All live state is a single
-managed `AppState`; the tray is rebuilt from it on every change. Windows are on-demand and almost
-entirely poll-based.
+Tauri's own event loop. The run callback vetoes implicit `ExitRequested { code: None }` events so
+closing the last utility window (or Cmd-Q) returns to the tray agent; only the tray's explicit
+`app.exit(0)` quits. All live state is a single managed `AppState`; the tray is rebuilt from it on
+every change. Windows are on-demand and almost entirely poll-based.
 
 ## Threads
 
@@ -148,16 +149,15 @@ the two `AtomicBool`s — nothing else.
 ## Windows — the `?view=` + activation-policy dance
 
 Five on-demand `WebviewWindow`s, all built from the *same* SPA `index.html`, differentiated by a
-`?view=` query param parsed in `app/ui/src/main.tsx:13` (branched at `main.tsx:29`). #85 factored the
-common open/focus/activation-policy boilerplate into `open_app_window` (`tray.rs:361`); the console kept
-its own copy:
+`?view=` query param parsed in `app/ui/src/main.tsx:13` (branched at `main.tsx:29`). All five use the
+shared `open_app_window` singleton/focus/activation-policy lifecycle:
 
 | Window | view | opener |
 |---|---|---|
 | Ethics & Legality guide | *(none, default)* | `open_ethics_window` (`tray.rs:408`) |
 | Settings | `?view=settings` | `open_settings_window` (`tray.rs:420`) |
 | Recording Queue | `?view=queue` | `open_queue_window` (`tray.rs:432`, #85) |
-| Diagnostics / console | `?view=console` | `open_console_window` (`tray.rs:447`) |
+| Diagnostics / console | `?view=console` | `open_console_window` |
 | How Corti Works | `?view=how` | `open_how_window` (`tray.rs:492`) |
 
 The **How Corti Works** window (`app/ui/src/How.tsx`) renders the pipeline as a row of boxes and
@@ -171,10 +171,9 @@ queue: it pulls `list_recordings` and refetches on the coarse `queue-changed` ev
 (`tray::emit_queue_changed`), with Retry / Reveal-audio / Open-note actions.
 
 Each is a singleton (focus-if-exists). The app launches windowless with
-`ActivationPolicy::Accessory` (no Dock icon, set at `setup`). Opening any window flips to
-`ActivationPolicy::Regular` (`tray.rs:380` in `open_app_window`, `tray.rs:459` for the console) so it can
-take focus; on `WindowEvent::Destroyed`, `revert_activation_policy_if_no_windows` (`tray.rs:505`) drops
-back to `Accessory` once the last window closes.
+`ActivationPolicy::Accessory` (no Dock icon, set at `setup`). The shared `open_app_window` flips to
+`ActivationPolicy::Regular` so any utility window can take focus; on `WindowEvent::Destroyed`,
+`revert_activation_policy_if_no_windows` drops back to `Accessory` once the last window closes.
 
 ## Command surface — pull, plus one push
 

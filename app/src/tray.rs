@@ -440,51 +440,17 @@ fn open_queue_window(app: &AppHandle) {
     );
 }
 
-/// Open (or focus, if already open) the on-demand Diagnostics console window. Created at runtime like the
-/// Settings/Ethics windows (ADR 0004): flips the app to `Regular` while it lives and reverts to menu-bar-only
-/// `Accessory` once it (and any other window) closes. It loads the same SPA bundle, selecting the console
-/// view via `?view=console`. Window + AppKit work runs on the main thread.
+/// The on-demand Diagnostics console window, using the same singleton/focus/activation lifecycle as every
+/// other utility window.
 fn open_console_window(app: &AppHandle) {
-    let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
-        // Singleton: focus the existing window instead of spawning a second.
-        if let Some(win) = app.get_webview_window("console") {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
-            return;
-        }
-
-        // A real window wants focusability + a Dock presence: flip Accessory → Regular while it lives.
-        let _ = app.set_activation_policy(ActivationPolicy::Regular);
-
-        match WebviewWindowBuilder::new(
-            &app,
-            "console",
-            WebviewUrl::App("index.html?view=console".into()),
-        )
-        .title("Diagnostics")
-        .inner_size(900.0, 640.0)
-        .min_inner_size(560.0, 420.0)
-        .resizable(true)
-        .build()
-        {
-            Ok(win) => {
-                // On close, drop back to menu-bar-only so no stale Dock icon lingers.
-                let app_for_evt = app.clone();
-                win.on_window_event(move |event| {
-                    if matches!(event, WindowEvent::Destroyed) {
-                        revert_activation_policy_if_no_windows(&app_for_evt);
-                    }
-                });
-            }
-            Err(e) => {
-                eprintln!("[corti] opening diagnostics window failed: {e}");
-                // Don't leave a dangling Regular policy with no window.
-                revert_activation_policy_if_no_windows(&app);
-            }
-        }
-    });
+    open_app_window(
+        app,
+        "console",
+        "index.html?view=console",
+        "Diagnostics",
+        (900.0, 640.0),
+        (560.0, 420.0),
+    );
 }
 
 /// The "How Corti Works" window: a live diagram of the detect → capture → echo-cancel → transcribe →
