@@ -17,6 +17,7 @@ function dto(over: Partial<RecordingDto>): RecordingDto {
     note_path: "/brain/00-Inbox/zoom.md",
     note_exists: true,
     audio_exists: true,
+    recovery_exists: true,
     audio_bytes: 22_000_000,
     retry_pending: false,
     retry_attempts: null,
@@ -41,7 +42,7 @@ describe("rowState — the printer-queue truth table", () => {
     });
   });
 
-  it("marks a backing-off transient failure as will-retry, not failed", () => {
+  it("marks a backing-off transcription failure as will-retry, not failed", () => {
     const s = rowState(
       dto({
         status: "pending_transcription",
@@ -51,6 +52,20 @@ describe("rowState — the printer-queue truth table", () => {
       }),
     );
     expect(s.label).toBe("Will retry (attempt 2/5): transcription failed: connection reset");
+    expect(s.tone).toBe("progress");
+    expect(s.action).toBeNull();
+  });
+
+  it("keeps a backing-off filing failure at the durable PendingNote checkpoint", () => {
+    const s = rowState(
+      dto({
+        status: "pending_note",
+        error: "vagus unavailable",
+        retry_pending: true,
+        retry_attempts: 1,
+      }),
+    );
+    expect(s.label).toBe("Will retry filing (attempt 1/5): vagus unavailable");
     expect(s.tone).toBe("progress");
     expect(s.action).toBeNull();
   });
@@ -78,9 +93,19 @@ describe("rowState — the printer-queue truth table", () => {
     expect(s.action).toBe("retry");
   });
 
-  it("withdraws Retry once the sweep expired the audio", () => {
-    const s = rowState(dto({ status: "failed", error: "x", audio_exists: false }));
-    expect(s.label).toBe("Failed (audio expired)");
+  it("offers Retry from a checkpoint after raw audio expires", () => {
+    const s = rowState(
+      dto({ status: "failed", error: "filing failed", audio_exists: false, recovery_exists: true }),
+    );
+    expect(s.label).toContain("Could not transcribe");
+    expect(s.action).toBe("retry");
+  });
+
+  it("withdraws Retry once every recovery input expired", () => {
+    const s = rowState(
+      dto({ status: "failed", error: "x", audio_exists: false, recovery_exists: false }),
+    );
+    expect(s.label).toBe("Failed (recovery expired)");
     expect(s.action).toBeNull();
   });
 

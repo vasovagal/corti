@@ -22,15 +22,18 @@ mapping ch0→`Speaker::Me` and ch1→`Speaker::Other` gives a usable transcript
 ch1 = them as separate channels, so we let AWS transcribe each channel and map it deterministically —
 `ch_0` → `Speaker::Me`, `ch_1` → `Speaker::Other("Them")` — no energy-alignment heuristic needed.
 Batch flow (`crates/corti-transcribe-aws/src/lib.rs`):
-1. Re-encode the 2-track **float** WAV → **16-bit PCM** (`src/wav.rs`; AWS Transcribe rejects float WAV),
-   keeping both channels + sample rate. Upload to S3 — `aws-sdk-s3`.
-2. `StartTranscriptionJob` with `Settings::builder().channel_identification(true)` and
-   `output_bucket_name`/`output_key` pointing back at our bucket — `aws-sdk-transcribe`.
-3. Poll `GetTranscriptionJob` until `Completed`/`Failed`; on success `GetObject` the result JSON we
-   directed to our own key (stays inside `aws-sdk-s3`, no extra HTTP client).
+1. For a durable stable name, probe `GetTranscriptionJob` first. A queued/in-progress/completed job is
+   reattached without decoding or uploading the full call; a failed job is deleted for a fresh submission.
+2. Only when no reusable job exists, re-encode the 2-track **float** WAV → **16-bit PCM** (`src/wav.rs`;
+   AWS Transcribe rejects float WAV), preserving channels/rate, upload it, and call
+   `StartTranscriptionJob` with channel identification plus our output bucket/key.
+3. Poll until `Completed`/`Failed`; on success `GetObject` the result JSON from our key. A transient fetch
+   or parse failure retains the job/output; a completed job whose key is confirmed missing is reset.
 4. Parse `results.channel_labels.channels[].items[]` (word + `start_time`/`end_time`, punctuation glued),
    group each channel into segments on a >1.5 s pause, then merge both channels sorted by time
-   (`src/parse.rs`, unit-tested). Best-effort delete the staged `.wav` + `.json` when done.
+   (`src/parse.rs`, unit-tested). Unique one-shot calls attempt staged-object cleanup on every outcome; the
+   durable app publishes exact ownership before upload, defers cleanup until its local transcript checkpoint
+   is persisted, and keeps a separate cleanup job beyond terminal filing/transcription exhaustion.
 
 **Config injection (not env):** the crate takes a caller-built `SdkConfig`
 (`AwsTranscriber::new(&sdk_config, AwsOptions { bucket, .. })`); the Tauri app runs the standard
@@ -55,7 +58,8 @@ after the call):
   "Version": "2012-10-17",
   "Statement": [
     { "Sid": "CortiTranscribeJobs", "Effect": "Allow",
-      "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"],
+      "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob",
+                 "transcribe:DeleteTranscriptionJob"],
       "Resource": "*" },
     { "Sid": "CortiStagedObjects", "Effect": "Allow",
       "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],

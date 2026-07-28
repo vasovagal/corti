@@ -93,7 +93,8 @@ cargo run -p corti-queue --example inspect                     # inspect the dur
     "Version": "2012-10-17",
     "Statement": [
       { "Sid": "CortiTranscribeJobs", "Effect": "Allow",
-        "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"],
+        "Action": ["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob",
+                   "transcribe:DeleteTranscriptionJob"],
         "Resource": "*" },
       { "Sid": "CortiStagedObjects", "Effect": "Allow",
         "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],

@@ -44,6 +44,8 @@ pub struct RecordingDto {
     /// inbox, which the UI shows as "Filed in brain" (not an error).
     pub note_exists: bool,
     pub audio_exists: bool,
+    /// Raw audio or a validated post-ASR checkpoint can drive a manual retry.
+    pub recovery_exists: bool,
     pub audio_bytes: Option<u64>,
     /// An active retry job exists for this recording ("Will retry (attempt n/5)").
     pub retry_pending: bool,
@@ -75,6 +77,8 @@ pub fn list_recordings() -> Result<Vec<RecordingDto>, String> {
         .rev() // all() is oldest-first; the window wants newest on top
         .map(|job| {
             let audio_meta = std::fs::metadata(&job.audio_path).ok();
+            let recovery_exists = audio_meta.is_some()
+                || crate::checkpoint::FilingCheckpoint::load(&job.audio_path).is_ok();
             let note_exists = job.note_path.as_deref().is_some_and(Path::exists);
             let retry_attempts = retry_for(&job.id);
             let mode = match job.meta().mode() {
@@ -96,6 +100,7 @@ pub fn list_recordings() -> Result<Vec<RecordingDto>, String> {
                 note_path: job.note_path.map(|p| p.to_string_lossy().into_owned()),
                 note_exists,
                 audio_exists: audio_meta.is_some(),
+                recovery_exists,
                 audio_bytes: audio_meta.map(|m| m.len()),
                 retry_pending: retry_attempts.is_some(),
                 retry_attempts,

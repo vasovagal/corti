@@ -44,7 +44,7 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
 
-      - name: clippy (default features = aws)
+      - name: clippy (default features = aws + local)
         run: cargo clippy --all-targets -- -D warnings
 
       - name: clippy (all features = aws + local, the dual-backend build)
@@ -53,9 +53,18 @@ jobs:
       - name: test (default features)
         run: cargo test --locked
 
-      # The offline-only build path (no aws) must still compile.
-      - name: check (local only, no default features)
-        run: cargo check --locked --no-default-features --features local
+      # Guardrail 6: each app backend must lint and test independently, in addition to the combined build.
+      - name: clippy (aws only, no default features)
+        run: cargo clippy --locked -p corti-app --all-targets --no-default-features --features aws -- -D warnings
+
+      - name: test (aws only, no default features)
+        run: cargo test --locked -p corti-app --no-default-features --features aws
+
+      - name: clippy (local only, no default features)
+        run: cargo clippy --locked -p corti-app --all-targets --no-default-features --features local -- -D warnings
+
+      - name: test (local only, no default features)
+        run: cargo test --locked -p corti-app --no-default-features --features local
 
       - name: sccache stats
         if: always()
