@@ -78,15 +78,15 @@ match.
 when the job completes). A bucket lifecycle TTL on the `corti/` prefix is a sensible backstop.
 
 ## corti-transcribe-local (feature `local`, offline flavor)
-Fully offline, on-device, Apple-Silicon transcription. Fully offline — matches vagus's ethos and avoids
-per-minute cost + PHI egress. Engine: **NVIDIA Parakeet-TDT-0.6B-v3** (ONNX) via the official
-`sherpa-onnx` Rust crate (CPU provider by default; `coreml` opt-in). A transducer, so far less
-hallucination-prone than Whisper. See `design/adr/0003-local-asr-sherpa-onnx.md`.
+Fully offline, on-device, Apple-Silicon transcription, avoiding per-minute cost + PHI egress. The model is
+**NVIDIA Parakeet-TDT-0.6B-v3**, a transducer far less hallucination-prone than Whisper. Its per-region ASR
+runtime is selectable: int8 ONNX via official sherpa-onnx/CPU (compatibility default, ADR 0003), or Q8_0
+GGUF via pinned transcribe.cpp/GGML on Metal (standard builds, ADR 0011). Both feed the same shared pipeline.
 
 Pipeline (`crates/corti-transcribe-local/`): read the 2-track float WAV (`audio.rs`) → per channel,
-resample to 16 kHz and run **Silero VAD** to chunk into speech regions (also sidesteps Parakeet's ~30 s
-offline clip limit), decode each region with Parakeet, and reassemble token timestamps into words
-(`engine.rs`). ch0 (mic) → `Speaker::Me`; ch1 (system tap) → `Speaker::Other("Them")` by default. Far-end
+resample to 16 kHz and run sherpa's **Silero VAD** to chunk into speech regions (also sidesteps Parakeet's
+~30 s offline clip limit) → dispatch each region through `Asr::{Sherpa,Ggml}` → map engine results into
+shared timestamped words. ch0 (mic) → `Speaker::Me`; ch1 (system tap) → `Speaker::Other("Them")` by default. Far-end
 speaker splitting (`Them 1/2/…` via pyannote-segmentation-3.0 + a speaker-embedding model, ONNX) is **opt-in**
 (`CORTI_LOCAL_DIARIZE=1`) and **off by default**; when off, the segmentation + embedding models aren't
 required. The embedding stage is **runtime-selectable** among three English (VoxCeleb-trained) models — NeMo
@@ -95,20 +95,20 @@ TitaNet-Large (default), WeSpeaker ResNet34-LM, 3D-Speaker CAM++ — chosen in S
 its ONNX metadata, so all three share one diarizer). Tune `CORTI_LOCAL_DIARIZE_THRESHOLD` (default 0.5) to
 curb over-clustering (issue #18). All shaping (pause-split grouping, speaker merge,
 diarization attribution) is the shared `corti_transcribe::segment` module — the same helpers the AWS parser
-uses. Models cache under `~/Library/Caches/corti/models/` (fetch once with
-`crates/corti-transcribe-local/fetch-models.sh`); a missing required model fails the job with a clear,
-actionable error.
+uses. Models cache under `~/Library/Caches/corti/models/`; Settings downloads the selected ASR artifact +
+shared models with pinned SHA-256 verification. A missing selected artifact fails clearly. The M1 Pro
+five-minute excerpt measured GGML/Metal at 4.09× sherpa's speed, 19% lower peak RSS, and equal normalized
+WER (ADR 0011).
 
-Out of scope here (tracked as `Feature`/`Bug Fix` issues): far-end diarization quality (#18, #14, #15),
-echo/cross-talk cancellation (the pipeline AEC-cleans upstream), live streaming, validating the `coreml`
-provider, in-app model download.
+Out of scope here: far-end diarization quality (#18, #14, #15), replacing sherpa's VAD/diarization with
+transcribe.cpp, and flipping the default engine before a real-call GGML live-checkpoint soak.
 
 ## Feature wiring (in the app)
-`default = ["aws"]`; the shipped app builds `--features aws,local`. Both backends compile in and the
-active one is chosen **at runtime** (`CORTI_TRANSCRIBE_BACKEND` = `aws` | `local`, default `aws`) behind
-the single `Transcriber` trait — `app/src/transcribe.rs` dispatches on a runtime `BackendKind` (no
-compile-time exclusivity). The local backend reads `CORTI_LOCAL_MODEL_DIR` / `CORTI_LOCAL_PROVIDER` /
-`CORTI_LOCAL_THREADS`. A Tauri settings screen to toggle this live is a planned `Feature`.
+Standard builds use `default = ["aws", "local", "local-ggml"]`: both cloud/local backends and both local
+ASR runtimes compile in. Settings chooses `CORTI_TRANSCRIBE_BACKEND = aws | local` and, for local,
+`CORTI_LOCAL_ASR_ENGINE = sherpa | ggml`; sherpa remains the config default for existing-model
+compatibility. A minimal `--no-default-features --features local` build omits transcribe.cpp/Metal and the UI
+disables that choice. Config reload applies between recordings.
 
 ## Depends on
 `corti-core` (DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment) and

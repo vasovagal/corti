@@ -10,16 +10,20 @@ function mb(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(bytes < 10_000_000 ? 1 : 0)} MB`;
 }
 
-// Settings → Models: per-model install state with verified downloads. Errors gracefully (e.g. "local backend
-// not compiled in") since the underlying commands are gated on the `local` feature.
-export function Models() {
+interface Props {
+  asrEngine: string;
+}
+
+// Settings → Models: per-model install state with verified downloads. Only the draft-selected ASR engine's
+// artifact is shown; VAD and configured diarization artifacts are shared. Errors gracefully on minimal builds.
+export function Models({ asrEngine }: Props) {
   const [models, setModels] = useState<ModelStatus[] | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [pct, setPct] = useState<Record<string, number>>({});
 
   const refresh = () =>
-    getModelsStatus()
+    getModelsStatus(asrEngine)
       .then((m) => {
         setModels(m);
         setError("");
@@ -34,7 +38,7 @@ export function Models() {
     return () => {
       unlisten.then((f) => f());
     };
-  }, []);
+  }, [asrEngine]);
 
   async function download(id: string) {
     setBusy(id);
@@ -69,8 +73,8 @@ export function Models() {
     <section className="card">
       <h2>Models</h2>
       <p className="muted small">
-        Local transcription models (sherpa-onnx). Diarization models are only needed when far-end
-        diarization is on; the embedding model shown is the one selected in Transcription settings.
+        The selected Parakeet ASR artifact plus shared Silero VAD. Diarization models are only needed when
+        far-end diarization is on; the embedding shown is the one selected above.
       </p>
       <table className="jtable">
         <tbody>

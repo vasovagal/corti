@@ -1,6 +1,6 @@
 # app — the Tauri tray surface
 
-> Verified against **main + crash-safe rolling live commits (#85, #87, #93, #103)**.
+> Verified against **main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#85, #87, #93, #103)**.
 > Current-state internals of the `app/` crate (`corti-app`, bin `corti`); `file.rs:line` anchors point
 > into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
@@ -204,13 +204,16 @@ recording indicator could also poll `get_stats` (whose `StatsSnapshot` carries `
 `AppConfig` is loaded once and shared as `SharedConfig = Arc<Mutex<AppConfig>>`; the managed
 `ConfigState { config, reload_tx }` (`main.rs:321`) holds it plus a clone of the pipeline sender.
 When the Settings window saves, `set_config` writes the shared config and sends
-`PipelineMsg::ReloadConfig` via `reload_tx` (`settings.rs:195`); the serial worker rebuilds its backend +
-AEC toggle between jobs — or immediately if idle (`reload_config`, `pipeline.rs:293,594`). The
+`PipelineMsg::ReloadConfig` via `reload_tx`; the serial worker rebuilds its backend + AEC toggle between
+jobs — or immediately if idle. Local settings include `asr_engine = sherpa | ggml`: standard builds compile
+both, while a minimal local build disables GGML in the UI. The model table follows the draft selector and
+shows only that engine's Parakeet artifact plus shared VAD/configured diarization artifacts. The
 retention sweep reads `retention_days` live from the same `SharedConfig` (#85), so a saved change applies
 to the next sweep with no reload; the live-filing hook snapshots the config at each recording start (#87),
 so `live_filing` and its rolling interval need no reload either. Env knobs (`CORTI_TRANSCRIBE_BACKEND`,
 `CORTI_AWS_BUCKET`, `CORTI_LANGUAGE`, `CORTI_LOCAL_*`, `CORTI_RETENTION_DAYS`, `CORTI_LIVE_FILING`,
-`CORTI_LIVE_BUFFER_MINUTES`) still seed the initial config (`config.rs`). `live_filing` defaults on; the
+`CORTI_LIVE_BUFFER_MINUTES`) still seed the initial config (`config.rs`), including
+`CORTI_LOCAL_ASR_ENGINE` and the advanced `CORTI_LOCAL_GGML_MODEL` path override. `live_filing` defaults on; the
 Settings screen also exposes `live_buffer_minutes` (default 1, range 1–10), the maximum ordinary interval
 between diarized + `sync_all` transcript commits. Both apply to the next recording.
 

@@ -111,3 +111,15 @@ future ORT/model or a persistent CoreML model cache changes the math.
 To re-measure: build a CoreML-capable lib, then
 `SHERPA_ONNX_LIB_DIR=<lib> cargo run -p corti-transcribe-local --features coreml-lib --example transcribe_file -- <recording.wav>`
 with `CORTI_LOCAL_PROVIDER=coreml` vs `=cpu`.
+
+## Addendum (2026-08-04): Metal arrives through transcribe.cpp, not ONNX Runtime
+
+ADR 0011 accepts a second implementation of **only the Parakeet per-region ASR decode**: the same
+Parakeet-TDT-0.6B-v3 as Q8_0 GGUF through pinned transcribe.cpp/GGML on Metal. On the M1 Pro excerpt it is
+4.09× faster than this ADR's sherpa/CPU path, uses 19% less peak RSS, and has equal normalized WER. This does
+not reverse the CoreML result above — it uses a different runtime and native Metal kernels.
+
+sherpa-onnx remains Corti's Silero VAD and optional pyannote/embedding diarization runtime, and remains the
+upgrade-safe ASR config default so existing installs do not suddenly require a new 740 MB model. Standard
+builds expose both ASR choices; see ADR 0011 for the exact upstream revision, model digest, benchmark, and
+real-call gate before any future default flip.

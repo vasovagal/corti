@@ -1,11 +1,13 @@
 # Chunked / live transcription
 
-_Verified against main + crash-safe rolling live commits (#87, #103)._
+_Verified against main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#87, #103)._
 
-The local backend can transcribe audio **as it arrives**, in arbitrary-sized chunks, over the same resident
-Parakeet engine the batch path uses — no second model, no async runtime in the engine. This page is the API
-reference and the design stance. See [ADR 0009](../design/adr/0009-chunked-transcription-api.md) for the decision, and
-`design/02-corti-transcribe.md` / [ADR 0003](../design/adr/0003-local-asr-sherpa-onnx.md) for the batch pipeline.
+The local backend can transcribe audio **as it arrives**, in arbitrary-sized chunks, over the same selected
+resident Parakeet engine the batch path uses — sherpa/ONNX on CPU or transcribe.cpp/GGML on Metal. There is
+no second ASR model and no async runtime in the engine. This page is the API reference and design stance.
+See [ADR 0009](../design/adr/0009-chunked-transcription-api.md),
+[ADR 0011](../design/adr/0011-spike-transcribe-cpp-ggml-asr.md), and
+[ADR 0012](../design/adr/0012-crash-safe-bounded-live-transcript.md).
 
 ## The pull model — `LiveTranscriber`
 
@@ -14,7 +16,7 @@ pull-based** transcriber for one mono channel. The caller drives it:
 
 ```rust
 // One recognizer, shared; one VAD per channel.
-let engine = LocalTranscriber::new(cfg).live_engine()?;   // loads Parakeet + Silero once
+let engine = LocalTranscriber::new(cfg).live_engine()?;   // loads selected Parakeet runtime + Silero once
 let mut live = engine.channel()?;                         // a fresh VAD sharing the recognizer
 
 live.push(&samples, 48_000);          // resample→VAD→decode closed regions→queue words
@@ -41,10 +43,11 @@ Two knobs matter for the pull model:
   `drain_regions` adds that base, so every word remains seconds-from-call-start. Ordinary push boundaries are
   absorbed by a `WindowBuffer` carrying the sub-512 remainder.
 
-`LiveEngine` is the resident engine: `LocalTranscriber::live_engine()` loads the recognizer + models once;
-`LiveEngine::channel()` spawns a `LiveTranscriber` per channel — each with its own stateful VAD, all sharing the
-one thread-safe recognizer via `Arc`. When `LocalConfig::diarize_far_end` is on, it also owns one reusable
-speaker diarizer; `diarize_chunk` accepts one bounded source-rate window and returns call-relative turns.
+`LiveEngine` is the resident engine: `LocalTranscriber::live_engine()` loads `Asr::Sherpa` or `Asr::Ggml`
+plus shared models once; `LiveEngine::channel()` spawns a `LiveTranscriber` per channel — each with its own
+stateful VAD, all sharing the one thread-safe ASR via `Arc`. A checkpoint never reloads either engine. When
+`LocalConfig::diarize_far_end` is on, `LiveEngine` also owns one reusable sherpa diarizer;
+`diarize_chunk` accepts one bounded source-rate window and returns call-relative turns.
 
 ## Batch runs on the live core
 
@@ -114,7 +117,8 @@ the lookahead — noted in `--help`. `--live` and `--inbox` are **mutually exclu
 The app now drives the same path for detector recordings. `Detector::start_with_live_hook`
 (`crates/corti-detect/src/platform.rs:70`) consults an app-supplied `LiveHook` (`platform.rs:37`) at every
 recording start; `AppLiveHook` returns a bounded tee (`TEE_BACKLOG = 2048`, at most about 64 MiB / 175 s at
-48 kHz) when `live_filing` is on, the backend is local, and all configured models are on disk — otherwise
+48 kHz) when `live_filing` is on, the backend is local, and the selected ASR + shared configured models are
+on disk — GGML does not require the ONNX Parakeet set. Otherwise
 `None` and the batch path runs unchanged. The fixed queue absorbs model/decode/rolling-diarization bursts but
 never scales with call length; full still means drop + count, never block capture.
 

@@ -27,7 +27,7 @@ enum BackendKind {
     /// Boxed: `SdkConfig` is large and would bloat the whole enum otherwise.
     #[cfg(feature = "aws")]
     Aws(Option<Box<aws_config::SdkConfig>>),
-    /// Local on-device Parakeet/ONNX backend.
+    /// Local on-device Parakeet backend (selected sherpa/CPU or transcribe.cpp/Metal runtime).
     #[cfg(feature = "local")]
     Local,
     /// The requested backend isn't compiled into this build; carries the reason for a clear error.
@@ -171,6 +171,8 @@ impl Backend {
             diarize_far_end: self.cfg.local_diarize_far_end,
             embedding_model: self.cfg.local_embedding_model.clone(),
             diarize_threshold: self.cfg.local_diarize_threshold,
+            asr_engine: self.cfg.local_asr_engine.clone(),
+            ggml_model: self.cfg.local_ggml_model.clone(),
             // VAD/diarizer fine-tuning knobs are exposed for the benchmark harness and default to the
             // shipping constants; the app keeps them at default until a tuned default is adopted.
             ..LocalConfig::default()

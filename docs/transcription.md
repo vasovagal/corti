@@ -1,6 +1,6 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against main + crash-safe rolling live commits (#85, #87, #93, #103).
+> Verified against main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#85, #87, #93, #103).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
@@ -44,19 +44,28 @@ arm; `transcribe_recording` (`:132`) is the pipeline entry point — it runs off
 `corti_capture::write_clean_wav` (`:145`), then hands the cleaned (or raw, if AEC skipped) path to
 the backend.
 
-## Local backend — Parakeet via sherpa-onnx
+## Local backend — Parakeet via sherpa or transcribe.cpp
 
-`crates/corti-transcribe-local`. Engine = the official **`sherpa-onnx` Rust crate** (which wraps
-ONNX Runtime), **not** raw `ort`. Model is **NVIDIA Parakeet-TDT-0.6B-v3 int8**, CPU provider by
-default (CoreML measured 4.6–11× slower on the int8 transducer, ADR 0003).
+`crates/corti-transcribe-local` always uses **NVIDIA Parakeet-TDT-0.6B-v3**, with a selectable
+per-region inference runtime behind `Asr::{Sherpa,Ggml}`:
+
+- `sherpa` (compatibility/default): int8 ONNX through the official `sherpa-onnx` Rust crate / ONNX
+  Runtime on CPU. CoreML measured 2.7–11× slower and is not shipped (ADR 0003).
+- `ggml`: the official Q8_0 GGUF through transcribe.cpp/GGML on Metal (ADR 0011), included in standard
+  app builds and selected in Settings or with `CORTI_LOCAL_ASR_ENGINE=ggml`. Corti pins upstream revision
+  `553f1099…` exactly while 0.2.0 is unreleased.
+
+Only ASR decode changes. Resampling, Silero VAD, optional pyannote/embedding diarization, speaker shaping,
+and timeline merge remain on the shared sherpa-backed path.
 
 Per job, `LocalTranscriber::transcribe` (`src/lib.rs:145`) runs:
 
-1. **Discover models** — `models::resolve_dir` (`models.rs:66`) → `~/Library/Caches/corti/models/`
-   (guardrail 5, outside any vault); `models::discover` (`:79`) validates the Parakeet
-   `{encoder,decoder,joiner}.int8.onnx` + `tokens.txt` under `PARAKEET_DIR` (`:18`), `silero_vad.onnx`
-   (`:22`), and — only when far-end diarization is on — pyannote + a selectable embedding model.
-   Missing required files bail with a fetch-script hint.
+1. **Discover models** — `models::resolve_dir` → `~/Library/Caches/corti/models/` (guardrail 5,
+   outside any vault). Engine-aware discovery requires either the Parakeet
+   `{encoder,decoder,joiner}.int8.onnx` + `tokens.txt` set (`sherpa`) or the verified Q8_0 GGUF (`ggml`),
+   plus shared `silero_vad.onnx` and — only when far-end diarization is on — pyannote + the selected
+   embedding. Settings → Models shows only the selected ASR representation and downloads it with a pinned
+   size/SHA-256; missing files fail clearly.
 2. **Decode the WAV** — `audio::read_two_track` (`audio.rs`) `hound`-decodes the whole file (int16
    or float32) and deinterleaves to `mic`/`them` f32 at source rate. Mono → all `them`.
 3. **Per channel** (`lib.rs:171-208`): `engine::resample_to_16k` (`engine.rs:35`) via sherpa
@@ -68,22 +77,25 @@ Per job, `LocalTranscriber::transcribe` (`src/lib.rs:145`) runs:
    speech regions, each capped at `MAX_SPEECH_SECONDS = 20` (`:32`). **No overlap** — regions are
    non-overlapping and VAD-delimited, sidestepping Parakeet's ~30 s clip limit and its
    empty-on-silence bug.
-5. **Per-region ASR** — `asr_segment` (`:213`): offline transducer `create_stream` →
-   `accept_waveform(16000, …)` → `decode` → tokens + timestamps + durations
-   (`model_type = "nemo_transducer"`, `:64`).
-6. **Token → word** — `tokens_to_words` (`:236`): reassembles SentencePiece subwords into whole
-   `Word`s at the `▁` (U+2581) boundary marker (`:242`), shifting timestamps by the region offset.
+5. **Per-region ASR** — `Asr::asr_segment` dispatches the same 16 kHz VAD region. Sherpa creates an
+   offline recognizer stream and reassembles timestamped SentencePiece tokens. transcribe.cpp runs one
+   resident mutex-serialized session with word timestamps, falling back to segment/text rows rather than
+   silently losing speech. Both lift region-relative times by the same call offset.
+6. **Token/result → word** — sherpa reassembles subwords at the `▁` (U+2581) boundary; GGML maps owned
+   transcribe.cpp word rows. Both produce the shared `Word { start, end, text }` type.
 7. **Shape** (`lib.rs:179-212`): ch0 → `words_to_segments(.., Speaker::Me, ..)`; ch1 →
    `words_to_segments(.., Other("Them"), ..)` by default, or opt-in `diarize_words` when
    `diarize_far_end` is set; then `merge_by_time` → `DiarizedTranscript::new`.
 
-Structurally **batch-only**: it uses the *offline* recognizer over complete regions, decodes the
-whole file up front, and merges only after both channels finish. Nothing is emitted mid-run.
+The `Transcriber` trait entry remains whole-WAV/batch, but it drives the same `LiveTranscriber` core used
+by live filing. `checkpoint()` resets bounded resampler/VAD state while retaining either resident ASR model
+and a cumulative timestamp epoch (ADRs 0009/0012).
 
-Tunable `LocalConfig` defaults (`lib.rs:85-99`): `provider = "cpu"`, `num_threads = 4`,
-`diarize_far_end = false`, `vad_threshold = 0.5`, `vad_min_silence = 1.0` (benchmark-tuned up from
-Silero's 0.25 — see `design/06-benchmark-harness.md`). Far-end diarization over-clusters on English
-audio (issue #18); it stays off by default.
+Tunable `LocalConfig` defaults include `asr_engine = "sherpa"` (upgrade-safe compatibility),
+`provider = "cpu"`, `num_threads = 4`, `diarize_far_end = false`, `vad_threshold = 0.5`, and
+`vad_min_silence = 1.0`. On the M1 Pro excerpt benchmark, transcribe.cpp/Metal was 4.09× faster with 19%
+lower peak RSS at identical normalized WER; see ADR 0011 and `bench/results/transcribe_cpp_round1.jsonl`.
+Far-end diarization over-clusters on English audio (issue #18); it stays off by default.
 
 ## AWS backend
 

@@ -1,9 +1,9 @@
 corti-transcribe-local — third-party model & runtime attributions
 ==================================================================
 
-This crate runs pre-trained models through the ONNX Runtime via sherpa-onnx. The models are downloaded at
-setup time (see fetch-models.sh) and are not redistributed in this repository. Their licenses require the
-following attributions:
+This crate runs pre-trained models through ONNX Runtime/sherpa-onnx and, when selected, through
+transcribe.cpp/GGML. Models are downloaded into Corti's cache and are not redistributed in this repository.
+Their licenses require the following attributions:
 
 - NVIDIA Parakeet-TDT-0.6B-v3 (speech recognition)
   © NVIDIA. Licensed under CC-BY-4.0 (https://creativecommons.org/licenses/by/4.0/).
@@ -28,5 +28,10 @@ following attributions:
   © 2023-2026 Xiaomi Corporation (k2-fsa). Licensed under Apache-2.0.
   https://github.com/k2-fsa/sherpa-onnx
 
+- transcribe.cpp + its vendored ggml runtime (optional Parakeet GGUF/Metal inference)
+  © handy-computer / ggml authors. Licensed under MIT.
+  https://github.com/handy-computer/transcribe.cpp
+
+The Parakeet GGUF is a quantized conversion of the same NVIDIA CC-BY-4.0 checkpoint attributed above.
 CC-BY-4.0 permits commercial use with attribution; this NOTICE satisfies that requirement. Verify the exact
 checkpoint license at integration time, as upstream terms can change.

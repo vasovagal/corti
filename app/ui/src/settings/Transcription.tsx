@@ -212,10 +212,42 @@ export function Transcription({ cfg, backends, onChange }: Props) {
       {cfg.transcribe_backend === "local" && (
         <>
           <p className="callout">
-            On-device engine: NVIDIA Parakeet-TDT — runs fully offline; nothing leaves your Mac.
+            NVIDIA Parakeet-TDT runs fully offline; choose its inference runtime below. Nothing leaves your Mac.
           </p>
           <div className="settings-field">
-            <label>ONNX threads{envBadge("local_threads")}</label>
+            <label>ASR engine{envBadge("local_asr_engine")}</label>
+            <div className="radio-row">
+              <label className="radio">
+                <input
+                  type="radio"
+                  name="local-asr-engine"
+                  value="ggml"
+                  checked={cfg.local_asr_engine === "ggml"}
+                  disabled={!cfg.local_ggml_available || isEnv("local_asr_engine")}
+                  onChange={() => set("local_asr_engine", "ggml")}
+                />
+                transcribe.cpp / Metal
+                {!cfg.local_ggml_available && " (not in this build)"}
+              </label>
+              <label className="radio">
+                <input
+                  type="radio"
+                  name="local-asr-engine"
+                  value="sherpa"
+                  checked={cfg.local_asr_engine === "sherpa"}
+                  disabled={isEnv("local_asr_engine")}
+                  onChange={() => set("local_asr_engine", "sherpa")}
+                />
+                sherpa-onnx / CPU (compatibility)
+              </label>
+            </div>
+            <p className="muted small">
+              Metal measured 4.09× faster with 19% lower peak memory on the M1 Pro benchmark at equal WER.
+              Download the matching model below before saving. Sherpa remains the upgrade-safe default.
+            </p>
+          </div>
+          <div className="settings-field">
+            <label>Inference threads{envBadge("local_threads")}</label>
             <input
               type="number"
               min={1}

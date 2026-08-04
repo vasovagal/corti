@@ -33,3 +33,8 @@ hound = "3.5"
 clap = { version = "4", features = ["derive"] }
 # flock(2) for the single-experiment lock (one Mac → one experiment at a time).
 libc = "0.2"
+
+[features]
+# ADR 0011 spike: compile in the transcribe.cpp (GGML/Metal) ASR engine so `process --asr-engine ggml`
+# can be benchmarked against the sherpa CPU baseline. Off by default (builds the vendored C++ tree).
+ggml = ["corti-transcribe-local/ggml"]

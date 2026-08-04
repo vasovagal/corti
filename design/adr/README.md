@@ -16,9 +16,8 @@ Append-only decision log (Context / Decision / Consequences). Guardrails in
 | [0008](0008-live-streaming-transcript-in-process.md) | Proposed | live streaming transcript: first push-driven window, in-process transport |
 | [0009](0009-chunked-transcription-api.md) | Accepted | chunked/live transcription: pull-based sync core, batch refactored onto it |
 | [0010](0010-live-inbox-filing.md) | Accepted | live inbox filing: corti may append to / state-flip / delete notes it created — *amends 0001's boundary and 0008's file stance* |
+| [0011](0011-spike-transcribe-cpp-ggml-asr.md) | Accepted (opt-in; sherpa default) | transcribe.cpp GGML/Metal as a selectable Parakeet ASR runtime; 4.09× M1 Pro speedup at equal excerpt WER |
 | [0012](0012-crash-safe-bounded-live-transcript.md) | Accepted | configurable rolling transcript windows; bounded live RAM; diarize then `sync_all` each durable chunk |
-
-ADR 0011 is reserved by the transcribe.cpp spike in open PR #92; ADR 0012 deliberately does not reuse it.
 
 **Two ADRs share number 0006** — `distribution-unsigned-cask-tap` (Accepted) and
 `far-end-recording-notice-spike` (Proposed spike) — a numbering collision left as-is; disambiguate by

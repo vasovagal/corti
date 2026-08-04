@@ -1567,6 +1567,7 @@ dependencies = [
  "sherpa-onnx",
  "tokio",
  "tracing",
+ "transcribe-cpp",
 ]
 
 [[package]]
@@ -6183,6 +6184,25 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "transcribe-cpp"
+version = "0.2.0"
+source = "git+https://github.com/handy-computer/transcribe.cpp.git?rev=553f1099a2b3a5bc4421894be171f09960fc0f3a#553f1099a2b3a5bc4421894be171f09960fc0f3a"
+dependencies = [
+ "log",
+ "thiserror 2.0.18",
+ "transcribe-cpp-sys",
+]
+
+[[package]]
+name = "transcribe-cpp-sys"
+version = "0.2.0"
+source = "git+https://github.com/handy-computer/transcribe.cpp.git?rev=553f1099a2b3a5bc4421894be171f09960fc0f3a#553f1099a2b3a5bc4421894be171f09960fc0f3a"
+dependencies = [
+ "cmake",
+ "serde_json",
 ]
 
 [[package]]
