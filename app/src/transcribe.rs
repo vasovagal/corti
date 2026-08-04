@@ -27,7 +27,7 @@ enum BackendKind {
     /// Boxed: `SdkConfig` is large and would bloat the whole enum otherwise.
     #[cfg(feature = "aws")]
     Aws(Option<Box<aws_config::SdkConfig>>),
-    /// Local on-device Parakeet/ONNX backend.
+    /// Local on-device Parakeet backend (selected sherpa/CPU or transcribe.cpp/Metal runtime).
     #[cfg(feature = "local")]
     Local,
     /// The requested backend isn't compiled into this build; carries the reason for a clear error.

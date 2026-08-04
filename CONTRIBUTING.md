@@ -42,17 +42,18 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check                        # formatting (run cargo fmt before pushing)
 cargo test
 
-# both transcription backends compiled together (runtime-selectable)
-cargo build --features aws,local
+# standard app posture: both backends + sherpa/CPU and transcribe.cpp/Metal local engines
+cargo build -p corti-app
 
 # the Tauri tray app
 cargo tauri dev                          # dev server + hot reload
 cargo tauri build                        # produces .app + .dmg under target/.../bundle/
 ```
 
-The app's transcription features are `aws` (default) and `local`; ship builds use
-`--features aws,local` and select the active backend at runtime via
-`CORTI_TRANSCRIBE_BACKEND`.
+The app defaults are `aws`, `local`, and `local-ggml`. Select the active backend with
+`CORTI_TRANSCRIBE_BACKEND`; local ASR uses `CORTI_LOCAL_ASR_ENGINE=sherpa|ggml`. A minimal
+`sherpa`-only build is `cargo build -p corti-app --no-default-features --features local`.
+transcribe.cpp compiles pinned native C++/Metal source and requires CMake on the build machine.
 
 Build the frontend first: the app crate's `generate_context!()` reads `frontendDist`
 (`app/ui/dist`) from `tauri.conf.json`, so `cargo` won't compile the workspace until
@@ -60,10 +61,10 @@ Build the frontend first: the app crate's `generate_context!()` reads `frontendD
 
 ### Local backend models
 
-The offline backend needs its ONNX models (Parakeet-TDT, Silero VAD, and — for opt-in
-far-end diarization — pyannote-segmentation + an English speaker-embedding model, default
-NeMo TitaNet-Large; ~0.7 GB total, cached under
-`~/Library/Caches/corti/models/`). Fetch them up front:
+The offline backend needs one selected Parakeet artifact (sherpa's ONNX set or transcribe.cpp's Q8_0
+GGUF), shared Silero VAD, and — for opt-in far-end diarization — pyannote segmentation + an English
+embedding. The app's Settings → Models screen downloads the engine-aware set with checksum verification.
+For sherpa CLI development, fetch the ONNX set up front:
 
 ```sh
 crates/corti-transcribe-local/fetch-models.sh

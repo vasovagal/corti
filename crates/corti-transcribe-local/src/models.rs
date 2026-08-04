@@ -1,14 +1,15 @@
-//! Resolve and validate the ONNX model files the local backend needs.
+//! Resolve and validate the selected Parakeet ASR artifact plus shared ONNX VAD/diarization models.
 //!
 //! Layout under the model dir (default `~/Library/Caches/corti/models/`, guardrail #5 — outside any vault):
 //! ```text
-//! sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/{encoder,decoder,joiner}.int8.onnx, tokens.txt
+//! sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/{encoder,decoder,joiner}.int8.onnx, tokens.txt  # sherpa
+//! parakeet-tdt-0.6b-v3-Q8_0.gguf                                                    # ggml
 //! sherpa-onnx-pyannote-segmentation-3-0/model.onnx
 //! nemo_en_titanet_large.onnx           (the selected speaker-embedding model — see EMBEDDING_IDS)
 //! silero_vad.onnx
 //! ```
-//! Fetch them once with `crates/corti-transcribe-local/fetch-models.sh` (pinned to sherpa-onnx releases).
-//! In-app first-run download is a tracked follow-up (`Feature`: model-management UX).
+//! The in-app Settings model manager downloads only the selected ASR representation plus shared/configured
+//! artifacts and verifies pinned SHA-256 digests. `fetch-models.sh` remains a sherpa development helper.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,15 @@ pub const PARAKEET_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 pub const SEGMENTATION_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 /// Silero VAD model.
 pub const VAD_FILE: &str = "silero_vad.onnx";
+/// Stable engine ids shared by config, catalog filtering, and the Settings model manager.
+pub const SHERPA_ASR_ENGINE: &str = "sherpa";
+pub const GGML_ASR_ENGINE: &str = "ggml";
+/// transcribe.cpp's official Q8_0 port of the same Parakeet-TDT model.
+pub const GGML_MODEL_ID: &str = "parakeet-ggml";
+pub const GGML_FILE: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
+pub const GGML_URL: &str = "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/85ac09ea12fc4b1112fa76810059364bc6adc9de/parakeet-tdt-0.6b-v3-Q8_0.gguf";
+pub const GGML_SHA256: &str = "5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7";
+pub const GGML_DOWNLOAD_BYTES: u64 = 739_508_576;
 
 /// The speaker-embedding model used by far-end diarization is **runtime-selectable** among these English
 /// (VoxCeleb-trained) models — the old zh-cn model was removed (it over-clustered on English; issue #18).
@@ -50,7 +60,8 @@ pub fn embedding_spec(id: &str) -> ModelSpec {
         .expect("embedding id must exist in the catalog")
 }
 
-/// Resolved, validated paths to every model file the backend loads.
+/// Resolved paths to sherpa-owned model files. [`discover_for`] validates only the subset the selected
+/// ASR/VAD/diarization configuration loads; the GGUF is resolved separately by `ggml::resolve_gguf`.
 #[derive(Debug, Clone)]
 pub struct Models {
     pub parakeet_encoder: PathBuf,
@@ -122,6 +133,7 @@ pub fn discover_for(
     tracing::info!(
         target: "corti::transcribe::local",
         dir = %dir.display(),
+        asr_engine = if need_parakeet { SHERPA_ASR_ENGINE } else { GGML_ASR_ENGINE },
         diarization = need_diarization,
         "local models discovered"
     );
@@ -167,7 +179,7 @@ pub struct ModelSpec {
     pub id: &'static str,
     /// Human-readable label.
     pub label: &'static str,
-    /// Download URL (a pinned sherpa-onnx release asset).
+    /// Download URL pinned to an immutable upstream release/revision.
     pub url: &'static str,
     /// SHA-256 of the **downloaded artifact** (the `.tar.bz2` or the bare file), pinned so a truncated or
     /// tampered download is caught before it's installed.
@@ -178,8 +190,11 @@ pub struct ModelSpec {
     /// How to install the artifact (extract vs. place).
     pub kind: ArtifactKind,
     /// Needed only when far-end diarization is enabled (segmentation + embedding); the default path needs
-    /// just Parakeet + VAD.
+    /// just the selected ASR artifact + VAD.
     pub diarize_only: bool,
+    /// `Some("sherpa" | "ggml")` for an engine-specific ASR artifact; `None` for shared VAD/diarization
+    /// artifacts. Settings uses this to avoid asking users to install both Parakeet representations.
+    pub asr_engine: Option<&'static str>,
     /// Path, relative to the model dir, that this artifact installs — a directory for tarballs, a file for
     /// bare files. Removed before a re-download so a partial install can't linger.
     pub install_rel: &'static str,
@@ -187,8 +202,8 @@ pub struct ModelSpec {
     pub present_rel: &'static str,
 }
 
-/// The pinned catalog of model artifacts the local backend needs. Digests and sizes were computed from the
-/// pinned sherpa-onnx release assets; keep them in lock-step with the URLs.
+/// The pinned catalog of model artifacts the local backend can use. Digests and sizes were computed from
+/// pinned sherpa-onnx/Hugging Face artifacts; keep them in lock-step with the URLs.
 pub fn model_catalog() -> Vec<ModelSpec> {
     // URLs share the prefix `https://github.com/k2-fsa/sherpa-onnx/releases/download`, spelled in full
     // below so each field is a plain `&'static str`.
@@ -201,8 +216,21 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 487170055,
             kind: ArtifactKind::Tarball,
             diarize_only: false,
+            asr_engine: Some(SHERPA_ASR_ENGINE),
             install_rel: PARAKEET_DIR,
             present_rel: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx",
+        },
+        ModelSpec {
+            id: GGML_MODEL_ID,
+            label: "Parakeet-TDT 0.6B v3 Q8 (transcribe.cpp / Metal)",
+            url: GGML_URL,
+            sha256: GGML_SHA256,
+            download_bytes: GGML_DOWNLOAD_BYTES,
+            kind: ArtifactKind::File,
+            diarize_only: false,
+            asr_engine: Some(GGML_ASR_ENGINE),
+            install_rel: GGML_FILE,
+            present_rel: GGML_FILE,
         },
         ModelSpec {
             id: "vad",
@@ -212,6 +240,7 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 643854,
             kind: ArtifactKind::File,
             diarize_only: false,
+            asr_engine: None,
             install_rel: VAD_FILE,
             present_rel: VAD_FILE,
         },
@@ -223,6 +252,7 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 6958444,
             kind: ArtifactKind::Tarball,
             diarize_only: true,
+            asr_engine: None,
             install_rel: SEGMENTATION_DIR,
             present_rel: "sherpa-onnx-pyannote-segmentation-3-0/model.onnx",
         },
@@ -237,6 +267,7 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 101405493,
             kind: ArtifactKind::File,
             diarize_only: true,
+            asr_engine: None,
             install_rel: "nemo_en_titanet_large.onnx",
             present_rel: "nemo_en_titanet_large.onnx",
         },
@@ -248,6 +279,7 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 26530550,
             kind: ArtifactKind::File,
             diarize_only: true,
+            asr_engine: None,
             install_rel: "wespeaker_en_voxceleb_resnet34_LM.onnx",
             present_rel: "wespeaker_en_voxceleb_resnet34_LM.onnx",
         },
@@ -259,8 +291,85 @@ pub fn model_catalog() -> Vec<ModelSpec> {
             download_bytes: 29596978,
             kind: ArtifactKind::File,
             diarize_only: true,
+            asr_engine: None,
             install_rel: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
             present_rel: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
         },
     ]
+}
+
+/// Catalog rows relevant to one Settings configuration: exactly one ASR representation, shared VAD,
+/// diarization segmentation, and the selected embedding. Keeping this filter next to the catalog prevents
+/// the UI from asking a GGML user to download the unused ONNX Parakeet set (or vice versa).
+pub fn model_catalog_for(asr_engine: &str, embedding_id: &str) -> Vec<ModelSpec> {
+    let engine = if asr_engine.is_empty() {
+        SHERPA_ASR_ENGINE
+    } else {
+        asr_engine
+    };
+    let selected_embedding = embedding_spec(embedding_id).id;
+    model_catalog()
+        .into_iter()
+        .filter(|spec| {
+            spec.asr_engine.is_none_or(|required| required == engine)
+                && (!is_embedding(spec.id) || spec.id == selected_embedding)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn catalog_ids_and_install_paths_are_unique() {
+        let catalog = model_catalog();
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|spec| spec.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            catalog.len()
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|spec| spec.install_rel)
+                .collect::<HashSet<_>>()
+                .len(),
+            catalog.len()
+        );
+    }
+
+    #[test]
+    fn selected_engine_catalog_never_requires_both_asr_artifacts() {
+        let sherpa = model_catalog_for(SHERPA_ASR_ENGINE, "titanet");
+        assert!(sherpa.iter().any(|spec| spec.id == "parakeet"));
+        assert!(!sherpa.iter().any(|spec| spec.id == GGML_MODEL_ID));
+
+        let ggml = model_catalog_for(GGML_ASR_ENGINE, "titanet");
+        let model = ggml
+            .iter()
+            .find(|spec| spec.id == GGML_MODEL_ID)
+            .expect("GGML artifact");
+        assert!(!ggml.iter().any(|spec| spec.id == "parakeet"));
+        assert_eq!(model.download_bytes, GGML_DOWNLOAD_BYTES);
+        assert_eq!(model.sha256, GGML_SHA256);
+        assert_eq!(model.url, GGML_URL);
+        assert!(ggml.iter().any(|spec| spec.id == "vad"));
+    }
+
+    #[test]
+    fn selected_catalog_keeps_only_the_requested_embedding() {
+        let catalog = model_catalog_for(GGML_ASR_ENGINE, "wespeaker-resnet34");
+        let embeddings: Vec<_> = catalog
+            .iter()
+            .filter(|spec| is_embedding(spec.id))
+            .map(|spec| spec.id)
+            .collect();
+        assert_eq!(embeddings, ["wespeaker-resnet34"]);
+    }
 }

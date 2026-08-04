@@ -1,7 +1,7 @@
 //! Chunked / live transcription over the resident Parakeet engine (ADR 0009).
 //!
-//! [`LiveTranscriber`] is a **pull-based, synchronous** wrapper around the same sherpa-onnx pieces the batch
-//! path uses ([`engine::build_recognizer`], [`engine::build_vad`], [`engine::asr_segment`]): audio is
+//! [`LiveTranscriber`] is a **pull-based, synchronous** wrapper around the same selected [`crate::Asr`] and
+//! sherpa Silero VAD the batch path uses: audio is
 //! `push`ed in arbitrary-sized chunks, resampled to 16 kHz, fed to a single stateful Silero VAD, and each
 //! **completed** VAD speech region is decoded immediately — so the decode cost lands inside the `push` that
 //! closes a region, not on a separate tick. Recognized [`Word`]s queue up; the caller drains them with
@@ -87,7 +87,7 @@ pub struct LiveTranscriber {
 
 impl LiveTranscriber {
     /// Wrap a resident ASR engine and a fresh (per-channel) Silero VAD. Build them via
-    /// [`crate::Asr`]/[`engine::build_vad`], or use [`crate::LiveEngine`] to load once and spawn
+    /// [`crate::Asr`] plus a VAD built by the crate, or use [`crate::LiveEngine`] to load once and spawn
     /// a transcriber per channel.
     pub fn new(rec: Arc<Asr>, vad: VoiceActivityDetector) -> Self {
         Self {
@@ -451,6 +451,49 @@ pub use stream::{LiveSink, LiveWordStream, live_word_stream};
 mod tests {
     use super::*;
 
+    fn verify_engine(dir: &std::path::Path) -> (crate::models::Models, Arc<Asr>) {
+        let engine = std::env::var("CORTI_VERIFY_ASR_ENGINE").unwrap_or_else(|_| "sherpa".into());
+        let m = crate::models::discover_for(dir, engine != "ggml", false, "titanet")
+            .expect("discover models");
+        let rec = match engine.as_str() {
+            "sherpa" => Asr::Sherpa(
+                engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("recognizer"),
+            ),
+            #[cfg(feature = "ggml")]
+            "ggml" => {
+                let path = crate::ggml::resolve_gguf(None, dir).expect("resolve GGUF");
+                Asr::Ggml(crate::ggml::GgmlAsr::load(&path, 4).expect("GGML recognizer"))
+            }
+            #[cfg(not(feature = "ggml"))]
+            "ggml" => panic!("re-run with --features ggml"),
+            other => panic!("unknown CORTI_VERIFY_ASR_ENGINE {other:?}"),
+        };
+        (m, Arc::new(rec))
+    }
+
+    fn verify_audio() -> (Vec<f32>, u32) {
+        let wav = std::path::PathBuf::from(
+            std::env::var("CORTI_VERIFY_WAV").expect("set CORTI_VERIFY_WAV to a speech WAV"),
+        );
+        let mut reader = hound::WavReader::open(&wav).expect("open WAV");
+        let spec = reader.spec();
+        let interleaved: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
+            hound::SampleFormat::Int => {
+                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|s| s.unwrap() as f32 / max)
+                    .collect()
+            }
+        };
+        let channels = spec.channels as usize;
+        (
+            interleaved.iter().step_by(channels).copied().collect(),
+            spec.sample_rate,
+        )
+    }
+
     /// A window that spans two pushes is still released as one 512-sample window: the boundary remainder is
     /// carried, not dropped or short-fed. Pure — no models.
     #[test]
@@ -537,44 +580,19 @@ mod tests {
 
     /// Live-vs-batch equivalence on a real recording: feeding a WAV in small, boundary-straddling chunks
     /// yields exactly the same words as one whole-channel push (which is the batch path). Gated — needs the
-    /// real Parakeet + Silero models and a speech WAV:
-    ///   CORTI_VERIFY_MODEL_DIR=~/Library/Caches/corti/models CORTI_VERIFY_WAV=/path/to/mono_or_2track.wav \
-    ///     cargo test -p corti-transcribe-local live_equals_batch_over_chunking -- --ignored --nocapture
+    /// real Parakeet + Silero models and a speech WAV. Set `CORTI_VERIFY_ASR_ENGINE=ggml` and add
+    /// `--features ggml` to exercise the transcribe.cpp/Metal arm:
+    ///   CORTI_VERIFY_MODEL_DIR=~/Library/Caches/corti/models CORTI_VERIFY_WAV=/path/to/audio.wav \
+    ///     cargo test -p corti-transcribe-local --features ggml live_equals_batch -- --ignored --nocapture
     #[test]
-    #[ignore = "needs the real ONNX models + a speech WAV; set CORTI_VERIFY_MODEL_DIR and CORTI_VERIFY_WAV"]
+    #[ignore = "needs real ASR/VAD models + a speech WAV; set CORTI_VERIFY_MODEL_DIR and CORTI_VERIFY_WAV"]
     fn live_equals_batch_over_chunking() {
-        use crate::models;
-        use std::path::PathBuf;
-
-        let dir = PathBuf::from(
+        let dir = std::path::PathBuf::from(
             std::env::var("CORTI_VERIFY_MODEL_DIR")
                 .expect("set CORTI_VERIFY_MODEL_DIR to the model cache dir"),
         );
-        let wav = PathBuf::from(
-            std::env::var("CORTI_VERIFY_WAV").expect("set CORTI_VERIFY_WAV to a speech WAV"),
-        );
-
-        // Read the first (or only) channel and its source rate straight from the WAV.
-        let mut reader = hound::WavReader::open(&wav).expect("open WAV");
-        let spec = reader.spec();
-        let interleaved: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
-            hound::SampleFormat::Int => {
-                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-                reader
-                    .samples::<i32>()
-                    .map(|s| s.unwrap() as f32 / max)
-                    .collect()
-            }
-        };
-        let ch = spec.channels as usize;
-        let mono: Vec<f32> = interleaved.iter().step_by(ch).copied().collect();
-        let rate = spec.sample_rate;
-
-        let m = models::discover(&dir, false, "titanet").expect("discover models");
-        let rec = Arc::new(Asr::Sherpa(
-            engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"),
-        ));
+        let (mono, rate) = verify_audio();
+        let (m, rec) = verify_engine(&dir);
 
         // Whole-channel push (the batch path).
         let mut whole = LiveTranscriber::new(
@@ -613,47 +631,72 @@ mod tests {
         eprintln!("live-vs-batch equivalence OK: {} words", words_whole.len());
     }
 
+    /// A real transcribe.cpp session survives the reusable durability checkpoint added by ADR 0012: the
+    /// model stays resident, the VAD epoch resets, and post-checkpoint words remain call-relative.
+    #[cfg(feature = "ggml")]
+    #[test]
+    #[ignore = "needs the real GGUF/VAD models + a speech WAV; set CORTI_VERIFY_MODEL_DIR and CORTI_VERIFY_WAV"]
+    fn ggml_checkpoint_keeps_call_relative_timestamps() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("CORTI_VERIFY_MODEL_DIR")
+                .expect("set CORTI_VERIFY_MODEL_DIR to the model cache dir"),
+        );
+        let (mono, rate) = verify_audio();
+        let m = crate::models::discover_for(&dir, false, false, "titanet")
+            .expect("discover GGML/VAD models");
+        let path = crate::ggml::resolve_gguf(None, &dir).expect("resolve GGUF");
+        let rec = Arc::new(Asr::Ggml(
+            crate::ggml::GgmlAsr::load(&path, 4).expect("GGML recognizer"),
+        ));
+        let mut live =
+            LiveTranscriber::new(rec, engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"));
+
+        let boundary = (rate as usize * 60).min(mono.len() / 2);
+        let end = (boundary + rate as usize * 60).min(mono.len());
+        live.push(&mono[..boundary], rate);
+        let before = live.checkpoint();
+        live.push(&mono[boundary..end], rate);
+        let after = live.finish();
+
+        assert!(
+            !before.is_empty(),
+            "fixture must contain speech before checkpoint"
+        );
+        assert!(
+            !after.is_empty(),
+            "fixture must contain speech after checkpoint"
+        );
+        let boundary_sec = boundary as f64 / rate as f64;
+        assert!(
+            after.iter().all(|word| word.start >= boundary_sec - 0.1),
+            "post-checkpoint timestamps must retain the call-relative epoch near {boundary_sec}s"
+        );
+        for words in [&before, &after] {
+            assert!(
+                words.windows(2).all(|pair| pair[1].start >= pair[0].start),
+                "timestamps must stay monotonic within each checkpoint epoch"
+            );
+        }
+    }
+
     /// A mid-stream sample-rate switch (source rate → 16 kHz) must flush the resampler's tail in order, not
     /// strand it and re-emit it after all the 16 kHz audio: word offsets stay non-decreasing. Before the
     /// flush fix the stale tail surfaced at finish() out of order. Gated — needs the real models and a
     /// non-16 kHz speech WAV (same env as `live_equals_batch_over_chunking`).
     #[test]
-    #[ignore = "needs the real ONNX models + a non-16 kHz speech WAV; set CORTI_VERIFY_MODEL_DIR and CORTI_VERIFY_WAV"]
+    #[ignore = "needs real ASR/VAD models + a non-16 kHz speech WAV; set CORTI_VERIFY_MODEL_DIR and CORTI_VERIFY_WAV"]
     fn live_survives_sample_rate_switch() {
-        use crate::models;
-        use std::path::PathBuf;
-
-        let dir = PathBuf::from(
+        let dir = std::path::PathBuf::from(
             std::env::var("CORTI_VERIFY_MODEL_DIR")
                 .expect("set CORTI_VERIFY_MODEL_DIR to the model cache dir"),
         );
-        let wav = PathBuf::from(
-            std::env::var("CORTI_VERIFY_WAV").expect("set CORTI_VERIFY_WAV to a speech WAV"),
-        );
-        let mut reader = hound::WavReader::open(&wav).expect("open WAV");
-        let spec = reader.spec();
-        let interleaved: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap()).collect(),
-            hound::SampleFormat::Int => {
-                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-                reader
-                    .samples::<i32>()
-                    .map(|s| s.unwrap() as f32 / max)
-                    .collect()
-            }
-        };
-        let ch = spec.channels as usize;
-        let mono: Vec<f32> = interleaved.iter().step_by(ch).copied().collect();
-        let rate = spec.sample_rate;
+        let (mono, rate) = verify_audio();
         assert_ne!(
             rate, 16_000,
             "this test needs a non-16 kHz WAV to force a resampler"
         );
 
-        let m = models::discover(&dir, false, "titanet").expect("discover models");
-        let rec = Arc::new(Asr::Sherpa(
-            engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("rec"),
-        ));
+        let (m, rec) = verify_engine(&dir);
         let mut live = LiveTranscriber::new(
             rec.clone(),
             engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"),

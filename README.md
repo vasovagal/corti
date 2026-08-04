@@ -28,8 +28,9 @@ signals. Exactly what this app does: audio → notes.
 - **Diarized, timestamped transcripts.** Clean Markdown with word-level timestamps and
   **Me** / **Them** speaker labels, dropped right into your vagus vault.
 - **Two transcription backends, picked at runtime.** **AWS Transcribe** for cloud accuracy,
-  or a **fully offline on-device** backend (NVIDIA Parakeet-TDT-0.6B-v3 via ONNX) when nothing
-  may leave the machine. Both compile in; choose with `CORTI_TRANSCRIBE_BACKEND`.
+  or fully offline **NVIDIA Parakeet-TDT-0.6B-v3** when nothing may leave the machine. Local ASR can run
+  through sherpa/ONNX on CPU or the faster transcribe.cpp/GGML path on Metal; choose both backend and local
+  engine in Settings (or with `CORTI_TRANSCRIBE_BACKEND` / `CORTI_LOCAL_ASR_ENGINE`).
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
   `--label` to name it).
@@ -54,7 +55,7 @@ signals. Exactly what this app does: audio → notes.
   in-process capture            one CoreAudio aggregate device, no subprocess
      process tap ─┐
      mic ─────────┼─▶ ring ─▶ 2-track WAV   (ch0 Me · ch1 Them)
-       │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet ─▶ rolling checkpoint
+       │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet (CPU or Metal) ─▶ rolling checkpoint
        │                              └─ optional diarize ─▶ append + sync_all (local backend)
        │  Action::Stop                   └─ sync tail, then flip `State:` durably
        ▼
@@ -62,7 +63,7 @@ signals. Exactly what this app does: audio → notes.
   AEC   FDAF adaptive filter + residual suppressor — strips speaker bleed off the mic track
        │
        ▼
-  transcribe   Parakeet-TDT (offline ONNX)  |  AWS Transcribe
+  transcribe   Parakeet-TDT (sherpa/CPU or transcribe.cpp/Metal)  |  AWS Transcribe
        │       → diarized, word-timestamped Markdown
        ▼
   vagus CLI    files the note (corti's other note writes are confined to notes it created — ADR 0010)
@@ -73,7 +74,7 @@ Internals — the same data flow with `file:line` anchors — live in
 
 ## In the app
 
-Past the tray menu, corti ships a **Settings** window (backend, S3 bucket, model download), an
+Past the tray menu, corti ships a **Settings** window (backend/local engine, S3 bucket, verified model download), an
 **Ethics & Legality** guide (recording-consent norms by jurisdiction), and a **Diagnostics**
 console with a live stats panel (CPU/RSS, per-stage timings, rolling logs). From the shell,
 `corti --list` prints every tracked recording with its pipeline status and filed note.
@@ -93,12 +94,13 @@ pre-1.0.)
 
 ## Speed & privacy
 
-The offline backend runs **~30–60× realtime** on Apple Silicon — a 1-hour call transcribes
-in roughly **1–2 minutes**, CPU-only, with no GPU dependency. Models are a ~0.7 GB one-time
-download cached under `~/Library/Caches/corti/models/`; after that the local path makes **zero
-network calls** — audio and transcript never leave the device. Prefer cloud accuracy? Point
-`CORTI_TRANSCRIBE_BACKEND=aws` at AWS Transcribe instead. Either way, capture and
-transcription run in the background; the UI never blocks.
+On the M1 Pro benchmark, transcribe.cpp/Metal processed a five-minute excerpt in **6.1 s** including model
+load — **4.09× faster** than Corti's sherpa/CPU path, with 19% lower peak RSS and the same normalized excerpt
+WER. Sherpa remains the upgrade-safe default; download the verified Q8_0 GGUF and select Metal in Settings.
+The selected ASR artifact is a ~0.5–0.74 GB one-time download cached under
+`~/Library/Caches/corti/models/`; after that the local path makes **zero network calls** — audio and
+transcript never leave the device. Prefer cloud accuracy? Select AWS Transcribe instead. Either way,
+capture and transcription run in the background; the UI never blocks. See [ADR 0011](./design/adr/0011-spike-transcribe-cpp-ggml-asr.md).
 
 ## AEC tuning
 

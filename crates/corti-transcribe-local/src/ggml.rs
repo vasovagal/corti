@@ -7,26 +7,37 @@
 //! the ASR runtime.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use corti_transcribe::segment::Word;
-use transcribe_cpp::{Model, RunOptions, Session, TimestampKind, Transcript};
+use transcribe_cpp::{
+    Backend, Model, ModelOptions, RunOptions, Session, SessionOptions, TimestampKind, Transcript,
+};
 
 /// Default GGUF filename expected under the model dir. Q8_0 is the tier closest to the shipping sherpa
 /// int8 ONNX (upstream WER 1.94% vs the 1.95% F32 reference on LibriSpeech test-clean).
-pub const DEFAULT_GGUF_FILE: &str = "parakeet-tdt-0.6b-v3-Q8_0.gguf";
-/// Where to fetch [`DEFAULT_GGUF_FILE`] (the transcribe.cpp author's official GGUF port).
-pub const DEFAULT_GGUF_URL: &str = "https://huggingface.co/handy-computer/parakeet-tdt-0.6b-v3-gguf/resolve/main/parakeet-tdt-0.6b-v3-Q8_0.gguf";
+pub const DEFAULT_GGUF_FILE: &str = crate::models::GGML_FILE;
+/// Pinned transcribe.cpp source revision used by this build (latest upstream `main` when ADR 0011 was
+/// validated). Cargo also pins this revision; the constant makes diagnostics and the ADR auditable.
+pub const TRANSCRIBE_CPP_REV: &str = "553f1099a2b3a5bc4421894be171f09960fc0f3a";
+/// Where to fetch [`DEFAULT_GGUF_FILE`] (the transcribe.cpp author's official GGUF port), pinned to the
+/// exact Hugging Face repository revision whose SHA-256 is recorded in [`crate::models::model_catalog`].
+pub const DEFAULT_GGUF_URL: &str = crate::models::GGML_URL;
+
+/// The native library defaults to extremely verbose stderr diagnostics (including one line per decoder
+/// region and Metal pipeline). Corti emits its own bounded structured load/decode events instead; silence
+/// the process-global native sink once before the first model load so long calls cannot flood diagnostics.
+static QUIET_NATIVE_LOGS: Once = Once::new();
 
 /// Resolve the GGUF to load: the explicit override, else `<model_dir>/`[`DEFAULT_GGUF_FILE`], failing
 /// with the one-line download command when the file is missing (mirrors `models::discover`'s
 /// actionable-error contract; spike-era manual fetch, no `fetch-models.sh` entry yet).
 pub fn resolve_gguf(override_path: Option<PathBuf>, model_dir: &Path) -> Result<PathBuf> {
     let path = override_path.unwrap_or_else(|| model_dir.join(DEFAULT_GGUF_FILE));
-    if !path.exists() {
+    if !path.is_file() {
         anyhow::bail!(
-            "ggml ASR model not found at {}\n\nDownload it once with:\n  curl -L --create-dirs -o {} \\\n    {}",
+            "ggml ASR model not found at {}\n\nDownload it in Corti Settings → Models, or run:\n  curl -L --create-dirs -o {} \\\n    {}",
             path.display(),
             path.display(),
             DEFAULT_GGUF_URL,
@@ -45,21 +56,48 @@ pub struct GgmlAsr {
 }
 
 impl GgmlAsr {
-    /// Load the GGUF and open a session. Logged like the sherpa `model loaded` lines (issue #76),
-    /// with the compute backend GGML actually picked (`Metal` / `CPU`) — the load-bearing fact for the
-    /// ADR 0011 benchmark.
-    pub fn load(gguf: &Path) -> Result<Self> {
+    /// Load the GGUF with required Metal (no silent CPU fallback) and open a session. Logged like the
+    /// sherpa `model loaded` lines (issue #76), including the actual Metal device — the load-bearing fact
+    /// for the ADR 0011 benchmark.
+    pub fn load(gguf: &Path, num_threads: i32) -> Result<Self> {
+        ensure!(
+            num_threads > 0,
+            "transcribe.cpp thread count must be positive"
+        );
+        QUIET_NATIVE_LOGS.call_once(transcribe_cpp::disable_logging);
+
         let started = std::time::Instant::now();
-        let model =
-            Model::load(gguf).with_context(|| format!("loading GGUF model {}", gguf.display()))?;
+        let model = Model::load_with(
+            gguf,
+            &ModelOptions {
+                backend: Backend::Metal,
+                ..ModelOptions::default()
+            },
+        )
+        .with_context(|| format!("loading GGUF model {} with Metal", gguf.display()))?;
+        let arch = model.arch();
+        let variant = model.variant();
+        ensure!(
+            arch == "parakeet" && variant == "tdt-0.6b-v3",
+            "GGUF model {} is {arch}/{variant}, expected parakeet/tdt-0.6b-v3",
+            gguf.display()
+        );
+        let backend = model.backend();
         let session = model
-            .session()
+            .session_with(&SessionOptions {
+                n_threads: num_threads,
+                ..SessionOptions::default()
+            })
             .context("opening a transcribe.cpp session")?;
         tracing::info!(
             target: "corti::transcribe::local",
             model = "parakeet-ggml",
             path = %gguf.display(),
-            backend = %model.backend(),
+            arch,
+            variant,
+            backend,
+            num_threads,
+            transcribe_cpp_rev = TRANSCRIBE_CPP_REV,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "model loaded"
         );
@@ -104,18 +142,24 @@ fn words_from(t: &Transcript, offset_sec: f64) -> Vec<Word> {
         })
     };
     if !t.words.is_empty() {
-        return t
+        let words: Vec<_> = t
             .words
             .iter()
             .filter_map(|w| word(w.t0_ms, w.t1_ms, &w.text))
             .collect();
+        if !words.is_empty() {
+            return words;
+        }
     }
     if !t.segments.is_empty() {
-        return t
+        let words: Vec<_> = t
             .segments
             .iter()
             .filter_map(|s| word(s.t0_ms, s.t1_ms, &s.text))
             .collect();
+        if !words.is_empty() {
+            return words;
+        }
     }
     word(0, 0, &t.text).into_iter().collect()
 }
@@ -179,6 +223,21 @@ mod tests {
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].text, "just text");
         assert!((words[0].start - 3.0).abs() < 1e-9);
+
+        // Empty/whitespace rows do not suppress the coarser non-empty fallback.
+        let t = Transcript {
+            text: "fallback".into(),
+            words: vec![transcribe_cpp::Word {
+                text: "  ".into(),
+                ..Default::default()
+            }],
+            segments: vec![transcribe_cpp::Segment {
+                text: " ".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(words_from(&t, 2.0)[0].text, "fallback");
 
         // Nothing anywhere → no words.
         assert!(words_from(&Transcript::default(), 0.0).is_empty());

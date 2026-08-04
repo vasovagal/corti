@@ -38,8 +38,8 @@ impl Asr {
 /// benchmark a silent fallback would mislabel every result.
 pub(crate) fn wants_ggml(engine: &str) -> anyhow::Result<bool> {
     match engine {
-        "" | "sherpa" => Ok(false),
-        "ggml" => Ok(true),
+        "" | crate::models::SHERPA_ASR_ENGINE => Ok(false),
+        crate::models::GGML_ASR_ENGINE => Ok(true),
         other => anyhow::bail!("unknown ASR engine `{other}` (expected `sherpa` or `ggml`)"),
     }
 }

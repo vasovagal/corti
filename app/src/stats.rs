@@ -155,7 +155,8 @@ pub struct StageSample {
 pub struct StatsSnapshot {
     /// ISO-8601 UTC timestamp (matches ConsoleEntry's `jiff::Timestamp::now().to_string()`).
     pub timestamp: String,
-    /// Active transcription backend label ("AWS Transcribe" / "Parakeet (local)" / "none").
+    /// Active transcription backend/engine label ("AWS Transcribe" / "Parakeet / CPU" /
+    /// "Parakeet / Metal" / "none").
     pub backend: String,
     /// Whether a detector (mic-triggered) capture is in flight.
     pub detector_recording: bool,

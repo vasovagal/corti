@@ -1,7 +1,7 @@
 # Benchmark results — 2026-06-21
 
 Corpus: NPR Planet Money (dough `nx-s1-5844617`, trees `nx-s1-5856509`, hackers `nx-s1-5859441`).
-Backend: local Parakeet-TDT-0.6B-v3-int8 + Silero VAD + pyannote, CPU, Apple-Silicon. AWS out of scope.
+Baseline backend: local Parakeet-TDT-0.6B-v3-int8 + Silero VAD + pyannote, CPU, Apple-Silicon. AWS out of scope. ADR 0011's later Metal comparison is recorded separately below.
 Method: `design/06-benchmark-harness.md`. Raw data: `bench/results/*.jsonl`. Regenerate tables with
 `bench/analyze.py {asr,aec,diar} <jsonl>`.
 
@@ -15,6 +15,23 @@ Method: `design/06-benchmark-harness.md`. Raw data: `bench/results/*.jsonl`. Reg
 
 Believable Parakeet numbers (hackers is harder — security jargon). Peak RSS dominated by model load, not
 knob-sensitive on the non-diarize path.
+
+## 0. Later runtime comparison — transcribe.cpp / Metal (2026-08-04, ADR 0011)
+
+Same Parakeet-TDT-0.6B-v3 model and 300 s dough excerpt, shipping VAD settings, no diarization. The GGML arm
+uses the official Q8_0 GGUF through transcribe.cpp upstream revision `553f1099…`; three alternating
+post-warm release processes per engine, each including model load:
+
+| engine | mean ASR wall | speedup | mean peak RSS | normalized WER |
+|---|---:|---:|---:|---:|
+| sherpa ONNX / CPU | 24.605 s | 1.00× | 1,543 MB | 0.304791 |
+| transcribe.cpp GGML / Metal | **6.016 s** | **4.09×** | **1,246 MB (−19.25%)** | **0.304791** |
+
+The stored 5-minute reference is imperfectly aligned, so use the equal WER as a relative parity result, not
+an absolute accuracy claim. Hypotheses differ by 14/887 normalized words (1.58%). The first-ever Metal
+shader build took 10.3 s; the cached library loaded in 11 ms on the next process. Raw rows:
+`transcribe_cpp_round1.jsonl`. Outcome: ship a selectable accelerated engine, retain sherpa as the
+upgrade-safe default until a real live-checkpoint call soak (ADR 0011).
 
 ## 1. Transcription — `vad_min_silence` is the win
 

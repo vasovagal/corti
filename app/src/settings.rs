@@ -38,6 +38,9 @@ pub struct SettingsDto {
     pub aws_profile: Option<String>,
     pub aws_region: Option<String>,
     pub local_threads: i32,
+    pub local_asr_engine: String,
+    /// Build capability, not persisted config: false in minimal `local` builds that omit transcribe.cpp.
+    pub local_ggml_available: bool,
     pub local_diarize_far_end: bool,
     pub local_embedding_model: String,
     pub aec_enabled: bool,
@@ -71,6 +74,8 @@ impl From<&AppConfig> for SettingsDto {
             aws_profile: cfg.aws_profile.clone(),
             aws_region: cfg.aws_region.clone(),
             local_threads: cfg.local_threads,
+            local_asr_engine: cfg.local_asr_engine.clone(),
+            local_ggml_available: cfg!(feature = "local-ggml"),
             local_diarize_far_end: cfg.local_diarize_far_end,
             local_embedding_model: cfg.local_embedding_model.clone(),
             aec_enabled: cfg.aec_enabled,
@@ -123,6 +128,7 @@ pub fn set_config(
     if dto.local_threads <= 0 {
         return Err("local thread count must be greater than zero".to_string());
     }
+    let local_asr_engine = validate_local_asr_engine(&dto.local_asr_engine)?;
     if !(1..=365).contains(&dto.retention_days) {
         return Err("retention must be between 1 and 365 days".to_string());
     }
@@ -165,6 +171,9 @@ pub fn set_config(
     // stays on the file baseline `to_save` started from, settable only via `CORTI_LOCAL_PROVIDER`.
     if !pinned("local_threads") {
         to_save.local_threads = dto.local_threads;
+    }
+    if !pinned("local_asr_engine") {
+        to_save.local_asr_engine = local_asr_engine.to_string();
     }
     if !pinned("local_diarize_far_end") {
         to_save.local_diarize_far_end = dto.local_diarize_far_end;
@@ -215,6 +224,18 @@ pub fn set_config(
     crate::tray::refresh_menu(&app);
 
     Ok(())
+}
+
+fn validate_local_asr_engine(value: &str) -> Result<&str, String> {
+    match value.trim() {
+        "sherpa" => Ok("sherpa"),
+        "ggml" if cfg!(feature = "local-ggml") => Ok("ggml"),
+        "ggml" => Err(
+            "transcribe.cpp / Metal is not compiled into this build; use a standard Corti build or select sherpa"
+                .to_string(),
+        ),
+        other => Err(format!("unknown local ASR engine {other:?}")),
+    }
 }
 
 /// Trim a string and treat empty as absent.
@@ -411,25 +432,38 @@ fn model_status(dir: &Path, spec: &corti_transcribe_local::models::ModelSpec) ->
     }
 }
 
-/// Install state of the local models needed for the **current** config (Settings → Models): the core models
-/// plus only the *selected* speaker-embedding model (the other embedding options live behind the
-/// Transcription dropdown via [`get_embedding_models`]). Errors when the local backend isn't compiled in.
+/// Install state of the models relevant to the selected config (Settings → Models): one ASR artifact, shared
+/// VAD, diarization segmentation, and only the selected embedding. `asr_engine` is the webview's unsaved
+/// draft when supplied, so switching the selector immediately shows the right download instead of both
+/// Parakeet representations. Errors when the local backend isn't compiled in.
 #[tauri::command]
-pub fn get_models_status(state: State<'_, ConfigState>) -> Result<Vec<ModelStatus>, String> {
+pub fn get_models_status(
+    asr_engine: Option<String>,
+    state: State<'_, ConfigState>,
+) -> Result<Vec<ModelStatus>, String> {
     #[cfg(not(feature = "local"))]
     {
-        let _ = &state;
+        let _ = (&state, asr_engine);
         Err("local transcription backend is not compiled into this build".to_string())
     }
     #[cfg(feature = "local")]
     {
         use corti_transcribe_local::models;
         let dir = models_dir_or_err(&state)?;
-        let selected = state.config.lock().unwrap().local_embedding_model.clone();
-        let selected_id = models::embedding_spec(&selected).id;
-        let statuses = models::model_catalog()
+        let (saved_engine, selected_embedding) = {
+            let cfg = state.config.lock().unwrap();
+            (
+                cfg.local_asr_engine.clone(),
+                cfg.local_embedding_model.clone(),
+            )
+        };
+        let engine = asr_engine
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&saved_engine);
+        let statuses = models::model_catalog_for(engine, &selected_embedding)
             .into_iter()
-            .filter(|spec| !models::is_embedding(spec.id) || spec.id == selected_id)
             .map(|spec| model_status(&dir, &spec))
             .collect();
         Ok(statuses)
@@ -815,6 +849,17 @@ pub async fn verify_aws() -> Result<AwsIdentity, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_asr_engine_validation_matches_build_capability() {
+        assert_eq!(validate_local_asr_engine(" sherpa ").unwrap(), "sherpa");
+        if cfg!(feature = "local-ggml") {
+            assert_eq!(validate_local_asr_engine("ggml").unwrap(), "ggml");
+        } else {
+            assert!(validate_local_asr_engine("ggml").is_err());
+        }
+        assert!(validate_local_asr_engine("metal").is_err());
+    }
 
     #[test]
     fn path_size_sums_a_directory_tree() {

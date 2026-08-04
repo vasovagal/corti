@@ -659,16 +659,21 @@ fn live_eligible(cfg: &AppConfig) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Cheap file-existence validation of the local model cache (no engine load).
+/// Cheap file-existence validation of exactly the selected local ASR/VAD/diarization artifacts (no engine
+/// load). In particular, GGML uses its GGUF and does not require the legacy Parakeet ONNX files.
 #[cfg(feature = "local")]
 fn discover_models(cfg: &AppConfig) -> Result<()> {
-    let dir = corti_transcribe_local::models::resolve_dir(cfg.local_model_dir.clone())?;
-    corti_transcribe_local::models::discover(
-        &dir,
-        cfg.local_diarize_far_end,
-        &cfg.local_embedding_model,
-    )?;
-    Ok(())
+    use corti_transcribe_local::{LocalConfig, LocalTranscriber};
+
+    LocalTranscriber::new(LocalConfig {
+        model_dir: cfg.local_model_dir.clone(),
+        diarize_far_end: cfg.local_diarize_far_end,
+        embedding_model: cfg.local_embedding_model.clone(),
+        asr_engine: cfg.local_asr_engine.clone(),
+        ggml_model: cfg.local_ggml_model.clone(),
+        ..LocalConfig::default()
+    })
+    .validate_models()
 }
 
 // ----- The per-recording session thread -----

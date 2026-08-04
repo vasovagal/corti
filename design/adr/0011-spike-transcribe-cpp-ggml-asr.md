@@ -1,68 +1,97 @@
-# ADR 0011 — Spike: transcribe.cpp (GGML/Metal) as a runtime-selectable ASR engine
+# ADR 0011 — transcribe.cpp (GGML/Metal) as a selectable local ASR engine
 
-- **Status:** Proposed (spike; 2026-07-19)
-- **References:** ADR 0003 (local ASR via sherpa-onnx — including the CoreML rejection this revisits from a
-  different angle), ADR 0009 (pull-based sync core; the `LiveTranscriber` seam this plugs into),
-  guardrail 3 (far-reaching dependency ⇒ ADR), guardrail 6 (pluggable `Transcriber`).
+- **Status:** Accepted as an accelerated opt-in engine (2026-08-04); sherpa remains the compatibility default
+- **References:** ADR 0003 (local ASR via sherpa-onnx and the CoreML rejection), ADR 0009 (pull-based live
+  core), ADR 0012 (bounded crash-safe live checkpoints), issues #91/#103, PRs #92/#104.
 
 ## Context
 
-ADR 0003 chose sherpa-onnx (ONNX Runtime) running NVIDIA Parakeet-TDT-0.6B-v3 int8, **CPU-only**: the
-measured CoreML execution provider was 2.7–11× *slower* than CPU on the int8 transducer, so Apple-Silicon
-GPU acceleration was rejected — as an ONNX Runtime EP problem, not as a verdict on the hardware.
+ADR 0003 chose NVIDIA Parakeet-TDT-0.6B-v3 int8 through sherpa-onnx / ONNX Runtime on CPU. ONNX
+Runtime's CoreML execution provider measured 2.7–11× slower than CPU for this transducer, so Corti did not
+ship it. That rejected one runtime/accelerator pairing, not Apple-Silicon GPU inference in general.
 
-[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (MIT, v0.1.3, by the author of Handy)
-is a GGML-based ASR inference library — the whisper.cpp/llama.cpp lineage — with a fundamentally
-different GPU path: **Metal, enabled automatically on Apple Silicon**. It ships an official GGUF port of
-the *exact model corti runs* (`handy-computer/parakeet-tdt-0.6b-v3-gguf`, Q8_0 at WER 1.94% vs the 1.95%
-F32 reference on LibriSpeech test-clean), maintainer-supported Rust bindings on crates.io
-(`transcribe-cpp` — the community `sherpa-rs` situation ADR 0003 lamented, solved), and a single-file
-model artifact instead of sherpa's multi-file ONNX directories. The author's headline claim is
-faster-than-realtime SOTA ASR at lower watts than ONNX-CPU — exactly the axis corti is pinned on.
+[transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) is an MIT-licensed GGML ASR runtime from
+the Handy author. It provides a Metal backend and an official CC-BY-4.0 GGUF conversion of the exact same
+Parakeet model. This is not a change from Parakeet to another model: it is a second implementation of the
+per-speech-region Parakeet decode. Silero VAD and optional pyannote/embedding diarization still use
+sherpa-onnx.
 
-Risks are real: the project is ~3 months old (0.1.x, "rough edges" per the author), it has **no
-Silero-VAD equivalent surfaced and no pyannote diarization** (its only diarization is a different model
-family, MOSS), and its `-sys` crate compiles the vendored C++/ggml tree with CMake at build time.
+The original spike used crates.io v0.1.3. Before integration, upstream had moved to an unreleased 0.2.0 and
+added model families, structured diarization APIs, and Rust API fields. Corti therefore pins the then-current
+upstream `main` revision exactly:
+
+- repository: `handy-computer/transcribe.cpp`
+- revision: `553f1099a2b3a5bc4421894be171f09960fc0f3a` (2026-08-03)
+- GGUF repository revision: `85ac09ea12fc4b1112fa76810059364bc6adc9de`
+- Q8_0 GGUF SHA-256: `5859f77944efcd8eafa23a6350731960b2b55b2203df51f319665c807d802cc7`
+
+The exact Git revision in `Cargo.toml`/`Cargo.lock` keeps the native source build reproducible while 0.2.0 is
+unreleased. Move back to crates.io once an equivalent release exists.
 
 ## Decision
 
-Run a **benchmark spike**, not a migration. The wager is narrow: *is GGML/Metal faster and cheaper (watts,
-wall-clock) than ONNX/CPU on the same Parakeet-TDT-0.6B-v3, at equal-or-better WER?* Everything else is
-deliberately held constant so the comparison isolates the ASR runtime:
+1. **Swap only per-region ASR.** `Asr::{Sherpa,Ggml}` sits behind the one `asr_segment` contract. Both
+   engines receive the same 16 kHz Silero-VAD regions and return call-relative `Word`s; resampling,
+   VAD, optional far-end diarization, word-to-segment shaping, channel labels, and timeline merge remain
+   common.
+2. **Use one loaded transcribe.cpp session.** The GGUF model/session is loaded once per job or live session,
+   shared across channels behind a mutex, and receives Corti's configured inference thread count. Corti
+   explicitly requires the Metal backend (no silent CPU fallback), and model metadata must identify
+   `parakeet/tdt-0.6b-v3`; an accidental different GGUF is a hard error.
+3. **Preserve crash-safe live semantics.** `LiveTranscriber::checkpoint()` resets only bounded resampler/VAD
+   state, not the GGML model. Its cumulative 16 kHz epoch base is applied before either ASR engine decodes,
+   so ADR 0012's rolling durable writes and call-relative timestamps are engine-independent. Optional
+   diarization still runs on each bounded far-end window before append.
+4. **Ship the engine, select it explicitly.** Standard app/release builds include `local-ggml`; minimal
+   `--no-default-features --features local` builds remain sherpa-only. Settings and
+   `CORTI_LOCAL_ASR_ENGINE={sherpa|ggml}` select the runtime. Unknown or unavailable values error rather
+   than silently falling back and corrupting benchmark labels.
+5. **Keep `sherpa` as the persisted/default value for upgrade safety.** Existing installations already have
+   the ONNX artifact and must not fail after an update because a new 740 MB GGUF is absent. Users can
+   download the verified GGUF in Settings → Models and opt into Metal. A future default flip requires a
+   real detector-call soak with rolling live checkpoints.
+6. **Make model management engine-aware.** Settings shows/downloads only the selected ASR representation
+   (ONNX or GGUF), shared Silero VAD, and configured diarization artifacts. Live eligibility validates the
+   selected representation; GGML no longer spuriously requires the ONNX Parakeet files. An explicit
+   `CORTI_LOCAL_GGML_MODEL` remains available for benchmarking.
+7. **Contain native diagnostics.** transcribe.cpp's default native sink emits Metal pipeline and per-region
+   decoder lines. Corti disables that process-global sink once and emits its own bounded structured model
+   load / region-failure events instead.
 
-1. **Swap only the per-region decode.** A new `Asr` enum in `corti-transcribe-local` sits where the
-   `Arc<OfflineRecognizer>` used to flow (batch + live paths, ADR 0009's `LiveTranscriber`): `Sherpa`
-   (shipping path, byte-identical) or `Ggml` (`ggml.rs` — `transcribe-cpp` `Model`/`Session` behind a
-   `Mutex`, word-level timestamps mapped onto `segment::Word`). Resampling, Silero VAD chunking, pyannote
-   far-end diarization and word→segment shaping all stay on sherpa-onnx in both configurations.
-2. **Runtime-selected, compile-time gated.** `LocalConfig::asr_engine = "sherpa" | "ggml"`
-   (`CORTI_LOCAL_ASR_ENGINE`, default `sherpa`), GGUF path override via `CORTI_LOCAL_GGML_MODEL`
-   (default `<model dir>/parakeet-tdt-0.6b-v3-Q8_0.gguf`). The engine is compiled in only by the new
-   `ggml` feature (`local-ggml` on the app, `ggml` on `corti-bench`) — **off by default**, so the default
-   build neither changes behavior nor compiles the C++ tree. An unknown engine token errors; a `ggml`
-   request against a non-`ggml` build errors (no silent fallback — that would mislabel bench results).
-3. **Bench it with the existing harness.** `corti-bench process --asr-engine ggml [--ggml-model …]`
-   emits the same JSON envelope (engine + GGUF recorded in `config`), so the Planet Money fixtures and
-   scorers (design/06) compare WER/speed/RSS against the sherpa CPU baseline unchanged. Wall-power via
-   `powermetrics` alongside, as in ADR 0003's methodology.
+## M1 Pro benchmark result
 
-### Go / no-go criteria (evaluate on the M1 Pro daily driver)
+Hardware: 10-core Apple M1 Pro, 32 GB, macOS 26.6. Input: the same 300 s Planet Money
+`nx-s1-5844617` excerpt, shipping Silero/VAD settings, no diarization, Q8_0 GGUF. Each row is the mean of
+three alternating post-warm release-process runs and includes model load.
 
-- **Go** looks like: ≥1.5× faster wall-clock on the batch fixture at ≤ +0.5 pp WER, or comparable speed
-  at clearly lower energy; live-path decode latency no worse than CPU sherpa.
-- **No-go** looks like: Metal parity-or-worse with CPU (the CoreML story again), WER regressions from the
-  GGUF port on real 2-track call audio (LibriSpeech parity does not guarantee far-end/AEC'd audio parity),
-  or instability (crashes, truncated decodes) attributable to the 0.1.x runtime.
+| engine | mean ASR wall | speedup | mean peak RSS | normalized WER |
+|---|---:|---:|---:|---:|
+| sherpa ONNX / CPU | 24.605 s | 1.00× | 1,543 MB | 0.304791 |
+| transcribe.cpp GGML / Metal | 6.016 s | **4.09×** | **1,246 MB (−19.25%)** | **0.304791** |
+
+The committed excerpt reference is imperfectly aligned, so the absolute WER is not a product-quality claim;
+the meaningful result is equal WER on the same input/reference. The two hypotheses differ by 14 of 887
+normalized words (1.58%). The loaded backend reports `MTL0` / Apple M1 Pro.
+
+First-ever Metal shader compilation took 10.3 s; the next process loaded the cached Metal library in 11 ms.
+Even that one-time cold GGML run took 17.45 s versus sherpa's 26.07 s. Power was not measured because the
+speed criterion alone passed. Raw post-warm runs live in `bench/results/transcribe_cpp_round1.jsonl`.
+
+This clears the spike gate (≥1.5× wall-clock improvement at no more than +0.5 percentage-point WER) by a
+wide margin and also lowers peak RSS.
 
 ## Consequences
 
-- The default build is byte-for-byte unchanged; the spike code is dark until the feature + env var are
-  both set. CI's `--all-features` lane compiles the C++ tree (CMake on the macOS runner) and runs the
-  pure mapping tests, so the spike can't rot silently.
-- Two runtimes ship in a `ggml` build (ONNX Runtime for VAD/diarization + GGML for ASR). Acceptable for
-  a spike; a real migration would need transcribe.cpp answers for VAD + diarization (or a corti-side
-  Silero port) before sherpa could be dropped — tracked as an open question, not assumed.
-- The GGUF is fetched manually for now (the resolve error prints the one-line `curl`);
-  `fetch-models.sh` / the in-app downloader (#24) deliberately don't learn about it unless the spike goes.
-- If no-go: delete `ggml.rs`, the `Asr::Ggml` arm and the features; the `Asr` seam itself is a
-  zero-cost refactor worth keeping either way.
+- A standard build contains two inference runtimes. sherpa-onnx remains necessary for Silero VAD and
+  pyannote-grade diarization, so transcribe.cpp is not yet a wholesale replacement for the local stack.
+- The release build needs CMake/C++; the resulting default static link is self-contained in the app. The
+  GGUF remains an external cache artifact and is never bundled into the app or a notes vault.
+- The GGUF is about 740 MB versus the compressed ONNX download's 487 MB, but the measured running RSS is
+  lower. Engine-aware Settings avoids requiring both artifacts.
+- The latest upstream revision is intentionally a pinned Git dependency while 0.2.0 is unreleased. Every
+  update requires rerunning compile, mapping, WER/speed/RSS, and real-call checks rather than following
+  upstream `main` implicitly.
+- `Them N` identity still comes from sherpa's optional diarizer and remains window-local under ADR 0012.
+  transcribe.cpp's newer model-specific diarization families do not replace that path.
+- Remaining default-flip gate: run a real detector call with GGML live filing across at least one durability
+  checkpoint, confirm no tee drops, inspect timestamps/note completion, and soak for crashes/truncation.

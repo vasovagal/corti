@@ -75,7 +75,7 @@ export default function Settings() {
           {status && <span className="muted small">{status}</span>}
         </div>
 
-        <Models />
+        <Models asrEngine={cfg.local_asr_engine} />
       </main>
     </div>
   );

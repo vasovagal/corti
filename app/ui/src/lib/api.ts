@@ -11,6 +11,8 @@ export interface SettingsDto {
   aws_profile: string | null;
   aws_region: string | null;
   local_threads: number;
+  local_asr_engine: string; // "sherpa" | "ggml"
+  local_ggml_available: boolean; // build capability; not persisted
   local_diarize_far_end: boolean;
   local_embedding_model: string; // a corti-transcribe-local EMBEDDING_IDS id, e.g. "titanet"
   aec_enabled: boolean;
@@ -88,8 +90,8 @@ export const revealPath = (which: "recordings" | "models"): Promise<void> =>
 
 export const setModelsDir = (dir: string): Promise<void> => invoke<void>("set_models_dir", { dir });
 
-export const getModelsStatus = (): Promise<ModelStatus[]> =>
-  invoke<ModelStatus[]>("get_models_status");
+export const getModelsStatus = (asrEngine?: string): Promise<ModelStatus[]> =>
+  invoke<ModelStatus[]>("get_models_status", { asrEngine: asrEngine ?? null });
 
 /** Install state of the selectable English speaker-embedding models (the Transcription dropdown). */
 export const getEmbeddingModels = (): Promise<ModelStatus[]> =>
@@ -148,7 +150,7 @@ export interface StageSample {
 /** Mirror of Rust `stats::StatsSnapshot`. One 1 Hz sample of process health. */
 export interface StatsSnapshot {
   timestamp: string; // ISO-8601 UTC, same format as ConsoleEntry.timestamp
-  backend: string; // active transcription backend label ("AWS Transcribe" | "Parakeet (local)" | "none")
+  backend: string; // active label ("AWS Transcribe" | "Parakeet / CPU" | "Parakeet / Metal" | "none")
   detector_recording: boolean;
   webinar_recording: boolean;
   phys_mb: number; // phys_footprint, mebibytes (MiB)

@@ -23,7 +23,7 @@ duration.
    exactly at the active boundary.
 2. **Checkpoint, do not reload, the live ASR.** `LiveTranscriber::checkpoint()` flushes the resampler/VAD tail,
    returns every pending word, resets the bounded VAD epoch, and remains usable. A cumulative 16 kHz sample base
-   keeps timestamps relative to the full call across resets. Parakeet and VAD sessions remain resident once per
+   keeps timestamps relative to the full call across resets. The selected Parakeet ASR (sherpa or transcribe.cpp) and VAD sessions remain resident once per
    recording.
 3. **Diarize only the active far-end window.** When far-end diarization is enabled, `LiveEngine` loads one
    reusable diarizer. The app retains only the current window's tap PCM, diarizes it before rendering, merges it

@@ -1,15 +1,16 @@
 //! Local on-device backend for corti — fully offline transcription on Apple Silicon.
 //!
-//! Engine: NVIDIA Parakeet-TDT-0.6B-v3 (ONNX) via the official `sherpa-onnx` Rust crate, CPU provider by
-//! default. corti records a 2-track WAV (ch0 = me/mic, ch1 = them/system-tap), so diarization for the
+//! ASR model: NVIDIA Parakeet-TDT-0.6B-v3 through selectable [`Asr`] runtimes — sherpa/ONNX on CPU
+//! (compatibility default) or transcribe.cpp/GGML on Metal. sherpa also supplies Silero VAD and optional
+//! far-end diarization. corti records a 2-track WAV (ch0 = me/mic, ch1 = them/system-tap), so diarization for the
 //! me-vs-them split is just the channel: ch0 → [`Speaker::Me`], ch1 → `Speaker::Other("Them")`. The
 //! far-end channel can **optionally** be diarized into `Them 1/2/…` (pyannote-segmentation-3.0 + a
 //! runtime-selectable English speaker-embedding model, both ONNX) when [`LocalConfig::diarize_far_end`] is
 //! set — off by default. Over-clustering on English audio is tracked as issue #18; the embedding model and a
 //! [`LocalConfig::diarize_threshold`] knob are tunable to address it.
 //!
-//! Pipeline per channel: resample to 16 kHz → Silero VAD into speech regions → Parakeet ASR per region
-//! (token timestamps) → reassemble words; far-end words are attributed to diarization turns. Words are
+//! Pipeline per channel: resample to 16 kHz → Silero VAD into speech regions → selected Parakeet ASR per
+//! region → map timestamped words; far-end words are attributed to diarization turns. Words are
 //! shaped into segments by the shared [`corti_transcribe::segment`] helpers and merged onto one timeline.
 //!
 //! See `design/02-corti-transcribe.md` and `design/adr/0003-local-asr-sherpa-onnx.md`.
@@ -36,7 +37,7 @@ pub use live::{LiveEngine, LiveTranscriber};
 #[cfg(feature = "stream")]
 pub use live::{LiveSink, LiveWordStream, live_word_stream};
 
-/// Where the ONNX models live and how to run them. Built by the app from its config.
+/// Where the local models live and how to run them. Built by the app from its config.
 #[derive(Debug, Clone)]
 pub struct LocalConfig {
     /// Directory holding the model files (Parakeet, pyannote segmentation, embedding, VAD).
@@ -44,10 +45,11 @@ pub struct LocalConfig {
     pub model_dir: Option<PathBuf>,
     /// ONNX Runtime execution provider. `"cpu"` (default) is the only one that ships: the prebuilt
     /// sherpa-onnx static lib has no CoreML execution provider, and CoreML measured 4.6–11× *slower* on the
-    /// int8 transducer anyway (see [`resolve_provider`] and design/adr/0003). A non-`cpu` value is honored
+    /// int8 transducer anyway (see `resolve_provider` and design/adr/0003). A non-`cpu` value is honored
     /// only in a build with the `coreml-lib` feature + a CoreML-enabled lib; otherwise it maps to `"cpu"`.
     pub provider: String,
-    /// ONNX intra-op threads. Small by default (a short batch job → favours battery on the M1 Pro).
+    /// Local inference threads: ONNX intra-op threads and transcribe.cpp session threads. Small by default
+    /// (a short batch job → favours battery on the M1 Pro).
     pub num_threads: i32,
     /// Split the far-end channel (ch1) into per-speaker labels (`Them 1/2/…`) via ONNX diarization
     /// (pyannote-segmentation-3.0 + the selected embedding model). **Off by default** — the default
@@ -118,7 +120,7 @@ impl Default for LocalConfig {
     }
 }
 
-/// Local offline transcriber (Parakeet-TDT via sherpa-onnx). Models load lazily on `transcribe`.
+/// Local offline transcriber (Parakeet-TDT via the selected ASR runtime). Models load lazily on `transcribe`.
 #[derive(Debug, Clone)]
 pub struct LocalTranscriber {
     cfg: LocalConfig,
@@ -127,6 +129,37 @@ pub struct LocalTranscriber {
 impl LocalTranscriber {
     pub fn new(cfg: LocalConfig) -> Self {
         Self { cfg }
+    }
+
+    /// Validate only the files required by the selected ASR engine, VAD, and optional diarizer without
+    /// loading any model. The app's live-capture eligibility check uses this cheap path so GGML sessions do
+    /// not incorrectly require the legacy Parakeet ONNX set (and unsupported engine builds fail clearly).
+    pub fn validate_models(&self) -> Result<()> {
+        let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
+        let wants_ggml = asr::wants_ggml(&self.cfg.asr_engine)?;
+        models::discover_for(
+            &dir,
+            !wants_ggml,
+            self.cfg.diarize_far_end,
+            &self.cfg.embedding_model,
+        )?;
+        if wants_ggml {
+            self.validate_ggml_model(&dir)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ggml")]
+    fn validate_ggml_model(&self, model_dir: &Path) -> Result<()> {
+        ggml::resolve_gguf(self.cfg.ggml_model.clone(), model_dir).map(|_| ())
+    }
+
+    #[cfg(not(feature = "ggml"))]
+    fn validate_ggml_model(&self, _model_dir: &Path) -> Result<()> {
+        anyhow::bail!(
+            "ASR engine `ggml` is not compiled into this build — rebuild with the `ggml` feature of \
+             corti-transcribe-local (ADR 0011)"
+        )
     }
 
     /// Load the models + recognizer once and return a [`LiveEngine`] for driving chunked/live transcription
@@ -195,7 +228,7 @@ impl LocalTranscriber {
     #[cfg(feature = "ggml")]
     fn build_ggml_asr(&self, model_dir: &Path) -> Result<Asr> {
         let gguf = ggml::resolve_gguf(self.cfg.ggml_model.clone(), model_dir)?;
-        Ok(Asr::Ggml(ggml::GgmlAsr::load(&gguf)?))
+        Ok(Asr::Ggml(ggml::GgmlAsr::load(&gguf, self.cfg.num_threads)?))
     }
 
     #[cfg(not(feature = "ggml"))]
@@ -223,6 +256,10 @@ impl Transcriber for LocalTranscriber {
             self.cfg.diarize_far_end,
             &self.cfg.embedding_model,
         )?;
+        if wants_ggml {
+            // Fail before decoding a call-sized WAV when the selected GGUF/build is unavailable.
+            self.validate_ggml_model(&dir)?;
+        }
         let track = audio::read_two_track(audio)?;
         let provider = resolve_provider(self.cfg.provider.as_str());
         let threads = self.cfg.num_threads;
@@ -307,7 +344,7 @@ fn resolve_provider(requested: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_provider;
+    use super::{LocalConfig, LocalTranscriber, models, resolve_provider};
 
     #[test]
     fn cpu_passes_through() {
@@ -326,5 +363,53 @@ mod tests {
     #[cfg(feature = "coreml-lib")]
     fn coreml_passes_through_with_the_feature() {
         assert_eq!(resolve_provider("coreml"), "coreml");
+    }
+
+    #[cfg(feature = "ggml")]
+    #[test]
+    fn ggml_file_validation_does_not_require_onnx_parakeet() {
+        let dir = std::env::temp_dir().join(format!(
+            "corti-ggml-model-validation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(models::VAD_FILE), []).unwrap();
+        std::fs::write(dir.join(models::GGML_FILE), []).unwrap();
+
+        let ggml = LocalTranscriber::new(LocalConfig {
+            model_dir: Some(dir.clone()),
+            asr_engine: models::GGML_ASR_ENGINE.into(),
+            ..LocalConfig::default()
+        });
+        ggml.validate_models().unwrap();
+
+        let sherpa = LocalTranscriber::new(LocalConfig {
+            model_dir: Some(dir.clone()),
+            asr_engine: models::SHERPA_ASR_ENGINE.into(),
+            ..LocalConfig::default()
+        });
+        assert!(sherpa.validate_models().is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "ggml")]
+    #[test]
+    #[ignore = "needs the real GGUF/VAD/diarization models; set CORTI_VERIFY_MODEL_DIR"]
+    fn ggml_live_engine_coexists_with_sherpa_diarizer() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("CORTI_VERIFY_MODEL_DIR")
+                .expect("set CORTI_VERIFY_MODEL_DIR to the model cache dir"),
+        );
+        let engine = LocalTranscriber::new(LocalConfig {
+            model_dir: Some(dir),
+            asr_engine: models::GGML_ASR_ENGINE.into(),
+            diarize_far_end: true,
+            ..LocalConfig::default()
+        })
+        .live_engine()
+        .expect("load GGML ASR + sherpa VAD/diarizer");
+        assert!(engine.diarizes_far_end());
+        engine.channel().expect("spawn channel sharing GGML ASR");
     }
 }

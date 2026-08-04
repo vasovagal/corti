@@ -64,7 +64,7 @@ pub struct AppConfig {
     /// ONNX Runtime provider for the local backend (`CORTI_LOCAL_PROVIDER`, default `cpu`; `coreml` opt-in).
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_provider: String,
-    /// ONNX intra-op thread count for the local backend (`CORTI_LOCAL_THREADS`, default 4).
+    /// Local inference thread count for sherpa or transcribe.cpp (`CORTI_LOCAL_THREADS`, default 4).
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_threads: i32,
     /// Split the far-end channel into per-speaker labels with the local backend (`CORTI_LOCAL_DIARIZE`,
@@ -85,8 +85,8 @@ pub struct AppConfig {
     pub local_diarize_threshold: f32,
     /// Which local ASR engine decodes speech regions (`CORTI_LOCAL_ASR_ENGINE` = `sherpa` | `ggml`,
     /// default `sherpa`). `ggml` is the ADR 0011 spike (the same Parakeet-TDT as a GGUF via
-    /// transcribe.cpp, Metal on Apple Silicon) and needs a build with the `local-ggml` feature. An
-    /// env-only spike knob; not surfaced in the webview.
+    /// transcribe.cpp, Metal on Apple Silicon) and needs a build with the `local-ggml` feature. Standard
+    /// builds expose this in Settings; minimal builds keep only `sherpa`.
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     #[serde(default = "default_asr_engine")]
     pub local_asr_engine: String,
@@ -326,7 +326,10 @@ impl AppConfig {
     pub fn backend_name(&self) -> &'static str {
         match self.transcribe_backend {
             BackendChoice::Aws if cfg!(feature = "aws") => "AWS Transcribe",
-            BackendChoice::Local if cfg!(feature = "local") => "Parakeet (local)",
+            BackendChoice::Local if cfg!(feature = "local") && self.local_asr_engine == "ggml" => {
+                "Parakeet / Metal"
+            }
+            BackendChoice::Local if cfg!(feature = "local") => "Parakeet / CPU",
             _ => "none",
         }
     }
@@ -460,6 +463,8 @@ mod tests {
             "CORTI_LOCAL_DIARIZE",
             "CORTI_LOCAL_EMBEDDING",
             "CORTI_LOCAL_DIARIZE_THRESHOLD",
+            "CORTI_LOCAL_ASR_ENGINE",
+            "CORTI_LOCAL_GGML_MODEL",
             "CORTI_AEC",
             "CORTI_LIVE_FILING",
             "CORTI_LIVE_BUFFER_MINUTES",
@@ -504,6 +509,19 @@ mod tests {
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn local_backend_name_reflects_the_selected_runtime() {
+        let mut cfg = AppConfig {
+            transcribe_backend: BackendChoice::Local,
+            ..AppConfig::default()
+        };
+        cfg.local_asr_engine = "sherpa".into();
+        assert_eq!(cfg.backend_name(), "Parakeet / CPU");
+        cfg.local_asr_engine = "ggml".into();
+        assert_eq!(cfg.backend_name(), "Parakeet / Metal");
     }
 
     #[test]
