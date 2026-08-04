@@ -16,6 +16,7 @@ export interface SettingsDto {
   aec_enabled: boolean;
   retention_days: number;
   live_filing: boolean;
+  live_buffer_minutes: number;
   env_managed: string[];
 }
 

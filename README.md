@@ -33,11 +33,12 @@ signals. Exactly what this app does: audio → notes.
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
   `--label` to name it).
-- **Live inbox filing.** With the local backend, the app transcribes the call **as it happens**
-  and appends finalized segments to the vagus note mid-call — `tail -f` the note and watch the
-  conversation arrive. The note's first body line is `State: transcribing` while streaming and
-  flips in place to `State: transcribed ` (same byte width) when final — the contract inbox
-  agents key off. Also available standalone as `corti-tap --live`. See
+- **Crash-safe live inbox filing.** With the local backend, the app transcribes continuously and
+  commits bounded, optionally diarized windows to the vagus note mid-call (one minute by default,
+  configurable to 1–10). Every chunk is OS-synced before its memory is reused, so a Corti/macOS crash
+  leaves every prior chunk instead of losing the whole conversation. The first body line is
+  `State: transcribing` while live and flips in place, durably, to `State: transcribed ` when final.
+  Also available standalone as `corti-tap --live`. See
   [`docs/streaming.md`](./docs/streaming.md) and
   [`docs/transcription.md`](./docs/transcription.md).
 
@@ -53,9 +54,9 @@ signals. Exactly what this app does: audio → notes.
   in-process capture            one CoreAudio aggregate device, no subprocess
      process tap ─┐
      mic ─────────┼─▶ ring ─▶ 2-track WAV   (ch0 Me · ch1 Them)
-       │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet ─▶ append segments
-       │                              to the vagus note as the call happens (local backend)
-       │  Action::Stop                └─ finish flips `State: transcribing` → `transcribed`
+       │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet ─▶ rolling checkpoint
+       │                              └─ optional diarize ─▶ append + sync_all (local backend)
+       │  Action::Stop                   └─ sync tail, then flip `State:` durably
        ▼
   batch fallback (live off/ineligible/failed):
   AEC   FDAF adaptive filter + residual suppressor — strips speaker bleed off the mic track

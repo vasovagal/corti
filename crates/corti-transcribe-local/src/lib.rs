@@ -116,12 +116,12 @@ impl LocalTranscriber {
     }
 
     /// Load the models + recognizer once and return a [`LiveEngine`] for driving chunked/live transcription
-    /// (ADR 0009). The far-end diarization models are **not** required here — the live path attributes the
-    /// far end to a single `Them`, like the batch default — so only Parakeet + Silero VAD must be present.
-    /// Spawn one [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
+    /// (ADR 0009). When `diarize_far_end` is enabled, the same engine also loads one reusable diarizer so a
+    /// caller can diarize bounded rolling windows before durably filing them; whole-call audio is never
+    /// required. Spawn one [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
     pub fn live_engine(&self) -> Result<LiveEngine> {
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
-        let m = models::discover(&dir, false, &self.cfg.embedding_model)?;
+        let m = models::discover(&dir, self.cfg.diarize_far_end, &self.cfg.embedding_model)?;
         let provider = resolve_provider(self.cfg.provider.as_str()).to_string();
         let rec = engine::build_recognizer(
             &m,
@@ -131,12 +131,28 @@ impl LocalTranscriber {
             self.cfg.asr_max_active_paths,
             self.cfg.asr_blank_penalty,
         )?;
+        let diarizer = self
+            .cfg
+            .diarize_far_end
+            .then(|| {
+                engine::build_diarizer(
+                    &m,
+                    &provider,
+                    self.cfg.num_threads,
+                    self.cfg.diarize_threshold,
+                    self.cfg.diarize_num_clusters,
+                    self.cfg.diarize_min_duration_on,
+                    self.cfg.diarize_min_duration_off,
+                )
+            })
+            .transpose()?;
         Ok(LiveEngine::new(
             rec,
             m,
             provider,
             self.cfg.vad_threshold,
             self.cfg.vad_min_silence,
+            diarizer,
         ))
     }
 }

@@ -4,6 +4,8 @@
 - **References:** ADR 0003 (local ASR / sherpa-onnx), ADR 0007 (streaming AEC; #74 — relocate
   `StreamingAec.push()` into the capture writer thread), ADR 0008 (live-transcript UI, still Proposed);
   guardrail 6 (pluggable `Transcriber`), guardrail 9 (HAL callbacks hand work off via a channel, never block).
+- **Amended by:** ADR 0012 — reusable `checkpoint()` boundaries force the current VAD tail final, reset
+  bounded state, and preserve call-relative timestamps.
 
 ## Context
 

@@ -43,6 +43,7 @@ pub struct SettingsDto {
     pub aec_enabled: bool,
     pub retention_days: u32,
     pub live_filing: bool,
+    pub live_buffer_minutes: u32,
     pub env_managed: Vec<String>,
 }
 
@@ -75,6 +76,7 @@ impl From<&AppConfig> for SettingsDto {
             aec_enabled: cfg.aec_enabled,
             retention_days: cfg.retention_days,
             live_filing: cfg.live_filing,
+            live_buffer_minutes: cfg.live_buffer_minutes,
             env_managed: config::env_managed_fields(),
         }
     }
@@ -123,6 +125,15 @@ pub fn set_config(
     }
     if !(1..=365).contains(&dto.retention_days) {
         return Err("retention must be between 1 and 365 days".to_string());
+    }
+    if !(config::MIN_LIVE_BUFFER_MINUTES..=config::MAX_LIVE_BUFFER_MINUTES)
+        .contains(&dto.live_buffer_minutes)
+    {
+        return Err(format!(
+            "live transcript buffer must be between {} and {} minutes",
+            config::MIN_LIVE_BUFFER_MINUTES,
+            config::MAX_LIVE_BUFFER_MINUTES
+        ));
     }
 
     // Seed from the FILE baseline (not the env-overridden runtime config) and apply only the edits to fields
@@ -178,6 +189,9 @@ pub fn set_config(
     }
     if !pinned("live_filing") {
         to_save.live_filing = dto.live_filing;
+    }
+    if !pinned("live_buffer_minutes") {
+        to_save.live_buffer_minutes = dto.live_buffer_minutes;
     }
 
     to_save

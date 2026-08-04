@@ -9,6 +9,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Minimum configurable interval between durable live-transcript chunks.
+pub const MIN_LIVE_BUFFER_MINUTES: u32 = 1;
+/// Maximum configurable interval. At 48 kHz, ten minutes of the one retained far-end `f32` channel is
+/// about 115 MiB; the live path also has a hard byte cap so unusual sample rates flush sooner.
+pub const MAX_LIVE_BUFFER_MINUTES: u32 = 10;
+/// Default crash-loss window for live transcripts.
+pub const DEFAULT_LIVE_BUFFER_MINUTES: u32 = 1;
+
 /// Which transcription backend to run. Both can be compiled in (`aws` + `local` features); this picks the
 /// active one at **runtime**. Persisted/serialized as the lowercase token (`"aws"` / `"local"`), matching
 /// the `CORTI_TRANSCRIBE_BACKEND` grammar.
@@ -101,10 +109,14 @@ pub struct AppConfig {
     /// (`CORTI_RETENTION_DAYS`, default 7, clamped to 1–365). Notes and transcripts are never touched,
     /// and the queue row outlives the audio so history stays visible in the Recording Queue window.
     pub retention_days: u32,
-    /// Live inbox filing (issue #87, `CORTI_LIVE_FILING`, default on): transcribe detector recordings
-    /// in-app while the call runs and append finalized segments to the vagus note as they land. Requires
-    /// the local backend with its models installed; otherwise (or when off) the batch path runs unchanged.
+    /// Live inbox filing (issues #87/#103, `CORTI_LIVE_FILING`, default on): transcribe detector
+    /// recordings in-app and durably append bounded rolling windows while the call runs. Requires the local
+    /// backend with its configured models installed; otherwise (or when off) the batch path runs unchanged.
     pub live_filing: bool,
+    /// Minutes of live transcript to buffer before one diarized, OS-synced note append
+    /// (`CORTI_LIVE_BUFFER_MINUTES`, default 1, clamped to 1–10). This is the ordinary commit interval;
+    /// hard byte caps can force an earlier write and decoder lag remains independently fixed/bounded.
+    pub live_buffer_minutes: u32,
 }
 
 impl Default for AppConfig {
@@ -130,6 +142,7 @@ impl Default for AppConfig {
             aec_suppress_residual: None,
             retention_days: 7,
             live_filing: true,
+            live_buffer_minutes: DEFAULT_LIVE_BUFFER_MINUTES,
         }
     }
 }
@@ -223,6 +236,17 @@ impl AppConfig {
         if env_non_empty("CORTI_LIVE_FILING").is_some() {
             cfg.live_filing = env_bool("CORTI_LIVE_FILING", cfg.live_filing);
         }
+        if let Some(minutes) = env_non_empty("CORTI_LIVE_BUFFER_MINUTES")
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|minutes| (MIN_LIVE_BUFFER_MINUTES..=MAX_LIVE_BUFFER_MINUTES).contains(minutes))
+        {
+            cfg.live_buffer_minutes = minutes;
+        }
+        // A hand-edited/old config file bypasses the Settings validator. Keep the runtime memory contract
+        // binding even then; an invalid env value is ignored and this clamped persisted value wins.
+        cfg.live_buffer_minutes = cfg
+            .live_buffer_minutes
+            .clamp(MIN_LIVE_BUFFER_MINUTES, MAX_LIVE_BUFFER_MINUTES);
 
         cfg
     }
@@ -322,6 +346,7 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_AEC", "aec_enabled"),
         ("CORTI_RETENTION_DAYS", "retention_days"),
         ("CORTI_LIVE_FILING", "live_filing"),
+        ("CORTI_LIVE_BUFFER_MINUTES", "live_buffer_minutes"),
     ]
     .into_iter()
     .filter(|(var, _)| env_non_empty(var).is_some())
@@ -409,6 +434,7 @@ mod tests {
             "CORTI_LOCAL_DIARIZE_THRESHOLD",
             "CORTI_AEC",
             "CORTI_LIVE_FILING",
+            "CORTI_LIVE_BUFFER_MINUTES",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
             unsafe { std::env::remove_var(k) };
@@ -444,6 +470,7 @@ mod tests {
             aec_suppress_residual: Some(3.0),
             retention_days: 14,
             live_filing: false,
+            live_buffer_minutes: 5,
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);
@@ -472,6 +499,43 @@ mod tests {
 
         assert!(AppConfig::load_file().is_none());
 
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::remove_var("CORTI_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_buffer_interval_is_clamped_and_env_overridable() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("corti-cfg-live-buffer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: process-global env is serialized by ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_DATA_DIR", &dir) };
+        clear_config_env();
+
+        AppConfig {
+            live_buffer_minutes: 999,
+            ..AppConfig::default()
+        }
+        .save()
+        .unwrap();
+        assert_eq!(
+            AppConfig::load().live_buffer_minutes,
+            MAX_LIVE_BUFFER_MINUTES
+        );
+
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_LIVE_BUFFER_MINUTES", "3") };
+        assert_eq!(AppConfig::load().live_buffer_minutes, 3);
+        unsafe { std::env::set_var("CORTI_LIVE_BUFFER_MINUTES", "999") };
+        assert_eq!(
+            AppConfig::load().live_buffer_minutes,
+            MAX_LIVE_BUFFER_MINUTES,
+            "invalid env must not bypass the persisted-value clamp"
+        );
+
+        clear_config_env();
         // SAFETY: still under ENV_LOCK.
         unsafe { std::env::remove_var("CORTI_DATA_DIR") };
         let _ = std::fs::remove_dir_all(&dir);

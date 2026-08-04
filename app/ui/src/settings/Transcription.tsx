@@ -289,6 +289,26 @@ export function Transcription({ cfg, backends, onChange }: Props) {
         back to normal end-of-call transcription otherwise).
       </p>
 
+      <div className="settings-field">
+        <label>Buffer before durable write (minutes){envBadge("live_buffer_minutes")}</label>
+        <input
+          type="number"
+          min={1}
+          max={10}
+          step={1}
+          value={cfg.live_buffer_minutes}
+          disabled={!cfg.live_filing || isEnv("live_buffer_minutes")}
+          onChange={(e) =>
+            set("live_buffer_minutes", Math.min(10, Math.max(1, Number(e.target.value) || 1)))
+          }
+        />
+        <p className="muted small">
+          Corti transcribes continuously, then diarizes and syncs one bounded chunk at this interval.
+          After a Corti or macOS crash, prior committed windows remain; only the active interval and any
+          fixed decoder backlog may be incomplete. Default: 1 minute.
+        </p>
+      </div>
+
       <p className="callout">Changes apply to the next recording.</p>
     </section>
   );

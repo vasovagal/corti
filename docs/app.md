@@ -1,6 +1,6 @@
 # app — the Tauri tray surface
 
-> Verified against **v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing)**.
+> Verified against **main + crash-safe rolling live commits (#85, #87, #93, #103)**.
 > Current-state internals of the `app/` crate (`corti-app`, bin `corti`); `file.rs:line` anchors point
 > into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
@@ -30,8 +30,9 @@ Transient / not app-owned:
 - **`corti-webinar-finish`** — one per manual webinar stop (`main.rs:536`); writes the WAV, sends
   `PipelineMsg::Process`, exits.
 - **`corti-capture-writer`** — one per recording, inside `CaptureSession`; streams the 2-track WAV.
-- **`corti-live`** — one per live-eligible detector recording (#87, `app/src/live.rs`); drains the
-  bounded capture tee, transcribes as the call runs, and appends segments to the vagus note. The detector's
+- **`corti-live`** — one per live-eligible detector recording (#87/#103, `app/src/live.rs`); drains the
+  fixed capture tee, runs streaming AEC/ASR, optionally diarizes one bounded rolling window, then appends and
+  OS-syncs that chunk. No transcript/audio collection grows with call duration. The detector's
   `LiveHook` delivers its recording-specific finish/discard verdict before the later pipeline event; the
   pipeline only collects the finished ID — see [transcription.md](transcription.md#live-inbox-filing-87).
 - **CoreAudio HAL callback threads** — `MicMonitor` listeners; they only `tx.send(Msg::…)` and never
@@ -207,10 +208,11 @@ When the Settings window saves, `set_config` writes the shared config and sends
 AEC toggle between jobs — or immediately if idle (`reload_config`, `pipeline.rs:293,594`). The
 retention sweep reads `retention_days` live from the same `SharedConfig` (#85), so a saved change applies
 to the next sweep with no reload; the live-filing hook snapshots the config at each recording start (#87),
-so `live_filing` needs no reload either. Env knobs (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`,
-`CORTI_LANGUAGE`, `CORTI_LOCAL_*`, `CORTI_RETENTION_DAYS`, `CORTI_LIVE_FILING`) still seed the initial
-config (`config.rs`). `live_filing` (default **true**, `config.rs:107`) gates #87's live inbox filing and
-has a Settings-window checkbox next to the AEC toggle.
+so `live_filing` and its rolling interval need no reload either. Env knobs (`CORTI_TRANSCRIBE_BACKEND`,
+`CORTI_AWS_BUCKET`, `CORTI_LANGUAGE`, `CORTI_LOCAL_*`, `CORTI_RETENTION_DAYS`, `CORTI_LIVE_FILING`,
+`CORTI_LIVE_BUFFER_MINUTES`) still seed the initial config (`config.rs`). `live_filing` defaults on; the
+Settings screen also exposes `live_buffer_minutes` (default 1, range 1–10), the maximum ordinary interval
+between diarized + `sync_all` transcript commits. Both apply to the next recording.
 
 ## Diagnostics console + stats sampler
 
