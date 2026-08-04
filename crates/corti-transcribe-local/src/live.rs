@@ -5,11 +5,12 @@
 //! `push`ed in arbitrary-sized chunks, resampled to 16 kHz, fed to a single stateful Silero VAD, and each
 //! **completed** VAD speech region is decoded immediately — so the decode cost lands inside the `push` that
 //! closes a region, not on a separate tick. Recognized [`Word`]s queue up; the caller drains them with
-//! [`LiveTranscriber::poll_words`] and flushes the tail with [`LiveTranscriber::finish`].
+//! [`LiveTranscriber::poll_words`], can force a reusable durability boundary with
+//! [`LiveTranscriber::checkpoint`], and ends the stream with [`LiveTranscriber::finish`].
 //!
-//! Timestamps stay **call-relative** across pushes for free: one VAD is fed the whole (contiguous) 16 kHz
-//! stream, and `SpeechSegment::start()` is the absolute sample index over everything fed so far, so
-//! `start / 16000` is seconds from the start of the call regardless of how the audio was chunked.
+//! Timestamps stay **call-relative** across pushes and checkpoints: within an epoch,
+//! `SpeechSegment::start()` is VAD-relative; each checkpoint advances a cumulative 16 kHz sample base before
+//! resetting that VAD, and decoded offsets add the base back.
 //!
 //! The core is deliberately sync (guardrail 9 — no runtime in the engine); the optional async `Stream`
 //! adapter lives behind the `stream` feature at the bottom of this file.
@@ -17,8 +18,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use corti_transcribe::segment::Word;
-use sherpa_onnx::{LinearResampler, OfflineRecognizer, VoiceActivityDetector};
+use corti_transcribe::segment::{SpeakerTurn, Word};
+use sherpa_onnx::{
+    LinearResampler, OfflineRecognizer, OfflineSpeakerDiarization, VoiceActivityDetector,
+};
 
 use crate::engine::{self, TARGET_RATE, VAD_WINDOW};
 
@@ -62,7 +65,8 @@ impl WindowBuffer {
 /// Feed audio with [`push`](Self::push) (any sample rate — resampled to 16 kHz internally, continuously
 /// across pushes). **Decoding happens inside `push`**: when a VAD speech region closes, it is decoded on the
 /// spot and its words are queued. Drain queued words without blocking via [`poll_words`](Self::poll_words),
-/// and flush the trailing region with [`finish`](Self::finish).
+/// force/reuse a bounded epoch via [`checkpoint`](Self::checkpoint), and flush the final trailing region with
+/// [`finish`](Self::finish).
 ///
 /// One `LiveTranscriber` handles one channel (its VAD is stateful); the [`OfflineRecognizer`] is shared —
 /// pass the same `Arc` to a second instance for the far-end channel.
@@ -74,6 +78,9 @@ pub struct LiveTranscriber {
     src_rate: i32,
     win: WindowBuffer,
     pending: Vec<Word>,
+    /// Absolute 16 kHz sample offset of the current VAD epoch. `checkpoint()` resets the VAD so its next
+    /// `SpeechSegment::start()` begins at zero; adding this base keeps word timestamps call-relative.
+    vad_base_samples: u64,
     finished: bool,
     /// One-shot latch so a persistent `LinearResampler::create` failure logs once, not per push.
     resampler_warned: bool,
@@ -91,6 +98,7 @@ impl LiveTranscriber {
             src_rate: 0,
             win: WindowBuffer::default(),
             pending: Vec::new(),
+            vad_base_samples: 0,
             finished: false,
             resampler_warned: false,
         }
@@ -160,27 +168,46 @@ impl LiveTranscriber {
         }
     }
 
+    /// Force the current bounded VAD/resampler tail to become final words without unloading the recognizer,
+    /// then reset the VAD epoch so more chunks can be pushed. This is the durable live-filing boundary: a
+    /// caller can write the returned words, release its rolling audio, and continue with constant memory.
+    ///
+    /// Timestamps remain seconds from the start of the full stream, not from this checkpoint. Calling this
+    /// with no new audio simply drains any un-polled words and is otherwise a no-op.
+    pub fn checkpoint(&mut self) -> Vec<Word> {
+        if self.finished {
+            return std::mem::take(&mut self.pending);
+        }
+        self.flush_decode_tail();
+        self.vad.reset();
+        self.vad_base_samples = self.win.fed;
+        std::mem::take(&mut self.pending)
+    }
+
     /// Flush the VAD (and the resampler tail), decode the final trailing region, and return **all** remaining
     /// words — those from the flush plus anything queued but not yet polled. Idempotent: a second call
     /// returns whatever has accumulated since (normally empty).
     pub fn finish(&mut self) -> Vec<Word> {
         if !self.finished {
-            // Flush any samples the resampler is still holding internally, then push them through.
-            self.flush_resampler_tail();
-            // Feed the final sub-window remainder (matches the batch loop's last `.chunks(512)` element),
-            // then flush the VAD so trailing buffered speech is emitted, and drain everything.
-            let remainder = self.win.take_remainder();
-            let rec = self.rec.clone();
-            let vad = &self.vad;
-            let pending = &mut self.pending;
-            if !remainder.is_empty() {
-                vad.accept_waveform(&remainder);
-            }
-            vad.flush();
-            drain_regions(vad, &rec, pending);
+            self.flush_decode_tail();
             self.finished = true;
         }
         std::mem::take(&mut self.pending)
+    }
+
+    /// Flush one epoch's resampler/VAD tails into `pending`. The `WindowBuffer` sample counter remains
+    /// cumulative across epochs and supplies the next checkpoint's absolute timestamp base.
+    fn flush_decode_tail(&mut self) {
+        self.flush_resampler_tail();
+        let remainder = self.win.take_remainder();
+        let rec = self.rec.clone();
+        let vad = &self.vad;
+        let pending = &mut self.pending;
+        if !remainder.is_empty() {
+            vad.accept_waveform(&remainder);
+        }
+        vad.flush();
+        drain_regions(vad, &rec, pending, self.vad_base_samples);
     }
 
     /// Feed already-16 kHz samples: buffer to whole VAD windows, then for each window accept + drain any
@@ -195,7 +222,7 @@ impl LiveTranscriber {
             let mut windows = samples_16k.chunks_exact(VAD_WINDOW);
             for window in windows.by_ref() {
                 vad.accept_waveform(window);
-                drain_regions(vad, &rec, pending);
+                drain_regions(vad, &rec, pending, self.vad_base_samples);
             }
             let remainder = windows.remainder();
             self.win.fed += (samples_16k.len() - remainder.len()) as u64;
@@ -209,7 +236,7 @@ impl LiveTranscriber {
         let block = self.win.take_windows();
         for window in block.chunks_exact(VAD_WINDOW) {
             vad.accept_waveform(window);
-            drain_regions(vad, &rec, pending);
+            drain_regions(vad, &rec, pending, self.vad_base_samples);
         }
     }
 
@@ -223,12 +250,21 @@ impl LiveTranscriber {
 
 /// Pop every completed VAD region, decode it at its absolute offset, and append the words. Shared by `push`
 /// and `finish`; `seg.start()` is already the absolute sample index across all audio fed to this VAD.
-fn drain_regions(vad: &VoiceActivityDetector, rec: &OfflineRecognizer, out: &mut Vec<Word>) {
+fn drain_regions(
+    vad: &VoiceActivityDetector,
+    rec: &OfflineRecognizer,
+    out: &mut Vec<Word>,
+    vad_base_samples: u64,
+) {
     while let Some(seg) = vad.front() {
-        let offset = seg.start() as f64 / TARGET_RATE as f64;
+        let offset = absolute_offset_sec(vad_base_samples, seg.start() as u64);
         out.extend(engine::asr_segment(rec, seg.samples(), offset));
         vad.pop();
     }
+}
+
+fn absolute_offset_sec(vad_base_samples: u64, segment_start: u64) -> f64 {
+    vad_base_samples.saturating_add(segment_start) as f64 / TARGET_RATE as f64
 }
 
 /// A resident local ASR engine: one loaded Parakeet recognizer plus the VAD parameters needed to spawn a
@@ -240,6 +276,7 @@ pub struct LiveEngine {
     provider: String,
     vad_threshold: f32,
     vad_min_silence: f32,
+    diarizer: Option<OfflineSpeakerDiarization>,
 }
 
 impl LiveEngine {
@@ -249,6 +286,7 @@ impl LiveEngine {
         provider: String,
         vad_threshold: f32,
         vad_min_silence: f32,
+        diarizer: Option<OfflineSpeakerDiarization>,
     ) -> Self {
         Self {
             rec: Arc::new(rec),
@@ -256,6 +294,7 @@ impl LiveEngine {
             provider,
             vad_threshold,
             vad_min_silence,
+            diarizer,
         }
     }
 
@@ -268,6 +307,32 @@ impl LiveEngine {
             self.vad_min_silence,
         )?;
         Ok(LiveTranscriber::new(self.rec.clone(), vad))
+    }
+
+    /// Whether this engine loaded the optional far-end diarizer.
+    pub fn diarizes_far_end(&self) -> bool {
+        self.diarizer.is_some()
+    }
+
+    /// Diarize one bounded far-end audio window and lift its turns onto the full recording timeline.
+    /// `samples` may use the capture rate; the diarizer always receives a temporary 16 kHz buffer which is
+    /// released when this call returns. `Ok(None)` means diarization was not configured.
+    pub fn diarize_chunk(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        offset_sec: f64,
+    ) -> Result<Option<Vec<SpeakerTurn>>> {
+        let Some(diarizer) = self.diarizer.as_ref() else {
+            return Ok(None);
+        };
+        let samples_16k = engine::resample_to_16k(samples, sample_rate as i32)?;
+        let mut turns = engine::diarize_channel(diarizer, &samples_16k);
+        for turn in &mut turns {
+            turn.start += offset_sec;
+            turn.end += offset_sec;
+        }
+        Ok(Some(turns))
     }
 }
 
@@ -409,6 +474,30 @@ mod tests {
         let remainder = wb.take_remainder();
         assert_eq!(remainder.len(), 76);
         assert_eq!(wb.fed, (2 * VAD_WINDOW) as u64 + 76);
+    }
+
+    #[test]
+    fn checkpoint_epoch_offsets_remain_call_relative() {
+        let minute = TARGET_RATE as u64 * 60;
+        assert_eq!(absolute_offset_sec(0, minute), 60.0);
+        assert_eq!(absolute_offset_sec(minute, TARGET_RATE as u64 / 2), 60.5);
+        assert_eq!(absolute_offset_sec(minute * 2, 0), 120.0);
+    }
+
+    #[test]
+    fn resampler_checkpoint_epochs_do_not_accumulate_time_drift() {
+        let one_second = vec![0.0f32; 48_000];
+        let mut emitted = 0usize;
+        for _ in 0..180 {
+            let resampler = LinearResampler::create(48_000, TARGET_RATE).unwrap();
+            emitted += resampler.resample(&one_second, false).len();
+            emitted += resampler.resample(&[], true).len();
+        }
+        assert_eq!(
+            emitted,
+            TARGET_RATE as usize * 180,
+            "restarting at durability boundaries must not drift the call-relative clock"
+        );
     }
 
     /// Many sub-window pushes accumulate without releasing a window until the total crosses 512, and the

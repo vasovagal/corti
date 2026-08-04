@@ -1,6 +1,6 @@
 # Chunked / live transcription
 
-_Verified against v0.9.0 + feat/live-inbox-filing (#87)._
+_Verified against main + crash-safe rolling live commits (#87, #103)._
 
 The local backend can transcribe audio **as it arrives**, in arbitrary-sized chunks, over the same resident
 Parakeet engine the batch path uses — no second model, no async runtime in the engine. This page is the API
@@ -19,29 +19,32 @@ let mut live = engine.channel()?;                         // a fresh VAD sharing
 
 live.push(&samples, 48_000);          // resample→VAD→decode closed regions→queue words
 while let Some(words) = live.poll_words() {  /* words as they fall out */ }
-let tail = live.finish();             // flush VAD + resampler, return the last region + any un-polled words
+let committed = live.checkpoint();    // force the open tail final; keep engine usable + absolute time
+live.push(&more_samples, 48_000);     // next bounded durability epoch
+let tail = live.finish();             // final flush; idempotently ends this channel
 ```
 
 | method | signature | behavior |
 |---|---|---|
 | `push` | `push(&mut self, &[f32], sample_rate: u32)` (`live.rs:103`) | Resamples to 16 kHz (continuously across pushes; no-op at 16 kHz), feeds one Silero VAD in 512-sample windows. **Decode happens here** — every VAD region that *closes* during this push is decoded on the spot and its words queued. Cheap while a region is still open. No-op after `finish`. |
-| `poll_words` | `poll_words(&mut self) -> Option<Vec<Word>>` (`live.rs:155`) | Non-blocking drain of queued words. `None` when empty. |
-| `finish` | `finish(&mut self) -> Vec<Word>` (`live.rs:166`) | Flush the resampler tail + VAD, decode the final trailing region, return **all** remaining words (flushed + un-polled). Idempotent. |
+| `poll_words` | `poll_words(&mut self) -> Option<Vec<Word>>` | Non-blocking drain of queued words. `None` when empty. |
+| `checkpoint` | `checkpoint(&mut self) -> Vec<Word>` | Flush the current resampler/VAD tail, return every un-polled word, reset the bounded VAD epoch, and remain usable. A cumulative sample base keeps timestamps call-relative across checkpoints. |
+| `finish` | `finish(&mut self) -> Vec<Word>` | Flush the final trailing region, return all remaining words, and end this channel. Idempotent. |
 
 Two knobs matter for the pull model:
 
 - **Decode cost lands inside `push`.** A `push` that closes a long (up to the 20 s VAD cap) region pays that
   region's decode synchronously. There is no background thread in the core — if you need decode off your
   thread, use the `stream` adapter below.
-- **Timestamps stay call-relative for free.** One VAD is fed the whole contiguous 16 kHz stream, and
-  `SpeechSegment::start()` is the absolute sample index over everything fed so far, so `start / 16000` is
-  seconds-from-start regardless of how the audio was chunked (`drain_regions`, `live.rs:226`). Chunk boundaries
-  are absorbed by a `WindowBuffer` that carries the sub-512 remainder across pushes.
+- **Timestamps stay call-relative across checkpoints.** Within one epoch, `SpeechSegment::start()` is the
+  VAD-relative sample index. `checkpoint()` advances a cumulative 16 kHz sample base before resetting the VAD;
+  `drain_regions` adds that base, so every word remains seconds-from-call-start. Ordinary push boundaries are
+  absorbed by a `WindowBuffer` carrying the sub-512 remainder.
 
-`LiveEngine` (`live.rs:237`) is the resident engine: `LocalTranscriber::live_engine()`
-(`crates/corti-transcribe-local/src/lib.rs:122`) loads the recognizer + models once; `LiveEngine::channel()`
-(`live.rs:263`) spawns a `LiveTranscriber` per channel — each with its own stateful VAD, all sharing the one
-(thread-safe) recognizer via `Arc`.
+`LiveEngine` is the resident engine: `LocalTranscriber::live_engine()` loads the recognizer + models once;
+`LiveEngine::channel()` spawns a `LiveTranscriber` per channel — each with its own stateful VAD, all sharing the
+one thread-safe recognizer via `Arc`. When `LocalConfig::diarize_far_end` is on, it also owns one reusable
+speaker diarizer; `diarize_chunk` accepts one bounded source-rate window and returns call-relative turns.
 
 ## Batch runs on the live core
 
@@ -110,22 +113,29 @@ the lookahead — noted in `--help`. `--live` and `--inbox` are **mutually exclu
 
 The app now drives the same path for detector recordings. `Detector::start_with_live_hook`
 (`crates/corti-detect/src/platform.rs:70`) consults an app-supplied `LiveHook` (`platform.rs:37`) at every
-recording start; `AppLiveHook` (`app/src/live.rs:229`) returns a bounded tee (`TEE_BACKLOG = 256` chunks
-≈ 22 s of slack, `live.rs:49`) when `live_filing` is on, the backend is local, and the models are on disk —
-otherwise `None` and the batch path runs unchanged. One `corti-live` std thread per recording mirrors
-`corti-tap --live`'s chunk loop and appends each closed segment to the vagus note as it lands. The detector
-delivers an ID-specific finish/discard verdict before its downstream event; finish and manager-owned discard
-handles remain keyed/gated by ID for pipeline collection, and any tee drop quality-gates the result into
-lossless batch rewrite of the same note. Filing semantics — lazy note creation, the `State:` line contract,
-fallback and crash recovery — are in
+recording start; `AppLiveHook` returns a bounded tee (`TEE_BACKLOG = 2048`, at most about 64 MiB / 175 s at
+48 kHz) when `live_filing` is on, the backend is local, and all configured models are on disk — otherwise
+`None` and the batch path runs unchanged. The fixed queue absorbs model/decode/rolling-diarization bursts but
+never scales with call length; full still means drop + count, never block capture.
+
+One `corti-live` thread continuously drives AEC + ASR. At `live_buffer_minutes` (default 1, range 1–10), it
+forces both ASR tails final, optionally diarizes only that window's far-end PCM, merges by timestamp, renders
+once, appends once, and `sync_all`s the note. The initial note + parent directory and the final state flip are
+also synced. A 128 MiB far-audio cap or 1 MiB text cap forces an earlier commit. After success all window
+lengths return to zero and their allocations are reused: memory reaches a fixed high-water mark instead of
+following call duration. The detector delivers an ID-specific finish/discard verdict before its downstream
+event; any tee drop quality-gates the result into lossless same-note fallback. Filing semantics are in
 [transcription.md](transcription.md#live-inbox-filing-87); the write-authority amendment is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md).
 
 ## What this is *not* (yet)
 
-- **Live quality < batch.** A live word is only correct once its VAD region closes; there is no trailing-window
-  re-decode (ADR 0008's Path A windowed interim, benchmark-tunable). When live filing succeeds, the live pass
-  **is** the filed note (#87); the batch `OfflineRecognizer` pass runs only as the fallback.
+- **Live quality trades context for durability.** A natural VAD region is still capped at 20 s; the configured
+  durability boundary additionally forces an open region final. There is no trailing-window re-decode. When
+  live filing succeeds, these committed windows **are** the filed note; batch runs only as fallback.
+- **Far-end speaker numbers are window-local.** Optional diarization runs before every append, but `Them N`
+  clustering may renumber at a boundary. Stable cross-window identity needs persistent embedding matching and
+  is outside ADR 0012.
 - **The ADR 0008 push-driven live-transcript window is still open.** #87 wired `StreamingAec::push` +
   `LiveTranscriber` into the app (closing #74's in-app gap for the filing path), but the in-process UI window
   and its Channel transport remain follow-up.

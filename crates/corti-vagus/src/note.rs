@@ -13,10 +13,10 @@
 //! [`flip_state`] seeks and overwrites only those bytes: no rename, no truncation, no full-file
 //! rewrite, so a `tail -f` follower keeps its inode and never observes the file shrink mid-stream.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 /// State line while live segments are still being appended.
 pub const STATE_TRANSCRIBING: &str = "State: transcribing";
@@ -24,7 +24,10 @@ pub const STATE_TRANSCRIBING: &str = "State: transcribing";
 /// flip is a same-width in-place overwrite.
 pub const STATE_TRANSCRIBED: &str = "State: transcribed ";
 
-/// Append `text` to the note, flushed so an external follower (`tail -f`) sees it immediately.
+/// Append `text` to the note as one durable chunk. [`File::sync_all`](std::fs::File::sync_all) is the
+/// explicit crash boundary: after this returns, an app or macOS crash may lose a later in-memory chunk but
+/// must not lose this one. A plain `Write::flush` is insufficient because `File` is unbuffered in userspace
+/// and the dirty pages may still exist only in the kernel cache.
 pub fn append(path: &Path, text: &str) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -32,7 +35,25 @@ pub fn append(path: &Path, text: &str) -> Result<()> {
         .with_context(|| format!("opening {} for append", path.display()))?;
     f.write_all(text.as_bytes())
         .with_context(|| format!("appending to {}", path.display()))?;
-    f.flush()?;
+    f.sync_all()
+        .with_context(|| format!("syncing appended chunk in {}", path.display()))?;
+    Ok(())
+}
+
+/// Sync a note just created by `vagus add-note` and its parent directory. The file sync makes the initial
+/// `State: transcribing` body durable; the directory sync makes the new name durable. Call this once before
+/// publishing the path to the queue or appending the first transcript chunk.
+pub fn sync_created(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening newly-created note {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing newly-created note {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent)
+            .with_context(|| format!("opening note directory {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("syncing note directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -40,17 +61,16 @@ pub fn append(path: &Path, text: &str) -> Result<()> {
 /// bytes (same width — no rename, no truncation; the inode survives). Idempotent.
 pub fn flip_state(path: &Path) -> Result<()> {
     const _: () = assert!(STATE_TRANSCRIBING.len() == STATE_TRANSCRIBED.len());
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {} to flip its state line", path.display()))?;
-    let off = state_line_offset(&content)
+    let off = state_line_offset_in_file(path)?
         .with_context(|| format!("{} has no state line to flip", path.display()))?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(path)
         .with_context(|| format!("opening {} to flip its state line", path.display()))?;
-    f.seek(SeekFrom::Start(off as u64))?;
+    f.seek(SeekFrom::Start(off))?;
     f.write_all(STATE_TRANSCRIBED.as_bytes())?;
-    f.flush()?;
+    f.sync_all()
+        .with_context(|| format!("syncing state line in {}", path.display()))?;
     Ok(())
 }
 
@@ -59,23 +79,86 @@ pub fn flip_state(path: &Path) -> Result<()> {
 /// truncate + write on the same file, never a rename, so the inode survives. (A follower may see the
 /// file shrink here; the strict no-shrink guarantee only covers the mid-stream [`flip_state`].)
 pub fn rewrite_body(path: &Path, new_body: &str) -> Result<()> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {} to rewrite its body", path.display()))?;
-    // Our live notes always start their body with the state line; the frontmatter fallback only
-    // covers a hand-edited note (the title heading is lost then — acceptable for a repair path).
-    let keep = state_line_offset(&content).unwrap_or_else(|| frontmatter_end(&content));
+    // Scan with a reusable line buffer: final live notes can be arbitrarily long, but their state line is
+    // near the top and a state flip/body rewrite must not clone the whole transcript into RAM.
+    let keep = match state_line_offset_in_file(path)? {
+        Some(offset) => offset,
+        // The fallback only covers a hand-edited note (the title heading is lost — acceptable for repair).
+        None => frontmatter_end_in_file(path)?,
+    };
+    const MAX_PREFIX_BYTES: u64 = 64 * 1024;
+    ensure!(
+        keep <= MAX_PREFIX_BYTES,
+        "refusing to retain an unexpectedly large note prefix ({keep} bytes) while rewriting {}",
+        path.display()
+    );
+    let mut prefix = Vec::with_capacity(keep as usize);
+    std::fs::File::open(path)?
+        .take(keep)
+        .read_to_end(&mut prefix)
+        .with_context(|| format!("reading prefix of {} to rewrite its body", path.display()))?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(path)
         .with_context(|| format!("opening {} to rewrite its body", path.display()))?;
-    f.write_all(&content.as_bytes()[..keep])?;
+    f.write_all(&prefix)?;
     f.write_all(new_body.as_bytes())?;
-    f.flush()?;
+    f.sync_all()
+        .with_context(|| format!("syncing rewritten body in {}", path.display()))?;
     Ok(())
 }
 
+/// Streaming state-line scanner. It retains one line rather than the complete, growing note.
+fn state_line_offset_in_file(path: &Path) -> Result<Option<u64>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to find its state line", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut offset = 0u64;
+    loop {
+        line.clear();
+        let bytes = reader
+            .read_line(&mut line)
+            .with_context(|| format!("reading {} to find its state line", path.display()))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let text = line.trim_end_matches('\n').trim_end_matches('\r');
+        if text == STATE_TRANSCRIBING || text == STATE_TRANSCRIBED {
+            return Ok(Some(offset));
+        }
+        offset = offset.saturating_add(bytes as u64);
+    }
+}
+
+/// Byte offset immediately after a leading YAML frontmatter block, without reading the body. Zero when the
+/// first line is not `---` or the block is unterminated.
+fn frontmatter_end_in_file(path: &Path) -> Result<u64> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} to find its frontmatter", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut offset = 0u64;
+    if reader.read_line(&mut line)? == 0 || line.trim_end_matches(['\r', '\n']) != "---" {
+        return Ok(0);
+    }
+    offset += line.len() as u64;
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(0);
+        }
+        offset += bytes as u64;
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            return Ok(offset);
+        }
+    }
+}
+
 /// Byte offset of the first line that is exactly a state line (either form). `None` if absent.
+#[cfg(test)]
 fn state_line_offset(content: &str) -> Option<usize> {
     let mut off = 0usize;
     for line in content.split_inclusive('\n') {
@@ -86,16 +169,6 @@ fn state_line_offset(content: &str) -> Option<usize> {
         off += line.len();
     }
     None
-}
-
-/// Byte offset just past the closing `---` of a leading YAML frontmatter block (0 if there is none).
-fn frontmatter_end(content: &str) -> usize {
-    if let Some(rest) = content.strip_prefix("---\n")
-        && let Some(i) = rest.find("\n---\n")
-    {
-        return "---\n".len() + i + "\n---\n".len();
-    }
-    0
 }
 
 #[cfg(test)]
@@ -168,6 +241,29 @@ mod tests {
         // Idempotent.
         flip_state(&p).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), after);
+    }
+
+    #[test]
+    fn state_operations_do_not_read_the_growing_transcript_tail() {
+        let p = test_note("bounded-state-scan", &live_note_content());
+        // Invalid UTF-8 after the state line proves flip/rewrite stop at the bounded prefix; the old
+        // read_to_string implementation failed here and allocated in proportion to the whole note.
+        let mut append = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        append.write_all(&[0xff; 4096]).unwrap();
+        flip_state(&p).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(
+            bytes
+                .windows(STATE_TRANSCRIBED.len())
+                .any(|window| window == STATE_TRANSCRIBED.as_bytes())
+        );
+
+        rewrite_body(&p, "new bounded body\n").unwrap();
+        assert!(
+            std::fs::read_to_string(&p)
+                .unwrap()
+                .ends_with("new bounded body\n")
+        );
     }
 
     #[test]

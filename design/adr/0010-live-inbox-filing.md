@@ -5,6 +5,7 @@
   transcript in v1)
 - **References:** ADR 0009 (chunked transcription core), ADR 0007 (#74 — streaming AEC in-flight),
   guardrail 9
+- **Amended by:** ADR 0012 (bounded rolling windows + OS-synced durability boundaries)
 
 ## Context
 
@@ -20,7 +21,8 @@ corti may perform exactly four writes beyond `add-note`, all confined to `corti-
 against a path `vagus add-note --print-path` returned for a recording corti is processing:
 
 1. **Append** body content: transcript segments while the recording is live, and a terse
-   "transcription incomplete" annotation when a recording terminally fails.
+   "transcription incomplete" annotation when a recording terminally fails. ADR 0012 batches live
+   segments into a configured rolling window and makes each append an explicit `sync_all` boundary.
 2. **Flip the state line in place.** The first corti-authored body line is exactly
    `State: transcribing` while streaming and exactly `State: transcribed ` (one trailing space —
    same byte width) when final. The flip seeks and overwrites only that line's bytes: no rename, no
@@ -44,3 +46,5 @@ Nothing else in the vault, ever — no index writes, no other files, no notes co
   shrinks or renames.
 - No recording may strand a note at `State: transcribing`: every terminal path flips the line
   (finish, batch rewrite, failure close-out) or deletes the note (discard).
+- ADR 0012 defines persistence, not just visibility: the new note + directory, each rolling transcript
+  chunk, body rewrites, and the final state flip are synced. A crash leaves all prior committed chunks.

@@ -1,6 +1,6 @@
 # Architecture — the whole-pipeline graph
 
-> Verified against v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing).
+> Verified against main + crash-safe rolling live commits (#85, #87, #93, #103).
 
 corti is a windowless macOS menu-bar agent that watches for a call, captures a 2-track WAV to
 disk, and files it as a vagus note — **live while the call runs** when the local backend + models
@@ -40,8 +40,8 @@ threads push events and PCM, which hop onto worker threads over an `rtrb` ring (
                           │           │ try_send (bounded lossy CaptureTee, #87)            │
                           │           ▼                                                     │
                           │   corti-live thread (one per recording, when live filing is on) │
-                          │     StreamingAec.push (mic) ──► 2× LiveTranscriber ──► append   │
-                          │     finalized segments to the vagus note; flip `State:` at end  │
+                          │     StreamingAec → 2× LiveTranscriber → rolling checkpoint      │
+                          │     → optional bounded diarize → append + sync_all; final flip   │
                           │                                    write_clean_wav (offline AEC)│
                           └──────────────────────────────────────────────────────────────┘
 ```
@@ -67,7 +67,7 @@ thread, still serial — see [transcription.md](transcription.md).
 | `corti-detect` worker | `Detector::start` (`crates/corti-detect/src/platform.rs:64`, spawn `:90`) | `Machine` + `MicMonitor` + `DefaultInputDeviceMonitor` + the in-flight `Recorder`. The state machine + poll loop. |
 | `corti-pipeline` | `app/src/main.rs:343` | **Sole** `Queue` owner; a tick loop (`run`, `app/src/pipeline.rs:101`) that drains `PipelineMsg` **and** due `corti-jobs` (retry/sweep) serially. |
 | `corti-capture-writer` (one per recording) | `crates/corti-coreaudio/src/capture.rs:416` | Drains the `rtrb` ring and writes the 2-track WAV with `hound` (`run_writer`, `:634`). |
-| `corti-live` (one per eligible detector recording, #87) | `LiveManager::spawn` (`app/src/live.rs:118`) via the detector's `LiveHook` | Drains the bounded tee → `StreamingAec::push` on the mic → two `LiveTranscriber`s → appends finalized segments to the vagus note; on finish flips the note's `State:` line in place. Panic-contained; any failure falls back to batch. |
+| `corti-live` (one per eligible detector recording, #87/#103) | `LiveManager::spawn` via the detector's `LiveHook` | Drains the bounded tee → streaming AEC + two ASR channels; checkpoints on the configured interval, optionally diarizes only that bounded far-end window, appends + `sync_all`s once, then syncs the final `State:` flip. Panic-contained; any failure preserves prior chunks and falls back to the same note. |
 | `corti-blink`, `corti-stats` | `app/src/tray.rs`, `app/src/stats.rs` | Icon-swap animation; 1 Hz stats sampler. |
 | CoreAudio HAL callback threads | OS/CoreAudio | `MicMonitor`/`DefaultInputDeviceMonitor` trampolines and `io_proc`. They only push (`tx.send` / ring write) — never touch capture state (guardrail 9). |
 
@@ -81,7 +81,7 @@ See [app.md](app.md) for the tray/window/command surface and the full thread inv
 | capture data plane | `rtrb::Producer<f32>` / `Consumer<f32>` (SPSC, wait-free) | `io_proc` → writer thread | interleaved f32 frames (mic channels first, then tap — the me/them contract). Ring sized `sample_rate · 8ch · RING_SECONDS` (`ring_capacity`, `capture.rs:134`, default 30 s, `:60`). |
 | detector → app | closure callback (`DetectorEvent`) | detect worker → `handle_detector_event` (`main.rs:381`) | `RecordingStarted` / `RecordingFinished{meta, audio_path}` / `RecordingDiscarded` / `Error` (`crates/corti-detect/src/lib.rs:43`) |
 | app → pipeline | `std::sync::mpsc::Sender<PipelineMsg>` (`main.rs:319`) | detector callback + webinar-finish thread + Queue-window Retry + corti-live thread → pipeline worker | `Process{meta, audio_path}` / `Retry{id}` / `ReloadConfig` / #87's `LiveNoteCreated{meta, note_path}` + `LiveDiscarded{id}` (`pipeline.rs:48`) |
-| capture tee (#87) | bounded `SyncSender<CaptureChunk>` in a `CaptureTee` (`app/src/live.rs:250`, `TEE_BACKLOG = 256`, `:49`) | writer thread → `corti-live` thread | ~4096-frame downmixed mono `(mic, tap)` chunks; `try_send` only — full ⇒ dropped + counted, the WAV is untouched |
+| capture tee (#87/#103) | bounded `SyncSender<CaptureChunk>` in a `CaptureTee` (`TEE_BACKLOG = 2048`, fixed ≤~64 MiB at 48 kHz) | writer thread → `corti-live` thread | ~4096-frame downmixed mono `(mic, tap)` chunks; `try_send` only — full ⇒ dropped + counted, the WAV is untouched |
 
 The `mpsc` control channels carry coarse events with file paths; the `rtrb` ring is the primary
 data-plane carrier, plus (#87) the bounded lossy tee that hands the live consumer its downmixed
@@ -124,8 +124,8 @@ Two things the diagram makes explicit because they are routinely misremembered:
 2. **The WAV on disk is still the source of truth — live transcription is a tee, not a replacement.**
    The capture path always streams f32 frames to the 2-track WAV; the #87 live path consumes a
    bounded lossy *copy* and can never stall or corrupt the recording. When live filing is eligible
-   (local backend + models + `live_filing`), the note is written during the call and batch
-   transcription is skipped; on any live-path failure — or for webinar/manual captures, which have
+   (local backend + configured models + `live_filing`), bounded transcript windows are diarized and
+   OS-synced during the call and batch transcription is skipped; on any live-path failure — or for webinar/manual captures, which have
    no live hook — the pipeline falls back to the batch `Backend::transcribe(path)` over the finished
    file. The `Transcriber` trait still takes a `&Path` to a complete 2-track WAV
    (`crates/corti-transcribe/src/lib.rs:23`); the chunked surface is `LiveTranscriber`

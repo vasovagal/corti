@@ -1,18 +1,20 @@
 #![cfg_attr(not(feature = "local"), allow(dead_code))]
 
-//! Live inbox filing (issue #87, ADR 0010): transcribe a detector recording **while it records** and
-//! append finalized segments to the vagus inbox note as they land, so `tail -f` on the note shows the
-//! conversation arriving and the end-of-call batch spike disappears.
+//! Crash-safe live inbox filing (issues #87/#103, ADRs 0010/0012): transcribe a detector recording
+//! **while it records**, then diarize and durably append bounded rolling windows to the vagus note. A
+//! crash can lose the active configured window, never every previously committed window.
 //!
 //! ## Shape
 //! [`AppLiveHook`] implements `corti_detect::LiveHook`: at recording start it checks eligibility
 //! (config `live_filing`, local backend, models on disk) and, if eligible, hands the detector a bounded
 //! lossy [`CaptureTee`]; once capture is running it spawns ONE `corti-live` std thread for the recording.
-//! That thread drains tee chunks → [`StreamingAec::push`] on the mic (mirroring `corti-tap --live`'s
-//! gating) → two `LiveTranscriber`s (mic → `Me`, tap → `Them`) → closed segments are appended to the
-//! note, which is created lazily on the FIRST finalized segment (a too-short discarded recording almost
-//! never creates one). The thread never blocks the capture writer (the tee already drops + counts when
-//! the consumer falls behind) and is panic-contained — any failure degrades to the batch path.
+//! That thread drains tee chunks → [`StreamingAec::push`] on the mic → two `LiveTranscriber`s. Every
+//! `live_buffer_minutes` (one minute by default), it checkpoints both VADs, optionally diarizes only that
+//! bounded far-end PCM window, merges the speakers, appends once, and calls `sync_all`. Independent audio/
+//! text caps force an earlier commit. The note is created lazily on the first non-empty window; its file +
+//! parent directory are synced before the path is published. The thread never blocks the capture writer
+//! (the fixed tee drops + counts when full) and is panic-contained — failure preserves prior chunks and
+//! degrades to the same-inode batch fallback.
 //!
 //! ## Finish / discard
 //! The tee sender is dropped when the recorder stops, which ends the chunk loop; the thread then waits
@@ -29,9 +31,8 @@
 //! rewrites the same note. Completed finish/discard handles are reaped before the gate opens; a new model
 //! session never overlaps an older one that is still flushing or draining after discard.
 //!
-//! Segments are appended in **finish order**, which may interleave `Me`/`Them` differently than the
-//! batch path's `merge_by_time` — accepted by design; the segment *lines* are byte-identical to
-//! `DiarizedTranscript::to_markdown`'s.
+//! Each window is merged by timestamp before its one append. Far-end `Them N` identities are window-local
+//! and may be renumbered at a boundary; stable cross-window embeddings are deliberately outside ADR 0012.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,17 +45,28 @@ use anyhow::{Context, Result};
 use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
-use corti_transcribe::segment::{SEGMENT_GAP, Word, merge_by_time};
+use corti_transcribe::segment::{
+    SEGMENT_GAP, SpeakerTurn, Word, diarize_words, merge_by_time, words_to_segments,
+};
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, BackendChoice};
 use crate::pipeline::PipelineMsg;
 use crate::settings::SharedConfig;
 
-/// Bounded tee backlog in chunks (~4096 frames ≈ 85 ms each at 48 kHz, so ≈ 22 s of slack, ≤ ~8 MB).
-/// Sized to absorb the one-time model/engine load — which happens on the live thread, never the detect
-/// worker — plus decode bursts, before the lossy tee starts dropping (drops are counted, not fatal).
-const TEE_BACKLOG: usize = 256;
+/// Bounded tee backlog in chunks (~4096 frames ≈ 85 ms each at 48 kHz, so ≈ 175 s of slack, ≤ ~64 MiB).
+/// The larger fixed queue absorbs one bounded 10-minute diarization pass on the measured local backend plus
+/// model/decode bursts. It never scales with call length; on a slower machine it still drops + counts rather
+/// than growing or blocking the capture writer.
+const TEE_BACKLOG: usize = 2048;
+
+/// Absolute cap for the one source-rate far-end window retained for optional diarization. The configured
+/// interval normally fires first (one minute at 48 kHz is ~11 MiB for this one `f32` channel); this guard
+/// makes unusual sample rates or hand-edited config unable to turn the rolling window into O(call length).
+const MAX_DIARIZATION_AUDIO_BYTES: usize = 128 * 1024 * 1024;
+/// Independent cap for recognized words awaiting the next durable append. ASR output per minute is tiny in
+/// practice, but a hard cap makes the memory contract hold even for malformed/model-pathological output.
+const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 
 /// How a live session ended, collected by the pipeline worker at `Process` time.
 #[derive(Debug)]
@@ -651,7 +663,11 @@ fn live_eligible(cfg: &AppConfig) -> Result<(), &'static str> {
 #[cfg(feature = "local")]
 fn discover_models(cfg: &AppConfig) -> Result<()> {
     let dir = corti_transcribe_local::models::resolve_dir(cfg.local_model_dir.clone())?;
-    corti_transcribe_local::models::discover(&dir, false, &cfg.local_embedding_model)?;
+    corti_transcribe_local::models::discover(
+        &dir,
+        cfg.local_diarize_far_end,
+        &cfg.local_embedding_model,
+    )?;
     Ok(())
 }
 
@@ -689,11 +705,11 @@ fn session_thread(
 /// while the parts (and the verdict logic) stay in one place.
 #[cfg(feature = "local")]
 struct SessionParts {
+    engine: corti_transcribe_local::LiveEngine,
     mic: corti_transcribe_local::LiveTranscriber,
     them: corti_transcribe_local::LiveTranscriber,
     aec: Option<StreamingAec>,
-    mic_seg: Segmenter,
-    them_seg: Segmenter,
+    window: TranscriptWindow,
 }
 
 /// Build the engine + per-channel state on the live thread — chunks buffer in the bounded tee
@@ -706,22 +722,31 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         model_dir: cfg.local_model_dir.clone(),
         provider: cfg.local_provider.clone(),
         num_threads: cfg.local_threads,
-        // Far-end diarization never runs live: the tap channel is a single `Them`, like the batch
-        // default and `corti-tap --live`. Everything else stays at the shipping defaults.
+        diarize_far_end: cfg.local_diarize_far_end,
+        embedding_model: cfg.local_embedding_model.clone(),
+        diarize_threshold: cfg.local_diarize_threshold,
         ..LocalConfig::default()
     };
     let engine = LocalTranscriber::new(local_cfg)
         .live_engine()
         .context("loading the local live engine")?;
+    let mic = engine.channel().context("building the mic transcriber")?;
+    let them = engine.channel().context("building the tap transcriber")?;
+    let window = TranscriptWindow::new(
+        sample_rate,
+        cfg.live_buffer_minutes,
+        engine.diarizes_far_end(),
+    )
+    .context("reserving the bounded live transcript window")?;
     Ok(SessionParts {
-        mic: engine.channel().context("building the mic transcriber")?,
-        them: engine.channel().context("building the tap transcriber")?,
+        engine,
+        mic,
+        them,
         // Streaming AEC on the mic, per config (skipped cleanly per-chunk when the mic side is empty).
         aec: cfg
             .aec_enabled
             .then(|| StreamingAec::new(sample_rate, cfg.aec_config())),
-        mic_seg: Segmenter::new(Speaker::Me),
-        them_seg: Segmenter::new(Speaker::Other("Them".to_string())),
+        window,
     })
 }
 
@@ -745,8 +770,8 @@ fn run_session(
             &mut p.aec,
             &mut p.mic,
             &mut p.them,
-            &mut p.mic_seg,
-            &mut p.them_seg,
+            &p.engine,
+            &mut p.window,
             writer,
         ),
         // Engine failed to load: fall through to the verdict wait; the error surfaces on Finish.
@@ -762,8 +787,8 @@ fn run_session(
                 p.aec,
                 p.mic,
                 p.them,
-                p.mic_seg,
-                p.them_seg,
+                p.engine,
+                p.window,
                 quality,
                 writer,
             )
@@ -777,67 +802,241 @@ fn run_session(
     }
 }
 
-/// Drain tee chunks until the sender (the capture writer) hangs up. Mirrors `corti-tap --live`'s
-/// per-chunk gating: the AEC/mic side keys on the actual chunk data, never on the capture mode, and
-/// `StreamingAec::push` is only reached with equal-length mic/tap blocks.
+/// Per-recording rolling state. Every collection is bounded by either the configured time window or an
+/// independent byte cap; after a successful durable append, lengths reset to zero and allocations are reused.
+struct TranscriptWindow {
+    sample_rate: u32,
+    frame_limit: u64,
+    start_frame: u64,
+    frames: u64,
+    mic_words: Vec<Word>,
+    them_words: Vec<Word>,
+    tap_audio: Vec<f32>,
+    buffered_text_bytes: usize,
+    diarize_far_end: bool,
+}
+
+impl TranscriptWindow {
+    fn new(sample_rate: u32, minutes: u32, diarize_far_end: bool) -> Result<Self> {
+        let sample_rate = sample_rate.max(1);
+        let configured = u64::from(sample_rate)
+            .saturating_mul(u64::from(minutes.max(1)))
+            .saturating_mul(60)
+            .max(1);
+        let audio_cap_frames = (MAX_DIARIZATION_AUDIO_BYTES / std::mem::size_of::<f32>()) as u64;
+        let frame_limit = if diarize_far_end {
+            configured.min(audio_cap_frames).max(1)
+        } else {
+            configured
+        };
+        // Exact fallible preallocation makes the advertised audio cap an allocation cap, not merely a
+        // length cap; ordinary geometric Vec growth could otherwise reserve almost twice the active window.
+        // Allocation pressure degrades to batch fallback instead of panicking the live thread.
+        let mut tap_audio = Vec::new();
+        if diarize_far_end {
+            tap_audio
+                .try_reserve_exact(frame_limit as usize)
+                .context("reserving far-end diarization audio")?;
+        }
+        Ok(Self {
+            sample_rate,
+            frame_limit,
+            start_frame: 0,
+            frames: 0,
+            mic_words: Vec::new(),
+            them_words: Vec::new(),
+            tap_audio,
+            buffered_text_bytes: 0,
+            diarize_far_end,
+        })
+    }
+
+    fn remaining_frames(&self) -> usize {
+        self.frame_limit.saturating_sub(self.frames).max(1) as usize
+    }
+
+    fn push_audio(&mut self, tap: &[f32], frames: usize) {
+        if self.diarize_far_end {
+            self.tap_audio.extend_from_slice(tap);
+        }
+        self.frames = self.frames.saturating_add(frames as u64);
+    }
+
+    fn push_mic_words(&mut self, words: Vec<Word>) {
+        self.buffered_text_bytes = self
+            .buffered_text_bytes
+            .saturating_add(buffered_word_bytes(&words));
+        self.mic_words.extend(words);
+    }
+
+    fn push_them_words(&mut self, words: Vec<Word>) {
+        self.buffered_text_bytes = self
+            .buffered_text_bytes
+            .saturating_add(buffered_word_bytes(&words));
+        self.them_words.extend(words);
+    }
+
+    fn due(&self) -> bool {
+        self.frames >= self.frame_limit || self.buffered_text_bytes >= MAX_BUFFERED_TRANSCRIPT_BYTES
+    }
+
+    fn start_sec(&self) -> f64 {
+        self.start_frame as f64 / f64::from(self.sample_rate)
+    }
+
+    fn clear_after_flush(&mut self) {
+        self.start_frame = self.start_frame.saturating_add(self.frames);
+        self.frames = 0;
+        self.mic_words.clear();
+        self.them_words.clear();
+        self.tap_audio.clear();
+        self.buffered_text_bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.tap_audio.capacity() * std::mem::size_of::<f32>() + self.buffered_text_bytes
+    }
+}
+
+fn buffered_word_bytes(words: &[Word]) -> usize {
+    words.iter().fold(0usize, |total, word| {
+        total
+            .saturating_add(std::mem::size_of::<Word>())
+            .saturating_add(word.text.len())
+    })
+}
+
+/// Drain tee chunks until the sender (the capture writer) hangs up. Input chunks are split exactly at the
+/// rolling boundary, so even a surprising producer chunk cannot push retained audio beyond the configured/
+/// hard limit. AEC and ASR remain chunk-agnostic; only a full window forces their current tails final.
 #[allow(clippy::too_many_arguments)] // the split keeps every piece testable without models
-fn consume_chunks<C: LiveChannel, F: NoteFiler>(
+fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
     rx: &Receiver<CaptureChunk>,
     sample_rate: u32,
     aec: &mut Option<StreamingAec>,
     mic: &mut C,
     them: &mut C,
-    mic_seg: &mut Segmenter,
-    them_seg: &mut Segmenter,
+    diarizer: &D,
+    window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
 ) -> Result<()> {
     while let Ok(chunk) = rx.recv() {
-        let clean = match aec.as_mut() {
-            Some(aec) if !chunk.mic.is_empty() && chunk.mic.len() == chunk.tap.len() => {
-                aec.push(&chunk.mic, &chunk.tap) // cleaned mic (empty while the lookahead warms)
+        let chunk_frames = chunk.mic.len().max(chunk.tap.len());
+        let mut offset = 0usize;
+        while offset < chunk_frames {
+            let take = window.remaining_frames().min(chunk_frames - offset);
+            let end = offset + take;
+            let mic_slice = if chunk.mic.len() == chunk_frames {
+                &chunk.mic[offset..end]
+            } else {
+                &[]
+            };
+            let tap_slice = if chunk.tap.len() == chunk_frames {
+                &chunk.tap[offset..end]
+            } else {
+                &[]
+            };
+
+            let clean = match aec.as_mut() {
+                Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => {
+                    aec.push(mic_slice, tap_slice)
+                }
+                Some(_) => Vec::new(),
+                None => mic_slice.to_vec(),
+            };
+            if !clean.is_empty() {
+                mic.push(&clean, sample_rate);
             }
-            Some(_) => Vec::new(), // no usable mic data this chunk — skip so the length assert stays unreachable
-            None => chunk.mic.clone(),
-        };
-        if !clean.is_empty() {
-            mic.push(&clean, sample_rate);
-        }
-        if let Some(words) = mic.poll_words() {
-            append_closed(mic_seg, &words, writer)?;
-        }
-        if !chunk.tap.is_empty() {
-            them.push(&chunk.tap, sample_rate);
-        }
-        if let Some(words) = them.poll_words() {
-            append_closed(them_seg, &words, writer)?;
+            if !tap_slice.is_empty() {
+                them.push(tap_slice, sample_rate);
+            }
+            if let Some(words) = mic.poll_words() {
+                window.push_mic_words(words);
+            }
+            if let Some(words) = them.poll_words() {
+                window.push_them_words(words);
+            }
+            window.push_audio(tap_slice, take);
+            offset = end;
+
+            if window.due() {
+                checkpoint_and_flush(mic, them, diarizer, window, writer)?;
+            }
         }
     }
     Ok(())
 }
 
-/// Feed a poll batch through the segmenter and append every segment it closed.
-fn append_closed<F: NoteFiler>(
-    seg: &mut Segmenter,
-    words: &[Word],
+fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
+    mic: &mut C,
+    them: &mut C,
+    diarizer: &D,
+    window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
 ) -> Result<()> {
-    for segment in seg.push_words(words) {
-        writer.append_segment(&segment)?;
+    window.push_mic_words(mic.checkpoint());
+    window.push_them_words(them.checkpoint());
+    flush_window(diarizer, window, writer)
+}
+
+/// Diarize and render one complete rolling window, then perform one OS-synced append. No state is cleared
+/// until that durability boundary succeeds, so an error still carries the already-created note to fallback.
+fn flush_window<D: LiveDiarizer, F: NoteFiler>(
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+) -> Result<()> {
+    let mut segments = words_to_segments(&window.mic_words, Speaker::Me, SEGMENT_GAP);
+    if !window.them_words.is_empty() {
+        let turns = if window.diarize_far_end {
+            diarizer
+                .diarize_chunk(&window.tap_audio, window.sample_rate, window.start_sec())?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if window.diarize_far_end {
+            segments.extend(diarize_words(
+                &window.them_words,
+                &turns,
+                SEGMENT_GAP,
+                "Them",
+            ));
+        } else {
+            segments.extend(words_to_segments(
+                &window.them_words,
+                Speaker::Other("Them".to_string()),
+                SEGMENT_GAP,
+            ));
+        }
     }
+    let segments = merge_by_time(segments);
+    if !segments.is_empty() {
+        writer.append_segments(&segments)?;
+        info!(
+            target: "corti::live",
+            start_sec = window.start_sec(),
+            duration_sec = window.frames as f64 / f64::from(window.sample_rate),
+            segments = segments.len(),
+            buffered_audio_bytes = window.tap_audio.len() * std::mem::size_of::<f32>(),
+            "durable live transcript chunk synced"
+        );
+    }
+    window.clear_after_flush();
     Ok(())
 }
 
-/// Finish the AEC/transcriber tails and append remaining segments merged by start time. The state line is
-/// flipped only when the detector's terminal quality verdict says the bounded tee was lossless; any drop
-/// leaves the note visibly `transcribing` for the canonical batch rewrite.
-#[allow(clippy::too_many_arguments)] // explicit channel/segment state keeps this model-free test seam small
-fn finish_session<C: LiveChannel, F: NoteFiler>(
+/// Finish the AEC/transcriber tails, diarize + sync the final short window, then durably flip the state line.
+/// A dropped tee leaves the note visibly `transcribing` for the canonical batch rewrite.
+#[allow(clippy::too_many_arguments)]
+fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
     sample_rate: u32,
     mut aec: Option<StreamingAec>,
     mut mic: C,
     mut them: C,
-    mut mic_seg: Segmenter,
-    mut them_seg: Segmenter,
+    diarizer: D,
+    mut window: TranscriptWindow,
     quality: FinishQuality,
     writer: &mut NoteWriter<F>,
 ) -> Result<LiveOutcome> {
@@ -847,23 +1046,23 @@ fn finish_session<C: LiveChannel, F: NoteFiler>(
             mic.push(&tail, sample_rate);
         }
     }
-    let mut finals: Vec<TranscriptSegment> = Vec::new();
-    let mic_words = mic.finish();
-    finals.extend(mic_seg.push_words(&mic_words));
-    finals.extend(mic_seg.take());
-    let them_words = them.finish();
-    finals.extend(them_seg.push_words(&them_words));
-    finals.extend(them_seg.take());
-    for segment in merge_by_time(finals) {
-        writer.append_segment(&segment)?;
+    if let Some(words) = mic.poll_words() {
+        window.push_mic_words(words);
     }
+    if let Some(words) = them.poll_words() {
+        window.push_them_words(words);
+    }
+    window.push_mic_words(mic.finish());
+    window.push_them_words(them.finish());
+    flush_window(&diarizer, &mut window, writer)?;
+
     match writer.path().cloned() {
         Some(note_path) if quality.dropped_chunks == 0 => {
             corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
             info!(
                 target: "corti::live",
                 note_path = %note_path.display(),
-                "live note finalized — state flipped to transcribed"
+                "live note finalized — final chunk and state are synced"
             );
             Ok(LiveOutcome::Filed { note_path })
         }
@@ -880,11 +1079,10 @@ fn finish_session<C: LiveChannel, F: NoteFiler>(
 
 // ----- Small seams so the loop and writer are testable without models or a vagus binary -----
 
-/// The slice of `LiveTranscriber` the consumer loop needs — a seam so the loop is unit-testable with a
-/// scripted channel instead of the real ONNX models.
 trait LiveChannel {
     fn push(&mut self, samples: &[f32], sample_rate: u32);
     fn poll_words(&mut self) -> Option<Vec<Word>>;
+    fn checkpoint(&mut self) -> Vec<Word>;
     fn finish(&mut self) -> Vec<Word>;
 }
 
@@ -896,56 +1094,32 @@ impl LiveChannel for corti_transcribe_local::LiveTranscriber {
     fn poll_words(&mut self) -> Option<Vec<Word>> {
         corti_transcribe_local::LiveTranscriber::poll_words(self)
     }
+    fn checkpoint(&mut self) -> Vec<Word> {
+        corti_transcribe_local::LiveTranscriber::checkpoint(self)
+    }
     fn finish(&mut self) -> Vec<Word> {
         corti_transcribe_local::LiveTranscriber::finish(self)
     }
 }
 
-/// Incremental twin of `corti_transcribe::segment::words_to_segments`: same gap rule (`SEGMENT_GAP`),
-/// but words arrive in poll batches and a segment is only *closed* (returned) when a later word starts
-/// past the gap — or at [`take`](Self::take) on finish.
-struct Segmenter {
-    speaker: Speaker,
-    cur: Option<TranscriptSegment>,
+trait LiveDiarizer {
+    fn diarize_chunk(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        offset_sec: f64,
+    ) -> Result<Option<Vec<SpeakerTurn>>>;
 }
 
-impl Segmenter {
-    fn new(speaker: Speaker) -> Self {
-        Self { speaker, cur: None }
-    }
-
-    /// Feed a batch of words; return the segments this batch closed.
-    fn push_words(&mut self, words: &[Word]) -> Vec<TranscriptSegment> {
-        let mut closed = Vec::new();
-        for w in words {
-            if w.text.is_empty() {
-                continue;
-            }
-            match self.cur.as_mut() {
-                Some(seg) if w.start - seg.end <= SEGMENT_GAP => {
-                    seg.text.push(' ');
-                    seg.text.push_str(&w.text);
-                    seg.end = w.end;
-                }
-                _ => {
-                    if let Some(done) = self.cur.take() {
-                        closed.push(done);
-                    }
-                    self.cur = Some(TranscriptSegment {
-                        speaker: self.speaker.clone(),
-                        start: w.start,
-                        end: w.end,
-                        text: w.text.clone(),
-                    });
-                }
-            }
-        }
-        closed
-    }
-
-    /// The still-open trailing segment, if any (call at finish).
-    fn take(&mut self) -> Option<TranscriptSegment> {
-        self.cur.take()
+#[cfg(feature = "local")]
+impl LiveDiarizer for corti_transcribe_local::LiveEngine {
+    fn diarize_chunk(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        offset_sec: f64,
+    ) -> Result<Option<Vec<SpeakerTurn>>> {
+        corti_transcribe_local::LiveEngine::diarize_chunk(self, samples, sample_rate, offset_sec)
     }
 }
 
@@ -967,9 +1141,9 @@ impl NoteFiler for VagusFiler {
     }
 }
 
-/// Lazily creates the inbox note on the first finalized segment and appends one rendered line per
-/// segment. Reports the created path to the pipeline (`PipelineMsg::LiveNoteCreated`) so it is
-/// persisted into the queue row as soon as it exists.
+/// Lazily creates the inbox note on the first non-empty rolling window and appends that window in one
+/// OS-synced write. Reports the created path to the pipeline (`PipelineMsg::LiveNoteCreated`) only after
+/// the initial note + directory entry are synced.
 struct NoteWriter<F: NoteFiler> {
     filer: F,
     meta: RecordingMeta,
@@ -987,15 +1161,22 @@ impl<F: NoteFiler> NoteWriter<F> {
         }
     }
 
-    /// Append one segment, creating the note first if this is the first one. The line is rendered by
-    /// the same code the batch note uses (`DiarizedTranscript::to_markdown` over a single segment), so
-    /// live and batch notes are line-for-line identical in shape.
-    fn append_segment(&mut self, segment: &TranscriptSegment) -> Result<()> {
+    /// Render and durably append one complete, already-merged transcript window. Empty/silent windows do
+    /// not create a note. Rendering once avoids per-segment syscalls and establishes one clear crash boundary.
+    fn append_segments(&mut self, segments: &[TranscriptSegment]) -> Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
         if self.note.is_none() {
             self.create()?;
         }
-        let line = DiarizedTranscript::new(vec![segment.clone()]).to_markdown();
-        corti_vagus::note::append(self.note.as_ref().expect("just created"), &line)
+        let chunk = DiarizedTranscript::new(segments.to_vec()).to_markdown();
+        corti_vagus::note::append(self.note.as_ref().expect("just created"), &chunk)
+    }
+
+    #[cfg(test)]
+    fn append_segment(&mut self, segment: &TranscriptSegment) -> Result<()> {
+        self.append_segments(std::slice::from_ref(segment))
     }
 
     fn create(&mut self) -> Result<()> {
@@ -1007,10 +1188,15 @@ impl<F: NoteFiler> NoteWriter<F> {
                 &corti_vagus::live_initial_body(&self.meta),
             )
             .context("creating the live inbox note")?;
+        // Retain ownership before the fallible sync. If syncing fails, `session_thread` must still return
+        // this path for fallback/recovery rather than forgetting a note vagus already created.
+        self.note = Some(path.clone());
+        corti_vagus::note::sync_created(&path)
+            .context("syncing the new live inbox note and directory")?;
         info!(
             target: "corti::live",
             note_path = %path.display(),
-            "live inbox note created (State: transcribing)"
+            "live inbox note created and synced (State: transcribing)"
         );
         if let Some(tx) = &self.pipe_tx {
             let _ = tx.send(PipelineMsg::LiveNoteCreated {
@@ -1018,7 +1204,6 @@ impl<F: NoteFiler> NoteWriter<F> {
                 note_path: path.clone(),
             });
         }
-        self.note = Some(path);
         Ok(())
     }
 
@@ -1058,7 +1243,7 @@ impl<F: NoteFiler> NoteWriter<F> {
 mod tests {
     use super::*;
     use corti_core::OwningApp;
-    use corti_transcribe::segment::words_to_segments;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::Path;
 
@@ -1113,8 +1298,46 @@ mod tests {
                 Some(std::mem::take(&mut self.pending))
             }
         }
+        fn checkpoint(&mut self) -> Vec<Word> {
+            std::mem::take(&mut self.pending)
+        }
         fn finish(&mut self) -> Vec<Word> {
-            std::mem::take(&mut self.tail)
+            let mut words = std::mem::take(&mut self.pending);
+            words.append(&mut self.tail);
+            words
+        }
+    }
+
+    #[derive(Default)]
+    struct NoDiarizer;
+
+    impl LiveDiarizer for NoDiarizer {
+        fn diarize_chunk(
+            &self,
+            _samples: &[f32],
+            _sample_rate: u32,
+            _offset_sec: f64,
+        ) -> Result<Option<Vec<SpeakerTurn>>> {
+            Ok(None)
+        }
+    }
+
+    struct ScriptedDiarizer {
+        turns: Vec<SpeakerTurn>,
+        calls: RefCell<Vec<(usize, u32, f64)>>,
+    }
+
+    impl LiveDiarizer for ScriptedDiarizer {
+        fn diarize_chunk(
+            &self,
+            samples: &[f32],
+            sample_rate: u32,
+            offset_sec: f64,
+        ) -> Result<Option<Vec<SpeakerTurn>>> {
+            self.calls
+                .borrow_mut()
+                .push((samples.len(), sample_rate, offset_sec));
+            Ok(Some(self.turns.clone()))
         }
     }
 
@@ -1153,30 +1376,6 @@ mod tests {
         std::fs::read_to_string(p).unwrap()
     }
 
-    /// The incremental segmenter must reproduce `words_to_segments` exactly, no matter how the word
-    /// stream is split into poll batches.
-    #[test]
-    fn segmenter_matches_batch_words_to_segments() {
-        let words = [
-            word(0.0, 0.4, "Morning"),
-            word(0.5, 0.8, "team."),
-            word(3.0, 3.4, "Thanks"),
-            word(3.5, 3.9, "all."),
-            word(9.0, 9.5, "Bye"),
-        ];
-        let batch = words_to_segments(&words, Speaker::Me, SEGMENT_GAP);
-
-        for split in [1usize, 2, 3, 5] {
-            let mut seg = Segmenter::new(Speaker::Me);
-            let mut got = Vec::new();
-            for chunk in words.chunks(split) {
-                got.extend(seg.push_words(chunk));
-            }
-            got.extend(seg.take());
-            assert_eq!(got, batch, "split size {split}");
-        }
-    }
-
     /// Lazy creation, exact appended strings, and delete-on-discard.
     #[test]
     fn note_writer_creates_lazily_appends_exact_lines_and_discards() {
@@ -1184,9 +1383,9 @@ mod tests {
         let note = filer.note();
         let mut writer = NoteWriter::new(filer, meta(), None);
 
-        // No segment yet ⇒ no note (the whole point of lazy creation).
         assert!(!note.exists());
-        assert!(writer.path().is_none());
+        writer.append_segments(&[]).unwrap();
+        assert!(!note.exists(), "a silent window must stay lazy");
 
         writer
             .append_segment(&TranscriptSegment {
@@ -1198,16 +1397,9 @@ mod tests {
             .unwrap();
         assert_eq!(writer.path(), Some(&note));
         let content = read(&note);
-        assert!(
-            content.contains("State: transcribing\n\n"),
-            "got: {content}"
-        );
+        assert!(content.contains("State: transcribing\n\n"));
         assert!(content.contains("## Transcript\n\n"));
-        // The segment line is byte-identical to DiarizedTranscript::to_markdown's rendering.
-        assert!(
-            content.ends_with("**[00:00] Me:** hello there\n\n"),
-            "got: {content}"
-        );
+        assert!(content.ends_with("**[00:00] Me:** hello there\n\n"));
 
         writer
             .append_segment(&TranscriptSegment {
@@ -1224,17 +1416,79 @@ mod tests {
         assert!(writer.path().is_none());
     }
 
-    /// End-to-end over the loop seams: empty-mic chunks never reach the mic channel (the corti-tap
-    /// gating), segments appear as they close, the finish tails are merged by start time, and the
-    /// state line flips only at finalize.
+    /// Simulate three hours without allocating three hours: the same one-minute allocation is reused 180
+    /// times and retained bytes never exceed the configured window. This test exercises irregular producer
+    /// chunks and exact boundary splitting, not just the arithmetic.
     #[test]
-    fn consume_and_finish_append_segments_and_flip_state() {
+    fn rolling_window_memory_is_invariant_over_three_hours() {
+        let sample_rate = 100u32;
+        let mut window = TranscriptWindow::new(sample_rate, 1, true).unwrap();
+        let source = vec![0.0f32; 137];
+        let mut remaining = u64::from(sample_rate) * 3 * 60 * 60;
+        let mut flushes = 0usize;
+        let mut max_retained = 0usize;
+
+        while remaining > 0 {
+            let take = window
+                .remaining_frames()
+                .min(source.len())
+                .min(remaining as usize);
+            window.push_audio(&source[..take], take);
+            remaining -= take as u64;
+            max_retained = max_retained.max(window.retained_bytes());
+            if window.due() {
+                assert_eq!(window.frames, u64::from(sample_rate) * 60);
+                window.clear_after_flush();
+                flushes += 1;
+            }
+        }
+
+        assert_eq!(flushes, 180);
+        assert_eq!(window.frames, 0);
+        assert!(max_retained <= sample_rate as usize * 60 * std::mem::size_of::<f32>());
+        assert_eq!(window.start_frame, u64::from(sample_rate) * 3 * 60 * 60);
+
+        let high_rate = TranscriptWindow::new(192_000, 10, true).unwrap();
+        assert_eq!(
+            high_rate.frame_limit as usize * std::mem::size_of::<f32>(),
+            MAX_DIARIZATION_AUDIO_BYTES,
+            "the absolute audio cap must override a large configured window"
+        );
+    }
+
+    #[test]
+    fn far_end_is_diarized_before_the_durable_chunk_is_written() {
+        let filer = TempFiler::new("diarized-window");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let diarizer = ScriptedDiarizer {
+            turns: vec![SpeakerTurn {
+                start: 60.0,
+                end: 70.0,
+                label: "Them 7".into(),
+            }],
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut window = TranscriptWindow::new(10, 1, true).unwrap();
+        window.start_frame = 600; // second minute: proves the absolute offset is supplied
+        window.push_audio(&vec![0.0; 100], 100);
+        window.push_them_words(vec![word(62.0, 62.5, "owned action item")]);
+
+        flush_window(&diarizer, &mut window, &mut writer).unwrap();
+
+        assert_eq!(&*diarizer.calls.borrow(), &[(100, 10, 60.0)]);
+        assert!(read(&note).contains("**[01:02] Them 7:** owned action item"));
+        assert_eq!(window.frames, 0);
+        assert!(window.tap_audio.is_empty());
+    }
+
+    /// Empty-mic chunks never reach the mic channel; a full configured interval is written while the call
+    /// is still live; the final short tail is synced before the state line flips.
+    #[test]
+    fn consume_and_finish_write_intervals_and_flip_state() {
         let filer = TempFiler::new("loop");
         let note = filer.note();
         let mut writer = NoteWriter::new(filer, meta(), None);
-
-        // them: chunk 1 yields an utterance at 0s; chunk 2 yields one at 5s (closes the first);
-        // finish yields a tail at 20s. mic: silent during the call, one tail utterance at 10s.
         let mut them = Scripted::new(
             vec![
                 vec![word(0.0, 0.5, "hi"), word(0.6, 1.0, "Xavier")],
@@ -1243,58 +1497,43 @@ mod tests {
             vec![word(20.0, 20.5, "bye")],
         );
         let mut mic = Scripted::new(vec![], vec![word(10.0, 10.5, "thanks")]);
-        let mut mic_seg = Segmenter::new(Speaker::Me);
-        let mut them_seg = Segmenter::new(Speaker::Other("Them".into()));
-
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
-        tx.send(CaptureChunk {
-            mic: Vec::new(), // no usable mic data — must not reach the mic channel
-            tap: vec![0.0; 4096],
-        })
-        .unwrap();
-        tx.send(CaptureChunk {
-            mic: Vec::new(),
-            tap: vec![0.0; 4096],
-        })
-        .unwrap();
-        drop(tx); // recorder stopped
+        for _ in 0..2 {
+            tx.send(CaptureChunk {
+                mic: Vec::new(),
+                tap: vec![0.0; 30],
+            })
+            .unwrap();
+        }
+        drop(tx);
 
         let mut aec = None;
+        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
         consume_chunks(
             &rx,
-            48_000,
+            1,
             &mut aec,
             &mut mic,
             &mut them,
-            &mut mic_seg,
-            &mut them_seg,
+            &NoDiarizer,
+            &mut window,
             &mut writer,
         )
         .unwrap();
 
-        assert!(
-            mic.pushes.is_empty(),
-            "empty mic chunks must never be pushed"
-        );
-        assert_eq!(them.pushes.len(), 2);
-        // The first them-utterance closed when the 5s word arrived; the 5s one is still open.
+        assert!(mic.pushes.is_empty());
+        assert_eq!(them.pushes, vec![30, 30]);
         let mid_call = read(&note);
-        assert!(
-            mid_call.contains("State: transcribing\n"),
-            "got: {mid_call}"
-        );
-        assert!(
-            mid_call.ends_with("**[00:00] Them:** hi Xavier\n\n"),
-            "got: {mid_call}"
-        );
+        assert!(mid_call.contains("State: transcribing\n"));
+        assert!(mid_call.ends_with("**[00:00] Them:** hi Xavier\n\n**[00:05] Them:** anyway\n\n"));
 
         let outcome = finish_session(
-            48_000,
+            1,
             aec,
             mic,
             them,
-            mic_seg,
-            them_seg,
+            NoDiarizer,
+            window,
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
         )
@@ -1303,27 +1542,47 @@ mod tests {
             panic!("expected Filed");
         };
         assert_eq!(note_path, note);
-
         let final_content = read(&note);
-        // Tails are merged by start time: the open 5s them-segment, then mic 10s, then them 20s.
-        assert!(
-            final_content.ends_with(
-                "**[00:00] Them:** hi Xavier\n\n\
-                 **[00:05] Them:** anyway\n\n\
-                 **[00:10] Me:** thanks\n\n\
-                 **[00:20] Them:** bye\n\n"
-            ),
-            "got: {final_content}"
-        );
-        assert!(
-            final_content.contains("State: transcribed \n"),
-            "state flipped"
-        );
+        assert!(final_content.ends_with(
+            "**[00:00] Them:** hi Xavier\n\n\
+             **[00:05] Them:** anyway\n\n\
+             **[00:10] Me:** thanks\n\n\
+             **[00:20] Them:** bye\n\n"
+        ));
+        assert!(final_content.contains("State: transcribed \n"));
         assert!(!final_content.contains("State: transcribing"));
     }
 
-    /// A lossy tee still flushes decoder tails, but the result is non-canonical: the note stays visibly
-    /// transcribing and its existing path is returned for the batch rewrite.
+    /// A later write failure cannot truncate a prior synced chunk.
+    #[test]
+    fn failed_later_append_preserves_prior_chunk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let filer = TempFiler::new("append-failure");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        writer
+            .append_segment(&TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 0.0,
+                end: 0.5,
+                text: "durable prefix".into(),
+            })
+            .unwrap();
+        let before = read(&note);
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let result = writer.append_segment(&TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 60.0,
+            end: 60.5,
+            text: "must not appear".into(),
+        });
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(read(&note), before);
+        assert_eq!(writer.path(), Some(&note), "fallback must retain ownership");
+    }
+
     #[test]
     fn dropped_chunks_flush_tails_without_flipping_state() {
         let filer = TempFiler::new("dropped");
@@ -1345,8 +1604,8 @@ mod tests {
             None,
             mic,
             them,
-            Segmenter::new(Speaker::Me),
-            Segmenter::new(Speaker::Other("Them".into())),
+            NoDiarizer,
+            TranscriptWindow::new(48_000, 1, false).unwrap(),
             FinishQuality { dropped_chunks: 3 },
             &mut writer,
         )
@@ -1360,14 +1619,13 @@ mod tests {
             panic!("a dropped tee must require fallback");
         };
         assert_eq!(note_path, note);
-        assert!(reason.contains("3 chunk"), "got: {reason}");
+        assert!(reason.contains("3 chunk"));
         let content = read(&note);
         assert!(content.contains("**[00:02] Me:** flushed tail"));
         assert!(content.contains("State: transcribing\n"));
         assert!(!content.contains("State: transcribed \n"));
     }
 
-    /// A session with no speech at all creates no note and reports `NoNote` (⇒ batch path).
     #[test]
     fn silent_session_creates_no_note() {
         let filer = TempFiler::new("silent");
@@ -1375,35 +1633,33 @@ mod tests {
         let mut writer = NoteWriter::new(filer, meta(), None);
         let mut them = Scripted::new(vec![], vec![]);
         let mut mic = Scripted::new(vec![], vec![]);
-        let mut mic_seg = Segmenter::new(Speaker::Me);
-        let mut them_seg = Segmenter::new(Speaker::Other("Them".into()));
-
         let (tx, rx) = sync_channel::<CaptureChunk>(2);
         tx.send(CaptureChunk {
             mic: Vec::new(),
-            tap: vec![0.0; 512],
+            tap: vec![0.0; 10],
         })
         .unwrap();
         drop(tx);
         let mut aec = None;
+        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
         consume_chunks(
             &rx,
-            48_000,
+            1,
             &mut aec,
             &mut mic,
             &mut them,
-            &mut mic_seg,
-            &mut them_seg,
+            &NoDiarizer,
+            &mut window,
             &mut writer,
         )
         .unwrap();
         let outcome = finish_session(
-            48_000,
+            1,
             aec,
             mic,
             them,
-            mic_seg,
-            them_seg,
+            NoDiarizer,
+            window,
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
         )

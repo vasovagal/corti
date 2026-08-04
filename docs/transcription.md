@@ -1,14 +1,15 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against v0.9.0 + feat/live-inbox-filing (#85 durable-jobs stack, #87 live inbox filing).
+> Verified against main + crash-safe rolling live commits (#85, #87, #93, #103).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
 `enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store, and #85 added a
 `corti-jobs` layer on top of it for durable retry-with-backoff and an hourly retention sweep (see
 _The queue_ and _The pipeline worker_ below). #87 adds a **live** first-class path for detector
-recordings: when the local backend + models are available, the note is written *during* the call and
-this whole batch machinery becomes the fallback (§Live inbox filing). Filing shells out to the
+recordings: when the local backend + models are available, bounded transcribed/diarized windows are
+OS-synced to the note *during* the call and this whole batch machinery becomes the fallback (§Live inbox
+filing). Filing shells out to the
 external `vagus` CLI, the only subprocess in the note path; after creation corti may also append to /
 state-flip / delete that one note (ADR 0010).
 
@@ -180,22 +181,26 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
 [streaming.md](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010); the write authority is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md). The filing semantics:
 
-- **State-line contract (for inbox agents).** The first corti-authored body line (right under vagus's
-  `# <title>` heading) is exactly `State: transcribing` while segments stream in, and exactly
-  `State: transcribed ` — one trailing space, same byte width — once final
-  (`crates/corti-vagus/src/note.rs:22`). The flip is an in-place seek+write of that line's bytes only
-  (`flip_state`, `note.rs:41`): no rename, no rewrite, so a `tail -f` follower keeps its inode.
-  Batch-filed notes carry the same `State: transcribed ` first line (`recording_body`,
-  `crates/corti-vagus/src/lib.rs:186`) — one contract, live or batch.
+- **State-line + storage contract (for inbox agents).** The first corti-authored body line is exactly
+  `State: transcribing` while windows stream in, and exactly `State: transcribed ` — one trailing space,
+  same byte width — once final. The flip is a same-inode seek+write. ADR 0012 makes persistence explicit:
+  the initial note + parent directory, every complete transcript chunk, body rewrites, and the final flip
+  call `sync_all`. The final short chunk is synced *before* the state is synced. Batch notes carry the same
+  final line, so inbox agents have one contract.
 - **Lazy note creation.** The note is created (`vagus add-note --print-path`, initial body =
-  `live_initial_body`, `lib.rs:197`) on the **first finalized segment**, not at recording start — a
-  too-short discarded recording almost never creates one. If a discard happens after creation, the
-  session deletes the note file. The created path is persisted into the queue row immediately
-  (`PipelineMsg::LiveNoteCreated` → `live_note_created`, `app/src/pipeline.rs:512` — the row is
-  created at status `Recording` if it doesn't exist yet).
-- **Segment lines are byte-identical to batch's** (`DiarizedTranscript::to_markdown` over a single
-  segment), appended in **finalize order** — which may interleave `Me`/`Them` differently than the
-  batch `merge_by_time` timeline. Accepted; the finish-time tails *are* merged by start time.
+  `live_initial_body`) on the **first non-empty committed window**, not at recording start. If discarded,
+  the session deletes it. Corti retains the path before the fallible first sync, then publishes it to the
+  queue only after syncing the file and directory (`PipelineMsg::LiveNoteCreated`, status `Recording`).
+- **Configurable bounded windows.** `live_buffer_minutes` / `CORTI_LIVE_BUFFER_MINUTES` defaults to 1 and
+  is clamped to 1–10. Input is split at the boundary; `LiveTranscriber::checkpoint` force-closes both VAD
+  tails without reloading models and preserves call-relative timestamps. The one optional far-end PCM window
+  is capped at 128 MiB and pending text at 1 MiB; either commits early. The capture tee is fixed at at most
+  ~64 MiB. No audio/text collection grows with call duration. After the first commit, a crash preserves every
+  prior window; ordinary uncommitted note loss is the configured interval, plus any fixed/bounded decoder-tee lag.
+- **Diarize, merge, append once.** If far-end diarization is enabled, its models are loaded once and only the
+  active tap window is processed; words become `Them N` before any bytes for that window are written. Mic +
+  far segments are merged by start, rendered with the batch formatter, and appended in one synced write.
+  `Them N` numbers are window-local and may be renumbered at a boundary (ADR 0012).
 - **Finish ownership and quality.** After the recorder closes its tee, the detector calls
   `LiveHook::finished(meta)` before emitting `RecordingFinished`. `LiveManager::finish(id)` freezes the
   dropped-chunk count and keeps the handle/outcome by ID while it flushes AEC and both transcriber tails.
@@ -204,7 +209,7 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
   retention expiry. A collecting/finishing sentinel prevents a second model-backed session from
   overlapping the tail join. Live work adds no telemetry stage; it remains under `Recording`.
 - **Fallback — no double notes, no repeated ASR after checkpoint.** Factory ineligible (config off,
-  non-local backend, models missing), no note created (silent call), a live-path error, or a dropped tee
+  non-local backend, any configured model missing), no note created (silent call), a live-path error, or a dropped tee
   chunk ⇒ batch runs from the lossless WAV. A returned partial path is passed directly as the preferred
   rewrite target and persisted in the retry payload before fallible row repair. Successful batch ASR puts
   that path and transcript in the post-ASR checkpoint; subsequent filing/completion retries load the
