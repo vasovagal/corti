@@ -115,10 +115,18 @@ each time a recording starts, so a Settings change applies to the next call.
 `FilterStage` (`capture.rs:945`) is the writer-side buffer: it stages downmixed mic/far into two
 `FILTER_FRAMES_PER_CHUNK`-sized (4096) Vecs, pushes them through the filter when full, and pairs each
 cleaned mic sample with its tap sample from a small `tap_pending` queue. Because `push` output lags
-input by up to the lookahead, `tap_pending` holds that lag — bounded by lookahead + one block (≈1 MB
-at 5 s/48 kHz), never by call length. `finish` drains the filter's backlog and, defensively, pads any
-unmatched tap with silence so the frame count stays truthful. The filter is only installed for
-`TwoTrack` with a mic channel: without a near end there is nothing to cancel.
+input by up to the lookahead, `tap_pending` holds that lag — bounded by lookahead + one block, never
+by call length. A `mic_pending` mirror of the raw mic is queued in lockstep (≈2 MB for the pair at
+5 s/48 kHz). `finish` drains the filter's backlog and, defensively, pads any unmatched tap with
+silence so the frame count stays truthful. The filter is only installed for `TwoTrack` with a mic
+channel: without a near end there is nothing to cancel.
+
+The mirror exists for one reason: **a DSP bug must not cost the recording.** Both `push` and `finish`
+run under `catch_unwind`; on a panic the filter is dropped, the backlog it was withholding is written
+raw from `mic_pending`, and the rest of the call passes through uncancelled. Degraded with a line on
+stderr, never lost — a panic escaping the writer thread would fail `stop()` and take the whole call.
+A filter emitting more than it was fed is a contract violation: the surplus is dropped and counted,
+and the total reported at end of recording.
 
 `StreamingAec` (`crates/corti-aec/src/streaming.rs`) is overlap-save FDAF: block hop = `filter_len`
 (default 8192 ≈ 170 ms @ 48 kHz), FFT size `2·hop`. A tunable lookahead window

@@ -938,16 +938,24 @@ fn send_microphone_chunk(tee: &CaptureTee, mic: &mut Vec<f32>) {
 /// Writer-thread state for the in-flight mic filter (#74): the block being staged for the next
 /// [`CaptureFilter::push`], and the far-end ("them") samples waiting for their cleaned mic partner.
 ///
-/// A filter's output lags its input by the warm-up/lookahead window, so the tap has to be queued until the
-/// matching clean sample arrives. **That queue is the entire memory cost of running the canceller here**:
-/// it never exceeds the filter's lookahead plus one staged block (≈1 MB at the 5 s default, 48 kHz) and is
-/// independent of call length.
+/// A filter's output lags its input by the warm-up/lookahead window, so each frame has to be queued until
+/// its cleaned mic partner arrives. **Those queues are the entire memory cost of running the canceller
+/// here**: neither exceeds the filter's lookahead plus one staged block (≈2 MB for the pair at the 5 s
+/// default, 48 kHz) and both are independent of call length.
 struct FilterStage {
-    /// `None` once [`FilterStage::finish`] has consumed it.
+    /// `None` once [`FilterStage::finish`] has consumed it — or once it panicked and was dropped.
     filter: Option<Box<dyn CaptureFilter>>,
     mic: Vec<f32>,
     far: Vec<f32>,
     tap_pending: VecDeque<f32>,
+    /// Raw mic, queued in lockstep with `tap_pending`. Only read if the filter panics: the backlog it was
+    /// still withholding is inside it and dies with it, so this mirror is what lets those frames be written
+    /// uncancelled instead of lost.
+    mic_pending: VecDeque<f32>,
+    /// The filter panicked; everything from here on is written raw.
+    degraded: bool,
+    /// Clean samples dropped because the filter emitted more than it was fed (a contract violation).
+    over_emitted: u64,
 }
 
 impl FilterStage {
@@ -957,6 +965,9 @@ impl FilterStage {
             mic: Vec::with_capacity(FILTER_FRAMES_PER_CHUNK),
             far: Vec::with_capacity(FILTER_FRAMES_PER_CHUNK),
             tap_pending: VecDeque::new(),
+            mic_pending: VecDeque::new(),
+            degraded: false,
+            over_emitted: 0,
         }
     }
 
@@ -966,24 +977,44 @@ impl FilterStage {
         self.mic.push(me);
         self.far.push(them);
         self.tap_pending.push_back(them);
+        self.mic_pending.push_back(me);
     }
 
     fn is_full(&self) -> bool {
         self.mic.len() >= FILTER_FRAMES_PER_CHUNK
     }
 
-    /// Write `clean` paired with the queued tap. Stops early if the filter somehow ran ahead of its input;
-    /// the length invariant says it can't, and dropping is safer than writing an unpaired frame.
+    /// The filter panicked mid-call. Cancellation quality is forfeit, the recording is not.
+    fn degrade(&mut self, during: &str) {
+        self.filter = None;
+        self.degraded = true;
+        eprintln!(
+            "corti-capture: capture filter panicked during {during} — recording the rest uncancelled"
+        );
+    }
+
+    /// Write `clean` paired with the queued tap. Stops early if the filter ran ahead of its input; the
+    /// length invariant says it can't, and dropping is safer than writing an unpaired frame — but count the
+    /// drops so a filter that violates the contract is visible rather than silently truncating.
     fn emit<W: std::io::Write + std::io::Seek>(
         &mut self,
         writer: &mut hound::WavWriter<W>,
         clean: &[f32],
     ) -> Result<u64, hound::Error> {
-        let mut frames = 0;
+        let mut frames = 0u64;
         for &me in clean {
             let Some(them) = self.tap_pending.pop_front() else {
+                let dropped = clean.len() as u64 - frames;
+                if self.over_emitted == 0 {
+                    eprintln!(
+                        "corti-capture: capture filter emitted more samples than it was fed — \
+                         dropping {dropped} (further drops counted, reported at end of recording)"
+                    );
+                }
+                self.over_emitted += dropped;
                 break;
             };
+            self.mic_pending.pop_front();
             writer.write_sample(me)?; // ch0 = cleaned me
             writer.write_sample(them)?; // ch1 = them, untouched
             frames += 1;
@@ -991,7 +1022,23 @@ impl FilterStage {
         Ok(frames)
     }
 
-    /// Push the staged block through the filter and write whatever it emits.
+    /// Degraded mode: write the queued frames straight through, mic uncancelled.
+    fn drain_raw<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        writer: &mut hound::WavWriter<W>,
+    ) -> Result<u64, hound::Error> {
+        let mut frames = 0;
+        while let Some(them) = self.tap_pending.pop_front() {
+            writer.write_sample(self.mic_pending.pop_front().unwrap_or(0.0))?;
+            writer.write_sample(them)?;
+            frames += 1;
+        }
+        Ok(frames)
+    }
+
+    /// Push the staged block through the filter and write whatever it emits. A panicking filter costs
+    /// cancellation, not audio: it is dropped and the stage falls through to raw passthrough for the rest of
+    /// the recording, backlog included.
     fn flush<W: std::io::Write + std::io::Seek>(
         &mut self,
         writer: &mut hound::WavWriter<W>,
@@ -999,30 +1046,63 @@ impl FilterStage {
         if self.mic.is_empty() {
             return Ok(0);
         }
-        let Some(filter) = self.filter.as_mut() else {
-            return Ok(0);
+        let clean = match self.filter.take() {
+            Some(mut filter) => {
+                let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    filter.push(&self.mic, &self.far)
+                }));
+                match pushed {
+                    Ok(clean) => {
+                        self.filter = Some(filter);
+                        clean
+                    }
+                    // `filter` is dropped here, taking its withheld backlog with it.
+                    Err(_) => {
+                        self.degrade("push");
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
         };
-        let clean = filter.push(&self.mic, &self.far);
         self.mic.clear();
         self.far.clear();
+        if self.degraded {
+            return self.drain_raw(writer);
+        }
         self.emit(writer, &clean)
     }
 
-    /// End of stream: flush the partial block, drain the filter, then write any tap frame still without a
-    /// partner as silence-on-ch0 so the file's frame count still matches what was captured.
+    /// End of stream: flush the partial block, drain the filter, then account for any frame still without a
+    /// cleaned partner so the file's frame count matches what was captured — raw if the filter panicked,
+    /// otherwise silence-on-ch0 (a filter that withholds past `finish` is out of contract, and writing the
+    /// raw mic there would defeat the point of cancelling at all).
     fn finish<W: std::io::Write + std::io::Seek>(
         mut self,
         writer: &mut hound::WavWriter<W>,
     ) -> Result<u64, hound::Error> {
         let mut frames = self.flush(writer)?;
         if let Some(filter) = self.filter.take() {
-            let tail = filter.finish();
-            frames += self.emit(writer, &tail)?;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter.finish())) {
+                Ok(tail) => frames += self.emit(writer, &tail)?,
+                Err(_) => self.degrade("finish"),
+            }
         }
-        while let Some(them) = self.tap_pending.pop_front() {
-            writer.write_sample(0.0f32)?;
-            writer.write_sample(them)?;
-            frames += 1;
+        if self.degraded {
+            frames += self.drain_raw(writer)?;
+        } else {
+            while let Some(them) = self.tap_pending.pop_front() {
+                self.mic_pending.pop_front();
+                writer.write_sample(0.0f32)?;
+                writer.write_sample(them)?;
+                frames += 1;
+            }
+        }
+        if self.over_emitted > 0 {
+            eprintln!(
+                "corti-capture: capture filter over-emitted {} samples in total",
+                self.over_emitted
+            );
         }
         Ok(frames)
     }
@@ -1035,7 +1115,8 @@ impl FilterStage {
 /// no file behind.
 ///
 /// With a `filter` (#74) the mic is echo-cancelled here, block by block, and only the cleaned 2-track is
-/// encoded: no raw mic ever reaches disk and nothing on this thread is sized by the recording length.
+/// encoded: no raw mic reaches disk and nothing on this thread is sized by the recording length. A filter
+/// that panics is dropped and the rest of the recording is written uncancelled — degraded, never lost.
 fn run_writer(
     mut consumer: rtrb::Consumer<f32>,
     shared: Arc<Shared>,
@@ -1689,6 +1770,82 @@ mod tests {
         let mut r = hound::WavReader::open(&out).unwrap();
         let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
         assert_eq!(got, vec![0.0, 0.5, 0.0, 0.75]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A panicking filter must cost cancellation quality, never the recording: the frames it was still
+    /// withholding are written raw from the mirror queue, every later frame passes straight through, and the
+    /// frame count is unchanged.
+    #[test]
+    fn writer_falls_back_to_raw_when_filter_panics() {
+        /// Lags like the real canceller, then panics on its second block.
+        struct PanicOnSecondPush {
+            pushes: usize,
+            pending: VecDeque<f32>,
+        }
+        impl CaptureFilter for PanicOnSecondPush {
+            fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+                self.pushes += 1;
+                assert!(self.pushes < 2, "boom");
+                for (m, f) in mic.iter().zip(far) {
+                    self.pending.push_back(m - f);
+                }
+                let ready = self.pending.len().saturating_sub(1_000);
+                self.pending.drain(..ready).collect()
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                unreachable!("dropped by the panic before finish")
+            }
+        }
+
+        let frames = FILTER_FRAMES_PER_CHUNK + 500;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(2 * frames + 16);
+        let mic = |i: usize| (i % 11) as f32 / 16.0;
+        let far = |i: usize| (i % 3) as f32 / 4.0;
+        for i in 0..frames {
+            producer.push(mic(i)).unwrap();
+            producer.push(far(i)).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-panic-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("degraded.wav");
+        let n = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| {
+                Box::new(PanicOnSecondPush {
+                    pushes: 0,
+                    pending: VecDeque::new(),
+                })
+            })),
+        )
+        .unwrap();
+        assert_eq!(n as usize, frames, "a filter panic loses no frames");
+
+        // The first push emitted all but its 1000-sample backlog; everything after that is raw.
+        let cleaned = FILTER_FRAMES_PER_CHUNK - 1_000;
+        let mut r = hound::WavReader::open(&out).unwrap();
+        let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got.len(), 2 * frames);
+        for i in 0..frames {
+            let want = if i < cleaned { mic(i) - far(i) } else { mic(i) };
+            assert_eq!(got[2 * i], want, "ch0 frame {i}");
+            assert_eq!(got[2 * i + 1], far(i), "ch1 frame {i}");
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
