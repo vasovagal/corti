@@ -553,8 +553,10 @@ mod tests {
         use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
 
         // 8 kHz keeps the 5 s lookahead (40k samples) and the run cheap; a short filter keeps the FFTs small.
+        // The length is deliberately not a multiple of any block size in play (4096 in flight, 16384 batch,
+        // filter_len 256), so `finish`'s zero-pad and overshoot-truncate actually run on both sides.
         let sample_rate = 8_000u32;
-        let frames = 64 * 1024;
+        let frames = 64 * 1024 + 97;
         let cfg = corti_aec::AecConfig {
             filter_len: 256,
             ..Default::default()
