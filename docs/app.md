@@ -1,6 +1,6 @@
 # app — the Tauri tray surface
 
-> Verified against **main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#85, #87, #93, #103)**.
+> Verified against **main + timestamped live reader/microphone test (#105), transcribe.cpp #92, and crash-safe rolling live commits (#85, #87, #93, #103)**.
 > Current-state internals of the `app/` crate (`corti-app`, bin `corti`); `file.rs:line` anchors point
 > into this worktree. Design rationale lives in `design/05-app-tauri.md` (partly stale) and the ADRs.
 
@@ -24,19 +24,25 @@ Every AppKit / tray / window mutation is marshalled to the Tauri main thread via
 | `corti-blink` | `tray.rs:297` | 500 ms tray-icon swap while recording |
 
 #85's durable background jobs add **no** new OS thread — the retry and hourly retention sweep run on the
-existing `corti-pipeline` thread's tick loop, interleaved with recordings.
+existing `corti-pipeline` thread's tick loop, interleaved with recordings. While the explicit microphone test
+owns the local model gate, due jobs remain unclaimed and the loop rechecks at 250 ms instead of overlapping a
+retry ASR session.
 
 Transient / not app-owned:
 - **`corti-webinar-finish`** — one per manual webinar stop (`main.rs:536`); writes the WAV, sends
   `PipelineMsg::Process`, exits.
 - **`corti-capture-writer`** — one per recording, inside `CaptureSession`; streams the 2-track WAV.
 - **`corti-live`** — one per live-eligible detector recording (#87/#103, `app/src/live.rs`); drains the
-  fixed capture tee, runs streaming AEC/ASR, optionally diarizes one bounded rolling window, then appends and
-  OS-syncs that chunk. No transcript/audio collection grows with call duration. The detector's
-  `LiveHook` delivers its recording-specific finish/discard verdict before the later pipeline event; the
-  pipeline only collects the finished ID — see [transcription.md](transcription.md#live-inbox-filing-87).
-- **CoreAudio HAL callback threads** — `MicMonitor` listeners; they only `tx.send(Msg::…)` and never
-  touch capture (guardrail 9).
+  fixed capture tee, runs streaming AEC/ASR, publishes closed regions to the bounded timestamped reader,
+  optionally diarizes one bounded rolling window, then appends and OS-syncs that chunk. No transcript/audio
+  collection grows with call duration. The detector's `LiveHook` delivers its recording-specific
+  finish/discard verdict before the later pipeline event; the pipeline only collects the finished ID — see
+  [transcription.md](transcription.md#live-inbox-filing-87).
+- **`corti-live-test` + `corti-mic-test-capture`** — only during the explicit idle microphone test (#105).
+  The first owns one local ASR/VAD channel; the second drains a direct-input SPSC ring into bounded mono tee
+  chunks. Detector edges are paused, and neither thread writes a WAV/note/queue row.
+- **CoreAudio HAL callback threads** — `MicMonitor` listeners and capture IO procs; they only hand bounded work
+  to channels/rings and never decode or touch a webview (guardrail 9).
 
 Deliberately no tokio in the capture/pipeline path — `std::sync::mpsc` + std threads throughout.
 `tauri::async_runtime` (Tauri's internal tokio) carries only the startup mic-permission check
@@ -48,8 +54,8 @@ Deliberately no tokio in the capture/pipeline path — `std::sync::mpsc` + std t
 every background thread. The tray owns no state — it snapshots this on each rebuild
 (`build_menu`, `tray.rs:47`):
 
-- `detector_recording: AtomicBool`, `webinar_recording: AtomicBool` — independent capture-source
-  flags; the icon blinks while *either* is true, and they never clobber each other.
+- `detector_recording`, `webinar_recording`, `live_test_active`: independent atomic ownership flags; the icon
+  blinks while any capture/test is live, and tray actions use them to prevent overlap.
 - `status: Mutex<String>` — the top menu line.
 - `stage: AtomicU8` — the current pipeline `Stage` (`main.rs:121`), read by the `get_pipeline_activity`
   command for the How-Corti-Works window. A single last-writer-wins global (like `status`), so with
@@ -122,6 +128,7 @@ fire. Items, in order:
 | id | kind | notes |
 |---|---|---|
 | `status` | disabled line | `AppState.status` (`tray.rs:54`) |
+| `live_transcript` | contextual action | call: **Read live transcript…**; idle: **Test microphone & live transcription…**; active test: read it; webinar: disabled (#105) |
 | `webinar_toggle` | action | `▶ Start` / `■ Stop` from `webinar_recording` (`tray.rs:70`) |
 | `History ▸` | submenu | up to 5; each id `note::<path>` when filed+clickable, else disabled `history::<id>` (`tray.rs:77`) |
 | `backend` | disabled | live summary from `ConfigState` (`tray.rs:110`) |
@@ -141,7 +148,7 @@ there is no dedicated stats window.
 ### Blink
 
 `spawn_blink` (`tray.rs:297`) runs a plain `corti-blink` std thread — deliberately independent of any
-tokio runtime. It loops `sleep(500ms)`; reads `detector_recording || webinar_recording`; while
+tokio runtime. It loops `sleep(500ms)`; reads all three capture/test ownership flags; while
 recording it toggles a local `phase` and swaps `ICON_REC`/`ICON_IDLE` via `tray.set_icon` marshalled
 to the main thread; idle it rests on `ICON_IDLE`. A `shown: Option<bool>` dedups so `set_icon` fires
 only on an actual change (`tray.rs:302,320`). The throb is a 500 ms two-frame template swap driven by
@@ -149,8 +156,8 @@ the two `AtomicBool`s — nothing else.
 
 ## Windows — the `?view=` + activation-policy dance
 
-Five on-demand `WebviewWindow`s, all built from the *same* SPA `index.html`, differentiated by a
-`?view=` query param parsed in `app/ui/src/main.tsx:13` (branched at `main.tsx:29`). All five use the
+Six on-demand `WebviewWindow`s, all built from the *same* SPA `index.html`, differentiated by a
+`?view=` query param parsed in `app/ui/src/main.tsx` (including `?view=live`). All six use the
 shared `open_app_window` singleton/focus/activation-policy lifecycle:
 
 | Window | view | opener |
@@ -158,6 +165,7 @@ shared `open_app_window` singleton/focus/activation-policy lifecycle:
 | Ethics & Legality guide | *(none, default)* | `open_ethics_window` (`tray.rs:408`) |
 | Settings | `?view=settings` | `open_settings_window` (`tray.rs:420`) |
 | Recording Queue | `?view=queue` | `open_queue_window` (`tray.rs:432`, #85) |
+| Live Transcript / mic test | `?view=live` | contextual `live_transcript` tray action (#105) |
 | Diagnostics / console | `?view=console` | `open_console_window` |
 | How Corti Works | `?view=how` | `open_how_window` (`tray.rs:492`) |
 
@@ -173,7 +181,9 @@ queue: it pulls `list_recordings` and refetches on the coarse `queue-changed` ev
 
 Each is a singleton (focus-if-exists). The app launches windowless with
 `ActivationPolicy::Accessory` (no Dock icon, set at `setup`). The shared `open_app_window` flips to
-`ActivationPolicy::Regular` so any utility window can take focus; on `WindowEvent::Destroyed`,
+`ActivationPolicy::Regular`, explicitly activates `NSApplication` on the AppKit main thread, then
+unminimizes/shows/focuses the centered window; this prevents tray-opened windows hiding behind the current
+app (#105). On `WindowEvent::Destroyed`,
 `revert_activation_policy_if_no_windows` drops back to `Accessory` once the last window closes.
 
 ## Command surface — pull, plus one push
@@ -185,6 +195,7 @@ get_config · set_config · get_backends · get_aws_status · verify_aws · get_
 reveal_path · set_models_dir · get_models_status · get_embedding_models · download_model ·
 get_console_logs · get_console_logs_text · save_console_logs · get_stats · get_pipeline_activity ·
 list_recordings · retry_recording · open_note · reveal_audio          ← Recording Queue (#85)
+get_live_transcript · start_live_test · stop_live_test                 ← Live Transcript (#105)
 ```
 
 The Diagnostics console polls `get_stats` on a 1 s `setInterval` (`Console.tsx:113,148`); the How
@@ -193,7 +204,12 @@ window (`queue_ui.rs`, #85) is the exception to pure polling — it pulls `list_
 refetches on the pushed **`queue-changed`** event, whose reads go through a per-call **read-only** SQLite
 connection so the pipeline thread stays the DB's only writer.
 
-Rust→JS push events: **`model-download-progress`** — `app.emit(...)` in `settings.rs:532,545,592` for
+The Live Transcript window subscribes before its initial `get_live_transcript` snapshot, applies only
+increasing revisions/row sequences, and reconciles slowly in case WKWebView suspended an event. The managed
+store retains at most 2,000 rows/~1 MiB; the Vagus note remains durable authority.
+
+Rust→JS push events: **`live-transcript-changed`** — tiny state/row deltas from the bounded store;
+**`model-download-progress`** — `app.emit(...)` in `settings.rs:532,545,592` for
 the Settings model-downloader progress bar — and #85's **`queue-changed`** (`tray::emit_queue_changed`),
 emitted whenever any tray-history change moves so the Queue window tracks the pipeline for free. A live
 recording indicator could also poll `get_stats` (whose `StatsSnapshot` carries `detector_recording` /

@@ -1,9 +1,10 @@
 //! Owned CoreAudio bindings for corti: thin, safe wrappers over the macOS HAL.
 //!
-//! This crate is the foundation for three things, all of which live in CoreAudio HAL:
+//! This crate is the foundation for four things, all of which live in CoreAudio HAL:
 //!   - **mic-in-use detection** — `kAudioDevicePropertyDeviceIsRunningSomewhere` listener (the trigger);
 //!   - **per-process attribution** — the `kAudioHardwarePropertyProcessObjectList` family;
-//!   - **synchronized capture** — `AudioHardwareCreateProcessTap` + an aggregate device.
+//!   - **synchronized capture** — `AudioHardwareCreateProcessTap` + an aggregate device;
+//!   - **ephemeral microphone test capture** — direct default-input IO proc, no tap or file.
 //!
 //! It is Apple-Silicon / latest-macOS only by design (see the workspace README). The modules are added as
 //! each milestone lands; the spike binary (`src/bin/spike.rs`) validates the capture bet first.
@@ -21,8 +22,8 @@ pub mod process;
 pub mod tap;
 
 pub use capture::{
-    CaptureChunk, CaptureSession, CaptureTee, CapturedAudio, OutputLayout, RecordingHandle,
-    TapTarget,
+    CaptureChunk, CaptureSession, CaptureTee, CapturedAudio, MicrophoneCapture,
+    MicrophoneCaptureHandle, OutputLayout, RecordingHandle, TapTarget,
 };
 pub use listener::{DefaultInputDeviceMonitor, MicMonitor, default_input_device, is_running};
 pub use process::{MicOwner, mic_owner, other_app_holds_input};

@@ -67,7 +67,8 @@ thread, still serial — see [transcription.md](transcription.md).
 | `corti-detect` worker | `Detector::start` (`crates/corti-detect/src/platform.rs:64`, spawn `:90`) | `Machine` + `MicMonitor` + `DefaultInputDeviceMonitor` + the in-flight `Recorder`. The state machine + poll loop. |
 | `corti-pipeline` | `app/src/main.rs:343` | **Sole** `Queue` owner; a tick loop (`run`, `app/src/pipeline.rs:101`) that drains `PipelineMsg` **and** due `corti-jobs` (retry/sweep) serially. |
 | `corti-capture-writer` (one per recording) | `crates/corti-coreaudio/src/capture.rs:416` | Drains the `rtrb` ring and writes the 2-track WAV with `hound` (`run_writer`, `:634`). |
-| `corti-live` (one per eligible detector recording, #87/#103) | `LiveManager::spawn` via the detector's `LiveHook` | Drains the bounded tee → streaming AEC + two channels sharing the selected resident Parakeet ASR (`sherpa`/CPU or `transcribe.cpp`/Metal); checkpoints on the configured interval, optionally diarizes only that bounded far-end window, appends + `sync_all`s once, then syncs the final `State:` flip. Panic-contained; any failure preserves prior chunks and falls back to the same note. |
+| `corti-live` (one per eligible detector recording, #87/#103/#105) | `LiveManager::spawn` via the detector's `LiveHook` | Drains the bounded tee → streaming AEC + two channels sharing the selected resident Parakeet ASR (`sherpa`/CPU or `transcribe.cpp`/Metal); publishes closed regions to the bounded reader, checkpoints on the configured interval, optionally diarizes only that bounded far-end window, appends + `sync_all`s once, then syncs the final `State:` flip. Panic-contained; any failure preserves prior chunks and falls back to the same note. |
+| `corti-live-test` + `corti-mic-test-capture` (#105) | contextual idle tray action | One selected local ASR/VAD channel plus direct default-input SPSC-ring consumer. No tap, WAV, note, or queue row; detector edges/background jobs are deferred until cleanup. |
 | `corti-blink`, `corti-stats` | `app/src/tray.rs`, `app/src/stats.rs` | Icon-swap animation; 1 Hz stats sampler. |
 | CoreAudio HAL callback threads | OS/CoreAudio | `MicMonitor`/`DefaultInputDeviceMonitor` trampolines and `io_proc`. They only push (`tx.send` / ring write) — never touch capture state (guardrail 9). |
 
@@ -77,11 +78,13 @@ See [app.md](app.md) for the tray/window/command surface and the full thread inv
 
 | Carrier | Type | From → To | Payload |
 |---------|------|-----------|---------|
-| HAL → detector | `std::sync::mpsc::Sender<Msg>` (`platform.rs`) | `MicMonitor`/`DefaultInputDeviceMonitor` callback → detect worker | `Msg::Signal(bool)` / `Msg::DeviceChanged` / `Msg::Shutdown` (`platform.rs:24-28`) |
+| HAL/app → detector | `std::sync::mpsc::Sender<Msg>` (`platform.rs`) | mic/device callbacks + test controller → detect worker | `Signal` / `DeviceChanged` / acknowledged `Pause` / `Resume` / `Shutdown` |
 | capture data plane | `rtrb::Producer<f32>` / `Consumer<f32>` (SPSC, wait-free) | `io_proc` → writer thread | interleaved f32 frames (mic channels first, then tap — the me/them contract). Ring sized `sample_rate · 8ch · RING_SECONDS` (`ring_capacity`, `capture.rs:134`, default 30 s, `:60`). |
 | detector → app | closure callback (`DetectorEvent`) | detect worker → `handle_detector_event` (`main.rs:381`) | `RecordingStarted` / `RecordingFinished{meta, audio_path}` / `RecordingDiscarded` / `Error` (`crates/corti-detect/src/lib.rs:43`) |
 | app → pipeline | `std::sync::mpsc::Sender<PipelineMsg>` (`main.rs:319`) | detector callback + webinar-finish thread + Queue-window Retry + corti-live thread → pipeline worker | `Process{meta, audio_path}` / `Retry{id}` / `ReloadConfig` / #87's `LiveNoteCreated{meta, note_path}` + `LiveDiscarded{id}` (`pipeline.rs:48`) |
 | capture tee (#87/#103) | bounded `SyncSender<CaptureChunk>` in a `CaptureTee` (`TEE_BACKLOG = 2048`, fixed ≤~64 MiB at 48 kHz) | writer thread → `corti-live` thread | ~4096-frame downmixed mono `(mic, tap)` chunks; `try_send` only — full ⇒ dropped + counted, the WAV is untouched |
+| mic-test ring + tee (#105) | fixed `rtrb` + `CaptureTee` (128 chunks) | direct default-input IO proc → mic worker → test ASR | mono `mic`, empty `tap`; no disk writer |
+| live reader event | managed bounded store + `live-transcript-changed` | call/test worker → Tauri webview | monotonic timestamped row/state deltas; open-late snapshot repairs/re-hydrates |
 
 The `mpsc` control channels carry coarse events with file paths; the `rtrb` ring is the primary
 data-plane carrier, plus (#87) the bounded lossy tee that hands the live consumer its downmixed
@@ -121,8 +124,8 @@ Two things the diagram makes explicit because they are routinely misremembered:
    `io_proc` and spawns an in-process writer thread. No child process is forked to record. The
    **only** subprocess in the whole flow is the external `vagus` CLI at filing time
    (`crates/corti-vagus/src/lib.rs:102`).
-2. **The WAV on disk is still the source of truth — live transcription is a tee, not a replacement.**
-   The capture path always streams f32 frames to the 2-track WAV; the #87 live path consumes a
+2. **The detector recording WAV is still the source of truth — live transcription is a tee, not a replacement.**
+   The detector capture path always streams f32 frames to the 2-track WAV; the #87 live path consumes a
    bounded lossy *copy* and can never stall or corrupt the recording. When live filing is eligible
    (local backend + selected ASR/shared configured models + `live_filing`), bounded transcript windows are diarized and
    OS-synced during the call and batch transcription is skipped; on any live-path failure — or for webinar/manual captures, which have
@@ -130,6 +133,11 @@ Two things the diagram makes explicit because they are routinely misremembered:
    file. The `Transcriber` trait still takes a `&Path` to a complete 2-track WAV
    (`crates/corti-transcribe/src/lib.rs:23`); the chunked surface is `LiveTranscriber`
    (ADR 0009) — see [streaming.md](streaming.md) and [transcription.md](transcription.md).
+3. **The Live Transcript window is a bounded observer, not a new authority.** Closed VAD regions are copied
+   into a 2,000-row/~1 MiB transient store and pushed to the webview with call-relative timestamps; durable
+   filing/fallback remains unchanged. The explicit idle microphone test is the one capture exception to point
+   2: it opens the input device directly and intentionally creates no tap, aggregate, WAV, queue row, or note
+   (ADR 0013).
 
 ## Async islands
 

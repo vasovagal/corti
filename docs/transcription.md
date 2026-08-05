@@ -191,7 +191,10 @@ the exact cloud address remains until deletion is acknowledged.
 For detector recordings, transcription + filing now happen **while the call records**, so `tail -f`
 on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTranscriber`s → note) is in
 [streaming.md](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010); the write authority is
-[ADR 0010](../design/adr/0010-live-inbox-filing.md). The filing semantics:
+[ADR 0010](../design/adr/0010-live-inbox-filing.md). ADR 0013 adds a separate transient reader: each closed
+VAD region reaches the timestamped Live Transcript window immediately, before the configured durable-note
+boundary, through a 2,000-row/~1 MiB bounded store. That observer never owns filing, fallback, or note state.
+The filing semantics:
 
 - **State-line + storage contract (for inbox agents).** The first corti-authored body line is exactly
   `State: transcribing` while windows stream in, and exactly `State: transcribed ` — one trailing space,
@@ -232,6 +235,10 @@ on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTr
   decode/drain and cleanup finish. If reaper spawn fails, the original handle/reporter are retained and the
   pipeline performs the join. If unlink fails, the path is reported for another attempt and then retained in
   a Failed row/closed note rather than being forgotten at `State: transcribing`.
+- **Ephemeral microphone test.** When no call/webinar/transcription is active, the tray can load the same
+  selected local ASR/VAD and feed it a direct default-microphone capture. Detector edges are paused before the
+  microphone opens and resumed after it closes. Test text is retained only in the bounded UI store; no WAV,
+  queue row, checkpoint, note, or cleanup job exists.
 - **Startup reaper.** A quit/crash mid-call can strand a row at `Recording` (created by the live
   note's mid-call persist). At startup the worker reaps them (`reap_recording_rows`,
   `app/src/pipeline.rs:623`): audio still on disk → reset to `PendingTranscription` + a due-now

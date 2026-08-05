@@ -180,6 +180,55 @@ export interface PipelineActivity {
 export const getPipelineActivity = (): Promise<PipelineActivity> =>
   invoke<PipelineActivity>("get_pipeline_activity");
 
+// ----- Timestamped Live Transcript window -----
+
+export type LiveTranscriptMode = "idle" | "call" | "test";
+export type LiveTranscriptStatus =
+  | "idle"
+  | "loading"
+  | "listening"
+  | "stopping"
+  | "complete"
+  | "unavailable"
+  | "error";
+
+export interface LiveTranscriptLine {
+  seq: number;
+  speaker: string;
+  start_sec: number;
+  end_sec: number;
+  text: string;
+}
+
+export interface LiveTranscriptSnapshot {
+  revision: number;
+  session_id: string | null;
+  mode: LiveTranscriptMode;
+  status: LiveTranscriptStatus;
+  title: string;
+  detail: string | null;
+  active: boolean;
+  evicted_lines: number;
+  retained_from_seq: number;
+  lines: LiveTranscriptLine[];
+}
+
+export interface LiveTranscriptEvent extends Omit<LiveTranscriptSnapshot, "lines"> {
+  reset: boolean;
+  line: LiveTranscriptLine | null;
+}
+
+export const getLiveTranscript = (): Promise<LiveTranscriptSnapshot> =>
+  invoke<LiveTranscriptSnapshot>("get_live_transcript");
+
+export const startLiveTest = (): Promise<void> => invoke<void>("start_live_test");
+export const stopLiveTest = (): Promise<void> => invoke<void>("stop_live_test");
+
+export const onLiveTranscriptChanged = (
+  handler: (event: LiveTranscriptEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<LiveTranscriptEvent>("live-transcript-changed", (event) => handler(event.payload));
+
 // ----- Recording Queue window -----
 
 /** Mirror of Rust `queue_ui::RecordingDto`. */

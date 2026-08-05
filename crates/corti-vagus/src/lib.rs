@@ -33,7 +33,7 @@ pub struct Vagus {
 
 impl Vagus {
     /// Resolve the `vagus` binary: `$VAGUS_BIN` override, else `vagus` on `PATH`, else the well-known
-    /// install dirs in [`default_candidates`].
+    /// install dirs returned by `default_candidates`.
     ///
     /// Verifies it is runnable now so callers fail fast with a clear message rather than at filing time.
     pub fn discover() -> Result<Self> {

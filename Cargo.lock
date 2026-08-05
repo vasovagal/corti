@@ -1401,6 +1401,8 @@ dependencies = [
  "hound",
  "jiff",
  "libc",
+ "objc2",
+ "objc2-app-kit",
  "rfd",
  "serde",
  "serde_json",

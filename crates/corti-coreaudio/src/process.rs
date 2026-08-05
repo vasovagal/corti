@@ -47,7 +47,7 @@ pub fn mic_owner() -> MicOwner {
 /// IO is "running" even before any audio flows / before the TCC grant). So the
 /// [`MicMonitor`](crate::MicMonitor) *falling* edge never fires while we're capturing. To detect that the
 /// *call* actually ended, poll this instead: it asks, at the process level, whether any app besides us
-/// still has mic input running. Mirrors [`best_running_input_app`]'s ranking via [`counts_as_call_owner`]:
+/// still has mic input running. Mirrors `best_running_input_app`'s ranking via `counts_as_call_owner`:
 /// a recognized conferencing app counts even when it's an Apple app (FaceTime, Safari are `com.apple.*`),
 /// as does any non-Apple app with a bundle id — but not an unrecognized `com.apple.*` audio helper.
 pub fn other_app_holds_input(self_pid: i32) -> bool {

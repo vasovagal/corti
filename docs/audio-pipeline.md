@@ -118,9 +118,10 @@ pipeline derivative: it remains available during a filing retry and is removed a
 the raw recording is retained until the configured sweep. `cancel(mic,far,sr,cfg)` remains the
 intentional full-input-lookahead scoring shim.
 
-**Why post-capture today:** relocating `StreamingAec::push()` into the writer thread (so `me` is
-cleaned live) is unbuilt — issue #74, the hard blocker for live transcription (ADR 0008). Until it
-lands, AEC is a whole-file pass after `finish()`.
+**Batch vs live:** the canonical fallback/batch AEC remains the whole-file pass above. Issue #74 shipped the
+live alternative without putting DSP on the writer: the writer emits a bounded, lossy mic/tap tee and the
+`corti-live` consumer runs `StreamingAec::push()` off the capture thread. Closed regions feed both ADR 0012's
+rolling note and ADR 0013's timestamped reader; a tee drop still selects the lossless post-capture fallback.
 
 ## corti-tap shares the same path
 

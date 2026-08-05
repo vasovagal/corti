@@ -29,6 +29,10 @@ mod jobs;
 #[cfg(target_os = "macos")]
 mod live;
 #[cfg(target_os = "macos")]
+mod live_test;
+#[cfg(target_os = "macos")]
+mod live_view;
+#[cfg(target_os = "macos")]
 mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
@@ -157,9 +161,12 @@ pub(crate) mod imp {
         /// Whether the detector (mic-triggered) capture is in flight.
         pub detector_recording: AtomicBool,
         /// Whether a manual webinar (tap-only) capture is in flight. Kept separate from
-        /// [`detector_recording`] so the two independent sources never clobber each other's blink/guard
-        /// state; the icon blinks while *either* is true.
+        /// [`detector_recording`] so the independent sources never clobber each other's blink/guard state.
         pub webinar_recording: AtomicBool,
+        /// Whether Corti's explicit, non-filing microphone transcription test owns the default input.
+        /// It participates in tray context/blink and excludes detector/webinar capture, but is not a
+        /// pipeline `Recording` stage and never creates history.
+        pub live_test_active: AtomicBool,
         /// The status line shown at the top of the tray menu.
         pub status: Mutex<String>,
         /// The current pipeline [`Stage`], read by the `get_pipeline_activity` command. A single global
@@ -182,6 +189,7 @@ pub(crate) mod imp {
             Self {
                 detector_recording: AtomicBool::new(false),
                 webinar_recording: AtomicBool::new(false),
+                live_test_active: AtomicBool::new(false),
                 status: Mutex::new("Starting…".to_string()),
                 stage: AtomicU8::new(Stage::Idle as u8),
                 history: Mutex::new(VecDeque::new()),
@@ -195,9 +203,9 @@ pub(crate) mod imp {
     }
 
     /// Keeps the [`Detector`] alive for the app's lifetime. `Detector` is `Send` but not `Sync`, so the
-    /// `Mutex` makes the managed holder `Send + Sync`. We never lock it — it exists only to own the detector
-    /// (whose `Drop` stops the worker + removes HAL listeners).
-    struct DetectorHandle(#[allow(dead_code)] Mutex<Detector>);
+    /// `Mutex` makes the managed holder `Send + Sync`. The live-test controller briefly locks it only to
+    /// pause/resume edge detection around Corti's own microphone use.
+    struct DetectorHandle(Mutex<Detector>);
 
     /// Manual "Webinar mode": a live tap-only [`Recorder`] driven by the tray toggle, plus a clone of the
     /// channel to the pipeline worker so a finished webinar enters the same transcribe → file path as a
@@ -234,7 +242,7 @@ pub(crate) mod imp {
     // The manual webinar's owning-app name (`corti_core::WEBINAR_NAME`) is the single signal `RecordingMeta::mode`
     // derives the webinar/call distinction from — kept in corti-core so the producer here and the consumer agree.
 
-    /// Holds the file-appender's non-blocking [`WorkerGuard`] for the process lifetime. Dropping the guard
+    /// Holds the file-appender's non-blocking `WorkerGuard` for the process lifetime. Dropping the guard
     /// would stop the background writer thread and lose any buffered log lines, so it lives in this static
     /// (set once in [`run_app`]) and is never dropped while the app runs.
     static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
@@ -274,6 +282,9 @@ pub(crate) mod imp {
                 crate::console::save_console_logs,
                 crate::stats::get_stats,
                 crate::activity::get_pipeline_activity,
+                crate::live_view::get_live_transcript,
+                crate::live_test::start_live_test,
+                crate::live_test::stop_live_test,
                 crate::queue_ui::list_recordings,
                 crate::queue_ui::retry_recording,
                 crate::queue_ui::open_note,
@@ -317,6 +328,11 @@ pub(crate) mod imp {
         // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
         app.manage(AppState::new());
 
+        // Transient, bounded timestamped transcript state. The same clone feeds call/test workers; managing
+        // it exposes open-late snapshots to the singleton Live Transcript webview.
+        let live_transcript = crate::live_view::LiveTranscriptStore::for_app(app.handle().clone());
+        app.manage(live_transcript.clone());
+
         // The diagnostics console ring buffer the `get_console_logs*`/`save_console_logs` commands read.
         // It already backs the live `ConsoleLayer` (installed in `run_app`); managing it just exposes the
         // same shared buffer to the webview.
@@ -343,7 +359,14 @@ pub(crate) mod imp {
 
         // Live-filing sessions (#87): the detector hook owns spawn/terminal verdict delivery; the
         // pipeline collects recording-scoped outcomes and owns durable fallback cleanup.
-        let live_manager = Arc::new(crate::live::LiveManager::new());
+        let live_manager = Arc::new(crate::live::LiveManager::with_transcript(
+            live_transcript.clone(),
+        ));
+        app.manage(crate::live_test::LiveTestManager::new(
+            live_manager.clone(),
+            shared_cfg.clone(),
+            live_transcript.clone(),
+        ));
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned
         // background jobs, then drains recordings + due durable jobs (retry/sweep) serially (#85).
@@ -407,6 +430,14 @@ pub(crate) mod imp {
                     "recording started"
                 );
                 set_detector_recording(app, true);
+                let id = corti_queue::job_id(&meta);
+                if let Some(store) = app.try_state::<crate::live_view::LiveTranscriptStore>() {
+                    store.ensure_unavailable_call(
+                        &id,
+                        &meta.owning_app.name,
+                        "Live streaming is unavailable for this call. It requires live filing, the local backend, and all selected local models.".to_string(),
+                    );
+                }
                 set_stage(app, Stage::Recording);
                 tray::push_history_recording(app, &meta);
                 tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
@@ -480,18 +511,60 @@ pub(crate) mod imp {
         }
     }
 
-    /// Whether the detector (mic-triggered) capture is currently running — used to refuse a webinar start.
-    fn detector_recording(app: &tauri::AppHandle) -> bool {
+    pub(crate) fn set_live_test_active(app: &tauri::AppHandle, on: bool) {
+        if let Some(state) = app.try_state::<AppState>() {
+            state.live_test_active.store(on, Ordering::Relaxed);
+        }
+        tray::refresh_menu(app);
+    }
+
+    pub(crate) fn live_test_active(app: &tauri::AppHandle) -> bool {
+        app.try_state::<AppState>()
+            .map(|state| state.live_test_active.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn transcription_active(app: &tauri::AppHandle) -> bool {
+        app.try_state::<AppState>()
+            .is_some_and(|state| state.stage() == Stage::Transcribing)
+    }
+
+    /// Whether the detector (mic-triggered) capture is currently running — used to exclude manual modes.
+    pub(crate) fn detector_recording(app: &tauri::AppHandle) -> bool {
         app.try_state::<AppState>()
             .map(|s| s.detector_recording.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
 
     /// Whether a manual webinar recording is currently in flight — drives the tray toggle's label.
-    pub fn webinar_active(app: &tauri::AppHandle) -> bool {
+    pub(crate) fn webinar_active(app: &tauri::AppHandle) -> bool {
         app.try_state::<Webinar>()
             .map(|w| w.lock().recorder.is_some())
             .unwrap_or(false)
+    }
+
+    /// Pause detector edges only after its worker confirms no real recording is in flight.
+    pub(crate) fn pause_detector(app: &tauri::AppHandle) -> Result<()> {
+        let detector = app
+            .try_state::<DetectorHandle>()
+            .context("detector is unavailable")?;
+        if detector.0.lock().unwrap().pause()? {
+            Ok(())
+        } else {
+            anyhow::bail!("a detected call is already recording")
+        }
+    }
+
+    pub(crate) fn resume_detector(app: &tauri::AppHandle) {
+        if let Some(detector) = app.try_state::<DetectorHandle>()
+            && let Err(error) = detector.0.lock().unwrap().resume()
+        {
+            tracing::warn!(
+                target: "corti::live_test",
+                error = %format!("{error:#}"),
+                "could not resume call detection after microphone test"
+            );
+        }
     }
 
     /// Start or stop a manual tap-only "webinar" recording from the tray. Invoked on the main thread (the
@@ -527,8 +600,8 @@ pub(crate) mod imp {
                     started_at,
                     tx: w.tx.clone(),
                 }
-            } else if detector_recording(app) {
-                // A detected call is already recording; refuse to double-capture.
+            } else if detector_recording(app) || live_test_active(app) {
+                // A detected call or explicit mic test already owns capture; refuse to double-capture.
                 Next::Busy
             } else {
                 Next::StartRequested
@@ -553,7 +626,7 @@ pub(crate) mod imp {
             }
             Next::Busy => tray::set_status(
                 app,
-                "Can't start webinar — a call is already recording".to_string(),
+                "Can't start webinar — the microphone is already in use by Corti".to_string(),
             ),
             Next::StartRequested => {
                 // Start the capture OUTSIDE the lock: a panic in CoreAudio FFI here won't poison the

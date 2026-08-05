@@ -335,7 +335,7 @@ impl AppConfig {
     }
 
     /// Stable, low-cardinality label for stats records ("aws" | "local" | "none"), distinct from the
-    /// human-readable [`backend_name`]. Feature-gated like backend_name so an uncompiled backend reads
+    /// human-readable `backend_name`. Feature-gated like `backend_name` so an uncompiled backend reads
     /// "none".
     pub fn backend_label(&self) -> &'static str {
         match self.transcribe_backend {

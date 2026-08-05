@@ -58,6 +58,20 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     )?));
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
 
+    let detector_live = state.detector_recording.load(Ordering::Relaxed);
+    let test_live = state.live_test_active.load(Ordering::Relaxed);
+    let webinar_live = crate::imp::webinar_active(app);
+    let (live_label, live_enabled) =
+        live_transcript_menu_state(detector_live, test_live, webinar_live);
+    items.push(Box::new(MenuItem::with_id(
+        app,
+        "live_transcript",
+        live_label,
+        live_enabled,
+        None::<&str>,
+    )?));
+    items.push(Box::new(PredefinedMenuItem::separator(app)?));
+
     // Manual "Webinar mode" toggle (tap-only, mic never opened). The label reflects whether a webinar is
     // currently recording.
     let webinar_label = if crate::imp::webinar_active(app) {
@@ -174,6 +188,51 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 
     let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|b| &**b).collect();
     Menu::with_items(app, &refs)
+}
+
+fn live_transcript_menu_state(
+    detector_live: bool,
+    test_live: bool,
+    webinar_live: bool,
+) -> (&'static str, bool) {
+    if detector_live {
+        ("Read live transcript…", true)
+    } else if test_live {
+        ("Read microphone test transcript…", true)
+    } else if webinar_live {
+        ("Test microphone & live transcription…", false)
+    } else {
+        ("Test microphone & live transcription…", true)
+    }
+}
+
+fn handle_live_transcript_action(app: &AppHandle) {
+    let (detector_live, test_live) = app
+        .try_state::<AppState>()
+        .map(|state| {
+            (
+                state.detector_recording.load(Ordering::Relaxed),
+                state.live_test_active.load(Ordering::Relaxed),
+            )
+        })
+        .unwrap_or((false, false));
+    if !detector_live && !test_live {
+        let result = app
+            .try_state::<crate::live_test::LiveTestManager>()
+            .ok_or_else(|| anyhow::anyhow!("microphone-test manager is unavailable"))
+            .and_then(|manager| manager.start(app));
+        if let Err(error) = result {
+            let detail = format!("Could not start microphone test: {error:#}");
+            // Do not overwrite a call that won the race after the tray menu snapshot was built.
+            if !crate::imp::detector_recording(app)
+                && let Some(store) = app.try_state::<crate::live_view::LiveTranscriptStore>()
+            {
+                store.show_test_error(&detail);
+            }
+            set_status(app, format!("⚠ {detail}"));
+        }
+    }
+    open_live_transcript_window(app);
 }
 
 /// Update the status line and rebuild the menu.
@@ -309,6 +368,7 @@ pub fn spawn_blink(app: AppHandle) {
                     .map(|s| {
                         s.detector_recording.load(Ordering::Relaxed)
                             || s.webinar_recording.load(Ordering::Relaxed)
+                            || s.live_test_active.load(Ordering::Relaxed)
                     })
                     .unwrap_or(false);
                 let want = if recording {
@@ -343,6 +403,7 @@ pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         "ethics_guide" => open_ethics_window(app),
         "open_how" => open_how_window(app),
         "open_diagnostics" => open_console_window(app),
+        "live_transcript" => handle_live_transcript_action(app),
         "webinar_toggle" => crate::imp::toggle(app),
         // A recent-note click opens the note; disabled labels (status/backend/bucket/header) never fire.
         _ => {
@@ -370,9 +431,7 @@ fn open_app_window(
     let _ = app.clone().run_on_main_thread(move || {
         // Singleton: focus the existing window instead of spawning a second.
         if let Some(win) = app.get_webview_window(label) {
-            let _ = win.unminimize();
-            let _ = win.show();
-            let _ = win.set_focus();
+            foreground_window(&app, &win);
             return;
         }
 
@@ -384,9 +443,11 @@ fn open_app_window(
             .inner_size(size.0, size.1)
             .min_inner_size(min_size.0, min_size.1)
             .resizable(true)
+            .center()
             .build()
         {
             Ok(win) => {
+                foreground_window(&app, &win);
                 // On close, drop back to menu-bar-only so no stale Dock icon lingers.
                 let app_for_evt = app.clone();
                 win.on_window_event(move |event| {
@@ -402,6 +463,20 @@ fn open_app_window(
             }
         }
     });
+}
+
+/// Activate Corti itself before focusing the webview. `set_focus` alone can leave an Accessory app's new
+/// window behind the currently active application (the tray-open bug reported with issue #105).
+fn foreground_window(app: &AppHandle, win: &tauri::WebviewWindow) {
+    let _ = app.set_activation_policy(ActivationPolicy::Regular);
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        let ns_app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        ns_app.activateIgnoringOtherApps(true);
+    }
+    let _ = win.unminimize();
+    let _ = win.show();
+    let _ = win.set_focus();
 }
 
 /// The in-app "Ethics & Legality Guide" window.
@@ -425,6 +500,18 @@ fn open_settings_window(app: &AppHandle) {
         "Settings",
         (720.0, 640.0),
         (560.0, 420.0),
+    );
+}
+
+/// The timestamped live call / ephemeral microphone-test reader.
+fn open_live_transcript_window(app: &AppHandle) {
+    open_app_window(
+        app,
+        "live",
+        "index.html?view=live",
+        "Live Transcript",
+        (760.0, 620.0),
+        (520.0, 360.0),
     );
 }
 
@@ -584,13 +671,33 @@ fn open_url(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTE_PREFIX, format_duration, history_entry_label, mode_tag, note_menu_id,
-        note_path_from_id, relative_time, status_label,
+        NOTE_PREFIX, format_duration, history_entry_label, live_transcript_menu_state, mode_tag,
+        note_menu_id, note_path_from_id, relative_time, status_label,
     };
     use crate::imp::HistoryEntry;
     use chrono::{DateTime, Duration, Local, TimeZone};
     use corti_core::{JobStatus, RecordingMode};
     use std::path::Path;
+
+    #[test]
+    fn live_transcript_action_tracks_call_test_and_webinar_context() {
+        assert_eq!(
+            live_transcript_menu_state(true, false, false),
+            ("Read live transcript…", true)
+        );
+        assert_eq!(
+            live_transcript_menu_state(false, true, false),
+            ("Read microphone test transcript…", true)
+        );
+        assert_eq!(
+            live_transcript_menu_state(false, false, false),
+            ("Test microphone & live transcription…", true)
+        );
+        assert_eq!(
+            live_transcript_menu_state(false, false, true),
+            ("Test microphone & live transcription…", false)
+        );
+    }
 
     #[test]
     fn note_menu_id_round_trips() {

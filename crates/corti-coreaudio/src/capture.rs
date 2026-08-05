@@ -80,7 +80,7 @@ pub struct CaptureChunk {
 
 /// A **bounded, lossy** tee of the downmixed capture stream, for live consumers (AEC / transcription).
 ///
-/// The writer thread `try_send`s ~[`TEE_FRAMES_PER_CHUNK`]-frame chunks and **never blocks**: if the consumer
+/// The writer thread `try_send`s ~`TEE_FRAMES_PER_CHUNK`-frame chunks and **never blocks**: if the consumer
 /// falls behind (channel full) or hangs up, the chunk is dropped and counted — the on-disk WAV is unaffected.
 /// The tee is strictly additive; with no tee attached the writer path is byte-identical to before (ADR 0009).
 /// Construct from the `SyncSender` half of a `sync_channel` (the caller keeps the `Receiver`); size the
@@ -514,6 +514,148 @@ impl Drop for CaptureSession {
     }
 }
 
+/// Ephemeral microphone-only capture for the in-app transcription test. Unlike [`CaptureSession`], this
+/// opens the default input device directly: no process tap, aggregate device, system-audio permission, or
+/// on-disk WAV. The HAL callback still writes only to the same fixed SPSC ring; a worker downmixes to mono
+/// and `try_send`s bounded [`CaptureChunk`]s whose `tap` side is empty.
+pub struct MicrophoneCapture {
+    device_id: ca::AudioObjectID,
+    proc_id: ca::AudioDeviceIOProcID,
+    state: *mut Cap,
+    sample_rate: u32,
+    worker: Option<JoinHandle<u64>>,
+    tee_dropped: Arc<AtomicU64>,
+}
+
+// The session uniquely owns its HAL proc/state and tears them down before freeing, so moving it to the
+// test worker thread is sound.
+unsafe impl Send for MicrophoneCapture {}
+
+/// Final bounded-capture counters from [`MicrophoneCapture::stop`].
+#[derive(Debug, Clone, Copy)]
+pub struct MicrophoneCaptureHandle {
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub callbacks: u32,
+    pub dropped_samples: u64,
+    pub tee_dropped_chunks: u64,
+}
+
+impl MicrophoneCapture {
+    /// Open the default microphone and begin bounded mono tee delivery. Returns after the IO proc and worker
+    /// are both running. Every fallible start path tears down the proc/state before returning.
+    pub fn start(tee: CaptureTee) -> Result<Self> {
+        let device_id = listener::default_input_device().context("default input device")?;
+        let sample_rate = unsafe { aggregate_input_format(device_id) }
+            .map(|format| format.mSampleRate as u32)
+            .unwrap_or(48_000)
+            .max(1);
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(0),
+            mic_channels: AtomicU32::new(0),
+            callbacks: AtomicU32::new(0),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity(sample_rate));
+        let state = Box::into_raw(Box::new(Cap {
+            producer: UnsafeCell::new(producer),
+            shared: shared.clone(),
+        }));
+
+        let mut proc_id: ca::AudioDeviceIOProcID = None;
+        let status = unsafe {
+            ca::AudioDeviceCreateIOProcID(device_id, Some(io_proc), state.cast(), &mut proc_id)
+        };
+        if status != 0 {
+            unsafe { drop(Box::from_raw(state)) };
+            bail!("AudioDeviceCreateIOProcID(microphone) failed: OSStatus {status}");
+        }
+        let status = unsafe { ca::AudioDeviceStart(device_id, proc_id) };
+        if status != 0 {
+            unsafe {
+                ca::AudioDeviceDestroyIOProcID(device_id, proc_id);
+                drop(Box::from_raw(state));
+            }
+            bail!("AudioDeviceStart(microphone) failed: OSStatus {status}");
+        }
+
+        let tee_dropped = tee.dropped.clone();
+        let worker = match std::thread::Builder::new()
+            .name("corti-mic-test-capture".into())
+            .spawn(move || run_microphone_tee(consumer, shared, tee))
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                unsafe {
+                    ca::AudioDeviceStop(device_id, proc_id);
+                    ca::AudioDeviceDestroyIOProcID(device_id, proc_id);
+                    drop(Box::from_raw(state));
+                }
+                return Err(error).context("spawning microphone capture worker");
+            }
+        };
+
+        Ok(Self {
+            device_id,
+            proc_id,
+            state,
+            sample_rate,
+            worker: Some(worker),
+            tee_dropped,
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Stop the IO proc, drain and close the tee, and return final quality counters.
+    pub fn stop(mut self) -> Result<MicrophoneCaptureHandle> {
+        unsafe {
+            ca::AudioDeviceStop(self.device_id, self.proc_id);
+            ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id);
+        }
+        let cap = unsafe { &*self.state };
+        let callbacks = cap.shared.callbacks.load(Ordering::Acquire);
+        let dropped_samples = cap.shared.dropped.load(Ordering::Acquire);
+        unsafe { drop(Box::from_raw(self.state)) };
+        self.state = std::ptr::null_mut();
+        let frames = match self.worker.take() {
+            Some(worker) => worker
+                .join()
+                .map_err(|_| anyhow!("microphone capture worker panicked")),
+            None => Ok(0),
+        };
+        let tee_dropped_chunks = self.tee_dropped.load(Ordering::Acquire);
+        let sample_rate = self.sample_rate;
+        std::mem::forget(self);
+        Ok(MicrophoneCaptureHandle {
+            frames: frames?,
+            sample_rate,
+            callbacks,
+            dropped_samples,
+            tee_dropped_chunks,
+        })
+    }
+}
+
+impl Drop for MicrophoneCapture {
+    fn drop(&mut self) {
+        unsafe {
+            ca::AudioDeviceStop(self.device_id, self.proc_id);
+            ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id);
+            if !self.state.is_null() {
+                drop(Box::from_raw(self.state));
+                self.state = std::ptr::null_mut();
+            }
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// State shared between the IO proc (the single producer) and the writer thread + session (readers).
 struct Shared {
     total_channels: AtomicU32,
@@ -624,6 +766,74 @@ unsafe extern "C" fn io_proc(
         }
     }
     0
+}
+
+/// Drain a direct microphone device into bounded mono tee chunks. No file is created and no sample vector
+/// grows past one HAL frame plus [`TEE_FRAMES_PER_CHUNK`].
+fn run_microphone_tee(
+    mut consumer: rtrb::Consumer<f32>,
+    shared: Arc<Shared>,
+    tee: CaptureTee,
+) -> u64 {
+    let total = loop {
+        let channels = shared.total_channels.load(Ordering::Acquire) as usize;
+        if channels > 0 {
+            break channels;
+        }
+        if consumer.is_abandoned() {
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let mut frame = Vec::with_capacity(total);
+    let mut mono = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
+    let mut frames = 0u64;
+    loop {
+        let available = consumer.slots();
+        if available == 0 {
+            if consumer.is_abandoned() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        let chunk = match consumer.read_chunk(available) {
+            Ok(chunk) => chunk,
+            Err(_) => break,
+        };
+        let (head, tail) = chunk.as_slices();
+        for &sample in head.iter().chain(tail.iter()) {
+            frame.push(sample);
+            if frame.len() == total {
+                mono.push(frame_mean(&frame, 0, total));
+                frame.clear();
+                frames = frames.saturating_add(1);
+                if mono.len() >= TEE_FRAMES_PER_CHUNK {
+                    send_microphone_chunk(&tee, &mut mono);
+                }
+            }
+        }
+        chunk.commit_all();
+    }
+    send_microphone_chunk(&tee, &mut mono);
+    frames
+}
+
+/// Non-blocking mic-only counterpart to [`send_tee_chunk`]. `tap` is intentionally empty so a consumer
+/// cannot mistake the test for far-end/system audio.
+fn send_microphone_chunk(tee: &CaptureTee, mic: &mut Vec<f32>) {
+    if mic.is_empty() {
+        return;
+    }
+    let chunk = CaptureChunk {
+        mic: std::mem::take(mic),
+        tap: Vec::new(),
+    };
+    *mic = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
+    if tee.tx.try_send(chunk).is_err() {
+        tee.dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The streaming writer thread: drain the ring, downmix each interleaved frame per `layout`, and write it to
@@ -1219,6 +1429,40 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Acquire), 0, "consumer kept up");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn microphone_tee_is_mono_and_has_no_system_audio_side() {
+        let frames = TEE_FRAMES_PER_CHUNK + 7;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(frames * 2 + 8);
+        for _ in 0..frames {
+            producer.push(0.25).unwrap();
+            producer.push(0.75).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(2),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureChunk>(4);
+        let tee = CaptureTee::new(tx);
+
+        assert_eq!(run_microphone_tee(consumer, shared, tee), frames as u64);
+        let chunks: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.mic.len()).sum::<usize>(),
+            frames
+        );
+        assert!(chunks.iter().all(|chunk| chunk.tap.is_empty()));
+        assert!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.mic)
+                .all(|sample| (*sample - 0.5).abs() < 1e-6)
+        );
     }
 
     /// A bounded tee whose consumer never drains overflows: chunks past the channel capacity are dropped and

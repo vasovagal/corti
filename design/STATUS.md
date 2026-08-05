@@ -1,6 +1,6 @@
 # corti — status
 
-Shipped through **v0.8.0**: the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
+Shipped through **v0.11.0**: the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
 capture (2-track WAV) → offline streaming AEC (`StreamingAec`, ADR 0007) → transcription (AWS batch or
 local offline Parakeet-TDT via sherpa/CPU or transcribe.cpp/Metal, runtime-selectable) → filed vagus note. Plus the Tauri UI
 surface (Settings, diagnostics Console, live stats, Ethics/Voiceprint guide, Recording Queue), the `corti`
@@ -10,5 +10,7 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
 
 - **Current-state internals:** see [`../docs/`](../docs/).
 - **Decisions:** see [`adr/`](adr/).
-- **Landed since v0.8.0:** `#85` (`feat/opus-independent-stack`) — durable background jobs (`corti-jobs`)
-  + retry/retention + a Recording Queue window (`app/src/queue_ui.rs`, `app/ui/src/Queue.tsx`).
+- **v0.11.0:** crash-safe bounded live note commits (#103) and selectable transcribe.cpp/Metal Parakeet
+  inference (#92), while sherpa remains the compatibility default.
+- **In progress:** #105 adds the bounded timestamped Live Transcript window, ephemeral microphone/ASR test,
+  and reliable foreground activation for every tray-opened utility window (ADR 0013).
