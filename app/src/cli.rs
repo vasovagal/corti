@@ -284,8 +284,6 @@ fn run_redo(args: RedoArgs) -> Result<()> {
             compiled_backends()
         );
     }
-    let aec_enabled = cfg.aec_enabled;
-
     // Open the queue best-effort: a missing/locked queue must not block re-doing an on-disk file. When it
     // opens it gives us the authoritative recording metadata + the old note path, and lets us reflect the
     // new note back so `--list`/tray history point at it.
@@ -294,17 +292,16 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         .ok();
 
     let resolved = resolve_recording(&args.input, queue.as_ref())?;
-    let effective_aec = aec_enabled && !resolved.skip_aec;
     eprintln!(
-        "[corti] re-transcribing {} (id {}) with {backend_label}; AEC {}",
+        "[corti] re-transcribing {} (id {}) with {backend_label}",
         resolved.audio.display(),
         resolved.id,
-        if effective_aec { "on" } else { "off" },
     );
 
-    let aec_cfg = cfg.aec_config();
+    // No AEC pass: a cached recording was echo-cancelled by the capture writer when it was made (#74), so
+    // cleaning it again would cancel twice. Use `--input` on a raw 2-track to run the file-to-file pass.
     let mut provenance_cfg = cfg.clone();
-    provenance_cfg.aec_enabled = effective_aec;
+    provenance_cfg.aec_enabled = false;
     let provenance = crate::provenance::from_config(
         &provenance_cfg,
         corti_vagus::provenance::GenerationMode::Batch,
@@ -312,9 +309,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
-        aec_enabled,
-        resolved.skip_aec,
-        &aec_cfg,
+        None,
         crate::transcribe::TranscriptionAttempt::fresh(&resolved.id),
         &resolved.meta,
         &resolved.audio,
@@ -393,10 +388,10 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let stem = stem_from_name(&name);
-    // AEC runs by default; --no-aec forces it off, and an already-`-clean.wav` is never re-cancelled
-    // (write_clean_wav itself reports "nothing to do" for a mono/tap-only WAV via Ok(None)).
-    let aec_enabled = !args.no_aec;
-    let skip_aec = name.ends_with("-clean.wav");
+    // The file-to-file AEC pass runs by default here — `--input` is the one path that still sees audio corti
+    // did not capture and clean in flight. `--no-aec` forces it off, and an already-`-clean.wav` is never
+    // re-cancelled (write_clean_wav itself reports "nothing to do" for a mono/tap-only WAV via Ok(None)).
+    let aec_enabled = !args.no_aec && !name.ends_with("-clean.wav");
     let job_id = if stem.is_empty() {
         "input".to_string()
     } else {
@@ -407,15 +402,11 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     eprintln!(
         "[corti] transcribing {} with {backend_label}; AEC {}",
         input.display(),
-        if aec_enabled && !skip_aec {
-            "on"
-        } else {
-            "off"
-        },
+        if aec_enabled { "on" } else { "off" },
     );
     let aec_cfg = cfg.aec_config();
     let mut provenance_cfg = cfg.clone();
-    provenance_cfg.aec_enabled = aec_enabled && !skip_aec;
+    provenance_cfg.aec_enabled = aec_enabled;
     let provenance = crate::provenance::from_config(
         &provenance_cfg,
         corti_vagus::provenance::GenerationMode::Batch,
@@ -423,9 +414,7 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
-        aec_enabled,
-        skip_aec,
-        &aec_cfg,
+        aec_enabled.then_some(&aec_cfg),
         crate::transcribe::TranscriptionAttempt::fresh(&job_id),
         &meta,
         input,
@@ -481,8 +470,6 @@ struct Resolved {
     audio: PathBuf,
     /// Metadata for the filed note (authoritative from the queue, else synthesized from the filename).
     meta: RecordingMeta,
-    /// `true` when `audio` is already a `-clean.wav` (AEC output) — skip AEC to avoid double-cancelling.
-    skip_aec: bool,
     /// The note filed by the previous run, if any (reported so the user can delete the stale one).
     old_note: Option<PathBuf>,
     /// Whether a queue row exists (⇒ safe to write the new note path back).
@@ -502,7 +489,6 @@ fn resolve_recording(input: &str, queue: Option<&Queue>) -> Result<Resolved> {
     if stem.is_empty() {
         bail!("`{input}` has no recording stem to identify");
     }
-    let arg_is_clean = name.ends_with("-clean.wav");
     let has_parent = path.parent().is_some_and(|p| !p.as_os_str().is_empty());
 
     // The durable row (by stem) is authoritative for app/timestamps and carries the old note path.
@@ -511,15 +497,14 @@ fn resolve_recording(input: &str, queue: Option<&Queue>) -> Result<Resolved> {
         None => None,
     };
 
-    // Which audio file to transcribe (+ whether it's already a -clean.wav).
-    let (audio, skip_aec) = if has_parent {
+    let audio = if has_parent {
         // An explicit path: honor exactly what was given.
         if !path.exists() {
             bail!("no such file: {}", path.display());
         }
-        (path.to_path_buf(), arg_is_clean)
+        path.to_path_buf()
     } else {
-        resolve_audio_in_cache(&stem, &name, arg_is_clean, row.as_ref())?
+        resolve_audio_in_cache(&stem, &name, row.as_ref())?
     };
 
     let (id, meta, old_note, had_row) = match &row {
@@ -536,28 +521,22 @@ fn resolve_recording(input: &str, queue: Option<&Queue>) -> Result<Resolved> {
         id,
         audio,
         meta,
-        skip_aec,
         old_note,
         had_row,
     })
 }
 
-/// Resolve a bare filename/stem to an audio file in the recordings cache. Prefers the raw WAV the row was
-/// recorded to (then its `-clean.wav`); with no row, looks up the literal name, then `<stem>.wav`, then
-/// `<stem>-clean.wav`.
-fn resolve_audio_in_cache(
-    stem: &str,
-    name: &str,
-    arg_is_clean: bool,
-    row: Option<&Job>,
-) -> Result<(PathBuf, bool)> {
+/// Resolve a bare filename/stem to an audio file in the recordings cache. Prefers the WAV the row was
+/// recorded to; with no row, looks up the literal name, then `<stem>.wav`. The `-clean.wav` fallbacks are
+/// vestigial — nothing writes that sibling since #74 — but still resolve a pre-#74 cache.
+fn resolve_audio_in_cache(stem: &str, name: &str, row: Option<&Job>) -> Result<PathBuf> {
     if let Some(job) = row {
         if job.audio_path.exists() {
-            return Ok((job.audio_path.clone(), false));
+            return Ok(job.audio_path.clone());
         }
         let clean = corti_capture::clean_wav_path(&job.audio_path);
         if clean.exists() {
-            return Ok((clean, true));
+            return Ok(clean);
         }
         bail!(
             "recording `{stem}` is tracked but its audio file is gone (pruned by the 30-day retention?); \
@@ -568,15 +547,15 @@ fn resolve_audio_in_cache(
     let dir = corti_capture::recordings_dir().context("resolving the recordings cache dir")?;
     let literal = dir.join(name);
     if literal.exists() {
-        return Ok((literal, arg_is_clean));
+        return Ok(literal);
     }
     let raw = dir.join(format!("{stem}.wav"));
     if raw.exists() {
-        return Ok((raw, false));
+        return Ok(raw);
     }
     let clean = dir.join(format!("{stem}-clean.wav"));
     if clean.exists() {
-        return Ok((clean, true));
+        return Ok(clean);
     }
     bail!(
         "no recording found for `{name}` in {} (looked for {stem}.wav and {stem}-clean.wav)",
@@ -866,22 +845,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("corti-cli-path-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Raw WAV given as an explicit path: honored verbatim, AEC on, meta synthesized from the name.
+        // Raw WAV given as an explicit path: honored verbatim, meta synthesized from the name.
         let raw = dir.join("20260608-160056-slack.wav");
         std::fs::write(&raw, b"x").unwrap();
         let r = resolve_recording(raw.to_str().unwrap(), None).unwrap();
         assert_eq!(r.audio, raw);
-        assert!(!r.skip_aec);
         assert!(!r.had_row);
         assert_eq!(r.id, "20260608-160056-slack");
         assert_eq!(r.meta.owning_app.name, "Slack");
 
-        // A -clean.wav explicit path ⇒ skip AEC (avoid double-cancel); same stem/id.
+        // A -clean.wav explicit path is honored verbatim and shares the raw recording's stem/id.
         let clean = dir.join("20260608-160056-slack-clean.wav");
         std::fs::write(&clean, b"x").unwrap();
         let rc = resolve_recording(clean.to_str().unwrap(), None).unwrap();
+        assert_eq!(rc.audio, clean);
         assert_eq!(rc.id, "20260608-160056-slack");
-        assert!(rc.skip_aec);
 
         // Missing explicit path ⇒ error.
         assert!(resolve_recording(dir.join("nope.wav").to_str().unwrap(), None).is_err());

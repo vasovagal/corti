@@ -137,9 +137,6 @@ pub(crate) struct Ctx {
     /// pipeline at startup.
     vagus: Result<Vagus, String>,
     backend: Backend,
-    /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
-    aec_enabled: bool,
-    aec_config: corti_aec::AecConfig,
     pub(crate) app: AppHandle,
     /// Clone of the managed stats buffer; the worker records coarse stage wall-clock here.
     stats: crate::stats::StatsBuffer,
@@ -181,18 +178,13 @@ pub fn run(
         warn!(target: "corti::pipeline", error = %e, "vagus not available — notes can't be filed");
     }
 
-    // Snapshot the shared config to build the initial backend. Capture the AEC toggle before `Backend::init`
-    // consumes the snapshot.
+    // Snapshot the shared config to build the initial backend.
     let cfg = config.lock().unwrap().clone();
-    let aec_enabled = cfg.aec_enabled;
-    let aec_config = cfg.aec_config();
     let backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     let mut ctx = Ctx {
         queue,
         vagus,
         backend: Backend::init(cfg),
-        aec_enabled,
-        aec_config,
         app,
         stats,
         backend_label,
@@ -955,20 +947,18 @@ fn live_discard_cleanup(ctx: &Ctx, meta: &RecordingMeta, note_path: &Path, previ
     }
 }
 
-/// Apply a saved config change: re-read the shared runtime config and rebuild the backend + AEC toggle. A
-/// job already transcribing finishes on the old backend (the worker is serial), so this is exactly "takes
-/// effect on the next recording".
+/// Apply a saved config change: re-read the shared runtime config and rebuild the backend. A job already
+/// transcribing finishes on the old backend (the worker is serial), so this is exactly "takes effect on the
+/// next recording". The AEC toggle is not mirrored here — it is read from [`SharedConfig`] at capture start
+/// (#74), so it needs no pipeline-side copy.
 fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     let cfg = config.lock().unwrap().clone();
     let backend_name = cfg.backend_name();
-    ctx.aec_enabled = cfg.aec_enabled;
-    ctx.aec_config = cfg.aec_config();
     ctx.backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     ctx.backend = Backend::init(cfg);
     info!(
         target: "corti::pipeline",
         backend = backend_name,
-        aec = if ctx.aec_enabled { "on" } else { "off" },
         "settings saved — backend reloaded"
     );
 }
@@ -1281,14 +1271,12 @@ pub(crate) fn transcribe_and_file(
     );
     tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
-    // Run AEC + backend from the retained raw recording. Pipeline AWS attempts use the row's stable name;
-    // one-shot CLI calls deliberately pass no stable name.
+    // Transcribe the retained recording, which the capture writer already echo-cancelled (#74) — hence no
+    // AEC pass here. Pipeline AWS attempts use the row's stable name; one-shot CLI calls pass none.
     let t0 = std::time::Instant::now();
     let transcribed = crate::transcribe::transcribe_recording(
         &ctx.backend,
-        ctx.aec_enabled,
-        false,
-        &ctx.aec_config,
+        None,
         crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
         meta,
         audio,
@@ -1540,8 +1528,9 @@ fn file_and_done(
     Ok(())
 }
 
-/// Completion cleanup has one authority: keep the raw recording for the configured sweep, but remove
+/// Completion cleanup has one authority: keep the recording for the configured sweep, but remove
 /// reproducible/transient derivatives. Failures are logged and the sweep retries all of these paths later.
+/// Nothing writes a `-clean.wav` sibling since #74; it is still swept so a pre-#74 cache drains.
 fn cleanup_completed_artifacts(raw: &Path) {
     for path in [corti_capture::clean_wav_path(raw), checkpoint_path(raw)] {
         if !path.exists() {
