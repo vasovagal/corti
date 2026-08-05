@@ -40,9 +40,10 @@ and reuse these to shape the final transcript.
 (`AppConfig::transcribe_backend`, env `CORTI_TRANSCRIBE_BACKEND`). `Backend::init` (`:37`) resolves
 `BackendChoice::{Aws,Local}` behind cfg-gated features; unavailable backends degrade to a stringly
 error rather than failing the build. `Backend::transcribe` (`:60`) dispatches to the AWS or local
-arm; `transcribe_recording` (`:132`) is the pipeline entry point — it runs offline AEC via
-`corti_capture::write_clean_wav` (`:145`), then hands the cleaned (or raw, if AEC skipped) path to
-the backend.
+arm; `transcribe_recording` (`:132`) is the pipeline entry point. Its `AecConfig` argument is `Some`
+only for **foreign** audio (`corti --input <wav>`), cleaned via `corti_capture::write_clean_wav`;
+recordings arrive already echo-cancelled by the capture writer (#74), so the pipeline passes `None`
+and hands the path straight to the backend.
 
 ## Local backend — Parakeet via sherpa or transcribe.cpp
 
@@ -159,12 +160,12 @@ due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) c
 job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
 
 Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` → publish any exact pre-ASR AWS
-owner → `transcribe::transcribe_recording` (offline AEC then `Backend::transcribe`, a **blocking** call on
-this thread) → atomically write the filing checkpoint → `queue.update(PendingNote, transcribe_secs)` →
-clean AWS staging (when applicable) → file. Cloud cleanup errors propagate and retry from the checkpoint.
-Completion is one `Queue::complete_with_note` SQL update for `note_path + Done`; errors propagate before
-any success UI. On durable success the clean WAV and checkpoint are removed, while raw audio remains for
-the configured retention sweep.
+owner → `transcribe::transcribe_recording` (`Backend::transcribe`, a **blocking** call on this thread —
+the recording is already echo-cancelled, #74) → atomically write the filing checkpoint →
+`queue.update(PendingNote, transcribe_secs)` → clean AWS staging (when applicable) → file. Cloud cleanup
+errors propagate and retry from the checkpoint. Completion is one `Queue::complete_with_note` SQL update
+for `note_path + Done`; errors propagate before any success UI. On durable success the checkpoint is
+removed, while audio remains for the configured retention sweep.
 
 **Retry with backoff.** A valid checkpoint is authoritative in any nonterminal transcription state, so a
 failed/crashed adjacent `PendingNote` write cannot repeat ASR. Without one, `PendingTranscription` and

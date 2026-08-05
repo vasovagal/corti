@@ -208,30 +208,28 @@ impl<'a> TranscriptionAttempt<'a> {
     }
 }
 
-/// Run offline AEC (unless `skip_aec`), then transcribe with the runtime-selected `backend`. This is the
-/// tray-free, queue-free transcription core shared by the pipeline worker
+/// Optionally run the file-to-file AEC pass, then transcribe with the runtime-selected `backend`. This is
+/// the tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
 /// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
 /// input) for logging. Persisting any transcript sidecar is a caller's concern, not this primitive's.
 ///
-/// `skip_aec` is set by the CLI when the input is already a `*-clean.wav` (a 2-channel AEC *output*):
-/// running AEC again would cancel a second time. The pipeline always passes `skip_aec = false` — its input
-/// is the raw 2-track recording, and a tap-only (mono) recording is handled inside `write_clean_wav`
-/// (`Ok(None)`). Only a genuine backend transcription failure is returned as `Err`; an AEC failure falls
-/// back to the raw recording so it never stalls the caller.
+/// `aec` is `Some` only for **foreign** audio — `corti --input <wav>` over a 2-track corti did not record.
+/// Corti's own recordings are echo-cancelled in the capture writer thread (#74), so cleaning them again
+/// here would cancel a second time; the pipeline and `--redo` pass `None`. A tap-only (mono) input is
+/// handled inside `write_clean_wav` (`Ok(None)`). Only a genuine backend transcription failure is returned
+/// as `Err`; an AEC failure falls back to the raw recording so it never stalls the caller.
 pub fn transcribe_recording(
     backend: &Backend,
-    aec_enabled: bool,
-    skip_aec: bool,
-    aec_cfg: &corti_aec::AecConfig,
+    aec: Option<&corti_aec::AecConfig>,
     attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
 ) -> Result<(DiarizedTranscript, PathBuf)> {
-    // Clean speaker bleed on disk before transcription (backend-agnostic). The raw recording is never
+    // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
-    let input: PathBuf = if aec_enabled && !skip_aec {
+    let input: PathBuf = if let Some(aec_cfg) = aec {
         match corti_capture::write_clean_wav(raw_audio, aec_cfg) {
             Ok(Some(clean)) => {
                 info!(

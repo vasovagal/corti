@@ -6,12 +6,12 @@ describe("activeBoxKeys", () => {
     expect(activeBoxKeys("idle")).toEqual([]);
   });
 
-  it("recording lights detect + capture together", () => {
-    expect(activeBoxKeys("recording")).toEqual(["detect", "capture"]);
+  it("recording lights detect + capture + echo-cancel (the writer cleans in flight)", () => {
+    expect(activeBoxKeys("recording")).toEqual(["detect", "capture", "echo"]);
   });
 
-  it("transcribing lights echo-cancel + transcribe (echo folded into the transcribe step)", () => {
-    expect(activeBoxKeys("transcribing")).toEqual(["echo", "transcribe"]);
+  it("transcribing lights the transcribe box only", () => {
+    expect(activeBoxKeys("transcribing")).toEqual(["transcribe"]);
   });
 
   it("cancelling_echo lights the echo-cancel box only", () => {
@@ -47,6 +47,6 @@ describe("activeBoxKeysForActivity", () => {
   });
 
   it("does not double-count when the stage already lights capture", () => {
-    expect(activeBoxKeysForActivity("recording", true)).toEqual(["detect", "capture"]);
+    expect(activeBoxKeysForActivity("recording", true)).toEqual(["detect", "capture", "echo"]);
   });
 });
