@@ -138,7 +138,7 @@ pub(crate) mod imp {
 
     /// The coarse pipeline stage the "How Corti Works" window highlights. A single low-cardinality signal
     /// distinct from the free-text `status` line: the UI maps it to which diagram box pulses. The shipped
-    /// pipeline folds echo cancellation into `Transcribing` (one `transcribe_recording` call), so
+    /// pipeline echo-cancels during `Recording` (in the capture writer, #74), so
     /// [`Stage::CancellingEcho`] is defined for completeness but not emitted on its own.
     #[derive(Clone, Copy, PartialEq, Eq)]
     #[repr(u8)]
