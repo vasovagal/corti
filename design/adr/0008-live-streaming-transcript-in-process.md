@@ -1,6 +1,6 @@
 # ADR 0008 — Live streaming transcript: first push-driven window, in-process transport, canonical in-memory buffer
 
-- **Status:** Proposed (2026-06-18)
+- **Status:** Superseded by ADR 0013 (2026-08-05; the recognizer/transport/buffer premises changed after ADRs 0009–0012)
 - **Amends:** ADR 0004 (informational webview) — its "static-content windows need no capability / make no `invoke()` calls" stance no longer covers every window; see Decision 6.
 - **References:** ADR 0007 (#74 — relocate `StreamingAec.push()` into the capture-writer thread, the prerequisite for a live `me` source); the prior 22-agent feasibility study; plan #25 / umbrella #10; the in-process Gemma copilot #26.
 

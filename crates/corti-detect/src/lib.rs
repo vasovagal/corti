@@ -7,7 +7,7 @@
 //! work cannot delay live-session teardown. See `design/01-corti-detect.md` for the full design (state
 //! machine, debounce/coalesce, thread model).
 //!
-//! The timing logic lives in the platform-independent [`machine`] module (unit-tested without any HAL);
+//! The timing logic lives in the platform-independent `machine` module (unit-tested without any HAL);
 //! the macOS [`Detector`] wires it to the CoreAudio listeners on a worker thread. The HAL callback runs
 //! on a CoreAudio thread (guardrail 9), so the worker — not the callback — owns the `Recorder` and calls
 //! `on_event`.

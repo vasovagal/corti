@@ -24,6 +24,11 @@ enum Msg {
     Signal(bool),
     /// The system default input device changed; rebind the mic monitor.
     DeviceChanged,
+    /// Temporarily suspend detection for Corti's explicit microphone test. The reply is false if a real
+    /// detector recording already owns capture and therefore cannot be preempted.
+    Pause(Sender<bool>),
+    /// Resume detection after the test microphone has closed.
+    Resume,
     /// Stop the worker (sent by `Detector::drop`).
     Shutdown,
 }
@@ -105,6 +110,7 @@ impl Detector {
                     _device_monitor: device_monitor,
                     self_pid: std::process::id() as i32,
                     current: None,
+                    paused: false,
                     on_event,
                     live,
                 };
@@ -115,6 +121,33 @@ impl Detector {
             ctrl,
             worker: Some(worker),
         })
+    }
+
+    /// Pause mic-edge detection before Corti opens its own explicit microphone test. The worker acks only
+    /// after clearing any pending debounce state, so the test's orange-dot edge cannot race into a duplicate
+    /// detector recording. Returns false when a real recording is already in flight.
+    pub fn pause(&self) -> Result<bool> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.ctrl
+            .send(Msg::Pause(reply_tx))
+            .map_err(|_| anyhow::anyhow!("detector worker is unavailable"))?;
+        match reply_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(accepted) => Ok(accepted),
+            Err(_) => {
+                // `Pause` may still be queued behind a slow capture operation. Queue a compensating resume
+                // so a caller timeout can never leave detection permanently suspended.
+                let _ = self.ctrl.send(Msg::Resume);
+                Err(anyhow::anyhow!("detector worker did not acknowledge pause"))
+            }
+        }
+    }
+
+    /// Resume normal detection. The worker re-seeds from the current microphone state, so a call that began
+    /// during the test is picked up through the ordinary debounce after the test device is closed.
+    pub fn resume(&self) -> Result<()> {
+        self.ctrl
+            .send(Msg::Resume)
+            .map_err(|_| anyhow::anyhow!("detector worker is unavailable"))
     }
 }
 
@@ -178,6 +211,9 @@ struct Worker<F: Fn(DetectorEvent)> {
     /// our capture aggregate would otherwise count as a mic user and the recording would never end.
     self_pid: i32,
     current: Option<(Recorder, RecordingMeta)>,
+    /// True only while Corti's explicit microphone test owns the default input. HAL edges are ignored and
+    /// no debounce deadline runs in this state.
+    paused: bool,
     on_event: F,
     /// Optional live-transcription hook (issue #87), consulted at every recording start.
     live: Option<Box<dyn LiveHook>>,
@@ -194,8 +230,18 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             match msg {
-                Ok(Msg::Signal(on)) => self.machine.on_signal(on, Instant::now()),
+                Ok(Msg::Signal(on)) if !self.paused => self.machine.on_signal(on, Instant::now()),
+                Ok(Msg::Signal(_)) => {}
                 Ok(Msg::DeviceChanged) => self.rebind(),
+                Ok(Msg::Pause(reply)) => {
+                    let accepted = self.current.is_none();
+                    if accepted {
+                        self.paused = true;
+                        self.machine.reset();
+                    }
+                    let _ = reply.send(accepted);
+                }
+                Ok(Msg::Resume) => self.resume_detection(),
                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.on_wakeup(),
             }
@@ -208,6 +254,9 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
     /// drives this; while a recording is in progress we additionally wake every [`POLL_INTERVAL`] to
     /// re-check process attribution (see [`on_wakeup`](Worker::on_wakeup)).
     fn next_wait(&self) -> Option<Duration> {
+        if self.paused {
+            return None;
+        }
         let deadline = self
             .machine
             .next_deadline()
@@ -224,6 +273,9 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
     /// instead re-derive the mic-in-use signal from process attribution — "does any app other than us
     /// still hold input?" — and feed it to the machine, which debounces the stop through `COALESCE`.
     fn on_wakeup(&mut self) {
+        if self.paused {
+            return;
+        }
         if self.current.is_some() {
             let still_on = other_app_holds_input(self.self_pid);
             self.machine.on_signal(still_on, Instant::now());
@@ -241,13 +293,29 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
             Ok(monitor) => {
                 let current = monitor.current();
                 self.mic_monitor = monitor; // drops the old monitor → removes its HAL listener
-                if let Ok(on) = current {
+                if let Ok(on) = current
+                    && !self.paused
+                {
                     self.machine.on_signal(on, Instant::now());
                 }
             }
             Err(e) => self.emit(DetectorEvent::Error(format!(
                 "re-binding mic monitor after device change failed: {e:#}"
             ))),
+        }
+    }
+
+    /// Leave explicit-test suspension and re-seed the normal debounce from the now-current device state.
+    fn resume_detection(&mut self) {
+        self.paused = false;
+        // A compensating Resume can arrive after a timed-out Pause that the worker ultimately rejected
+        // because a real recorder had started. Never reset that recorder's state machine underneath it.
+        if self.current.is_some() {
+            return;
+        }
+        self.machine.reset();
+        if self.mic_monitor.current().unwrap_or(false) {
+            self.machine.on_signal(true, Instant::now());
         }
     }
 

@@ -34,6 +34,9 @@ signals. Exactly what this app does: audio → notes.
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
   `--label` to name it).
+- **Timestamped live reader + microphone test.** During a local call, choose **Read live transcript…**
+  from the tray to follow call-relative **Me** / **Them 1** rows as speech regions close. While idle, the same
+  tray action runs an ephemeral microphone/ASR test: microphone only, with no audio file, queue row, or note.
 - **Crash-safe live inbox filing.** With the local backend, the app transcribes continuously and
   commits bounded, optionally diarized windows to the vagus note mid-call (one minute by default,
   configurable to 1–10). Every chunk is OS-synced before its memory is reused, so a Corti/macOS crash
@@ -74,9 +77,10 @@ Internals — the same data flow with `file:line` anchors — live in
 
 ## In the app
 
-Past the tray menu, corti ships a **Settings** window (backend/local engine, S3 bucket, verified model download), an
-**Ethics & Legality** guide (recording-consent norms by jurisdiction), and a **Diagnostics**
-console with a live stats panel (CPU/RSS, per-stage timings, rolling logs). From the shell,
+Past the tray menu, corti ships a timestamped **Live Transcript** reader, **Settings** (backend/local engine,
+S3 bucket, verified model download), an **Ethics & Legality** guide (recording-consent norms by jurisdiction),
+and a **Diagnostics** console with a live stats panel (CPU/RSS, per-stage timings, rolling logs). Tray-opened
+windows activate and come to the foreground. From the shell,
 `corti --list` prints every tracked recording with its pipeline status and filed note.
 
 ## Install
@@ -117,9 +121,9 @@ persisted in `config.toml`.
 
 ## Status
 
-Pre-1.0. The full pipeline runs end-to-end (detect → capture → AEC → transcribe → vagus) with
-both backends working; the live join-call → note loop still needs a signed `.app` to exercise
-the macOS audio-capture (TCC) grant.
+Pre-1.0. The full signed-app pipeline ships end-to-end (detect → capture → live/batch AEC + ASR →
+vagus) with both backends working, crash-safe local live filing, the bounded timestamped reader, and an
+on-device microphone/transcription test for validating TCC + local models without a call.
 
 ## More
 

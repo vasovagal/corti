@@ -417,6 +417,11 @@ pub fn run(
 /// How long to block on the channel: until the next pending background job is due, clamped to
 /// `[0, MAX_IDLE_WAIT]`. No pending jobs (or a read error) ⇒ the max — the drain re-checks anyway.
 fn next_wake(ctx: &Ctx) -> Duration {
+    if crate::imp::live_test_active(&ctx.app) {
+        // A due retry must not spin at zero timeout while the explicit mic test owns the local model slot;
+        // poll the flag cheaply so cleanup can hand work back without a new pipeline message variant.
+        return Duration::from_millis(250);
+    }
     match ctx.queue.jobs().next_due_at() {
         Ok(Some(due)) => (due - Utc::now())
             .to_std()
@@ -432,6 +437,11 @@ fn next_wake(ctx: &Ctx) -> Duration {
 
 /// Claim and run every due background job, oldest due first.
 fn drain_due_jobs(ctx: &mut Ctx) {
+    // Test mode is deliberately exclusive with model-backed work. Deferring all durable jobs is simpler and
+    // safe: retention/filing can wait too, and the 250 ms wake above resumes immediately after the test.
+    if crate::imp::live_test_active(&ctx.app) {
+        return;
+    }
     loop {
         let job = match ctx.queue.jobs().claim_due(Utc::now()) {
             Ok(Some(j)) => j,

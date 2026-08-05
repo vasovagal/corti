@@ -5,11 +5,13 @@ import Queue from "./Queue";
 import Settings from "./Settings";
 import Console from "./Console";
 import How from "./How";
+import LiveTranscript from "./LiveTranscript";
 import { validate } from "./lib/data";
 import "./styles.css";
 
 // One bundle serves every webview window; the tray picks a view via the URL query
-// (`index.html?view=settings`, `?view=console`, `?view=queue`, `?view=how`; no query = the Ethics Guide).
+// (`index.html?view=settings`, `?view=console`, `?view=queue`, `?view=how`, `?view=live`; no query =
+// the Ethics Guide).
 const view = new URLSearchParams(window.location.search).get("view");
 
 // Fail loudly in dev if a hand-edit to the Ethics Guide JSON datasets broke their shape/counts.
@@ -34,6 +36,8 @@ ReactDOM.createRoot(root).render(
       <Queue />
     ) : view === "how" ? (
       <How />
+    ) : view === "live" ? (
+      <LiveTranscript />
     ) : (
       <App />
     )}

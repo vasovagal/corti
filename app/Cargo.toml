@@ -78,6 +78,12 @@ corti-transcribe-local = { workspace = true, optional = true }
 sha2 = { version = "0.10", optional = true }
 ureq = { version = "2", optional = true }
 
+# Tauri's `set_focus` does not activate an Accessory app when a tray-opened window is behind another app.
+# Activate NSApplication explicitly on the main thread before focusing every singleton utility window.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication"] }
+
 # Both backends ship in every build (dev + the default-feature release bundle): the active one is chosen at
 # runtime in Settings. `local` stays a named feature so a minimal `--no-default-features` build is still
 # possible (and CI exercises it), but it is on by default — Parakeet is always available.

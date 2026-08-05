@@ -19,7 +19,7 @@
 //! ## Finish / discard
 //! The tee sender is dropped when the recorder stops, which ends the chunk loop; the thread then waits
 //! for an explicit recording-specific verdict so a finish and discard are never confused. The detector's
-//! [`LiveHook`] delivers that verdict immediately, before its later pipeline message:
+//! `LiveHook` delivers that verdict immediately, before its later pipeline message:
 //! - finish freezes the tee's canonical dropped-chunk count, moves the handle into an ID-keyed collection,
 //!   and lets the thread flush both transcribers. The pipeline later [`LiveManager::collect`]s that exact ID;
 //! - discard transfers the handle to a manager-owned non-blocking reaper that removes any partial note,
@@ -51,6 +51,7 @@ use corti_transcribe::segment::{
 use tracing::{info, warn};
 
 use crate::config::{AppConfig, BackendChoice};
+use crate::live_view::LiveTranscriptStore;
 use crate::pipeline::PipelineMsg;
 use crate::settings::SharedConfig;
 
@@ -114,12 +115,15 @@ enum Verdict {
 /// released even while an older pipeline job blocks collection.
 pub struct LiveManager {
     inner: Mutex<Inner>,
+    transcript: LiveTranscriptStore,
 }
 
 #[derive(Default)]
 struct Inner {
     /// Tee receiver stashed between `LiveHook::attach` and `LiveHook::started`.
     pending: Option<Pending>,
+    /// Generation token held while the explicit microphone test owns the one resident local model slot.
+    test_reservation: Option<u64>,
     /// The one session that may still consume capture chunks.
     active: Option<Active>,
     /// Finish verdict delivered, awaiting collection by recording ID.
@@ -236,8 +240,36 @@ impl Default for LiveManager {
 
 impl LiveManager {
     pub fn new() -> Self {
+        Self::with_transcript(LiveTranscriptStore::detached())
+    }
+
+    pub(crate) fn with_transcript(transcript: LiveTranscriptStore) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
+            transcript,
+        }
+    }
+
+    /// Reserve the same one-model gate detector calls use for a microphone test. A generation token makes
+    /// stale test cleanup unable to release a newer reservation.
+    pub(crate) fn reserve_test(&self, generation: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reap_completed();
+        if inner.pending.is_some()
+            || inner.active.is_some()
+            || inner.has_finishing_thread()
+            || inner.test_reservation.is_some()
+        {
+            return false;
+        }
+        inner.test_reservation = Some(generation);
+        true
+    }
+
+    pub(crate) fn release_test(&self, generation: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.test_reservation == Some(generation) {
+            inner.test_reservation = None;
         }
     }
 
@@ -247,7 +279,11 @@ impl LiveManager {
     fn stash_pending(&self, rx: Receiver<CaptureChunk>, dropped: Arc<AtomicU64>) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.reap_completed();
-        if inner.pending.is_some() || inner.active.is_some() || inner.has_finishing_thread() {
+        if inner.pending.is_some()
+            || inner.active.is_some()
+            || inner.has_finishing_thread()
+            || inner.test_reservation.is_some()
+        {
             return false;
         }
         inner.pending = Some(Pending { rx, dropped });
@@ -271,15 +307,28 @@ impl LiveManager {
         #[cfg(feature = "local")]
         {
             let id = corti_queue::job_id(&meta);
+            self.transcript.begin_call(&id, &meta.owning_app.name);
             let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict>();
             let dropped = pending.dropped.clone();
             let discard_reporter = DiscardReporter {
                 meta: meta.clone(),
                 pipe_tx: pipe_tx.clone(),
             };
+            let publisher = StorePublisher {
+                store: self.transcript.clone(),
+                id: id.clone(),
+            };
             let thread = std::thread::Builder::new().name("corti-live".into()).spawn(
                 move || -> LiveOutcome {
-                    session_thread(pending.rx, verdict_rx, meta, sample_rate, cfg, pipe_tx)
+                    session_thread(
+                        pending.rx,
+                        verdict_rx,
+                        meta,
+                        sample_rate,
+                        cfg,
+                        pipe_tx,
+                        publisher,
+                    )
                 },
             );
             match thread {
@@ -294,7 +343,10 @@ impl LiveManager {
                     let rejected = {
                         let mut inner = self.inner.lock().unwrap();
                         inner.reap_completed();
-                        if inner.active.is_none() && !inner.has_finishing_thread() {
+                        if inner.active.is_none()
+                            && !inner.has_finishing_thread()
+                            && inner.test_reservation.is_none()
+                        {
                             inner.active = Some(active);
                             None
                         } else {
@@ -311,6 +363,10 @@ impl LiveManager {
                     }
                 }
                 Err(e) => {
+                    self.transcript.set_error(
+                        &id,
+                        "Could not start the live transcript; Corti will transcribe after the call.",
+                    );
                     warn!(target: "corti::live", error = %e, "could not spawn the live transcription thread — batch path will run");
                 }
             }
@@ -340,6 +396,8 @@ impl LiveManager {
     /// after capture closes the tee and before it emits `RecordingFinished`; the serial pipeline later
     /// calls [`collect`](Self::collect) for this exact ID.
     pub fn finish(&self, id: &str) {
+        self.transcript
+            .set_stopping(id, "Finishing the last speech region…");
         let mut inner = self.inner.lock().unwrap();
         inner.reap_completed();
         let Some(active) = inner.active.take_if(|active| active.id == id) else {
@@ -411,6 +469,8 @@ impl LiveManager {
     /// tiny reaper thread; if spawning it fails, the original handle/reporter remain in `Inline` for the
     /// pipeline. Either state keeps the single-model gate closed without blocking the detector callback.
     pub fn discard(&self, id: &str) {
+        self.transcript
+            .set_stopping(id, "The short recording is being discarded…");
         let mut inner = self.inner.lock().unwrap();
         inner.reap_completed();
         let Some(active) = inner.active.take_if(|active| active.id == id) else {
@@ -688,12 +748,13 @@ fn session_thread(
     sample_rate: u32,
     cfg: AppConfig,
     pipe_tx: Sender<PipelineMsg>,
+    publisher: StorePublisher,
 ) -> LiveOutcome {
     let mut writer = NoteWriter::new(VagusFiler, meta.clone(), Some(pipe_tx));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_session(&rx, &verdict_rx, sample_rate, &cfg, &mut writer)
+        run_session(&rx, &verdict_rx, sample_rate, &cfg, &mut writer, &publisher)
     }));
-    match result {
+    let outcome = match result {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(e)) => LiveOutcome::Fallback {
             reason: format!("{e:#}"),
@@ -703,7 +764,15 @@ fn session_thread(
             reason: "live transcription panicked".to_string(),
             note_path: writer.path().cloned(),
         },
+    };
+    match &outcome {
+        LiveOutcome::Filed { .. } => publisher.complete("Call complete — transcript filed."),
+        LiveOutcome::NoNote => publisher.complete("Call complete — no note was filed."),
+        LiveOutcome::Fallback { reason, .. } => publisher.error(format!(
+            "Live transcript stopped ({reason}); Corti will rebuild it from the recording."
+        )),
     }
+    outcome
 }
 
 /// Everything a running session owns besides the writer, so an engine/consume error can be parked
@@ -768,22 +837,38 @@ fn run_session(
     sample_rate: u32,
     cfg: &AppConfig,
     writer: &mut NoteWriter<VagusFiler>,
+    publisher: &StorePublisher,
 ) -> Result<LiveOutcome> {
     let mut parts = build_parts(sample_rate, cfg);
     let consumed = match parts.as_mut() {
-        Ok(p) => consume_chunks(
-            rx,
-            sample_rate,
-            &mut p.aec,
-            &mut p.mic,
-            &mut p.them,
-            &p.engine,
-            &mut p.window,
-            writer,
-        ),
-        // Engine failed to load: fall through to the verdict wait; the error surfaces on Finish.
-        Err(_) => Ok(()),
+        Ok(p) => {
+            publisher.listening();
+            consume_chunks(
+                rx,
+                sample_rate,
+                &mut p.aec,
+                &mut p.mic,
+                &mut p.them,
+                &p.engine,
+                &mut p.window,
+                writer,
+                publisher,
+            )
+        }
+        // Engine failed to load: surface it to the reader now, but still wait for the recording-specific
+        // verdict so discard/fallback ownership remains unchanged.
+        Err(error) => {
+            publisher.error(format!(
+                "Live transcript unavailable ({error:#}); Corti will transcribe after the call."
+            ));
+            Ok(())
+        }
     };
+    if let Err(error) = &consumed {
+        publisher.error(format!(
+            "Live transcript stopped ({error:#}); Corti will transcribe after the call."
+        ));
+    }
 
     match verdict_rx.recv() {
         Ok(Verdict::Finish(quality)) => {
@@ -798,6 +883,7 @@ fn run_session(
                 p.window,
                 quality,
                 writer,
+                publisher,
             )
         }
         Ok(Verdict::Discard) => {
@@ -918,7 +1004,7 @@ fn buffered_word_bytes(words: &[Word]) -> usize {
 /// rolling boundary, so even a surprising producer chunk cannot push retained audio beyond the configured/
 /// hard limit. AEC and ASR remain chunk-agnostic; only a full window forces their current tails final.
 #[allow(clippy::too_many_arguments)] // the split keeps every piece testable without models
-fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
+fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
     rx: &Receiver<CaptureChunk>,
     sample_rate: u32,
     aec: &mut Option<StreamingAec>,
@@ -927,6 +1013,7 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
     diarizer: &D,
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
+    publisher: &P,
 ) -> Result<()> {
     while let Ok(chunk) = rx.recv() {
         let chunk_frames = chunk.mic.len().max(chunk.tap.len());
@@ -959,31 +1046,38 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
                 them.push(tap_slice, sample_rate);
             }
             if let Some(words) = mic.poll_words() {
+                publisher.words(Speaker::Me, &words);
                 window.push_mic_words(words);
             }
             if let Some(words) = them.poll_words() {
+                publisher.words(Speaker::Other("Them".to_string()), &words);
                 window.push_them_words(words);
             }
             window.push_audio(tap_slice, take);
             offset = end;
 
             if window.due() {
-                checkpoint_and_flush(mic, them, diarizer, window, writer)?;
+                checkpoint_and_flush(mic, them, diarizer, window, writer, publisher)?;
             }
         }
     }
     Ok(())
 }
 
-fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
+fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
     mic: &mut C,
     them: &mut C,
     diarizer: &D,
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
+    publisher: &P,
 ) -> Result<()> {
-    window.push_mic_words(mic.checkpoint());
-    window.push_them_words(them.checkpoint());
+    let mic_words = mic.checkpoint();
+    publisher.words(Speaker::Me, &mic_words);
+    window.push_mic_words(mic_words);
+    let them_words = them.checkpoint();
+    publisher.words(Speaker::Other("Them".to_string()), &them_words);
+    window.push_them_words(them_words);
     flush_window(diarizer, window, writer)
 }
 
@@ -1037,7 +1131,7 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
 /// Finish the AEC/transcriber tails, diarize + sync the final short window, then durably flip the state line.
 /// A dropped tee leaves the note visibly `transcribing` for the canonical batch rewrite.
 #[allow(clippy::too_many_arguments)]
-fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
+fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
     sample_rate: u32,
     mut aec: Option<StreamingAec>,
     mut mic: C,
@@ -1046,6 +1140,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
     mut window: TranscriptWindow,
     quality: FinishQuality,
     writer: &mut NoteWriter<F>,
+    publisher: &P,
 ) -> Result<LiveOutcome> {
     if let Some(aec) = aec.take() {
         let tail = aec.finish();
@@ -1054,13 +1149,19 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
         }
     }
     if let Some(words) = mic.poll_words() {
+        publisher.words(Speaker::Me, &words);
         window.push_mic_words(words);
     }
     if let Some(words) = them.poll_words() {
+        publisher.words(Speaker::Other("Them".to_string()), &words);
         window.push_them_words(words);
     }
-    window.push_mic_words(mic.finish());
-    window.push_them_words(them.finish());
+    let mic_words = mic.finish();
+    publisher.words(Speaker::Me, &mic_words);
+    window.push_mic_words(mic_words);
+    let them_words = them.finish();
+    publisher.words(Speaker::Other("Them".to_string()), &them_words);
+    window.push_them_words(them_words);
     flush_window(&diarizer, &mut window, writer)?;
 
     match writer.path().cloned() {
@@ -1085,6 +1186,46 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler>(
 }
 
 // ----- Small seams so the loop and writer are testable without models or a vagus binary -----
+
+trait TranscriptPublisher {
+    fn words(&self, speaker: Speaker, words: &[Word]);
+}
+
+struct StorePublisher {
+    store: LiveTranscriptStore,
+    id: String,
+}
+
+impl StorePublisher {
+    fn listening(&self) {
+        self.store.set_listening(
+            &self.id,
+            "Listening — lines appear when each speech region closes.",
+        );
+    }
+
+    fn complete(&self, detail: impl Into<String>) {
+        self.store.set_complete(&self.id, detail);
+    }
+
+    fn error(&self, detail: impl Into<String>) {
+        self.store.set_error(&self.id, detail);
+    }
+}
+
+impl TranscriptPublisher for StorePublisher {
+    fn words(&self, speaker: Speaker, words: &[Word]) {
+        self.store.append_words(&self.id, speaker, words);
+    }
+}
+
+#[cfg(test)]
+struct NoopPublisher;
+
+#[cfg(test)]
+impl TranscriptPublisher for NoopPublisher {
+    fn words(&self, _speaker: Speaker, _words: &[Word]) {}
+}
 
 trait LiveChannel {
     fn push(&mut self, samples: &[f32], sample_rate: u32);
@@ -1318,6 +1459,19 @@ mod tests {
     #[derive(Default)]
     struct NoDiarizer;
 
+    #[derive(Default)]
+    struct RecordingPublisher(RefCell<Vec<(String, Vec<Word>)>>);
+
+    impl TranscriptPublisher for RecordingPublisher {
+        fn words(&self, speaker: Speaker, words: &[Word]) {
+            if !words.is_empty() {
+                self.0
+                    .borrow_mut()
+                    .push((speaker.display().to_string(), words.to_vec()));
+            }
+        }
+    }
+
     impl LiveDiarizer for NoDiarizer {
         fn diarize_chunk(
             &self,
@@ -1489,6 +1643,45 @@ mod tests {
         assert!(window.tap_audio.is_empty());
     }
 
+    #[test]
+    fn closed_region_reaches_live_reader_before_the_durable_minute_boundary() {
+        let filer = TempFiler::new("reader-before-commit");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![vec![word(4.0, 5.0, "visible now")]], vec![]);
+        let publisher = RecordingPublisher::default();
+        let (tx, rx) = sync_channel(2);
+        tx.send(CaptureChunk {
+            mic: Vec::new(),
+            tap: vec![0.0; 10],
+        })
+        .unwrap();
+        drop(tx);
+
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut TranscriptWindow::new(1, 1, false).unwrap(),
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+
+        let published = publisher.0.borrow();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, "Them");
+        assert_eq!(published[0].1[0].text, "visible now");
+        assert!(
+            !note.exists(),
+            "the one-minute durable window is not due yet"
+        );
+    }
+
     /// Empty-mic chunks never reach the mic channel; a full configured interval is written while the call
     /// is still live; the final short tail is synced before the state line flips.
     #[test]
@@ -1525,6 +1718,7 @@ mod tests {
             &NoDiarizer,
             &mut window,
             &mut writer,
+            &NoopPublisher,
         )
         .unwrap();
 
@@ -1543,6 +1737,7 @@ mod tests {
             window,
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
+            &NoopPublisher,
         )
         .unwrap();
         let LiveOutcome::Filed { note_path } = outcome else {
@@ -1615,6 +1810,7 @@ mod tests {
             TranscriptWindow::new(48_000, 1, false).unwrap(),
             FinishQuality { dropped_chunks: 3 },
             &mut writer,
+            &NoopPublisher,
         )
         .unwrap();
 
@@ -1658,6 +1854,7 @@ mod tests {
             &NoDiarizer,
             &mut window,
             &mut writer,
+            &NoopPublisher,
         )
         .unwrap();
         let outcome = finish_session(
@@ -1669,6 +1866,7 @@ mod tests {
             window,
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
+            &NoopPublisher,
         )
         .unwrap();
         assert!(matches!(outcome, LiveOutcome::NoNote));
@@ -1715,6 +1913,30 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn microphone_test_reservation_excludes_calls_and_uses_generation_ownership() {
+        let manager = LiveManager::new();
+        assert!(manager.reserve_test(7));
+        assert!(!manager.reserve_test(8), "a second test cannot overlap");
+
+        let (tx, rx) = sync_channel(1);
+        assert!(!manager.stash_pending(rx, Arc::new(AtomicU64::new(0))));
+        drop(tx);
+        manager.release_test(8);
+        let (tx, rx) = sync_channel(1);
+        assert!(
+            !manager.stash_pending(rx, Arc::new(AtomicU64::new(0))),
+            "stale cleanup cannot release generation 7"
+        );
+        drop(tx);
+
+        manager.release_test(7);
+        let (tx, rx) = sync_channel(1);
+        assert!(manager.stash_pending(rx, Arc::new(AtomicU64::new(0))));
+        drop(tx);
+        manager.take_pending();
     }
 
     /// Collection moves a running handle out before joining it. The Collecting sentinel must keep the

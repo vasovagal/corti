@@ -1,10 +1,11 @@
 //! Shared reconciliation helpers: turn timestamped words into a [`DiarizedTranscript`]'s segments.
 //!
 //! Both backends produce per-word timing and need the same downstream shaping:
-//! - group one speaker's words into pause-split utterances ([`words_to_segments`]),
-//! - merge multiple speakers onto one timeline ([`merge_by_time`]),
+//! - group one speaker's words into pause-split utterances
+//!   ([`words_to_segments`](crate::segment::words_to_segments)),
+//! - merge multiple speakers onto one timeline ([`merge_by_time`](crate::segment::merge_by_time)),
 //! - and, for the local backend, attribute far-end words to diarization turns and segment them in one pass
-//!   ([`diarize_words`]).
+//!   ([`diarize_words`](crate::segment::diarize_words)).
 //!
 //! The AWS backend feeds channel-identified words (ch0 = me, ch1 = them); the local backend feeds Parakeet
 //! words (ch0 = me) plus ch1 words attributed to pyannote speaker turns.

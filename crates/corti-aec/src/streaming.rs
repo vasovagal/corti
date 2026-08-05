@@ -13,7 +13,7 @@
 //!    residual suppression uses the *frozen* snapshot (the offline-frozen-`W` analog) so it matches
 //!    offline-style suppression; steady-state blocks beyond the lookahead suppress with the live adapting
 //!    `W`.
-//! 3. **Delay-sync stability**: [`crate::estimate_delay`] runs over the whole lookahead window (a real
+//! 3. **Delay-sync stability**: `estimate_delay` runs over the whole lookahead window (a real
 //!    multi-second span) and the result is **locked** for the rest of the call (the room delay is a single
 //!    physical constant — ADR Decision 2), then realized as a primed `far_delay` queue so the far reference
 //!    is delayed by exactly `delay` samples, bit-equivalent to the offline `x[delay..]` pre-shift.
@@ -126,7 +126,7 @@ pub struct StreamingAec {
 
 impl StreamingAec {
     /// Build a streaming canceller. The lookahead window defaults from `CORTI_AEC_LOOKAHEAD_SECS` (or
-    /// [`DEFAULT_LOOKAHEAD_SECS`]), clamped and rounded up to a whole multiple of the block size.
+    /// `DEFAULT_LOOKAHEAD_SECS`), clamped and rounded up to a whole multiple of the block size.
     pub fn new(sample_rate: u32, cfg: AecConfig) -> Self {
         let b = cfg.filter_len.max(1);
         let lookahead = lookahead_samples_from_env(sample_rate, b);

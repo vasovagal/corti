@@ -68,7 +68,7 @@ impl RecordingMeta {
     }
 
     /// The `--source` value for `vagus add-note`: app name plus start time. The app-name half is run through
-    /// [`yaml_safe`] because `vagus` writes `--source` verbatim and unquoted into the note's YAML frontmatter,
+    /// `yaml_safe` because `vagus` writes `--source` verbatim and unquoted into the note's YAML frontmatter,
     /// and the name can be an arbitrary macOS bundle id or the user's `corti-tap --label`.
     pub fn source(&self) -> String {
         format!(

@@ -132,6 +132,26 @@ event; any tee drop quality-gates the result into lossless same-note fallback. F
 [transcription.md](transcription.md#live-inbox-filing-87); the write-authority amendment is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md).
 
+## In-app timestamped reader and microphone test (#105, ADR 0013)
+
+The tray exposes one contextual action over the same live engine:
+
+- During a detector recording, **Read live transcript…** opens a singleton `?view=live` window. Every closed
+  mic/tap VAD region is grouped with the normal `SEGMENT_GAP` and published as a call-relative timestamp range
+  plus `Me` / `Them 1` text. This happens before the one-minute default note boundary; no speculative second
+  decode runs. Optional `Them N` diarization remains a durability-boundary operation, so immediate far-end rows
+  deliberately say `Them`.
+- Open-late readers take a `LiveTranscriptStore` snapshot, then apply monotonic revision/sequence events. The
+  transient store is capped at 2,000 rows and about 1 MiB; it evicts oldest UI rows and reports that fact while
+  leaving the durable note untouched. Closing the webview does not stop the stream.
+- While idle, **Test microphone & live transcription…** loads the selected local ASR/VAD, pauses detector edges,
+  and then opens the default microphone directly. `MicrophoneCapture` uses a fixed SPSC ring and bounded lossy
+  tee but creates no process tap, aggregate, WAV, queue row, Vagus note, or retained transcript. Stop closes the
+  microphone before releasing the generation-owned model slot and resuming detection.
+
+See [ADR 0013](../design/adr/0013-live-transcript-window-and-microphone-test.md). AWS and manual webinar paths
+remain batch-only and show an unavailable state rather than starting a second capture.
+
 ## What this is *not* (yet)
 
 - **Live quality trades context for durability.** A natural VAD region is still capped at 20 s; the configured
@@ -140,6 +160,6 @@ event; any tee drop quality-gates the result into lossless same-note fallback. F
 - **Far-end speaker numbers are window-local.** Optional diarization runs before every append, but `Them N`
   clustering may renumber at a boundary. Stable cross-window identity needs persistent embedding matching and
   is outside ADR 0012.
-- **The ADR 0008 push-driven live-transcript window is still open.** #87 wired `StreamingAec::push` +
-  `LiveTranscriber` into the app (closing #74's in-app gap for the filing path), but the in-process UI window
-  and its Channel transport remain follow-up.
+- **No unstable partial-word hypotheses.** ADR 0013 supersedes ADR 0008's proposed pseudo-partial recognizer.
+  The reader updates when a VAD speech region closes, reusing exactly the words already headed to the durable
+  path; it does not repeatedly re-decode a growing utterance.

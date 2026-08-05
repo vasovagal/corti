@@ -1,11 +1,11 @@
 # ADR 0009 — Chunked/live transcription: a pull-based sync core, batch refactored onto it
 
 - **Status:** Accepted (2026-07-07; this branch)
-- **References:** ADR 0003 (local ASR / sherpa-onnx), ADR 0007 (streaming AEC; #74 — relocate
-  `StreamingAec.push()` into the capture writer thread), ADR 0008 (live-transcript UI, still Proposed);
+- **References:** ADR 0003 (local ASR / sherpa-onnx), ADR 0007 (streaming AEC; #74 — bounded
+  capture tee + `StreamingAec.push()` live consumer), ADR 0008 (superseded by ADR 0013's bounded UI);
   guardrail 6 (pluggable `Transcriber`), guardrail 9 (HAL callbacks hand work off via a channel, never block).
 - **Amended by:** ADR 0012 — reusable `checkpoint()` boundaries force the current VAD tail final, reset
-  bounded state, and preserve call-relative timestamps.
+  bounded state, and preserve call-relative timestamps; ADR 0013 observes those same closed regions in the UI.
 
 ## Context
 
@@ -47,13 +47,11 @@ audio path sync) and without regressing the batch path.
 
 - **One engine path.** Batch and live share `LiveTranscriber`; a decode bug or VAD tweak is fixed once. The
   batch refactor changes no observable behavior or tests.
-- **#74 is still the blocker for a live *app* pipeline.** The tee gives live consumers downmixed capture, but
-  the mic side is only echo-cancelled if AEC runs in-flight. `corti-tap --live` wires tee → `StreamingAec` →
-  `LiveTranscriber` end-to-end as the first real consumer / proof; wiring it into the app pipeline and the
-  ADR 0008 live window is follow-up.
-- **Live quality < batch.** Path A (re-decode the resident offline recognizer over closed VAD regions) is
-  simple and reuses the resident weights, but a live word is only correct once its region closes, and there is
-  no trailing-window re-decode yet (ADR 0008 Path A's windowed interim). The filed note stays the batch pass.
+- **#74 and the app consumers shipped later.** `corti-tap --live` proved tee → `StreamingAec` →
+  `LiveTranscriber`; #87/#103 added crash-safe app filing, and ADR 0013 added its bounded timestamped observer.
+- **Closed regions, not unstable partials.** A live word appears once its VAD region closes. ADR 0012 made
+  zero-drop committed live windows canonical (batch remains fallback); ADR 0013 deliberately reuses those
+  words instead of adding ADR 0008's proposed trailing pseudo-partial re-decode.
 - **Workspace deps.** `futures-core` is new, pulled only by `corti-transcribe-local`'s `stream` feature.
   `tokio` was already a workspace dep (`corti-tap`'s default `inbox`/AWS); the `stream` feature reuses it. Both
   are pinned in the root `Cargo.toml`. `corti-tap --live` pulls neither — it wires the sync core over std

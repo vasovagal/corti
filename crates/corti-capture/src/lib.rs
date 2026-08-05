@@ -142,7 +142,7 @@ pub use platform::Recorder;
 /// Bounded, lossy live-tee of the downmixed capture stream (ADR 0009); re-exported so callers depend only on
 /// `corti-capture`. See [`Recorder::start_with_tee`].
 #[cfg(target_os = "macos")]
-pub use corti_coreaudio::{CaptureChunk, CaptureTee};
+pub use corti_coreaudio::{CaptureChunk, CaptureTee, MicrophoneCapture, MicrophoneCaptureHandle};
 
 #[cfg(target_os = "macos")]
 mod platform {
