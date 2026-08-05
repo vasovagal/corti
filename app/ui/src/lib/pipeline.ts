@@ -2,10 +2,9 @@
 // backend stage id to the box(es) that pulse. Stage ids mirror Rust `imp::Stage` (app/src/main.rs);
 // `idle` (and any unknown id) lights nothing.
 //
-// Detect + Capture are one live phase (`recording`), so both pulse together. The shipped pipeline folds
-// echo cancellation into a single `transcribing` step (one `transcribe_recording` call), so `transcribing`
-// lights both the Echo-cancel and Transcribe boxes; the standalone `cancelling_echo` id is honoured too in
-// case the backend ever reports it on its own.
+// Detect + Capture are one live phase (`recording`), and since #74 echo cancellation runs in the capture
+// writer, so `recording` lights Detect + Capture + Echo-cancel together; the standalone `cancelling_echo`
+// id is honoured too in case the backend ever reports it on its own.
 
 export interface PipelineBox {
   key: string;
@@ -31,8 +30,8 @@ export const PIPELINE_BOXES: PipelineBox[] = [
   {
     key: "echo",
     title: "Echo-cancel",
-    blurb: "Strips the far side bleeding into your mic before transcribing.",
-    stages: ["cancelling_echo", "transcribing"],
+    blurb: "Strips the far side bleeding into your mic, as the call is recorded.",
+    stages: ["cancelling_echo", "recording"],
   },
   {
     key: "transcribe",

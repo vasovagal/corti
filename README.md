@@ -57,15 +57,14 @@ signals. Exactly what this app does: audio → notes.
        ▼
   in-process capture            one CoreAudio aggregate device, no subprocess
      process tap ─┐
-     mic ─────────┼─▶ ring ─▶ 2-track WAV   (ch0 Me · ch1 Them)
+     mic ─────────┼─▶ ring ─▶ AEC ─▶ 2-track WAV   (ch0 Me, cleaned · ch1 Them)
+       │             writer thread runs the FDAF adaptive filter + residual suppressor in flight,
+       │             so no raw mic ever hits disk and RAM stays flat on a multi-hour call
        │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet (CPU or Metal) ─▶ rolling checkpoint
        │                              └─ optional diarize ─▶ append + sync_all (local backend)
        │  Action::Stop                   └─ sync tail, then flip `State:` durably
        ▼
   batch fallback (live off/ineligible/failed):
-  AEC   FDAF adaptive filter + residual suppressor — strips speaker bleed off the mic track
-       │
-       ▼
   transcribe   Parakeet-TDT (sherpa/CPU or transcribe.cpp/Metal)  |  AWS Transcribe
        │       → diarized, word-timestamped Markdown
        ▼
@@ -121,8 +120,8 @@ persisted in `config.toml`.
 
 ## Status
 
-Pre-1.0. The full signed-app pipeline ships end-to-end (detect → capture → live/batch AEC + ASR →
-vagus) with both backends working, crash-safe local live filing, the bounded timestamped reader, and an
+Pre-1.0. The full signed-app pipeline ships end-to-end (detect → capture + in-flight AEC → live/batch
+ASR → vagus) with both backends working, crash-safe local live filing, the bounded timestamped reader, and an
 on-device microphone/transcription test for validating TCC + local models without a call.
 
 ## More
