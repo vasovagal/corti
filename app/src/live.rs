@@ -668,6 +668,14 @@ impl corti_detect::LiveHook for AppLiveHook {
         Some(tee)
     }
 
+    /// Read straight from the shared runtime config, so toggling AEC in Settings takes effect on the next
+    /// recording without any reload plumbing. Independent of `attach`: in-flight AEC (#74) applies to every
+    /// recording, live-filed or batch.
+    fn aec_config(&self) -> Option<corti_capture::AecConfig> {
+        let cfg = self.config.lock().unwrap();
+        cfg.aec_enabled.then(|| cfg.aec_config())
+    }
+
     fn started(&self, meta: &RecordingMeta, sample_rate: u32) {
         let Some(pending) = self.manager.take_pending() else {
             warn!(target: "corti::live", "live hook started() without a pending tee — batch path will run");

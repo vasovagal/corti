@@ -5,17 +5,49 @@
 //!
 //! Keeping the two ends as separate tracks is what gives downstream code free "me vs. them" diarization and
 //! lets [`corti-aec`](../corti_aec) cancel speaker bleed from time-aligned signals. Under ADR 0007
-//! (streaming-AEC-first) the captured 2-track is the **AEC input**, written lossless (float, never
-//! quantized) so the adaptive filter sees bit-exact PCM. The captured raw recording is retained for the
-//! configured sweep; the cleaned sibling is a reproducible derivative removed after durable filing.
+//! (streaming-AEC-first) the mic is echo-cancelled against the mono tap; since #74 that happens **in the
+//! capture writer thread**, block by block, so the file written is already clean and the raw mic never
+//! reaches disk. [`write_clean_wav`] remains the file-to-file pass for audio corti did not capture
+//! (`corti --input`, `corti-bench`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-/// Whole-file AEC adapter push size (frames). The WAV is still decoded in memory for now, but bounded
-/// pushes keep `StreamingAec`'s steady-state staging independent of call length (#97).
+/// Re-exported so callers configuring an in-flight capture filter depend only on `corti-capture`.
+pub use corti_aec::AecConfig;
+
+/// Whole-file AEC adapter push size (frames). The WAV is decoded in memory here, but bounded pushes keep
+/// `StreamingAec`'s steady-state staging independent of call length (#97).
 const AEC_PUSH_FRAMES: usize = 16 * 1024;
+
+/// Drive `StreamingAec` over the mic/tap blocks a capture writer thread hands it (#74).
+///
+/// This is the in-flight half of ADR 0007: identical DSP to [`write_clean_wav`], just fed from the ring
+/// drain instead of a finished file. Its memory is the filter's own state plus one block — nothing here is
+/// sized by call length.
+pub struct StreamingAecFilter {
+    aec: corti_aec::StreamingAec,
+}
+
+impl StreamingAecFilter {
+    pub fn new(sample_rate: u32, cfg: AecConfig) -> Self {
+        Self {
+            aec: corti_aec::StreamingAec::new(sample_rate, cfg),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
+    fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+        self.aec.push(mic, far)
+    }
+
+    fn finish(self: Box<Self>) -> Vec<f32> {
+        self.aec.finish()
+    }
+}
 
 /// Where recordings are cached. Outside any vault, prunable. Override with `$CORTI_RECORDINGS_DIR`.
 pub fn recordings_dir() -> Result<PathBuf> {
@@ -55,16 +87,19 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
     raw.with_file_name(format!("{stem}-clean.wav"))
 }
 
-/// Read the captured 2-track recording, cancel speaker bleed on ch0 (mic) using ch1 (mono far-end tap) as the
-/// echo reference, and write the cleaned 2-track WAV (ch0 = cleaned mic, ch1 = mono tap "them"). Returns the
-/// clean path wrapped in `Some`.
+/// The **file-to-file** AEC pass: read a 2-track WAV, cancel speaker bleed on ch0 (mic) using ch1 (mono
+/// far-end tap) as the echo reference, and write the cleaned 2-track sibling (ch0 = cleaned mic, ch1 = mono
+/// tap "them"). Returns the clean path wrapped in `Some`.
+///
+/// Since #74 corti's own recordings are cleaned in the capture writer thread, so this is for audio corti did
+/// not capture — `corti --input <wav>` and `corti-bench` scoring. It decodes the whole file into memory, so
+/// it is bounded by the input, not by [`StreamingAecFilter`]'s block bound.
 ///
 /// Returns `Ok(None)` for a **1-channel** input: a tap-only / listen-only ("webinar") recording has no mic
 /// track, so there is nothing to cancel — the caller transcribes the tap directly. This is an expected
 /// outcome, not an error. Any other channel count (0, or 3+) is a genuine error.
 ///
-/// The captured file is only read here, not modified. The pipeline retains it for the configured audio
-/// retention period; this reproducible cleaned sibling is removed after durable filing.
+/// The input file is only read here, not modified.
 pub fn write_clean_wav(
     raw_2track_wav: &Path,
     aec_cfg: &corti_aec::AecConfig,
@@ -137,17 +172,60 @@ pub fn write_clean_wav(
 }
 
 #[cfg(target_os = "macos")]
-pub use platform::Recorder;
+pub use platform::{Recorder, RecordingOptions};
 
-/// Bounded, lossy live-tee of the downmixed capture stream (ADR 0009); re-exported so callers depend only on
-/// `corti-capture`. See [`Recorder::start_with_tee`].
+/// Bounded, lossy live-tee of the downmixed capture stream (ADR 0009), plus the writer-thread filter seam
+/// (#74); re-exported so callers depend only on `corti-capture`. See [`Recorder::start_with_tee`] and
+/// [`RecordingOptions::with_aec`].
 #[cfg(target_os = "macos")]
-pub use corti_coreaudio::{CaptureChunk, CaptureTee, MicrophoneCapture, MicrophoneCaptureHandle};
+pub use corti_coreaudio::{
+    CaptureChunk, CaptureFilter, CaptureTee, FILTER_FRAMES_PER_CHUNK, MicrophoneCapture,
+    MicrophoneCaptureHandle,
+};
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use corti_coreaudio::{CaptureSession, CaptureTee, OutputLayout, TapTarget};
+    use corti_coreaudio::{
+        CaptureFilter, CaptureOptions, CaptureSession, CaptureTee, OutputLayout, TapTarget,
+    };
+
+    /// Per-recording capture options: an optional live tee (ADR 0009) and optional in-flight AEC (#74).
+    /// Both default to off, which is the pre-#74 behaviour byte for byte.
+    #[derive(Default)]
+    pub struct RecordingOptions {
+        tee: Option<CaptureTee>,
+        aec: Option<AecConfig>,
+    }
+
+    impl RecordingOptions {
+        /// Tee bounded, downmixed **raw** live chunks to `tee`. Never blocks capture, never affects the WAV.
+        pub fn with_tee(mut self, tee: CaptureTee) -> Self {
+            self.tee = Some(tee);
+            self
+        }
+
+        /// Echo-cancel the mic in the writer thread, so the recording written is already clean.
+        /// Ignored for a tap-only capture, which has no mic.
+        pub fn with_aec(mut self, cfg: AecConfig) -> Self {
+            self.aec = Some(cfg);
+            self
+        }
+
+        /// Lower to the engine's options. `keep_aec = false` for layouts with no mic track.
+        fn into_capture_options(self, keep_aec: bool) -> CaptureOptions {
+            let mut out = CaptureOptions::default();
+            if let Some(tee) = self.tee {
+                out = out.with_tee(tee);
+            }
+            if let Some(cfg) = self.aec.filter(|_| keep_aec) {
+                out = out.with_filter(Box::new(move |sample_rate| {
+                    Box::new(StreamingAecFilter::new(sample_rate, cfg)) as Box<dyn CaptureFilter>
+                }));
+            }
+            out
+        }
+    }
 
     /// A fresh recording path in the recordings cache for `app`, creating the cache dir.
     fn new_recording_path(app: &corti_core::OwningApp) -> Result<PathBuf> {
@@ -179,14 +257,7 @@ mod platform {
         /// Start recording the given app (`pid = None` ⇒ global tap of all system audio) to a fresh file in
         /// the recordings cache. Returns the recorder and the output path.
         pub fn start(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
-            let out = new_recording_path(app)?;
-            let session = CaptureSession::start_recording(
-                tap_target(pid),
-                out.clone(),
-                OutputLayout::TwoTrack,
-            )
-            .with_context(|| format!("starting capture for {}", app.name))?;
-            Ok(Self { session, out })
+            Self::start_with(app, pid, RecordingOptions::default())
         }
 
         /// Like [`start`], additionally teeing bounded, downmixed live chunks to `tee` (ADR 0009). The tee
@@ -198,12 +269,24 @@ mod platform {
             pid: Option<i32>,
             tee: CaptureTee,
         ) -> Result<Self> {
+            Self::start_with(app, pid, RecordingOptions::default().with_tee(tee))
+        }
+
+        /// [`start`] with explicit [`RecordingOptions`] — the form that can request in-flight AEC (#74), so
+        /// the 2-track written is already cleaned and the raw mic never lands on disk.
+        ///
+        /// [`start`]: Recorder::start
+        pub fn start_with(
+            app: &corti_core::OwningApp,
+            pid: Option<i32>,
+            options: RecordingOptions,
+        ) -> Result<Self> {
             let out = new_recording_path(app)?;
-            let session = CaptureSession::start_recording_with_tee(
+            let session = CaptureSession::start_recording_with_options(
                 tap_target(pid),
                 out.clone(),
                 OutputLayout::TwoTrack,
-                tee,
+                options.into_capture_options(true),
             )
             .with_context(|| format!("starting capture for {}", app.name))?;
             Ok(Self { session, out })
@@ -215,14 +298,7 @@ mod platform {
         ///
         /// [`start`]: Recorder::start
         pub fn start_tap_only(app: &corti_core::OwningApp, pid: Option<i32>) -> Result<Self> {
-            let out = new_recording_path(app)?;
-            let session = CaptureSession::start_tap_only_recording(
-                tap_target(pid),
-                out.clone(),
-                OutputLayout::TapOnlyMono,
-            )
-            .with_context(|| format!("starting tap-only capture for {}", app.name))?;
-            Ok(Self { session, out })
+            Self::start_tap_only_with(app, pid, RecordingOptions::default())
         }
 
         /// Like [`start_tap_only`], additionally teeing bounded, downmixed live chunks (the `mic` side is
@@ -234,12 +310,24 @@ mod platform {
             pid: Option<i32>,
             tee: CaptureTee,
         ) -> Result<Self> {
+            Self::start_tap_only_with(app, pid, RecordingOptions::default().with_tee(tee))
+        }
+
+        /// [`start_tap_only`] with explicit [`RecordingOptions`]. Any requested AEC is dropped here: a
+        /// tap-only capture has no mic and therefore no echo to cancel.
+        ///
+        /// [`start_tap_only`]: Recorder::start_tap_only
+        pub fn start_tap_only_with(
+            app: &corti_core::OwningApp,
+            pid: Option<i32>,
+            options: RecordingOptions,
+        ) -> Result<Self> {
             let out = new_recording_path(app)?;
-            let session = CaptureSession::start_tap_only_recording_with_tee(
+            let session = CaptureSession::start_tap_only_recording_with_options(
                 tap_target(pid),
                 out.clone(),
                 OutputLayout::TapOnlyMono,
-                tee,
+                options.into_capture_options(false),
             )
             .with_context(|| format!("starting tap-only capture for {}", app.name))?;
             Ok(Self { session, out })
@@ -450,6 +538,80 @@ mod tests {
             !clean_wav_path(&raw).exists(),
             "skipping AEC must not write a -clean.wav sibling"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #74 acceptance: **ERLE parity**. The in-flight filter the capture writer drives in
+    /// [`FILTER_FRAMES_PER_CHUNK`] blocks must cancel exactly as well as the post-capture
+    /// [`write_clean_wav`] pass, which reads the whole file and pushes [`AEC_PUSH_FRAMES`] at a time. Both
+    /// drive the same `StreamingAec`, so the chunk size must not change the output — asserted sample-exact
+    /// here, with a real echo so a broken canceller can't pass by leaving the mic untouched.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_flight_filter_matches_post_capture_pass() {
+        use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
+
+        // 8 kHz keeps the 5 s lookahead (40k samples) and the run cheap; a short filter keeps the FFTs small.
+        let sample_rate = 8_000u32;
+        let frames = 64 * 1024;
+        let cfg = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        // Mic = quiet near-end speech + a delayed, attenuated copy of the far end (the echo to cancel).
+        let mic: Vec<f32> = (0..frames)
+            .map(|i| {
+                let near = (i as f32 * 0.011).sin() * 0.05;
+                let echo = if i >= 24 { tap[i - 24] * 0.6 } else { 0.0 };
+                near + echo
+            })
+            .collect();
+
+        let dir = std::env::temp_dir().join("corti-aec-parity-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("rec.wav");
+        {
+            let mut w = hound::WavWriter::create(
+                &raw,
+                hound::WavSpec {
+                    channels: 2,
+                    sample_rate,
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                },
+            )
+            .unwrap();
+            for i in 0..frames {
+                w.write_sample(mic[i]).unwrap();
+                w.write_sample(tap[i]).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        let clean_path = write_clean_wav(&raw, &cfg).unwrap().unwrap();
+        let mut r = hound::WavReader::open(&clean_path).unwrap();
+        let interleaved: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        let batch: Vec<f32> = interleaved.iter().step_by(2).copied().collect();
+
+        // The writer thread's drive: fixed-size blocks, nothing sized by the recording length.
+        let mut filter: Box<dyn CaptureFilter> =
+            Box::new(StreamingAecFilter::new(sample_rate, cfg.clone()));
+        let mut in_flight = Vec::with_capacity(frames);
+        for start in (0..frames).step_by(FILTER_FRAMES_PER_CHUNK) {
+            let end = (start + FILTER_FRAMES_PER_CHUNK).min(frames);
+            in_flight.extend(filter.push(&mic[start..end], &tap[start..end]));
+        }
+        in_flight.extend(filter.finish());
+        in_flight.truncate(frames);
+
+        assert_eq!(in_flight.len(), batch.len(), "same frame count");
+        assert_eq!(in_flight, batch, "chunk size must not change the output");
+
+        let energy = |v: &[f32]| v.iter().map(|s| (s * s) as f64).sum::<f64>();
+        let erle = 10.0 * (energy(&mic) / energy(&in_flight).max(f64::MIN_POSITIVE)).log10();
+        assert!(erle > 6.0, "expected real cancellation, got {erle:.1} dB");
 
         std::fs::remove_dir_all(&dir).ok();
     }

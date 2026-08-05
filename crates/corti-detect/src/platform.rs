@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Local;
-use corti_capture::Recorder;
+use corti_capture::{Recorder, RecordingOptions};
 use corti_core::RecordingMeta;
 use corti_coreaudio::{DefaultInputDeviceMonitor, MicMonitor, mic_owner, other_app_holds_input};
 
@@ -44,6 +44,12 @@ pub trait LiveHook: Send + 'static {
     /// best-effort owning-app attribution (the full [`RecordingMeta`] doesn't exist yet — the recorder
     /// chooses the output path).
     fn attach(&self, app: &corti_core::OwningApp) -> Option<corti_capture::CaptureTee>;
+    /// Echo-cancellation settings for this recording, or `None` to record unfiltered. Consulted at every
+    /// start (independently of [`attach`](Self::attach)) so a settings change applies to the next call.
+    /// With `Some`, the capture writer thread cleans the mic in-flight and no raw mic reaches disk (#74).
+    fn aec_config(&self) -> Option<corti_capture::AecConfig> {
+        None
+    }
     /// Capture started with the tee attached: the definitive meta (with `audio_path`) plus the capture
     /// sample rate (to size a resampler/AEC). Only called when [`attach`](Self::attach) returned `Some`.
     fn started(&self, meta: &RecordingMeta, sample_rate: u32);
@@ -330,10 +336,16 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 // captures it at session creation), so `attach` runs on the incomplete attribution.
                 let tee = self.live.as_ref().and_then(|h| h.attach(&owner.app));
                 let live_attached = tee.is_some();
-                let started = match tee {
-                    Some(tee) => Recorder::start_with_tee(&owner.app, owner.pid, tee),
-                    None => Recorder::start(&owner.app, owner.pid),
-                };
+                let aec = self.live.as_ref().and_then(|h| h.aec_config());
+                let aec_enabled = aec.is_some();
+                let mut options = RecordingOptions::default();
+                if let Some(tee) = tee {
+                    options = options.with_tee(tee);
+                }
+                if let Some(cfg) = aec {
+                    options = options.with_aec(cfg);
+                }
+                let started = Recorder::start_with(&owner.app, owner.pid, options);
                 match started {
                     Ok(recorder) => {
                         let meta = RecordingMeta {
@@ -348,6 +360,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             pid = owner.pid,
                             started_at = %meta.started_at,
                             live = live_attached,
+                            aec = aec_enabled,
                             path = %meta.audio_path.display(),
                             "call started — recording"
                         );
