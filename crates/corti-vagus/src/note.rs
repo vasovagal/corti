@@ -18,6 +18,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::provenance::TranscriptProvenance;
+
 /// State line while live segments are still being appended.
 pub const STATE_TRANSCRIBING: &str = "State: transcribing";
 /// Final state line. The trailing space pads it to the byte width of [`STATE_TRANSCRIBING`] so the
@@ -79,6 +81,25 @@ pub fn flip_state(path: &Path) -> Result<()> {
 /// truncate + write on the same file, never a rename, so the inode survives. (A follower may see the
 /// file shrink here; the strict no-shrink guarantee only covers the mid-stream [`flip_state`].)
 pub fn rewrite_body(path: &Path, new_body: &str) -> Result<()> {
+    rewrite_body_inner(path, new_body, None)
+}
+
+/// Replace the body and upsert the Corti-owned provenance field in the same bounded-prefix, same-inode
+/// rewrite. A partial live note that falls back to batch must never retain stale `mode: live` metadata over
+/// its canonical batch transcript. Provenance is written into the prefix before the final body bytes.
+pub fn rewrite_body_with_provenance(
+    path: &Path,
+    new_body: &str,
+    provenance: &TranscriptProvenance,
+) -> Result<()> {
+    rewrite_body_inner(path, new_body, Some(provenance))
+}
+
+fn rewrite_body_inner(
+    path: &Path,
+    new_body: &str,
+    provenance: Option<&TranscriptProvenance>,
+) -> Result<()> {
     // Scan with a reusable line buffer: final live notes can be arbitrarily long, but their state line is
     // near the top and a state flip/body rewrite must not clone the whole transcript into RAM.
     let keep = match state_line_offset_in_file(path)? {
@@ -97,6 +118,16 @@ pub fn rewrite_body(path: &Path, new_body: &str) -> Result<()> {
         .take(keep)
         .read_to_end(&mut prefix)
         .with_context(|| format!("reading prefix of {} to rewrite its body", path.display()))?;
+    if let Some(provenance) = provenance {
+        prefix = upsert_provenance(&prefix, provenance)
+            .with_context(|| format!("updating transcript provenance in {}", path.display()))?;
+        ensure!(
+            prefix.len() as u64 <= MAX_PREFIX_BYTES,
+            "refusing an unexpectedly large note prefix ({} bytes) after adding provenance to {}",
+            prefix.len(),
+            path.display()
+        );
+    }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -107,6 +138,62 @@ pub fn rewrite_body(path: &Path, new_body: &str) -> Result<()> {
     f.sync_all()
         .with_context(|| format!("syncing rewritten body in {}", path.display()))?;
     Ok(())
+}
+
+/// Replace or insert the top-level `corti:` field in a bounded note prefix. Current Vagus writes the value
+/// on one JSON-flow line; the indented-line removal also handles a user reformatting that object as block
+/// YAML before a fallback rewrite.
+fn upsert_provenance(prefix: &[u8], provenance: &TranscriptProvenance) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(prefix).context("note prefix is not UTF-8")?;
+    let lines: Vec<(usize, usize, &str)> = text
+        .split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, *offset, line))
+        })
+        .collect();
+    ensure!(
+        lines
+            .first()
+            .is_some_and(|(_, _, line)| line.trim_end_matches(['\r', '\n']) == "---"),
+        "note has no leading YAML frontmatter"
+    );
+    let close = lines
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, (_, _, line))| line.trim_end_matches(['\r', '\n']) == "---")
+        .map(|(index, _)| index)
+        .context("note has unterminated YAML frontmatter")?;
+    let replacement = provenance
+        .frontmatter_line()
+        .context("serializing transcript provenance")?;
+
+    let existing = lines[..close]
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, (_, _, line))| line.starts_with("corti:"));
+    let (start, end) = if let Some((index, (start, initial_end, _))) = existing {
+        let mut end = *initial_end;
+        for (_, line_end, line) in &lines[index + 1..close] {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                end = *line_end;
+            } else {
+                break;
+            }
+        }
+        (*start, end)
+    } else {
+        (lines[close].0, lines[close].0)
+    };
+
+    let mut out = Vec::with_capacity(prefix.len() + replacement.len());
+    out.extend_from_slice(&prefix[..start]);
+    out.extend_from_slice(replacement.as_bytes());
+    out.extend_from_slice(&prefix[end..]);
+    Ok(out)
 }
 
 /// Streaming state-line scanner. It retains one line rather than the complete, growing note.
@@ -174,6 +261,7 @@ fn state_line_offset(content: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provenance::GenerationMode;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
 
@@ -292,6 +380,45 @@ mod tests {
         assert!(got.contains("the full batch transcript"));
         assert!(!got.contains("partial words"), "old body replaced");
         assert!(got.contains(&format!("\n{STATE_TRANSCRIBED}\n")));
+    }
+
+    #[test]
+    fn fallback_rewrite_upserts_batch_provenance_without_reading_the_tail() {
+        let live = crate::provenance::TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        let mut content = live_note_content();
+        content = content.replacen(
+            "---\n\n#",
+            &format!("{}---\n\n#", live.frontmatter_line().unwrap()),
+            1,
+        );
+        let p = test_note("rewrite-provenance", &content);
+        let mut append = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        append.write_all(&[0xff; 4096]).unwrap();
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        let batch = crate::provenance::TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+
+        rewrite_body_with_provenance(&p, "canonical batch body\n", &batch).unwrap();
+
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+        assert_eq!(
+            got.matches("\ncorti: ").count(),
+            1,
+            "old value was replaced"
+        );
+        assert!(got.contains(r#""mode":"batch""#), "got: {got}");
+        assert!(!got.contains(r#""mode":"live""#), "got: {got}");
+        assert!(got.ends_with("canonical batch body\n"));
+    }
+
+    #[test]
+    fn fallback_rewrite_inserts_provenance_when_an_older_vagus_omitted_it() {
+        let p = test_note("insert-provenance", &live_note_content());
+        let batch = crate::provenance::TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+        rewrite_body_with_provenance(&p, "canonical batch body\n", &batch).unwrap();
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert!(got.contains("\ncorti: {"), "got: {got}");
+        assert!(got.find("corti:").unwrap() < got.find("\n---\n\n#").unwrap());
     }
 
     #[test]

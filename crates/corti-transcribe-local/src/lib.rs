@@ -322,6 +322,16 @@ impl Transcriber for LocalTranscriber {
     }
 }
 
+/// Effective ONNX provider for this build, without loading a model or logging. Public so transcript
+/// provenance can record the provider that will really run rather than an unavailable configured token.
+pub fn effective_provider(requested: &str) -> &str {
+    if requested != "cpu" && !cfg!(feature = "coreml-lib") {
+        "cpu"
+    } else {
+        requested
+    }
+}
+
 /// Resolve the requested ONNX execution provider against what this build can actually honor.
 ///
 /// A `coreml` request only works when the crate is compiled with the `coreml-lib` feature, which links a
@@ -331,15 +341,15 @@ impl Transcriber for LocalTranscriber {
 /// (3 ASR + 2 VAD = 5 lines for a typical job) — which reads like platform misdetection on an Apple-Silicon
 /// Mac. When CoreML can't be honored, map the request to `cpu` ourselves and say so once, clearly.
 fn resolve_provider(requested: &str) -> &str {
-    if requested != "cpu" && !cfg!(feature = "coreml-lib") {
+    let effective = effective_provider(requested);
+    if effective != requested {
         tracing::warn!(
             target: "corti::transcribe::local",
             requested,
             "provider unavailable in this build — running on CPU (build with the `coreml-lib` feature + a CoreML-enabled sherpa-onnx lib to enable it)"
         );
-        return "cpu";
     }
-    requested
+    effective
 }
 
 #[cfg(test)]

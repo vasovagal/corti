@@ -24,6 +24,7 @@ libc = "0.2"
 corti-transcribe = { workspace = true, optional = true }
 corti-transcribe-aws = { workspace = true, optional = true }
 corti-vagus = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 aws-config = { version = "1", optional = true }
 tokio = { workspace = true, features = ["rt", "time", "net"], optional = true }
 
@@ -34,5 +35,5 @@ corti-aec = { workspace = true, optional = true }
 
 [features]
 default = ["inbox"]
-inbox = ["dep:corti-transcribe", "dep:corti-transcribe-aws", "dep:corti-vagus", "dep:aws-config", "dep:tokio"]
+inbox = ["dep:corti-transcribe", "dep:corti-transcribe-aws", "dep:corti-vagus", "dep:serde_json", "dep:aws-config", "dep:tokio"]
 live = ["dep:corti-transcribe-local", "dep:corti-aec"]

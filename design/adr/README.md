@@ -19,6 +19,7 @@ Append-only decision log (Context / Decision / Consequences). Guardrails in
 | [0011](0011-spike-transcribe-cpp-ggml-asr.md) | Accepted (opt-in; sherpa default) | transcribe.cpp GGML/Metal as a selectable Parakeet ASR runtime; 4.09× M1 Pro speedup at equal excerpt WER |
 | [0012](0012-crash-safe-bounded-live-transcript.md) | Accepted | configurable rolling transcript windows; bounded live RAM; diarize then `sync_all` each durable chunk |
 | [0013](0013-live-transcript-window-and-microphone-test.md) | Accepted | bounded timestamped live reader, ephemeral mic/ASR test, and foreground tray windows |
+| [0014](0014-transcript-generation-provenance.md) | Accepted | versioned, Vagus-searchable transcript provenance: Corti release, final live/batch path, models, and quality config in safe namespaced frontmatter |
 
 **Two ADRs share number 0006** — `distribution-unsigned-cask-tap` (Accepted) and
 `far-end-recording-notice-spike` (Proposed spike) — a numbering collision left as-is; disambiguate by

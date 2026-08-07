@@ -37,6 +37,8 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod provenance;
+#[cfg(target_os = "macos")]
 mod queue_ui;
 #[cfg(target_os = "macos")]
 mod settings;

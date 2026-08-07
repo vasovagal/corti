@@ -11,10 +11,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use corti_core::DiarizedTranscript;
+use corti_vagus::provenance::{GenerationMode, TranscriptProvenance};
 use serde::{Deserialize, Serialize};
 
 const VERSION: u32 = 1;
 const AWS_STAGING_VERSION: u32 = 1;
+
+fn legacy_batch_provenance() -> TranscriptProvenance {
+    TranscriptProvenance::legacy_unknown(GenerationMode::Batch)
+}
 
 /// A note path whose ownership must survive a retry. Partial live notes may be rewritten/replaced; canonical
 /// notes were already returned by vagus (or finalized live) and need completion only, even after they move.
@@ -103,6 +108,10 @@ pub(crate) struct FilingCheckpoint {
     /// reorganized it out of the inbox; absence is not permission to invoke `add-note` again.
     #[serde(default)]
     pub(crate) note_canonical: bool,
+    /// Generation identity captured from the backend's exact config snapshot. Additive/defaulted so a
+    /// pre-provenance v1 checkpoint remains readable without being mislabeled from current Settings.
+    #[serde(default = "legacy_batch_provenance")]
+    pub(crate) provenance: TranscriptProvenance,
     /// Present only for an AWS transcript whose staged input/output have not yet been deleted.
     pub(crate) aws_staging: Option<AwsStaging>,
 }
@@ -118,6 +127,7 @@ impl FilingCheckpoint {
             transcript,
             note_path,
             note_canonical: false,
+            provenance: legacy_batch_provenance(),
             aws_staging,
         }
     }
@@ -132,6 +142,10 @@ impl FilingCheckpoint {
     pub(crate) fn set_canonical_note(&mut self, path: PathBuf) {
         self.note_path = Some(path);
         self.note_canonical = true;
+    }
+
+    pub(crate) fn set_provenance(&mut self, provenance: TranscriptProvenance) {
+        self.provenance = provenance;
     }
 
     /// Atomically replace the checkpoint beside `audio` and fsync the file before publishing it.
@@ -320,6 +334,10 @@ mod tests {
         let audio = dir.join("recording.wav");
         let mut expected = checkpoint(Some(dir.join("note.md")));
         expected.set_canonical_note(dir.join("note.md"));
+        let mut captured = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+        captured.version = "captured-before-settings-changed".into();
+        captured.backend = "local".into();
+        expected.set_provenance(captured);
         expected.store(&audio).unwrap();
         assert_eq!(FilingCheckpoint::load(&audio).unwrap(), expected);
         assert!(expected.owned_note().unwrap().canonical);
@@ -345,6 +363,22 @@ mod tests {
         AwsStaging::remove(&audio).unwrap();
         assert!(!aws_staging_path_for(&audio).exists());
         assert!(!has_unresolved_aws_staging(&audio));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn pre_provenance_checkpoint_loads_as_explicit_unknown() {
+        let dir = dir("legacy-provenance");
+        let audio = dir.join("recording.wav");
+        std::fs::write(
+            path_for(&audio),
+            r#"{"version":1,"transcript":{"segments":[]},"note_path":null,"aws_staging":null}"#,
+        )
+        .unwrap();
+        let loaded = FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(loaded.provenance.version, "unknown");
+        assert_eq!(loaded.provenance.backend, "unknown");
+        assert_eq!(loaded.provenance.mode, GenerationMode::Batch);
         std::fs::remove_dir_all(dir).ok();
     }
 

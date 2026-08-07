@@ -53,6 +53,15 @@ impl Backend {
         Self { cfg, kind }
     }
 
+    /// Provenance from the same immutable config snapshot this backend owns. Filing retries persist this
+    /// beside the transcript rather than re-reading possibly newer Settings.
+    pub fn provenance(
+        &self,
+        mode: corti_vagus::provenance::GenerationMode,
+    ) -> corti_vagus::provenance::TranscriptProvenance {
+        crate::provenance::from_config(&self.cfg, mode)
+    }
+
     /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
     /// pipeline supplies the stable name persisted on the recording row so retries reattach; explicit CLI
     /// runs pass `None` so `--redo --aws` always creates a fresh AWS attempt.

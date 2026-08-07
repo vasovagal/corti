@@ -361,7 +361,7 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
 
     eprintln!("transcribing via AWS Transcribe…");
     let opts = AwsOptions {
-        language,
+        language: language.clone(),
         ..AwsOptions::new(bucket)
     };
     let transcript = AwsTranscriber::new(&sdk, opts)
@@ -369,8 +369,36 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
         .context("transcription failed")?;
 
     eprintln!("filing note…");
+    let mut configuration = std::collections::BTreeMap::new();
+    configuration.insert("language".into(), serde_json::Value::String(language));
+    configuration.insert(
+        "input".into(),
+        serde_json::Value::String("completed_recording".into()),
+    );
+    configuration.insert(
+        "aec".into(),
+        serde_json::json!({ "enabled": false, "mode": "disabled" }),
+    );
+    configuration.insert(
+        "speaker_attribution".into(),
+        serde_json::Value::String("channel_identification_for_multichannel".into()),
+    );
+    let provenance = corti_vagus::provenance::TranscriptProvenance::new(
+        corti_vagus::provenance::GenerationMode::Batch,
+        "aws",
+        corti_vagus::provenance::TranscriptModels {
+            asr: corti_vagus::provenance::ModelIdentity::new(
+                "aws/transcribe-default",
+                None::<String>,
+            ),
+            vad: None,
+            diarization: None,
+            speaker_embedding: None,
+        },
+        configuration,
+    );
     let vagus = Vagus::discover()?;
-    let note = vagus.file_recording(&meta, &transcript)?;
+    let note = vagus.file_recording(&meta, &transcript, &provenance)?;
     eprintln!("note: {}", note.display());
 
     Ok(())

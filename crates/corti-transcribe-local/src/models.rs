@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
+/// Stable upstream model identities recorded in transcript provenance.
+pub const PARAKEET_MODEL_ID: &str = "nvidia/parakeet-tdt-0.6b-v3";
+pub const SEGMENTATION_MODEL_ID: &str = "pyannote/segmentation-3.0";
+pub const VAD_MODEL_ID: &str = "silero-vad";
 /// Parakeet-TDT-0.6B-v3 (multilingual, int8) — directory name as extracted from the release archive.
 pub const PARAKEET_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
 /// pyannote speaker-segmentation 3.0 — directory name as extracted from the release archive.

@@ -303,6 +303,12 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     );
 
     let aec_cfg = cfg.aec_config();
+    let mut provenance_cfg = cfg.clone();
+    provenance_cfg.aec_enabled = effective_aec;
+    let provenance = crate::provenance::from_config(
+        &provenance_cfg,
+        corti_vagus::provenance::GenerationMode::Batch,
+    );
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
@@ -329,7 +335,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     let vagus = Vagus::discover()
         .context("vagus not available (needed to file the note; pass --print to skip filing)")?;
     let note = vagus
-        .file_recording(&resolved.meta, &transcript)
+        .file_recording(&resolved.meta, &transcript, &provenance)
         .context("filing the note into vagus")?;
     println!("filed note: {}", note.display());
 
@@ -408,6 +414,12 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         },
     );
     let aec_cfg = cfg.aec_config();
+    let mut provenance_cfg = cfg.clone();
+    provenance_cfg.aec_enabled = aec_enabled && !skip_aec;
+    let provenance = crate::provenance::from_config(
+        &provenance_cfg,
+        corti_vagus::provenance::GenerationMode::Batch,
+    );
     let backend = Backend::init(cfg);
     let (transcript, used) = crate::transcribe::transcribe_recording(
         &backend,
@@ -428,7 +440,8 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     let title = args.title.unwrap_or_else(|| meta.note_title());
     let source = args.source.unwrap_or_else(|| meta.source());
     let body = corti_vagus::recording_body(&meta, &transcript);
-    let note = render_note(&title, &source, &body, Local::now());
+    let note = render_note(&title, &source, &body, &provenance, Local::now())
+        .context("rendering transcript provenance")?;
 
     match &args.output {
         Some(path) => {
@@ -445,11 +458,18 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
 /// this itself on purpose: the `vagus` CLI can only file into its own inbox with its own generated
 /// filename, and `--input` exists precisely to let the caller choose the path. This duplicates vagus's
 /// frontmatter shape (`created`/`status`/`source`); keep it in sync if vagus's note format changes.
-fn render_note(title: &str, source: &str, body: &str, created: chrono::DateTime<Local>) -> String {
-    format!(
-        "---\ncreated: {}\nstatus: inbox\nsource: {source}\n---\n\n# {title}\n\n{body}",
+fn render_note(
+    title: &str,
+    source: &str,
+    body: &str,
+    provenance: &corti_vagus::provenance::TranscriptProvenance,
+    created: chrono::DateTime<Local>,
+) -> Result<String> {
+    Ok(format!(
+        "---\ncreated: {}\nstatus: inbox\nsource: {source}\n{}---\n\n# {title}\n\n{body}",
         created.format("%Y-%m-%dT%H:%M"),
-    )
+        provenance.frontmatter_line()?,
+    ))
 }
 
 /// A recording resolved for re-transcription: which audio file to feed the backend, the metadata for the
@@ -772,15 +792,21 @@ mod tests {
     #[test]
     fn renders_note_like_vagus() {
         let created = Local.with_ymd_and_hms(2026, 6, 8, 16, 0, 56).unwrap();
+        let provenance = corti_vagus::provenance::TranscriptProvenance::legacy_unknown(
+            corti_vagus::provenance::GenerationMode::Batch,
+        );
         let note = render_note(
             "Slack call — 2026-06-08 16:00",
             "Slack · 2026-06-08 16:00",
             "> Auto-captured by corti from Slack.\n\n## Transcript\n\n**[00:00] Me:** hi\n",
+            &provenance,
             created,
-        );
+        )
+        .unwrap();
         assert!(note.starts_with(
-            "---\ncreated: 2026-06-08T16:00\nstatus: inbox\nsource: Slack · 2026-06-08 16:00\n---\n"
+            "---\ncreated: 2026-06-08T16:00\nstatus: inbox\nsource: Slack · 2026-06-08 16:00\ncorti: {"
         ));
+        assert!(note.contains(r#""mode":"batch""#));
         assert!(note.contains("\n# Slack call — 2026-06-08 16:00\n"));
         assert!(note.contains("## Transcript\n\n**[00:00] Me:** hi\n"));
     }
