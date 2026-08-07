@@ -750,7 +750,10 @@ fn session_thread(
     pipe_tx: Sender<PipelineMsg>,
     publisher: StorePublisher,
 ) -> LiveOutcome {
-    let mut writer = NoteWriter::new(VagusFiler, meta.clone(), Some(pipe_tx));
+    let provenance =
+        crate::provenance::from_config(&cfg, corti_vagus::provenance::GenerationMode::Live);
+    let mut writer =
+        NoteWriter::with_provenance(VagusFiler, meta.clone(), Some(pipe_tx), provenance);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_session(&rx, &verdict_rx, sample_rate, &cfg, &mut writer, &publisher)
     }));
@@ -1274,7 +1277,13 @@ impl LiveDiarizer for corti_transcribe_local::LiveEngine {
 /// How a note gets created — a seam so [`NoteWriter`] is testable against temp files. The production
 /// impl shells out to `vagus add-note --print-path` (the ADR 0001 boundary).
 trait NoteFiler {
-    fn create_note(&self, title: &str, source: &str, body: &str) -> Result<PathBuf>;
+    fn create_note(
+        &self,
+        title: &str,
+        source: &str,
+        body: &str,
+        provenance: &corti_vagus::provenance::TranscriptProvenance,
+    ) -> Result<PathBuf>;
 }
 
 /// Production filer: vagus is discovered lazily, at first-segment time — a missing binary is a
@@ -1284,8 +1293,14 @@ struct VagusFiler;
 
 #[cfg(feature = "local")]
 impl NoteFiler for VagusFiler {
-    fn create_note(&self, title: &str, source: &str, body: &str) -> Result<PathBuf> {
-        corti_vagus::Vagus::discover()?.add_note(title, source, body)
+    fn create_note(
+        &self,
+        title: &str,
+        source: &str,
+        body: &str,
+        provenance: &corti_vagus::provenance::TranscriptProvenance,
+    ) -> Result<PathBuf> {
+        corti_vagus::Vagus::discover()?.add_note(title, source, body, provenance)
     }
 }
 
@@ -1295,15 +1310,34 @@ impl NoteFiler for VagusFiler {
 struct NoteWriter<F: NoteFiler> {
     filer: F,
     meta: RecordingMeta,
+    provenance: corti_vagus::provenance::TranscriptProvenance,
     pipe_tx: Option<Sender<PipelineMsg>>,
     note: Option<PathBuf>,
 }
 
 impl<F: NoteFiler> NoteWriter<F> {
+    #[cfg(test)]
     fn new(filer: F, meta: RecordingMeta, pipe_tx: Option<Sender<PipelineMsg>>) -> Self {
+        Self::with_provenance(
+            filer,
+            meta,
+            pipe_tx,
+            corti_vagus::provenance::TranscriptProvenance::legacy_unknown(
+                corti_vagus::provenance::GenerationMode::Live,
+            ),
+        )
+    }
+
+    fn with_provenance(
+        filer: F,
+        meta: RecordingMeta,
+        pipe_tx: Option<Sender<PipelineMsg>>,
+        provenance: corti_vagus::provenance::TranscriptProvenance,
+    ) -> Self {
         Self {
             filer,
             meta,
+            provenance,
             pipe_tx,
             note: None,
         }
@@ -1334,6 +1368,7 @@ impl<F: NoteFiler> NoteWriter<F> {
                 &self.meta.note_title(),
                 &self.meta.source(),
                 &corti_vagus::live_initial_body(&self.meta),
+                &self.provenance,
             )
             .context("creating the live inbox note")?;
         // Retain ownership before the fallible sync. If syncing fails, `session_thread` must still return
@@ -1521,12 +1556,19 @@ mod tests {
     }
 
     impl NoteFiler for TempFiler {
-        fn create_note(&self, title: &str, source: &str, body: &str) -> Result<PathBuf> {
+        fn create_note(
+            &self,
+            title: &str,
+            source: &str,
+            body: &str,
+            provenance: &corti_vagus::provenance::TranscriptProvenance,
+        ) -> Result<PathBuf> {
             let p = self.note();
             std::fs::write(
                 &p,
                 format!(
-                    "---\ncreated: x\nstatus: inbox\nsource: {source}\n---\n\n# {title}\n\n{body}"
+                    "---\ncreated: x\nstatus: inbox\nsource: {source}\n{}---\n\n# {title}\n\n{body}",
+                    provenance.frontmatter_line()?
                 ),
             )?;
             Ok(p)
@@ -1558,6 +1600,8 @@ mod tests {
             .unwrap();
         assert_eq!(writer.path(), Some(&note));
         let content = read(&note);
+        assert!(content.contains(r#"corti: {"schema":1"#), "got: {content}");
+        assert!(content.contains(r#""mode":"live""#), "got: {content}");
         assert!(content.contains("State: transcribing\n\n"));
         assert!(content.contains("## Transcript\n\n"));
         assert!(content.ends_with("**[00:00] Me:** hello there\n\n"));

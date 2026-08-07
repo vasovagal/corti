@@ -5,7 +5,8 @@
   transcript in v1)
 - **References:** ADR 0009 (chunked transcription core), ADR 0007 (#74 — streaming AEC in-flight),
   guardrail 9
-- **Amended by:** ADR 0012 (bounded rolling windows + OS-synced durability boundaries)
+- **Amended by:** ADR 0012 (bounded rolling windows + OS-synced durability boundaries), ADR 0014
+  (the fallback body rewrite also replaces/inserts Corti's provenance frontmatter field)
 
 ## Context
 
@@ -28,8 +29,10 @@ against a path `vagus add-note --print-path` returned for a recording corti is p
    same byte width) when final. The flip seeks and overwrites only that line's bytes: no rename, no
    truncation, so a `tail -f` follower keeps its inode. Batch-filed notes carry the same
    `State: transcribed ` first line, so inbox agents have one contract.
-3. **Rewrite the body in place** (truncate + write on the same file — frontmatter/title kept, inode
-   kept) when the batch pass supersedes a partial live note. Never a second note.
+3. **Rewrite the body in place** (truncate + write on the same file — Vagus frontmatter/title kept,
+   inode kept) when the batch pass supersedes a partial live note. ADR 0014 makes the same bounded-prefix
+   operation replace/insert only Corti's `corti:` frontmatter field with the durable batch provenance before
+   writing the canonical body. Never a second note.
 4. **Delete** the note when its recording is discarded (too short / capture error).
 
 Nothing else in the vault, ever — no index writes, no other files, no notes corti didn't create.

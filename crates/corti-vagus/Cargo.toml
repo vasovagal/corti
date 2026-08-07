@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 corti-core = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

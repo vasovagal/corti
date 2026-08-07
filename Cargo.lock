@@ -1526,6 +1526,7 @@ dependencies = [
  "corti-transcribe-local",
  "corti-vagus",
  "libc",
+ "serde_json",
  "tokio",
 ]
 
@@ -1579,6 +1580,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "corti-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

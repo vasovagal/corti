@@ -129,8 +129,9 @@ Recording → PendingTranscription → Transcribing → PendingNote → Done
 ```
 
 `PendingNote` has a durable meaning: `<recording-stem>.transcript.json` was atomically written beside the
-raw recording and contains a versioned `DiarizedTranscript`, an optional existing/returned note path plus
-partial/canonical provenance, and any exact AWS staging location still awaiting deletion. A canonical path
+raw recording and contains a versioned `DiarizedTranscript`, generation provenance captured from the
+backend's exact config snapshot, an optional existing/returned note path plus partial/canonical ownership,
+and any exact AWS staging location still awaiting deletion. A canonical path
 means vagus/live filing already completed the note body, so only SQLite completion remains even if the path
 has moved. Only cloud cleanup (when marked) and filing/completion remain.
 
@@ -198,12 +199,15 @@ The filing semantics:
 
 - **State-line + storage contract (for inbox agents).** The first corti-authored body line is exactly
   `State: transcribing` while windows stream in, and exactly `State: transcribed ` — one trailing space,
-  same byte width — once final. The flip is a same-inode seek+write. ADR 0012 makes persistence explicit:
+  same byte width — once final. The flip is a same-inode seek+write. The note's `corti` frontmatter object
+  separately records `mode: live` plus the session's release/models/config (ADR 0014). ADR 0012 makes
+  persistence explicit:
   the initial note + parent directory, every complete transcript chunk, body rewrites, and the final flip
   call `sync_all`. The final short chunk is synced *before* the state is synced. Batch notes carry the same
   final line, so inbox agents have one contract.
-- **Lazy note creation.** The note is created (`vagus add-note --print-path`, initial body =
-  `live_initial_body`) on the **first non-empty committed window**, not at recording start. If discarded,
+- **Lazy note creation.** The note is created (`vagus add-note --print-path`, with the safe child-only
+  provenance payload and initial body = `live_initial_body`) on the **first non-empty committed window**,
+  not at recording start. If discarded,
   the session deletes it. Corti retains the path before the fallible first sync, then publishes it to the
   queue only after syncing the file and directory (`PipelineMsg::LiveNoteCreated`, status `Recording`).
 - **Configurable bounded windows.** `live_buffer_minutes` / `CORTI_LIVE_BUFFER_MINUTES` defaults to 1 and
@@ -227,8 +231,9 @@ The filing semantics:
   non-local backend, any configured model missing), no note created (silent call), a live-path error, or a dropped tee
   chunk ⇒ batch runs from the lossless WAV. A returned partial path is passed directly as the preferred
   rewrite target and persisted in the retry payload before fallible row repair. Successful batch ASR puts
-  that path and transcript in the post-ASR checkpoint; subsequent filing/completion retries load the
-  checkpoint, rewrite the same path/inode, and never invoke ASR again. Missing-audio failure and exhaustion
+  that path, transcript, and generation identity in the post-ASR checkpoint; subsequent filing/completion
+  retries load the checkpoint, replace/insert that note's one Corti-owned frontmatter field with
+  `mode: batch`, rewrite the same path/inode, and never invoke ASR again. Missing-audio failure and exhaustion
   also retain/close the directly-owned path. Webinar/manual captures have no live hook and always take batch.
 - **Discard.** The detector similarly delivers `discarded(meta)` before `RecordingDiscarded`. The live
   thread deletes its partial note; its reaper remains manager-owned and inside the one-model gate until
@@ -252,14 +257,22 @@ The filing semantics:
 `add_note` (`:102`), which **shells out** to the external `vagus` binary:
 
 ```
-vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
+VAGUS_ADD_NOTE_FRONTMATTER_JSON='{"corti":{...}}' \
+  vagus add-note "<title>" --source "<source>" --print-path   < body-on-stdin
 ```
 
-`--print-path` skips the editor and prints the created note path, which corti captures. The body
+The child-only JSON object is validated and rendered as YAML flow frontmatter by current Vagus releases;
+an older Vagus ignores it and still files the transcript. `--print-path` skips the editor and prints the
+created note path, which corti captures. The body
 (`recording_body`, `:186`) is the `State: transcribed ` line (#87), an auto-capture context line, and
 `DiarizedTranscript::to_markdown()`. The binary is resolved via `$VAGUS_BIN` → `vagus` on `PATH` →
 Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
+
+ADR 0014's versioned `corti` schema records package version, final `live`/`batch` mode, backend,
+ASR/VAD/optional segmentation+embedding identities, and an allowlist of quality settings. It excludes
+credentials, AWS bucket/profile, model directories, and absolute override paths. Standalone
+`--input --output` emits the same field without Vagus.
 
 After `vagus add-note` returns, its path is marked canonical in the local checkpoint, then
 `Queue::complete_with_note` atomically persists `note_path + Done`. A completion failure leaves the row at

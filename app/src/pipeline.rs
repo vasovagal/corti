@@ -1286,6 +1286,10 @@ pub(crate) fn transcribe_and_file(
         owned_note.as_ref().map(|note| note.path.clone()),
         aws_staging,
     );
+    checkpoint.set_provenance(
+        ctx.backend
+            .provenance(corti_vagus::provenance::GenerationMode::Batch),
+    );
     if let Some(note) = owned_note
         && note.canonical
     {
@@ -1353,11 +1357,12 @@ fn rewrite_checkpoint_note(
     let Some(existing) = existing else {
         return Ok(None);
     };
-    corti_vagus::note::rewrite_body(
+    corti_vagus::note::rewrite_body_with_provenance(
         &existing,
         &corti_vagus::recording_body(meta, &checkpoint.transcript),
+        &checkpoint.provenance,
     )
-    .context("rewriting the existing note")?;
+    .context("rewriting the existing note with batch provenance")?;
     Ok(Some(existing))
 }
 
@@ -1404,7 +1409,7 @@ fn file_and_done(
             Err(e) => anyhow::bail!("vagus unavailable: {e}"),
         };
         let note = vagus
-            .file_recording(meta, &checkpoint.transcript)
+            .file_recording(meta, &checkpoint.transcript, &checkpoint.provenance)
             .context("filing note failed")?;
         info!(
             target: "corti::pipeline",
@@ -1758,6 +1763,8 @@ mod tests {
         let content = std::fs::read_to_string(&note).unwrap();
         assert!(content.contains("State: transcribed \n"), "got: {content}");
         assert!(content.contains("canonical batch text"), "got: {content}");
+        assert!(content.contains(r#"corti: {"schema":1"#), "got: {content}");
+        assert!(content.contains(r#""mode":"batch""#), "got: {content}");
 
         checkpoint.set_canonical_note(rewritten.clone());
         checkpoint.store(&raw).unwrap();

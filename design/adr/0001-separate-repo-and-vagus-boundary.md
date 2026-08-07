@@ -14,8 +14,9 @@ whose whole value is being a small, offline, single-binary CLI.
 - corti is its **own repo** (`vasovagal/corti`), a Cargo workspace with many small crates.
 - corti integrates with vagus **only** by shelling out to the installed `vagus` binary —
   `vagus add-note "<title>" --source "<…>" --print-path` with the note body piped on stdin — exactly the
-  contract vagus's own Claude Code skills use. corti never writes the iCloud vault or the vagus index
-  directly.
+  contract vagus's own Claude Code skills use. ADR 0014 adds the child-only
+  `VAGUS_ADD_NOTE_FRONTMATTER_JSON` input for safe transcript provenance. Corti never writes the Vagus
+  index; the narrowly bounded writes to a returned note path are defined by ADR 0010/0014.
 - The boundary lives in one crate, `corti-vagus`. Everything else is unaware of vagus.
 
 ## Consequences

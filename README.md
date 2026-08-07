@@ -27,6 +27,9 @@ signals. Exactly what this app does: audio → notes.
   echo reference) so the filter sees bit-exact audio.
 - **Diarized, timestamped transcripts.** Clean Markdown with word-level timestamps and
   **Me** / **Them** speaker labels, dropped right into your vagus vault.
+- **Self-describing quality provenance.** Each note's `corti` frontmatter records the Corti release,
+  final live-versus-batch path, backend, exact selected ASR/VAD/diarization artifacts, and quality-relevant
+  configuration—without credentials, buckets, or private model paths.
 - **Two transcription backends, picked at runtime.** **AWS Transcribe** for cloud accuracy,
   or fully offline **NVIDIA Parakeet-TDT-0.6B-v3** when nothing may leave the machine. Local ASR can run
   through sherpa/ONNX on CPU or the faster transcribe.cpp/GGML path on Metal; choose both backend and local

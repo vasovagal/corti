@@ -5,10 +5,13 @@
 //! skills do:
 //!
 //! ```text
-//! vagus add-note "<title>" --source "<source>" --print-path  < body-on-stdin
+//! VAGUS_ADD_NOTE_FRONTMATTER_JSON='<safe object>' \
+//!   vagus add-note "<title>" --source "<source>" --print-path  < body-on-stdin
 //! ```
 //!
-//! `--print-path` makes `vagus` skip the editor and print the created note path, which we capture.
+//! `--print-path` makes `vagus` skip the editor and print the created note path, which we capture. The
+//! child-only environment payload adds the versioned `corti` provenance object on current Vagus releases;
+//! an older Vagus ignores it and still files the note instead of rejecting an unknown flag.
 //!
 //! Discovery order: `$VAGUS_BIN` if set (an explicit override — never falls back), else `vagus` on
 //! `PATH`, else well-known install dirs (Homebrew, `~/.cargo/bin`). The fallback dirs exist because a
@@ -24,6 +27,12 @@ use anyhow::{Context, Result, bail};
 use corti_core::{DiarizedTranscript, RecordingMeta};
 
 pub mod note;
+pub mod provenance;
+
+use provenance::TranscriptProvenance;
+
+/// Version-skew-safe metadata channel accepted by current `vagus add-note` (ADR 0014 / Vagus ADR 0027).
+const FRONTMATTER_ENV: &str = "VAGUS_ADD_NOTE_FRONTMATTER_JSON";
 
 /// A handle to the `vagus` binary.
 #[derive(Debug)]
@@ -98,10 +107,22 @@ impl Vagus {
         }
     }
 
-    /// Create a note with `vagus add-note`, piping `body` on stdin. Returns the created note path.
-    pub fn add_note(&self, title: &str, source: &str, body: &str) -> Result<PathBuf> {
+    /// Create a note with `vagus add-note`, piping `body` on stdin and passing versioned Corti provenance
+    /// through the child-only compatibility environment. Returns the created note path.
+    pub fn add_note(
+        &self,
+        title: &str,
+        source: &str,
+        body: &str,
+        provenance: &TranscriptProvenance,
+    ) -> Result<PathBuf> {
+        // Serialize before spawning: malformed metadata can never create an unowned note side effect.
+        let frontmatter = provenance
+            .frontmatter_json()
+            .context("serializing transcript provenance")?;
         let mut child = Command::new(&self.bin)
             .args(["add-note", title, "--source", source, "--print-path"])
+            .env(FRONTMATTER_ENV, frontmatter)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -135,11 +156,13 @@ impl Vagus {
         &self,
         meta: &RecordingMeta,
         transcript: &DiarizedTranscript,
+        provenance: &TranscriptProvenance,
     ) -> Result<PathBuf> {
         self.add_note(
             &meta.note_title(),
             &meta.source(),
             &recording_body(meta, transcript),
+            provenance,
         )
     }
 }
@@ -265,6 +288,42 @@ mod tests {
         std::fs::write(&p, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
+    }
+
+    #[test]
+    fn add_note_passes_namespaced_provenance_on_the_child_environment() {
+        use provenance::GenerationMode;
+
+        let dir = test_dir("frontmatter-env");
+        let bin = dir.join("vagus-capture");
+        let env_capture = dir.join("frontmatter.json");
+        let body_capture = dir.join("body.md");
+        let returned = dir.join("note.md");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$VAGUS_ADD_NOTE_FRONTMATTER_JSON\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}'\n",
+            env_capture.display(),
+            body_capture.display(),
+            returned.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let vagus = Vagus { bin };
+        let provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+
+        let path = vagus
+            .add_note("Title", "Source", "State: transcribed\n", &provenance)
+            .unwrap();
+
+        assert_eq!(path, returned);
+        assert_eq!(
+            std::fs::read_to_string(body_capture).unwrap(),
+            "State: transcribed\n"
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(env_capture).unwrap()).unwrap();
+        assert_eq!(payload["corti"]["mode"], "batch");
+        assert_eq!(payload["corti"]["schema"], provenance::SCHEMA_VERSION);
     }
 
     #[test]

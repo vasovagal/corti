@@ -41,8 +41,11 @@ fn main() -> anyhow::Result<()> {
         },
     ]);
 
+    let provenance = corti_vagus::provenance::TranscriptProvenance::legacy_unknown(
+        corti_vagus::provenance::GenerationMode::Batch,
+    );
     let vagus = Vagus::discover()?;
-    let path = vagus.file_recording(&meta, &transcript)?;
+    let path = vagus.file_recording(&meta, &transcript, &provenance)?;
     println!("filed note: {}", path.display());
     Ok(())
 }
