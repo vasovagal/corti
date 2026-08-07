@@ -6,6 +6,7 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
    ADR 0014's safe child-only provenance input); never write the Vagus index or SQLite DB. Against only a
    note path returned for the current recording, ADR 0010 permits bounded append/state/body/delete writes,
    and ADR 0014 lets the fallback body rewrite replace/insert only Corti's own `corti:` frontmatter field.
+   Vagus alone derives the searchable metadata chunks from that field (Vagus ADR 0028).
    Never touch any other vault path. (ADRs 0001, 0010, 0014)
 2. **Apple Silicon + latest macOS only.** No Intel, no universal binaries, no `cfg(target_arch = "x86_64")`,
    no support for macOS more than one release behind current. (ADR 0002)

@@ -262,7 +262,10 @@ VAGUS_ADD_NOTE_FRONTMATTER_JSON='{"corti":{...}}' \
 ```
 
 The child-only JSON object is validated and rendered as YAML flow frontmatter by current Vagus releases;
-an older Vagus ignores it and still files the transcript. `--print-path` skips the editor and prints the
+Vagus also projects it into dedicated BM25 + semantic metadata chunks, so `vagus search parakeet` (or a
+version/mode/config term) can retrieve the transcript by generation provenance. Vagus lifecycle fields stay
+out of chunk text. An older Vagus ignores the environment variable and still files the transcript.
+`--print-path` skips the editor and prints the
 created note path, which corti captures. The body
 (`recording_body`, `:186`) is the `State: transcribed ` line (#87), an auto-capture context line, and
 `DiarizedTranscript::to_markdown()`. The binary is resolved via `$VAGUS_BIN` → `vagus` on `PATH` →

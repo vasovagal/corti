@@ -4,7 +4,8 @@
 - **Amends:** ADR 0001 (Vagus CLI contract), ADR 0010 decision 3 (fallback rewrite owns one Corti
   frontmatter field as well as the body)
 - **References:** ADR 0003 (local models), ADR 0009 (shared live/batch core), ADR 0011 (GGML/Metal),
-  ADR 0012 (durable live windows), Vagus ADR 0027 (safe producer frontmatter)
+  ADR 0012 (durable live windows), Vagus ADR 0027 (safe producer frontmatter), Vagus ADR 0028
+  (searchable producer metadata)
 
 ## Context
 
@@ -54,7 +55,9 @@ flag would make staggered upgrades destructive because an older Vagus rejects un
    spawning the child, then sets `VAGUS_ADD_NOTE_FRONTMATTER_JSON` only on that `vagus add-note` process.
    Vagus ADR 0027 validates the object, protects Vagus-owned fields, and JSON-encodes values into YAML. An
    older Vagus ignores the environment variable and still creates the note; this availability fallback is
-   preferable to dropping/parking a transcript because release order differed.
+   preferable to dropping/parking a transcript because release order differed. Under Vagus ADR 0028, a
+   current Vagus also projects the `corti` JSON into dedicated lexical + semantic metadata chunks, making
+   release/model/config provenance searchable without indexing Vagus lifecycle fields.
 
 5. **A live→batch fallback updates provenance in the existing rewrite.** Live note creation uses the live
    session's snapshot. If batch becomes canonical, `rewrite_body_with_provenance` reads only the bounded
@@ -71,7 +74,9 @@ flag would make staggered upgrades destructive because an older Vagus rejects un
 
 - A bad note is self-describing enough to group quality reports by Corti release, final path, model set, and
   tuning without relying on mutable local logs.
-- Frontmatter stays one producer-owned namespace and is excluded from Vagus's indexed Markdown body.
+- Frontmatter stays one producer-owned namespace. Current Vagus indexes a normalized projection as
+  dedicated producer-metadata chunks, so searches such as `parakeet` find the generating model without
+  repeating provenance across transcript body chunks.
 - Batch filing retries cannot drift to a newer Settings snapshot; historical checkpoints are honest about
   missing identity.
 - Current Vagus is needed for provenance on a newly batch-filed note. Version skew still preserves the note,
