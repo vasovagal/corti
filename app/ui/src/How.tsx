@@ -63,8 +63,8 @@ export default function How() {
         <p className="how-detail">{activity?.detail || "Idle — waiting for a call."}</p>
 
         <p className="muted small">
-          It all runs on your Mac: audio is captured locally, and nothing is transcribed until the call
-          ends.
+          It all runs on your Mac: audio is captured locally, and the local backend can transcribe and
+          sync the note while the call is still running.
         </p>
       </main>
     </div>

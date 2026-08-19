@@ -7,5 +7,10 @@
 /recordings
 # bundled spike .app output
 dist/
+# deterministic Playwright marketing capture (sources are tracked; output is regenerated)
+screenshots/node_modules/
+screenshots/output/
+screenshots/test-results/
+screenshots/playwright-report/
 # tauri_build-generated ACL/capability schemas (regenerated each build)
 app/gen/

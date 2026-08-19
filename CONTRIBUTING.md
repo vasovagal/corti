@@ -48,7 +48,13 @@ cargo build -p corti-app
 # the Tauri tray app
 cargo tauri dev                          # dev server + hot reload
 cargo tauri build                        # produces .app + .dmg under target/.../bundle/
+
+# deterministic marketing screenshots (real frontend + mocked Tauri IPC)
+cd screenshots && npm install && npm run capture
 ```
+
+The screenshot harness needs Playwright Chromium once (`npx playwright install chromium`) and writes
+ignored Retina PNGs to `screenshots/output/`. See [`screenshots/README.md`](./screenshots/README.md).
 
 The app defaults are `aws`, `local`, and `local-ggml`. Select the active backend with
 `CORTI_TRANSCRIBE_BACKEND`; local ASR uses `CORTI_LOCAL_ASR_ENGINE=sherpa|ggml`. A minimal

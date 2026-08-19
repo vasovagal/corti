@@ -17,3 +17,15 @@ Then commit and push the tap:
 The tap also holds vagus's formula. Install UX: `brew tap vasovagal/tap` then
 `brew install --cask corti`. See
 [`design/adr/0006`](./design/adr/0006-distribution-unsigned-cask-tap.md).
+
+## Screenshots
+
+Marketing screenshots are generated from the real React frontend with deterministic Tauri IPC fixtures:
+
+    cd screenshots
+    npm install
+    npm run capture
+
+`./screenshots/update_site.py` captures and copies the PNGs into the sibling
+`vasovagal.github.io/assets/screenshots/` checkout. Generated `screenshots/output/` files stay ignored;
+commit the harness here and the copied images in the website repo. See [`screenshots/README.md`](./screenshots/README.md).
