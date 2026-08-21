@@ -1,0 +1,18 @@
+{
+  "mode": "asr",
+  "_comment": "Issue #118 stage 2: sherpa/ONNX-CPU vs transcribe.cpp/GGML-Metal across the whole Planet Money corpus — all three episodes at full length plus their 5-minute excerpts. Two alternating post-warm release processes per engine (WER is deterministic; the iterations exist for wall-clock/RSS variance). Full-episode references are the untrimmed NPR transcripts, so absolute WER carries the inserted-ad penalty; read the engine delta, not the level. NOTE: trees_5min and hackers_5min have placeholder reference files (no clean 5-minute slice exists for those episodes) — their wer_norm is meaningless and only their timing/RSS is usable.",
+  "fixtures": [
+    {"id": "dough_full",     "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5844617.full.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5844617.reference.txt"},
+    {"id": "trees_full",     "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5856509.full.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5856509.reference.txt"},
+    {"id": "hackers_full",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5859441.full.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5859441.reference.txt"},
+    {"id": "dough_5min",     "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5844617.5min.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5844617.5min.reference.txt"},
+    {"id": "trees_5min",     "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5856509.5min.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5856509.5min.reference.txt"},
+    {"id": "hackers_5min",   "wav": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5859441.5min.wav", "ref": "/Users/xlange/code/vasovagal/corti-worktrees/retire-coreml-ggml-first/bench/fixtures/nx-s1-5859441.5min.reference.txt"}
+  ],
+  "runs": [
+    {"name": "sherpa_1", "flags": {"asr-engine": "sherpa"}},
+    {"name": "ggml_1",   "flags": {"asr-engine": "ggml"}},
+    {"name": "sherpa_2", "flags": {"asr-engine": "sherpa"}},
+    {"name": "ggml_2",   "flags": {"asr-engine": "ggml"}}
+  ]
+}

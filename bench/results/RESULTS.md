@@ -33,6 +33,45 @@ shader build took 10.3 s; the cached library loaded in 11 ms on the next process
 `transcribe_cpp_round1.jsonl`. Outcome: ship a selectable accelerated engine, retain sherpa as the
 upgrade-safe default until a real live-checkpoint call soak (ADR 0011).
 
+## 0b. Whole-corpus engine comparison (2026-08-21, issue #118 stage 2)
+
+Round 0 above is one 300 s excerpt. This round re-runs the same two engines over **all three episodes at
+full length** — 5,568.7 s (92.8 min) of audio — plus the 5-minute excerpts, two alternating post-warm
+release processes each. Spec `bench/configs/engine_round2.json`, raw rows `engine_round2.jsonl`.
+
+Full-episode references are the untrimmed NPR transcripts while the mp3s carry inserted ads, so the ~0.18–0.21
+absolute WER is inflated by that mismatch. Both engines eat the identical penalty, so the **delta** is the
+result; the level is not a product-quality claim.
+
+| fixture | audio | sherpa WER | ggml WER | ΔWER | sherpa ASR | ggml ASR | speedup | sherpa RSS | ggml RSS | ΔRSS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| dough (full) | 1851 s | 0.1926 | **0.1796** | −0.0130 | 149.8 s | **39.0 s** | 3.84× | 1473 MB | **1291 MB** | −12.4% |
+| trees (full) | 1722 s | 0.1810 | **0.1719** | −0.0091 | 145.7 s | **35.1 s** | 4.15× | 1334 MB | **1162 MB** | −12.9% |
+| hackers (full) | 1995 s | 0.2149 | **0.2004** | −0.0146 | 165.8 s | **42.3 s** | 3.92× | 1336 MB | **1261 MB** | −5.6% |
+| dough (5 min) | 300 s | 0.2926 | **0.2875** | −0.0051 | 25.5 s | **7.0 s** | 3.62× | 1302 MB | **1105 MB** | −15.1% |
+| trees (5 min) | 300 s | n/a | n/a | n/a | 25.9 s | **6.5 s** | 4.02× | 1171 MB | **1153 MB** | −1.5% |
+| hackers (5 min) | 300 s | n/a | n/a | n/a | 26.5 s | **6.8 s** | 3.89× | 1260 MB | **1157 MB** | −8.2% |
+
+`trees`/`hackers` at 5 min score `n/a`: their `.5min.reference.txt` are placeholder stubs (the untimed NPR
+transcript cannot be sliced to a [120 s, 420 s) window), so a WER against them is meaningless. Their timing
+and RSS are still valid. Only `dough` has a real aligned 5-minute reference.
+
+Corpus totals over the three full episodes: mean WER **0.1840 ggml vs 0.1961 sherpa (−1.22 pp)**, total ASR
+**116.4 s vs 461.3 s (3.96×**, 47.8× vs 12.1× realtime), mean peak RSS **1238 MB vs 1381 MB (−10.3%)**.
+
+GGML is not merely at parity — it is slightly *more* accurate on every episode. Scoring the two hypotheses
+against **each other** (frozen normalizer, sherpa as reference) puts the disagreement at **3.63%** of words
+(657 edits / 18,114 words) across all six fixtures — a sharper parity signal than either engine's WER against
+an ad-contaminated reference.
+
+Corpus caveat: NPR re-encoded all three mp3s between the round-0 run and this one (new SHA-256s, durations
+shorter by 3–29 s — dynamic ad insertion). `manifest.json` was regenerated to match the audio actually
+measured here. Round 0's numbers are therefore not directly comparable to this round's, though both engines
+within this round saw byte-identical input.
+
+**This did not unlock a default flip.** See ADR 0011's addendum: the remaining gate is a real detector-call
+live soak, which this file-tier batch benchmark cannot exercise.
+
 ## 1. Transcription — `vad_min_silence` is the win
 
 Round 1 (12 configs × 3 clips, mean ΔWER vs baseline):
