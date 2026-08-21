@@ -1,0 +1,521 @@
+//! Non-secret hosted post-processing preferences.
+//!
+//! This document is deliberately separate from [`crate::config::AppConfig`]: hosted controls need their
+//! own monotonic revision and must never become enabled as a side effect of saving transcription settings
+//! or connecting a credential. Secret values are unrepresentable here; fixed [`SecretReference`] values
+//! are lookup handles for a later app-owned macOS Keychain boundary.
+
+// This phase intentionally lands the boundary before coordinator/Settings wiring.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail, ensure};
+use corti_postprocess::{
+    ConnectionScopeId, LocalCacheMode, ModelId, ProviderCacheMode, ProviderId, TransportId,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::private_file::{atomic_write_private, read_private};
+
+pub(crate) const HOSTED_PREFERENCES_SCHEMA: u32 = 1;
+pub(crate) const EGRESS_DISCLOSURE_VERSION: u32 = 1;
+pub(crate) const PINNED_AUTO_DISCLOSURE_VERSION: u32 = 1;
+pub(crate) const PROVIDER_CACHE_DISCLOSURE_VERSION: u32 = 1;
+const DEFAULT_FINAL_DEADLINE_SECONDS: u32 = 90;
+const MAX_FINAL_DEADLINE_SECONDS: u32 = 10 * 60;
+const MAX_HOSTED_PREFERENCES_BYTES: usize = 1024 * 1024;
+
+/// The host facility that owns a secret. No secret bytes, path, account id, or user-supplied label can be
+/// represented by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SecretBackend {
+    MacosNonSynchronizingGenericPassword,
+}
+
+/// Fixed app-owned Keychain slots. A future Security.framework adapter maps these handles to service/account
+/// constants and reports presence separately; TOML never contains key material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SecretPurpose {
+    OpenAiApiKey,
+    AnthropicApiKey,
+    PostprocessCacheMasterKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretReference {
+    backend: SecretBackend,
+    purpose: SecretPurpose,
+}
+
+impl SecretReference {
+    pub(crate) const fn openai_api_key() -> Self {
+        Self::keychain(SecretPurpose::OpenAiApiKey)
+    }
+
+    pub(crate) const fn anthropic_api_key() -> Self {
+        Self::keychain(SecretPurpose::AnthropicApiKey)
+    }
+
+    pub(crate) const fn cache_master_key() -> Self {
+        Self::keychain(SecretPurpose::PostprocessCacheMasterKey)
+    }
+
+    const fn keychain(purpose: SecretPurpose) -> Self {
+        Self {
+            backend: SecretBackend::MacosNonSynchronizingGenericPassword,
+            purpose,
+        }
+    }
+
+    pub(crate) const fn purpose(self) -> SecretPurpose {
+        self.purpose
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ProviderScopePreferences {
+    /// Opaque Corti-local scope identity; never a provider account id.
+    pub(crate) connection_scope_id: Option<ConnectionScopeId>,
+    /// Human-selected non-secret connection label.
+    pub(crate) alias: Option<String>,
+    /// Vertex configuration values are intentionally non-secret. They are not telemetry fields.
+    pub(crate) project: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) quota_project: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectProviderPreferences {
+    pub(crate) scope: ProviderScopePreferences,
+    pub(crate) credential: SecretReference,
+    /// Provider-side retention/caching remains independently disclosed and off by default.
+    pub(crate) provider_cache_acknowledgement_version: Option<u32>,
+}
+
+impl DirectProviderPreferences {
+    fn openai() -> Self {
+        Self {
+            scope: ProviderScopePreferences::default(),
+            credential: SecretReference::openai_api_key(),
+            provider_cache_acknowledgement_version: None,
+        }
+    }
+
+    fn anthropic() -> Self {
+        Self {
+            scope: ProviderScopePreferences::default(),
+            credential: SecretReference::anthropic_api_key(),
+            provider_cache_acknowledgement_version: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ProviderPreferences {
+    pub(crate) vertex: ProviderScopePreferences,
+    pub(crate) vertex_provider_cache_acknowledgement_version: Option<u32>,
+    pub(crate) openai: DirectProviderPreferences,
+    pub(crate) anthropic: DirectProviderPreferences,
+    /// Product/legal approval is distinct from build capability. This persisted gate starts false.
+    pub(crate) codex_experimental_approved: bool,
+}
+
+impl Default for ProviderPreferences {
+    fn default() -> Self {
+        Self {
+            vertex: ProviderScopePreferences::default(),
+            vertex_provider_cache_acknowledgement_version: None,
+            openai: DirectProviderPreferences::openai(),
+            anthropic: DirectProviderPreferences::anthropic(),
+            codex_experimental_approved: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct LanePreferences {
+    pub(crate) enabled: bool,
+    pub(crate) provider: Option<ProviderId>,
+    pub(crate) transport: Option<TransportId>,
+    pub(crate) model: Option<ModelId>,
+    pub(crate) local_cache: LocalCacheMode,
+    pub(crate) provider_cache: ProviderCacheMode,
+}
+
+impl Default for LanePreferences {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: None,
+            transport: None,
+            model: None,
+            local_cache: LocalCacheMode::Reusable,
+            provider_cache: ProviderCacheMode::Off,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct HostedPreferenceValues {
+    pub(crate) master_enabled: bool,
+    pub(crate) live: LanePreferences,
+    pub(crate) final_lane: LanePreferences,
+    pub(crate) questions: LanePreferences,
+    pub(crate) providers: ProviderPreferences,
+    pub(crate) default_steering: String,
+    pub(crate) pinned_question_template: String,
+    pub(crate) pinned_auto_enabled: bool,
+    pub(crate) pinned_auto_acknowledgement_version: Option<u32>,
+    pub(crate) final_deadline_seconds: u32,
+    pub(crate) egress_acknowledgement_version: Option<u32>,
+    pub(crate) show_history_diagnostics: bool,
+    pub(crate) show_live_metrics_by_default: bool,
+}
+
+impl Default for HostedPreferenceValues {
+    fn default() -> Self {
+        Self {
+            master_enabled: false,
+            live: LanePreferences::default(),
+            final_lane: LanePreferences::default(),
+            questions: LanePreferences::default(),
+            providers: ProviderPreferences::default(),
+            default_steering: String::new(),
+            pinned_question_template: String::new(),
+            pinned_auto_enabled: false,
+            pinned_auto_acknowledgement_version: None,
+            final_deadline_seconds: DEFAULT_FINAL_DEADLINE_SECONDS,
+            egress_acknowledgement_version: None,
+            show_history_diagnostics: false,
+            show_live_metrics_by_default: false,
+        }
+    }
+}
+
+/// Separately revisioned hosted preferences document. Fields are nested under `preferences` so schema and
+/// revision remain unmistakably document metadata rather than request controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct HostedPreferences {
+    schema: u32,
+    revision: u64,
+    preferences: HostedPreferenceValues,
+}
+
+impl Default for HostedPreferences {
+    fn default() -> Self {
+        Self {
+            schema: HOSTED_PREFERENCES_SCHEMA,
+            revision: 0,
+            preferences: HostedPreferenceValues::default(),
+        }
+    }
+}
+
+impl HostedPreferences {
+    pub(crate) const fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(crate) const fn values(&self) -> &HostedPreferenceValues {
+        &self.preferences
+    }
+
+    /// Replace the non-secret values and increment only this document's revision. A semantic no-op keeps
+    /// the old revision, which makes later patch conflict checks deterministic.
+    pub(crate) fn revise(&self, update: impl FnOnce(&mut HostedPreferenceValues)) -> Result<Self> {
+        let mut preferences = self.preferences.clone();
+        update(&mut preferences);
+        if preferences == self.preferences {
+            return Ok(self.clone());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .context("hosted preferences revision overflow")?;
+        let revised = Self {
+            schema: HOSTED_PREFERENCES_SCHEMA,
+            revision,
+            preferences,
+        };
+        revised.validate()?;
+        Ok(revised)
+    }
+
+    pub(crate) fn load() -> Result<Self> {
+        Self::load_at(&hosted_preferences_path()?)
+    }
+
+    pub(crate) fn save(&self) -> Result<()> {
+        self.save_at(&hosted_preferences_path()?)
+    }
+
+    fn load_at(path: &Path) -> Result<Self> {
+        let Some(bytes) = read_private(path, "hosted preferences", MAX_HOSTED_PREFERENCES_BYTES)?
+        else {
+            return Ok(Self::default());
+        };
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("decoding hosted preferences {}", path.display()))?;
+        let document: Self = toml::from_str(text)
+            .with_context(|| format!("parsing hosted preferences {}", path.display()))?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    fn save_at(&self, path: &Path) -> Result<()> {
+        self.validate()?;
+        let body = toml::to_string_pretty(self).context("serializing hosted preferences")?;
+        atomic_write_private(path, body.as_bytes(), "hosted preferences")
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == HOSTED_PREFERENCES_SCHEMA,
+            "unsupported hosted preferences schema {} (expected {})",
+            self.schema,
+            HOSTED_PREFERENCES_SCHEMA
+        );
+        ensure!(
+            (1..=MAX_FINAL_DEADLINE_SECONDS).contains(&self.preferences.final_deadline_seconds),
+            "hosted final deadline must be between 1 and {MAX_FINAL_DEADLINE_SECONDS} seconds"
+        );
+        if self.preferences.master_enabled {
+            ensure!(
+                self.preferences.egress_acknowledgement_version == Some(EGRESS_DISCLOSURE_VERSION),
+                "hosted egress cannot be enabled without the current disclosure acknowledgement"
+            );
+        }
+        if self.preferences.pinned_auto_enabled {
+            ensure!(
+                self.preferences.pinned_auto_acknowledgement_version
+                    == Some(PINNED_AUTO_DISCLOSURE_VERSION),
+                "automatic pinned questions require the repeated-call acknowledgement"
+            );
+        }
+        validate_direct_provider(
+            &self.preferences.providers.openai,
+            SecretPurpose::OpenAiApiKey,
+        )?;
+        validate_direct_provider(
+            &self.preferences.providers.anthropic,
+            SecretPurpose::AnthropicApiKey,
+        )?;
+        for lane in [
+            &self.preferences.live,
+            &self.preferences.final_lane,
+            &self.preferences.questions,
+        ] {
+            if matches!(
+                lane.provider_cache,
+                ProviderCacheMode::ExplicitStablePrefix | ProviderCacheMode::UnavoidableImplicit
+            ) {
+                let acknowledged = match lane.provider.as_ref().map(ProviderId::as_str) {
+                    Some("openai") => {
+                        self.preferences
+                            .providers
+                            .openai
+                            .provider_cache_acknowledgement_version
+                    }
+                    Some("anthropic") => {
+                        self.preferences
+                            .providers
+                            .anthropic
+                            .provider_cache_acknowledgement_version
+                    }
+                    Some("google") => {
+                        self.preferences
+                            .providers
+                            .vertex_provider_cache_acknowledgement_version
+                    }
+                    // Experimental transports have no controllable provider-cache policy.
+                    _ => None,
+                };
+                ensure!(
+                    acknowledged == Some(PROVIDER_CACHE_DISCLOSURE_VERSION),
+                    "provider caching requires the current provider-retention acknowledgement"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_direct_provider(
+    provider: &DirectProviderPreferences,
+    expected: SecretPurpose,
+) -> Result<()> {
+    if provider.credential.purpose() != expected {
+        bail!("hosted credential reference does not match its provider slot");
+    }
+    Ok(())
+}
+
+pub(crate) fn hosted_preferences_path() -> Result<PathBuf> {
+    Ok(corti_queue::data_dir()?.join("hosted.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn test_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "corti-hosted-preferences-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("hosted.toml")
+    }
+
+    #[test]
+    fn defaults_are_off_and_independently_revisioned() {
+        let preferences = HostedPreferences::default();
+        assert_eq!(preferences.schema(), HOSTED_PREFERENCES_SCHEMA);
+        assert_eq!(preferences.revision(), 0);
+        assert!(!preferences.values().master_enabled);
+        assert!(!preferences.values().live.enabled);
+        assert!(!preferences.values().final_lane.enabled);
+        assert!(!preferences.values().questions.enabled);
+        assert!(!preferences.values().pinned_auto_enabled);
+        assert!(!preferences.values().providers.codex_experimental_approved);
+
+        let unchanged = preferences.revise(|_| {}).unwrap();
+        assert_eq!(unchanged.revision(), 0);
+        let revised = preferences
+            .revise(|values| values.show_history_diagnostics = true)
+            .unwrap();
+        assert_eq!(revised.revision(), 1);
+        assert_eq!(AppConfigBoundary::FILE_NAME, "config.toml");
+        assert_eq!(HOSTED_FILE_NAME, "hosted.toml");
+    }
+
+    // Tiny constants make the separate-file assertion explicit without loading process-global paths.
+    struct AppConfigBoundary;
+    impl AppConfigBoundary {
+        const FILE_NAME: &'static str = "config.toml";
+    }
+    const HOSTED_FILE_NAME: &str = "hosted.toml";
+
+    #[test]
+    fn enable_requires_persisted_egress_acknowledgement() {
+        let preferences = HostedPreferences::default();
+        let error = preferences
+            .revise(|values| values.master_enabled = true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("disclosure acknowledgement"), "{error}");
+
+        let enabled = preferences
+            .revise(|values| {
+                values.egress_acknowledgement_version = Some(EGRESS_DISCLOSURE_VERSION);
+                values.master_enabled = true;
+            })
+            .unwrap();
+        assert!(enabled.values().master_enabled);
+    }
+
+    #[test]
+    fn private_round_trip_contains_references_but_no_secret_values() {
+        let path = test_path("round-trip");
+        let preferences = HostedPreferences::default()
+            .revise(|values| {
+                values.providers.openai.scope.connection_scope_id =
+                    Some(ConnectionScopeId::new("scope-fixture").unwrap());
+                values.providers.openai.scope.alias = Some("Fixture connection".into());
+            })
+            .unwrap();
+        preferences.save_at(&path).unwrap();
+
+        assert_eq!(HostedPreferences::load_at(&path).unwrap(), preferences);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("macos_non_synchronizing_generic_password"));
+        assert!(text.contains("open_ai_api_key"));
+        for forbidden in [
+            "synthetic-secret-value",
+            "bearer ",
+            "sk-",
+            "access_token",
+            "refresh_token",
+        ] {
+            assert!(!text.to_ascii_lowercase().contains(forbidden));
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn missing_document_fails_closed_to_off_defaults() {
+        let path = test_path("missing");
+        std::fs::remove_file(&path).ok();
+        let loaded = HostedPreferences::load_at(&path).unwrap();
+        assert_eq!(loaded, HostedPreferences::default());
+        assert!(!loaded.values().master_enabled);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn partial_current_document_uses_safe_defaults_and_keeps_its_revision() {
+        let path = test_path("partial");
+        atomic_write_private(
+            &path,
+            b"schema = 1\nrevision = 9\n\n[preferences]\nshow_history_diagnostics = true\n",
+            "hosted preferences",
+        )
+        .unwrap();
+        let loaded = HostedPreferences::load_at(&path).unwrap();
+        assert_eq!(loaded.revision(), 9);
+        assert!(loaded.values().show_history_diagnostics);
+        assert!(!loaded.values().master_enabled);
+        assert_eq!(
+            loaded.values().providers.openai.credential.purpose(),
+            SecretPurpose::OpenAiApiKey
+        );
+        assert_eq!(
+            loaded.values().providers.anthropic.credential.purpose(),
+            SecretPurpose::AnthropicApiKey
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn unknown_schema_is_rejected_without_enabling_anything() {
+        let path = test_path("schema");
+        atomic_write_private(&path, b"schema = 999\nrevision = 0\n", "hosted preferences").unwrap();
+        let error = HostedPreferences::load_at(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported hosted preferences schema"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn cache_master_reference_is_fixed_and_secret_free() {
+        let reference = SecretReference::cache_master_key();
+        assert_eq!(
+            reference.purpose(),
+            SecretPurpose::PostprocessCacheMasterKey
+        );
+        let json = serde_json::to_string(&reference).unwrap();
+        assert_eq!(
+            json,
+            r#"{"backend":"macos_non_synchronizing_generic_password","purpose":"postprocess_cache_master_key"}"#
+        );
+    }
+}

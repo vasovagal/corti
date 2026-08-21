@@ -1357,12 +1357,13 @@ fn rewrite_checkpoint_note(
     let Some(existing) = existing else {
         return Ok(None);
     };
-    corti_vagus::note::rewrite_body_with_provenance(
-        &existing,
-        &corti_vagus::recording_body(meta, &checkpoint.transcript),
-        &checkpoint.provenance,
-    )
-    .context("rewriting the existing note with batch provenance")?;
+    corti_vagus::note::CurrentNote::from_returned_path(existing.clone())
+        .context("binding the checkpoint-owned current note")?
+        .rewrite_transcript(
+            &corti_vagus::recording_body(meta, &checkpoint.transcript),
+            &checkpoint.provenance,
+        )
+        .context("rewriting the existing note with batch provenance")?;
     Ok(Some(existing))
 }
 
@@ -1763,7 +1764,13 @@ mod tests {
         let content = std::fs::read_to_string(&note).unwrap();
         assert!(content.contains("State: transcribed \n"), "got: {content}");
         assert!(content.contains("canonical batch text"), "got: {content}");
-        assert!(content.contains(r#"corti: {"schema":1"#), "got: {content}");
+        assert!(
+            content.contains(&format!(
+                r#"corti: {{"schema":{}"#,
+                corti_vagus::provenance::SCHEMA_VERSION
+            )),
+            "got: {content}"
+        );
         assert!(content.contains(r#""mode":"batch""#), "got: {content}");
 
         checkpoint.set_canonical_note(rewritten.clone());

@@ -37,6 +37,10 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod postprocess_config;
+#[cfg(target_os = "macos")]
+mod private_file;
+#[cfg(target_os = "macos")]
 mod provenance;
 #[cfg(target_os = "macos")]
 mod queue_ui;
@@ -48,6 +52,8 @@ mod stats;
 mod transcribe;
 #[cfg(target_os = "macos")]
 mod tray;
+#[cfg(target_os = "macos")]
+mod word_bank;
 
 #[cfg(target_os = "macos")]
 fn main() {

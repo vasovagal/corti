@@ -1393,6 +1393,7 @@ dependencies = [
  "corti-core",
  "corti-detect",
  "corti-jobs",
+ "corti-postprocess",
  "corti-queue",
  "corti-transcribe",
  "corti-transcribe-aws",
@@ -1535,7 +1536,9 @@ dependencies = [
  "chrono",
  "corti-core",
  "corti-jobs",
+ "corti-postprocess",
  "rusqlite",
+ "serde",
  "serde_json",
  "tracing",
 ]
@@ -1609,6 +1612,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "corti-core",
+ "corti-postprocess",
  "serde",
  "serde_json",
 ]

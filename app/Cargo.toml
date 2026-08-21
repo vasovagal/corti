@@ -24,6 +24,7 @@ corti-capture = { workspace = true }
 corti-detect = { workspace = true }
 corti-queue = { workspace = true }
 corti-jobs = { workspace = true }
+corti-postprocess = { workspace = true }
 corti-transcribe = { workspace = true }
 corti-vagus = { workspace = true }
 

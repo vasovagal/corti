@@ -16,7 +16,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use corti_core::{JobStatus, OwningApp, RecordingMeta};
+use corti_postprocess::{
+    BillingBasis, CallId, CurrencyCode, ErrorCode, Lane, LatencyFields, ModelId, NormalizedUsage,
+    ProviderId, RequestGroupId, SupportTier, TargetId, TransportId,
+};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Where the queue DB lives. Outside any vault. Override with `$CORTI_DATA_DIR`.
 pub fn data_dir() -> Result<PathBuf> {
@@ -54,6 +59,9 @@ pub struct Job {
     /// Wall-clock seconds the (successful) transcription took, for the Queue UI's
     /// "transcribed 55 min in 30 s" line.
     pub transcribe_secs: Option<f64>,
+    /// Additive hosted projection; the existing `status` remains the downgrade authority.
+    pub postprocess_state: Option<PostprocessState>,
+    pub postprocess_updated_at: Option<DateTime<Local>>,
     pub updated_at: DateTime<Local>,
 }
 
@@ -89,6 +97,199 @@ pub struct JobUpdate {
     pub ended_at: Option<DateTime<Local>>,
 }
 
+/// Small downgrade-safe projection beside the existing recording status. These values never enter the
+/// `JobStatus` column, so an older Corti binary can continue to parse every recording row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostprocessState {
+    AwaitingAuth,
+    Dispatching,
+    Finalizing,
+    Fallback,
+    Complete,
+}
+
+/// Sanitized terminal disposition for a hosted call. There is intentionally no free-form error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostprocessOutcome {
+    Applied,
+    Completed,
+    Canceled,
+    Failed,
+    Superseded,
+    Timeout,
+    Fallback,
+    Ambiguous,
+}
+
+/// Where an accepted terminal result came from. Failed/pre-dispatch calls use `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostprocessCacheSource {
+    None,
+    Local,
+    Provider,
+    Network,
+    Mixed,
+}
+
+/// Nullable truthful cost metadata. Non-metered and unknown variants cannot carry a dollar amount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostprocessCost {
+    billing_basis: BillingBasis,
+    cost_micros: Option<u64>,
+    currency: Option<CurrencyCode>,
+    pricing_catalog_version: Option<String>,
+    tariff_id: Option<String>,
+    tariff_effective_at: Option<DateTime<Utc>>,
+}
+
+impl PostprocessCost {
+    pub fn unknown() -> Self {
+        Self::without_cost(BillingBasis::Unknown)
+    }
+
+    pub fn included_subscription() -> Self {
+        Self::without_cost(BillingBasis::IncludedSubscription)
+    }
+
+    pub fn no_provider_request() -> Self {
+        Self::without_cost(BillingBasis::NoProviderRequest)
+    }
+
+    pub fn metered_estimate(
+        cost_micros: u64,
+        currency: CurrencyCode,
+        pricing_catalog_version: impl Into<String>,
+        tariff_id: impl Into<String>,
+        tariff_effective_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            billing_basis: BillingBasis::MeteredEstimate,
+            cost_micros: Some(cost_micros),
+            currency: Some(currency),
+            pricing_catalog_version: Some(pricing_catalog_version.into()),
+            tariff_id: Some(tariff_id.into()),
+            tariff_effective_at: Some(tariff_effective_at),
+        }
+    }
+
+    fn without_cost(billing_basis: BillingBasis) -> Self {
+        Self {
+            billing_basis,
+            cost_micros: None,
+            currency: None,
+            pricing_catalog_version: None,
+            tariff_id: None,
+            tariff_effective_at: None,
+        }
+    }
+
+    pub const fn billing_basis(&self) -> BillingBasis {
+        self.billing_basis
+    }
+
+    pub const fn cost_micros(&self) -> Option<u64> {
+        self.cost_micros
+    }
+
+    pub fn currency(&self) -> Option<&CurrencyCode> {
+        self.currency.as_ref()
+    }
+
+    pub fn pricing_catalog_version(&self) -> Option<&str> {
+        self.pricing_catalog_version.as_deref()
+    }
+
+    pub fn tariff_id(&self) -> Option<&str> {
+        self.tariff_id.as_deref()
+    }
+
+    pub fn tariff_effective_at(&self) -> Option<&DateTime<Utc>> {
+        self.tariff_effective_at.as_ref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.billing_basis {
+            BillingBasis::MeteredEstimate => ensure_cost_fields(self, true),
+            BillingBasis::IncludedSubscription
+            | BillingBasis::NoProviderRequest
+            | BillingBasis::Unknown => ensure_cost_fields(self, false),
+        }
+    }
+}
+
+fn ensure_cost_fields(cost: &PostprocessCost, expected: bool) -> Result<()> {
+    let present = [
+        cost.cost_micros.is_some(),
+        cost.currency.is_some(),
+        cost.pricing_catalog_version.is_some(),
+        cost.tariff_id.is_some(),
+        cost.tariff_effective_at.is_some(),
+    ];
+    if present.into_iter().all(|actual| actual == expected) {
+        Ok(())
+    } else if expected {
+        bail!("metered postprocess cost is missing tariff provenance")
+    } else {
+        bail!("unknown/subscription/local postprocess cost must remain null")
+    }
+}
+
+/// One content-free terminal provider-call record. The type has no prompt, transcript, replacement, diff,
+/// steering text, word-bank entry, question, answer, credential, account/project id, response body, or
+/// free-form provider-error field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostprocessCallRecord {
+    pub call_id: CallId,
+    pub recording_id: String,
+    pub request_group_id: RequestGroupId,
+    pub target_id: Option<TargetId>,
+    pub lane: Lane,
+    pub attempt_no: u64,
+    pub provider_id: ProviderId,
+    pub transport_id: TransportId,
+    pub support_tier: SupportTier,
+    pub model_id: ModelId,
+    pub adapter_version: u32,
+    pub prompt_version: u32,
+    pub output_schema_version: u32,
+    pub session_generation: u64,
+    pub transcript_revision: u64,
+    pub control_revision: u64,
+    pub steering_revision: u64,
+    pub bank_revision: u64,
+    pub question_revision: Option<u64>,
+    pub outcome: PostprocessOutcome,
+    pub error_code: Option<ErrorCode>,
+    pub cache_source: PostprocessCacheSource,
+    pub provider_request_sent: bool,
+    pub usage: NormalizedUsage,
+    pub cost: PostprocessCost,
+    pub queued_at: DateTime<Utc>,
+    pub dispatched_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub latency: LatencyFields,
+    pub created_at: DateTime<Utc>,
+}
+
+impl PostprocessCallRecord {
+    fn validate(&self) -> Result<()> {
+        if self.recording_id.is_empty()
+            || self.recording_id.len() > 512
+            || self.recording_id.chars().any(char::is_control)
+        {
+            bail!("invalid postprocess recording id");
+        }
+        if self.attempt_no == 0 {
+            bail!("postprocess attempt number must be positive");
+        }
+        self.cost.validate()?;
+        Ok(())
+    }
+}
+
 /// The durable job store. Open with [`Queue::open`] (or [`Queue::open_at`] for an explicit path).
 pub struct Queue {
     conn: Connection,
@@ -114,6 +315,8 @@ impl Queue {
             Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .context("enabling foreign keys")?;
         // WAL keeps readers and the writer from blocking each other and survives crashes cleanly.
         // (journal_mode returns the resulting mode as a row, so read it back rather than execute().)
         let _: String = conn
@@ -146,6 +349,8 @@ impl Queue {
         .with_context(|| format!("opening {} read-only", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .context("setting busy_timeout")?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .context("enabling foreign keys")?;
         Ok(Self { conn })
     }
 
@@ -349,6 +554,143 @@ impl Queue {
         raws.into_iter().map(raw_to_job).collect()
     }
 
+    /// Set or clear the downgrade-safe hosted projection without changing the existing pipeline status.
+    pub fn set_postprocess_state(
+        &self,
+        recording_id: &str,
+        state: Option<PostprocessState>,
+    ) -> Result<()> {
+        let state = state.map(enum_token).transpose()?;
+        let updated_at = state.as_ref().map(|_| fmt_utc(Utc::now()));
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE recordings
+                 SET postprocess_state = ?2, postprocess_updated_at = ?3
+                 WHERE id = ?1",
+                params![recording_id, state, updated_at],
+            )
+            .context("updating postprocess recording projection")?;
+        if changed == 0 {
+            bail!("no recording with id {recording_id}");
+        }
+        Ok(())
+    }
+
+    /// Insert or idempotently refresh one terminal content-free call row. The pipeline owner is the only
+    /// production caller; read-only Queue handles fail at SQLite if this method is accidentally invoked.
+    pub fn upsert_postprocess_call(&self, call: &PostprocessCallRecord) -> Result<()> {
+        call.validate()?;
+        let attempt_no = sqlite_u64(call.attempt_no, "attempt_no")?;
+        let session_generation = sqlite_u64(call.session_generation, "session_generation")?;
+        let transcript_revision = sqlite_u64(call.transcript_revision, "transcript_revision")?;
+        let control_revision = sqlite_u64(call.control_revision, "control_revision")?;
+        let steering_revision = sqlite_u64(call.steering_revision, "steering_revision")?;
+        let bank_revision = sqlite_u64(call.bank_revision, "bank_revision")?;
+        let question_revision = sqlite_optional_u64(call.question_revision, "question_revision")?;
+        let usage = call.usage;
+        let input_tokens = sqlite_optional_u64(usage.input_tokens, "input_tokens")?;
+        let output_tokens = sqlite_optional_u64(usage.output_tokens, "output_tokens")?;
+        let cached_read_tokens =
+            sqlite_optional_u64(usage.cached_read_tokens, "cached_read_tokens")?;
+        let cached_write_tokens =
+            sqlite_optional_u64(usage.cached_write_tokens, "cached_write_tokens")?;
+        let reasoning_tokens = sqlite_optional_u64(usage.reasoning_tokens, "reasoning_tokens")?;
+        let cost_micros = sqlite_optional_u64(call.cost.cost_micros, "cost_micros")?;
+        let latency = call.latency;
+        let queue_us = sqlite_optional_u64(latency.queue_us, "queue_us")?;
+        let auth_us = sqlite_optional_u64(latency.auth_us, "auth_us")?;
+        let cache_lookup_us = sqlite_optional_u64(latency.cache_lookup_us, "cache_lookup_us")?;
+        let connect_us = sqlite_optional_u64(latency.connect_us, "connect_us")?;
+        let ttfb_us = sqlite_optional_u64(latency.ttfb_us, "ttfb_us")?;
+        let ttft_us = sqlite_optional_u64(latency.ttft_us, "ttft_us")?;
+        let stream_us = sqlite_optional_u64(latency.stream_us, "stream_us")?;
+        let parse_us = sqlite_optional_u64(latency.parse_us, "parse_us")?;
+        let cache_commit_us = sqlite_optional_u64(latency.cache_commit_us, "cache_commit_us")?;
+        let total_us = sqlite_optional_u64(latency.total_us, "total_us")?;
+
+        self.conn
+            .execute(
+                UPSERT_POSTPROCESS_CALL,
+                params![
+                    call.call_id.as_str(),
+                    call.recording_id,
+                    call.request_group_id.as_str(),
+                    call.target_id.as_ref().map(TargetId::as_str),
+                    enum_token(call.lane)?,
+                    attempt_no,
+                    call.provider_id.as_str(),
+                    call.transport_id.as_str(),
+                    enum_token(call.support_tier)?,
+                    call.model_id.as_str(),
+                    i64::from(call.adapter_version),
+                    i64::from(call.prompt_version),
+                    i64::from(call.output_schema_version),
+                    session_generation,
+                    transcript_revision,
+                    control_revision,
+                    steering_revision,
+                    bank_revision,
+                    question_revision,
+                    enum_token(call.outcome)?,
+                    call.error_code.map(enum_token).transpose()?,
+                    enum_token(call.cache_source)?,
+                    call.provider_request_sent,
+                    usage.usage_complete,
+                    input_tokens,
+                    output_tokens,
+                    cached_read_tokens,
+                    cached_write_tokens,
+                    reasoning_tokens,
+                    cost_micros,
+                    call.cost.currency.as_ref().map(CurrencyCode::as_str),
+                    enum_token(call.cost.billing_basis)?,
+                    call.cost.pricing_catalog_version.as_deref(),
+                    call.cost.tariff_id.as_deref(),
+                    call.cost.tariff_effective_at.map(fmt_utc),
+                    fmt_utc(call.queued_at),
+                    call.dispatched_at.map(fmt_utc),
+                    call.completed_at.map(fmt_utc),
+                    queue_us,
+                    auth_us,
+                    cache_lookup_us,
+                    connect_us,
+                    ttfb_us,
+                    ttft_us,
+                    stream_us,
+                    parse_us,
+                    cache_commit_us,
+                    total_us,
+                    fmt_utc(call.created_at),
+                ],
+            )
+            .context("upserting content-free postprocess call")?;
+        Ok(())
+    }
+
+    /// Content-free call history for one recording, in deterministic schedule/call-id order.
+    pub fn postprocess_history(&self, recording_id: &str) -> Result<Vec<PostprocessCallRecord>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {POSTPROCESS_CALL_COLS} FROM postprocess_calls
+             WHERE recording_id = ?1 ORDER BY queued_at, call_id"
+        ))?;
+        let rows = statement
+            .query_map(params![recording_id], read_postprocess_call)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(raw_to_postprocess_call).collect()
+    }
+
+    /// Fetch one content-free call by its globally unique id.
+    pub fn postprocess_call(&self, call_id: &CallId) -> Result<Option<PostprocessCallRecord>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {POSTPROCESS_CALL_COLS} FROM postprocess_calls WHERE call_id = ?1"
+        ))?;
+        let raw = statement
+            .query_row(params![call_id.as_str()], read_postprocess_call)
+            .optional()?;
+        raw.map(raw_to_postprocess_call).transpose()
+    }
+
     /// Terminal (`Done` | `Failed`) rows last updated before `older_than` — the retention sweep's
     /// audio-deletion candidates, oldest first. **Read-only**: rows now outlive their audio, so the
     /// Recording Queue window keeps showing history ("Filed in brain") after the files are reclaimed.
@@ -411,10 +753,10 @@ impl Queue {
 /// Columns in a fixed order shared by every `SELECT` so [`read_row`] indices stay aligned.
 const COLS: &str = "id, started_at, ended_at, owning_app, bundle_id, audio_path, \
                     status, s3_uri, transcribe_job, note_path, error, updated_at, \
-                    transcribe_secs";
+                    transcribe_secs, postprocess_state, postprocess_updated_at";
 
 /// Bumped whenever [`migrate`] gains a step; stamped into `PRAGMA user_version` on every open.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS recordings(
@@ -428,11 +770,68 @@ CREATE TABLE IF NOT EXISTS recordings(
   s3_uri          TEXT,
   transcribe_job  TEXT,
   note_path       TEXT,
-  error           TEXT,
-  updated_at      TEXT NOT NULL,
-  transcribe_secs REAL
+  error                   TEXT,
+  updated_at              TEXT NOT NULL,
+  transcribe_secs         REAL,
+  postprocess_state       TEXT,
+  postprocess_updated_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
+
+CREATE TABLE IF NOT EXISTS postprocess_calls(
+  call_id                  TEXT PRIMARY KEY,
+  recording_id             TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+  request_group_id         TEXT NOT NULL,
+  target_id                TEXT,
+  lane                     TEXT NOT NULL,
+  attempt_no               INTEGER NOT NULL,
+  provider_id              TEXT NOT NULL,
+  transport_id             TEXT NOT NULL,
+  support_tier             TEXT NOT NULL,
+  model_id                 TEXT NOT NULL,
+  adapter_version          INTEGER NOT NULL,
+  prompt_version           INTEGER NOT NULL,
+  output_schema_version    INTEGER NOT NULL,
+  session_generation       INTEGER NOT NULL,
+  transcript_revision      INTEGER NOT NULL,
+  control_revision         INTEGER NOT NULL,
+  steering_revision        INTEGER NOT NULL,
+  bank_revision            INTEGER NOT NULL,
+  question_revision        INTEGER,
+  outcome                  TEXT NOT NULL,
+  error_code               TEXT,
+  cache_source             TEXT NOT NULL,
+  provider_request_sent    INTEGER NOT NULL,
+  usage_complete           INTEGER NOT NULL,
+  input_tokens             INTEGER,
+  output_tokens            INTEGER,
+  cached_read_tokens       INTEGER,
+  cached_write_tokens      INTEGER,
+  reasoning_tokens         INTEGER,
+  cost_micros              INTEGER,
+  currency                 TEXT,
+  billing_basis            TEXT NOT NULL,
+  pricing_catalog_version  TEXT,
+  tariff_id                TEXT,
+  tariff_effective_at      TEXT,
+  queued_at                TEXT NOT NULL,
+  dispatched_at            TEXT,
+  completed_at             TEXT,
+  queue_us                 INTEGER,
+  auth_us                  INTEGER,
+  cache_lookup_us          INTEGER,
+  connect_us               INTEGER,
+  ttfb_us                  INTEGER,
+  ttft_us                  INTEGER,
+  stream_us                INTEGER,
+  parse_us                 INTEGER,
+  cache_commit_us          INTEGER,
+  total_us                 INTEGER,
+  created_at               TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_postprocess_recording_lane_time
+  ON postprocess_calls(recording_id, lane, queued_at);
+CREATE INDEX IF NOT EXISTS idx_postprocess_time ON postprocess_calls(queued_at);
 ";
 
 /// Bring a pre-existing DB up to [`SCHEMA_VERSION`]. Runs before `execute_batch(SCHEMA)`, so a fresh DB
@@ -442,7 +841,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .context("reading user_version")?;
-    if version >= SCHEMA_VERSION {
+    if version > SCHEMA_VERSION {
+        bail!("queue schema version {version} is newer than supported version {SCHEMA_VERSION}");
+    }
+    if version == SCHEMA_VERSION {
         return Ok(());
     }
     let has_table: bool = conn
@@ -455,7 +857,99 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version < 1 && has_table {
         migrate_v0_to_v1(conn).context("migrating queue schema v0 → v1")?;
     }
+    if version < 2 && has_table {
+        migrate_v1_to_v2(conn).context("migrating queue schema v1 → v2")?;
+    }
     Ok(())
+}
+
+/// v1 → v2 is wholly additive. Probe before each `ALTER TABLE`, create call history/indexes, and stamp the
+/// version in one transaction. The probes make replay safe for a fixture interrupted by an older migration
+/// implementation even though ordinary SQLite transaction rollback is already atomic.
+fn migrate_v1_to_v2(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("starting v1 → v2 migration tx")?;
+    for (column, declaration) in [
+        ("postprocess_state", "TEXT"),
+        ("postprocess_updated_at", "TEXT"),
+    ] {
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('recordings') WHERE name = ?1
+                 )",
+                params![column],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("probing for recordings.{column}"))?;
+        if !exists {
+            tx.execute(
+                &format!("ALTER TABLE recordings ADD COLUMN {column} {declaration}"),
+                [],
+            )
+            .with_context(|| format!("adding recordings.{column}"))?;
+        }
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS postprocess_calls(
+           call_id                  TEXT PRIMARY KEY,
+           recording_id             TEXT NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+           request_group_id         TEXT NOT NULL,
+           target_id                TEXT,
+           lane                     TEXT NOT NULL,
+           attempt_no               INTEGER NOT NULL,
+           provider_id              TEXT NOT NULL,
+           transport_id             TEXT NOT NULL,
+           support_tier             TEXT NOT NULL,
+           model_id                 TEXT NOT NULL,
+           adapter_version          INTEGER NOT NULL,
+           prompt_version           INTEGER NOT NULL,
+           output_schema_version    INTEGER NOT NULL,
+           session_generation       INTEGER NOT NULL,
+           transcript_revision      INTEGER NOT NULL,
+           control_revision         INTEGER NOT NULL,
+           steering_revision        INTEGER NOT NULL,
+           bank_revision            INTEGER NOT NULL,
+           question_revision        INTEGER,
+           outcome                  TEXT NOT NULL,
+           error_code               TEXT,
+           cache_source             TEXT NOT NULL,
+           provider_request_sent    INTEGER NOT NULL,
+           usage_complete           INTEGER NOT NULL,
+           input_tokens             INTEGER,
+           output_tokens            INTEGER,
+           cached_read_tokens       INTEGER,
+           cached_write_tokens      INTEGER,
+           reasoning_tokens         INTEGER,
+           cost_micros              INTEGER,
+           currency                 TEXT,
+           billing_basis            TEXT NOT NULL,
+           pricing_catalog_version  TEXT,
+           tariff_id                TEXT,
+           tariff_effective_at      TEXT,
+           queued_at                TEXT NOT NULL,
+           dispatched_at            TEXT,
+           completed_at             TEXT,
+           queue_us                 INTEGER,
+           auth_us                  INTEGER,
+           cache_lookup_us          INTEGER,
+           connect_us               INTEGER,
+           ttfb_us                  INTEGER,
+           ttft_us                  INTEGER,
+           stream_us                INTEGER,
+           parse_us                 INTEGER,
+           cache_commit_us          INTEGER,
+           total_us                 INTEGER,
+           created_at               TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_postprocess_recording_lane_time
+           ON postprocess_calls(recording_id, lane, queued_at);
+         CREATE INDEX IF NOT EXISTS idx_postprocess_time ON postprocess_calls(queued_at);
+         PRAGMA user_version = 2;",
+    )
+    .context("creating v2 postprocess call history")?;
+    tx.commit().context("committing v1 → v2 migration")
 }
 
 /// v0 → v1: add `transcribe_secs`, and rewrite every stored timestamp to the fixed-width UTC `…Z` form
@@ -533,6 +1027,8 @@ struct RawRow {
     error: Option<String>,
     updated_at: String,
     transcribe_secs: Option<f64>,
+    postprocess_state: Option<String>,
+    postprocess_updated_at: Option<String>,
 }
 
 fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -550,6 +1046,8 @@ fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         error: row.get(10)?,
         updated_at: row.get(11)?,
         transcribe_secs: row.get(12)?,
+        postprocess_state: row.get(13)?,
+        postprocess_updated_at: row.get(14)?,
     })
 }
 
@@ -567,6 +1065,16 @@ fn raw_to_job(r: RawRow) -> Result<Job> {
         note_path: r.note_path.map(PathBuf::from),
         error: r.error,
         transcribe_secs: r.transcribe_secs,
+        postprocess_state: r
+            .postprocess_state
+            .as_deref()
+            .map(enum_from_token)
+            .transpose()?,
+        postprocess_updated_at: r
+            .postprocess_updated_at
+            .as_deref()
+            .map(parse_dt)
+            .transpose()?,
         updated_at: parse_dt(&r.updated_at)?,
     })
 }
@@ -599,6 +1107,315 @@ fn status_from_str(s: &str) -> Result<JobStatus> {
         .with_context(|| format!("unrecognized JobStatus {s:?}"))
 }
 
+const POSTPROCESS_CALL_COLS: &str = "call_id, recording_id, request_group_id, target_id, lane, \
+    attempt_no, provider_id, transport_id, support_tier, model_id, adapter_version, prompt_version, \
+    output_schema_version, session_generation, transcript_revision, control_revision, steering_revision, \
+    bank_revision, question_revision, outcome, error_code, cache_source, provider_request_sent, \
+    usage_complete, input_tokens, output_tokens, cached_read_tokens, cached_write_tokens, reasoning_tokens, \
+    cost_micros, currency, billing_basis, pricing_catalog_version, tariff_id, tariff_effective_at, queued_at, \
+    dispatched_at, completed_at, queue_us, auth_us, cache_lookup_us, connect_us, ttfb_us, ttft_us, stream_us, \
+    parse_us, cache_commit_us, total_us, created_at";
+
+const UPSERT_POSTPROCESS_CALL: &str = "
+INSERT INTO postprocess_calls(
+  call_id, recording_id, request_group_id, target_id, lane, attempt_no, provider_id, transport_id,
+  support_tier, model_id, adapter_version, prompt_version, output_schema_version, session_generation,
+  transcript_revision, control_revision, steering_revision, bank_revision, question_revision, outcome,
+  error_code, cache_source, provider_request_sent, usage_complete, input_tokens, output_tokens,
+  cached_read_tokens, cached_write_tokens, reasoning_tokens, cost_micros, currency, billing_basis,
+  pricing_catalog_version, tariff_id, tariff_effective_at, queued_at, dispatched_at, completed_at, queue_us,
+  auth_us, cache_lookup_us, connect_us, ttfb_us, ttft_us, stream_us, parse_us, cache_commit_us, total_us,
+  created_at
+) VALUES (
+  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+  ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37,
+  ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49
+)
+ON CONFLICT(call_id) DO UPDATE SET
+  recording_id = excluded.recording_id,
+  request_group_id = excluded.request_group_id,
+  target_id = excluded.target_id,
+  lane = excluded.lane,
+  attempt_no = excluded.attempt_no,
+  provider_id = excluded.provider_id,
+  transport_id = excluded.transport_id,
+  support_tier = excluded.support_tier,
+  model_id = excluded.model_id,
+  adapter_version = excluded.adapter_version,
+  prompt_version = excluded.prompt_version,
+  output_schema_version = excluded.output_schema_version,
+  session_generation = excluded.session_generation,
+  transcript_revision = excluded.transcript_revision,
+  control_revision = excluded.control_revision,
+  steering_revision = excluded.steering_revision,
+  bank_revision = excluded.bank_revision,
+  question_revision = excluded.question_revision,
+  outcome = excluded.outcome,
+  error_code = excluded.error_code,
+  cache_source = excluded.cache_source,
+  provider_request_sent = excluded.provider_request_sent,
+  usage_complete = excluded.usage_complete,
+  input_tokens = excluded.input_tokens,
+  output_tokens = excluded.output_tokens,
+  cached_read_tokens = excluded.cached_read_tokens,
+  cached_write_tokens = excluded.cached_write_tokens,
+  reasoning_tokens = excluded.reasoning_tokens,
+  cost_micros = excluded.cost_micros,
+  currency = excluded.currency,
+  billing_basis = excluded.billing_basis,
+  pricing_catalog_version = excluded.pricing_catalog_version,
+  tariff_id = excluded.tariff_id,
+  tariff_effective_at = excluded.tariff_effective_at,
+  queued_at = excluded.queued_at,
+  dispatched_at = excluded.dispatched_at,
+  completed_at = excluded.completed_at,
+  queue_us = excluded.queue_us,
+  auth_us = excluded.auth_us,
+  cache_lookup_us = excluded.cache_lookup_us,
+  connect_us = excluded.connect_us,
+  ttfb_us = excluded.ttfb_us,
+  ttft_us = excluded.ttft_us,
+  stream_us = excluded.stream_us,
+  parse_us = excluded.parse_us,
+  cache_commit_us = excluded.cache_commit_us,
+  total_us = excluded.total_us,
+  created_at = excluded.created_at
+";
+
+struct RawPostprocessCall {
+    call_id: String,
+    recording_id: String,
+    request_group_id: String,
+    target_id: Option<String>,
+    lane: String,
+    attempt_no: i64,
+    provider_id: String,
+    transport_id: String,
+    support_tier: String,
+    model_id: String,
+    adapter_version: i64,
+    prompt_version: i64,
+    output_schema_version: i64,
+    session_generation: i64,
+    transcript_revision: i64,
+    control_revision: i64,
+    steering_revision: i64,
+    bank_revision: i64,
+    question_revision: Option<i64>,
+    outcome: String,
+    error_code: Option<String>,
+    cache_source: String,
+    provider_request_sent: i64,
+    usage_complete: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_read_tokens: Option<i64>,
+    cached_write_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
+    cost_micros: Option<i64>,
+    currency: Option<String>,
+    billing_basis: String,
+    pricing_catalog_version: Option<String>,
+    tariff_id: Option<String>,
+    tariff_effective_at: Option<String>,
+    queued_at: String,
+    dispatched_at: Option<String>,
+    completed_at: Option<String>,
+    queue_us: Option<i64>,
+    auth_us: Option<i64>,
+    cache_lookup_us: Option<i64>,
+    connect_us: Option<i64>,
+    ttfb_us: Option<i64>,
+    ttft_us: Option<i64>,
+    stream_us: Option<i64>,
+    parse_us: Option<i64>,
+    cache_commit_us: Option<i64>,
+    total_us: Option<i64>,
+    created_at: String,
+}
+
+fn read_postprocess_call(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawPostprocessCall> {
+    Ok(RawPostprocessCall {
+        call_id: row.get(0)?,
+        recording_id: row.get(1)?,
+        request_group_id: row.get(2)?,
+        target_id: row.get(3)?,
+        lane: row.get(4)?,
+        attempt_no: row.get(5)?,
+        provider_id: row.get(6)?,
+        transport_id: row.get(7)?,
+        support_tier: row.get(8)?,
+        model_id: row.get(9)?,
+        adapter_version: row.get(10)?,
+        prompt_version: row.get(11)?,
+        output_schema_version: row.get(12)?,
+        session_generation: row.get(13)?,
+        transcript_revision: row.get(14)?,
+        control_revision: row.get(15)?,
+        steering_revision: row.get(16)?,
+        bank_revision: row.get(17)?,
+        question_revision: row.get(18)?,
+        outcome: row.get(19)?,
+        error_code: row.get(20)?,
+        cache_source: row.get(21)?,
+        provider_request_sent: row.get(22)?,
+        usage_complete: row.get(23)?,
+        input_tokens: row.get(24)?,
+        output_tokens: row.get(25)?,
+        cached_read_tokens: row.get(26)?,
+        cached_write_tokens: row.get(27)?,
+        reasoning_tokens: row.get(28)?,
+        cost_micros: row.get(29)?,
+        currency: row.get(30)?,
+        billing_basis: row.get(31)?,
+        pricing_catalog_version: row.get(32)?,
+        tariff_id: row.get(33)?,
+        tariff_effective_at: row.get(34)?,
+        queued_at: row.get(35)?,
+        dispatched_at: row.get(36)?,
+        completed_at: row.get(37)?,
+        queue_us: row.get(38)?,
+        auth_us: row.get(39)?,
+        cache_lookup_us: row.get(40)?,
+        connect_us: row.get(41)?,
+        ttfb_us: row.get(42)?,
+        ttft_us: row.get(43)?,
+        stream_us: row.get(44)?,
+        parse_us: row.get(45)?,
+        cache_commit_us: row.get(46)?,
+        total_us: row.get(47)?,
+        created_at: row.get(48)?,
+    })
+}
+
+fn raw_to_postprocess_call(raw: RawPostprocessCall) -> Result<PostprocessCallRecord> {
+    let billing_basis = enum_from_token(&raw.billing_basis)?;
+    let cost = PostprocessCost {
+        billing_basis,
+        cost_micros: raw_optional_u64(raw.cost_micros, "cost_micros")?,
+        currency: raw
+            .currency
+            .map(CurrencyCode::new)
+            .transpose()
+            .context("reading postprocess currency")?,
+        pricing_catalog_version: raw.pricing_catalog_version,
+        tariff_id: raw.tariff_id,
+        tariff_effective_at: raw
+            .tariff_effective_at
+            .as_deref()
+            .map(parse_utc)
+            .transpose()?,
+    };
+    let call = PostprocessCallRecord {
+        call_id: CallId::new(raw.call_id).context("reading postprocess call id")?,
+        recording_id: raw.recording_id,
+        request_group_id: RequestGroupId::new(raw.request_group_id)
+            .context("reading postprocess request group id")?,
+        target_id: raw
+            .target_id
+            .map(TargetId::new)
+            .transpose()
+            .context("reading postprocess target id")?,
+        lane: enum_from_token(&raw.lane)?,
+        attempt_no: raw_u64(raw.attempt_no, "attempt_no")?,
+        provider_id: ProviderId::new(raw.provider_id).context("reading postprocess provider id")?,
+        transport_id: TransportId::new(raw.transport_id)
+            .context("reading postprocess transport id")?,
+        support_tier: enum_from_token(&raw.support_tier)?,
+        model_id: ModelId::new(raw.model_id).context("reading postprocess model id")?,
+        adapter_version: raw_u32(raw.adapter_version, "adapter_version")?,
+        prompt_version: raw_u32(raw.prompt_version, "prompt_version")?,
+        output_schema_version: raw_u32(raw.output_schema_version, "output_schema_version")?,
+        session_generation: raw_u64(raw.session_generation, "session_generation")?,
+        transcript_revision: raw_u64(raw.transcript_revision, "transcript_revision")?,
+        control_revision: raw_u64(raw.control_revision, "control_revision")?,
+        steering_revision: raw_u64(raw.steering_revision, "steering_revision")?,
+        bank_revision: raw_u64(raw.bank_revision, "bank_revision")?,
+        question_revision: raw_optional_u64(raw.question_revision, "question_revision")?,
+        outcome: enum_from_token(&raw.outcome)?,
+        error_code: raw.error_code.as_deref().map(enum_from_token).transpose()?,
+        cache_source: enum_from_token(&raw.cache_source)?,
+        provider_request_sent: raw_bool(raw.provider_request_sent, "provider_request_sent")?,
+        usage: NormalizedUsage {
+            input_tokens: raw_optional_u64(raw.input_tokens, "input_tokens")?,
+            output_tokens: raw_optional_u64(raw.output_tokens, "output_tokens")?,
+            cached_read_tokens: raw_optional_u64(raw.cached_read_tokens, "cached_read_tokens")?,
+            cached_write_tokens: raw_optional_u64(raw.cached_write_tokens, "cached_write_tokens")?,
+            reasoning_tokens: raw_optional_u64(raw.reasoning_tokens, "reasoning_tokens")?,
+            usage_complete: raw_bool(raw.usage_complete, "usage_complete")?,
+        },
+        cost,
+        queued_at: parse_utc(&raw.queued_at)?,
+        dispatched_at: raw.dispatched_at.as_deref().map(parse_utc).transpose()?,
+        completed_at: raw.completed_at.as_deref().map(parse_utc).transpose()?,
+        latency: LatencyFields {
+            queue_us: raw_optional_u64(raw.queue_us, "queue_us")?,
+            auth_us: raw_optional_u64(raw.auth_us, "auth_us")?,
+            cache_lookup_us: raw_optional_u64(raw.cache_lookup_us, "cache_lookup_us")?,
+            connect_us: raw_optional_u64(raw.connect_us, "connect_us")?,
+            ttfb_us: raw_optional_u64(raw.ttfb_us, "ttfb_us")?,
+            ttft_us: raw_optional_u64(raw.ttft_us, "ttft_us")?,
+            stream_us: raw_optional_u64(raw.stream_us, "stream_us")?,
+            parse_us: raw_optional_u64(raw.parse_us, "parse_us")?,
+            cache_commit_us: raw_optional_u64(raw.cache_commit_us, "cache_commit_us")?,
+            total_us: raw_optional_u64(raw.total_us, "total_us")?,
+        },
+        created_at: parse_utc(&raw.created_at)?,
+    };
+    call.validate()?;
+    Ok(call)
+}
+
+fn enum_token<T: Serialize>(value: T) -> Result<String> {
+    match serde_json::to_value(value).context("serializing content-free enum token")? {
+        serde_json::Value::String(token) => Ok(token),
+        _ => bail!("content-free enum did not serialize as a string"),
+    }
+}
+
+fn enum_from_token<T: DeserializeOwned>(token: &str) -> Result<T> {
+    serde_json::from_value(serde_json::Value::String(token.to_owned()))
+        .context("unrecognized content-free enum token")
+}
+
+fn sqlite_u64(value: u64, label: &str) -> Result<i64> {
+    i64::try_from(value).with_context(|| format!("{label} exceeds SQLite INTEGER range"))
+}
+
+fn sqlite_optional_u64(value: Option<u64>, label: &str) -> Result<Option<i64>> {
+    value.map(|value| sqlite_u64(value, label)).transpose()
+}
+
+fn raw_u64(value: i64, label: &str) -> Result<u64> {
+    u64::try_from(value).with_context(|| format!("{label} is negative"))
+}
+
+fn raw_optional_u64(value: Option<i64>, label: &str) -> Result<Option<u64>> {
+    value.map(|value| raw_u64(value, label)).transpose()
+}
+
+fn raw_u32(value: i64, label: &str) -> Result<u32> {
+    u32::try_from(value).with_context(|| format!("{label} is outside the u32 range"))
+}
+
+fn raw_bool(value: i64, label: &str) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => bail!("{label} is not a SQLite boolean"),
+    }
+}
+
+fn fmt_utc(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn parse_utc(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .context("parsing postprocess UTC timestamp")?
+        .with_timezone(&Utc))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,8 +1425,11 @@ mod tests {
         /// In-memory DB for tests (no filesystem, no path collisions).
         fn memory() -> Self {
             let conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
             conn.execute_batch(SCHEMA).unwrap();
             corti_jobs::Jobs::ensure_schema(&conn).unwrap();
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .unwrap();
             Self { conn }
         }
     }
@@ -620,6 +1440,53 @@ mod tests {
             ended_at: Some(Local.with_ymd_and_hms(2026, 5, 30, 14, 35, 0).unwrap()),
             owning_app: OwningApp::from_bundle_id(bundle),
             audio_path: PathBuf::from(path),
+        }
+    }
+
+    fn content_free_call(recording_id: &str) -> PostprocessCallRecord {
+        let queued_at = Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).unwrap();
+        PostprocessCallRecord {
+            call_id: CallId::new("call-fixture-1").unwrap(),
+            recording_id: recording_id.into(),
+            request_group_id: RequestGroupId::new("group-fixture-1").unwrap(),
+            target_id: Some(TargetId::new("target-fixture-1").unwrap()),
+            lane: Lane::Final,
+            attempt_no: 1,
+            provider_id: ProviderId::new("fixture-provider").unwrap(),
+            transport_id: TransportId::new("fixture-transport").unwrap(),
+            support_tier: SupportTier::Documented,
+            model_id: ModelId::new("fixture-model").unwrap(),
+            adapter_version: 1,
+            prompt_version: 1,
+            output_schema_version: 1,
+            session_generation: 2,
+            transcript_revision: 3,
+            control_revision: 4,
+            steering_revision: 5,
+            bank_revision: 6,
+            question_revision: None,
+            outcome: PostprocessOutcome::Failed,
+            error_code: Some(ErrorCode::Timeout),
+            cache_source: PostprocessCacheSource::None,
+            provider_request_sent: true,
+            usage: NormalizedUsage::unknown(),
+            cost: PostprocessCost::unknown(),
+            queued_at,
+            dispatched_at: Some(queued_at + chrono::Duration::milliseconds(10)),
+            completed_at: Some(queued_at + chrono::Duration::milliseconds(250)),
+            latency: LatencyFields {
+                queue_us: Some(10_000),
+                auth_us: None,
+                cache_lookup_us: Some(500),
+                connect_us: Some(20_000),
+                ttfb_us: Some(30_000),
+                ttft_us: None,
+                stream_us: None,
+                parse_us: None,
+                cache_commit_us: None,
+                total_us: Some(250_000),
+            },
+            created_at: queued_at + chrono::Duration::milliseconds(250),
         }
     }
 
@@ -890,6 +1757,218 @@ mod tests {
             "pending_transcription"
         );
         assert!(status_from_str("not_a_status").is_err());
+    }
+
+    #[test]
+    fn content_free_history_round_trips_nullable_unknown_cost_and_latency() {
+        let queue = Queue::memory();
+        let recording_id = queue
+            .enqueue(&meta("/cache/hosted-fixture.wav", "us.zoom.xos"))
+            .unwrap();
+        let call = content_free_call(&recording_id);
+        queue.upsert_postprocess_call(&call).unwrap();
+
+        let stored = queue.postprocess_call(&call.call_id).unwrap().unwrap();
+        assert_eq!(stored, call);
+        assert_eq!(
+            queue.postprocess_history(&recording_id).unwrap(),
+            vec![call.clone()]
+        );
+        assert_eq!(stored.cost.billing_basis(), BillingBasis::Unknown);
+        assert_eq!(stored.cost.cost_micros(), None);
+        assert_eq!(stored.usage, NormalizedUsage::unknown());
+        assert_eq!(stored.latency.ttft_us, None);
+        assert_eq!(stored.latency.total_us, Some(250_000));
+
+        let sql_values: (Option<i64>, Option<String>, String) = queue
+            .conn
+            .query_row(
+                "SELECT cost_micros, currency, billing_basis
+                 FROM postprocess_calls WHERE call_id = ?1",
+                params![stored.call_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sql_values, (None, None, "unknown".into()));
+
+        // Outbox replay/import is idempotent: one call id is refreshed, never duplicated.
+        let mut refreshed = call;
+        refreshed.outcome = PostprocessOutcome::Canceled;
+        refreshed.error_code = Some(ErrorCode::Canceled);
+        queue.upsert_postprocess_call(&refreshed).unwrap();
+        assert_eq!(
+            queue.postprocess_history(&recording_id).unwrap(),
+            vec![refreshed]
+        );
+    }
+
+    #[test]
+    fn postprocess_call_schema_is_an_exact_content_free_allowlist() {
+        let queue = Queue::memory();
+        let columns = {
+            let mut statement = queue
+                .conn
+                .prepare("SELECT name FROM pragma_table_info('postprocess_calls') ORDER BY cid")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let expected = POSTPROCESS_CALL_COLS
+            .split(',')
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(columns, expected);
+        for forbidden in [
+            "transcript",
+            "prompt",
+            "replacement",
+            "diff",
+            "steering",
+            "word_bank_entry",
+            "question",
+            "answer",
+            "credential",
+            "account_id",
+            "project_id",
+            "provider_body",
+            "error_body",
+            "error_message",
+        ] {
+            assert!(
+                !columns.iter().any(|column| column == forbidden),
+                "content column {forbidden} must not exist"
+            );
+        }
+        // The only similarly named fields are numeric revisions/versions required for fencing.
+        assert!(columns.contains(&"transcript_revision".into()));
+        assert!(columns.contains(&"prompt_version".into()));
+        assert!(columns.contains(&"steering_revision".into()));
+        assert!(columns.contains(&"question_revision".into()));
+    }
+
+    #[test]
+    fn call_history_cascades_with_recording_and_projection_preserves_job_status() {
+        let queue = Queue::memory();
+        let recording_id = queue
+            .enqueue(&meta("/cache/cascade-fixture.wav", "us.zoom.xos"))
+            .unwrap();
+        let call = content_free_call(&recording_id);
+        queue.upsert_postprocess_call(&call).unwrap();
+        let old_status = queue.get(&recording_id).unwrap().unwrap().status;
+
+        queue
+            .set_postprocess_state(&recording_id, Some(PostprocessState::Finalizing))
+            .unwrap();
+        let projected = queue.get(&recording_id).unwrap().unwrap();
+        assert_eq!(projected.status, old_status);
+        assert_eq!(
+            projected.postprocess_state,
+            Some(PostprocessState::Finalizing)
+        );
+        assert!(projected.postprocess_updated_at.is_some());
+        queue.set_postprocess_state(&recording_id, None).unwrap();
+        let cleared = queue.get(&recording_id).unwrap().unwrap();
+        assert_eq!(cleared.postprocess_state, None);
+        assert_eq!(cleared.postprocess_updated_at, None);
+
+        queue.set_status(&recording_id, JobStatus::Done).unwrap();
+        assert!(queue.delete_terminal(&recording_id).unwrap());
+        assert!(queue.postprocess_history(&recording_id).unwrap().is_empty());
+    }
+
+    /// The v1 schema verbatim (schema version 1, before hosted projection/history). Keep frozen so the
+    /// migration test does not accidentally begin from the current schema.
+    const V1_SCHEMA: &str = "
+CREATE TABLE recordings(
+  id              TEXT PRIMARY KEY,
+  started_at      TEXT NOT NULL,
+  ended_at        TEXT,
+  owning_app      TEXT NOT NULL,
+  bundle_id       TEXT,
+  audio_path      TEXT NOT NULL,
+  status          TEXT NOT NULL,
+  s3_uri          TEXT,
+  transcribe_job  TEXT,
+  note_path       TEXT,
+  error           TEXT,
+  updated_at      TEXT NOT NULL,
+  transcribe_secs REAL
+);
+CREATE INDEX idx_recordings_status ON recordings(status);
+PRAGMA user_version = 1;
+";
+
+    #[test]
+    fn migrates_v1_to_v2_transactionally_and_is_reopen_safe() {
+        let dir = std::env::temp_dir().join(format!(
+            "corti-queue-test-migrate-v1-v2-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(V1_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO recordings(
+                       id, started_at, owning_app, audio_path, status, updated_at, transcribe_secs
+                     ) VALUES (
+                       'v1-fixture', '2026-08-21T12:00:00.000Z', 'Fixture App',
+                       '/cache/v1-fixture.wav', 'done', '2026-08-21T12:01:00.000Z', NULL
+                     )",
+                    [],
+                )
+                .unwrap();
+            // Simulate a prior rerunnable implementation that added only the first column before stamp.
+            connection
+                .execute(
+                    "ALTER TABLE recordings ADD COLUMN postprocess_state TEXT",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let queue = Queue::open_at(&path).unwrap();
+        let version: i64 = queue
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let migrated = queue.get("v1-fixture").unwrap().unwrap();
+        assert_eq!(migrated.postprocess_state, None);
+        assert_eq!(migrated.postprocess_updated_at, None);
+        let call_table: bool = queue
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'postprocess_calls'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(call_table);
+        drop(queue);
+
+        let reopened = Queue::open_at(&path).unwrap();
+        assert_eq!(
+            reopened.get("v1-fixture").unwrap().unwrap().status,
+            JobStatus::Done
+        );
+        assert_eq!(
+            reopened
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The v0 schema verbatim (pre-`user_version`, pre-`transcribe_secs`, local-offset timestamps), for

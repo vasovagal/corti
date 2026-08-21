@@ -1600,7 +1600,13 @@ mod tests {
             .unwrap();
         assert_eq!(writer.path(), Some(&note));
         let content = read(&note);
-        assert!(content.contains(r#"corti: {"schema":1"#), "got: {content}");
+        assert!(
+            content.contains(&format!(
+                r#"corti: {{"schema":{}"#,
+                corti_vagus::provenance::SCHEMA_VERSION
+            )),
+            "got: {content}"
+        );
         assert!(content.contains(r#""mode":"live""#), "got: {content}");
         assert!(content.contains("State: transcribing\n\n"));
         assert!(content.contains("## Transcript\n\n"));

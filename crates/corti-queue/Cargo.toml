@@ -9,11 +9,13 @@ rust-version.workspace = true
 
 [dependencies]
 corti-core = { workspace = true }
+corti-postprocess = { workspace = true }
 # The background-jobs table lives in this same DB (and borrows this crate's Connection).
 corti-jobs = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
-# JobStatus' snake_case wire form is the source of truth for the `status` column (no drift).
+serde = { workspace = true }
+# JobStatus and hosted enum snake_case wire forms are the source of truth for SQLite text columns.
 serde_json = { workspace = true }
 # Bundled SQLite: shared workspace pin so corti-queue and corti-jobs borrow the same Connection type.
 rusqlite = { workspace = true }
