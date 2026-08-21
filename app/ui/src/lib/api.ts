@@ -412,12 +412,10 @@ export interface BedrockCredentialDto {
   has_session_token: boolean;
 }
 
-/** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. */
+/** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Keychain presence is not here: it comes
+ * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
 export interface AwsCredentialOptionsDto {
   profiles: string[];
-  has_access_key_id: boolean;
-  has_secret_access_key: boolean;
-  has_session_token: boolean;
 }
 
 /** Mirror of Rust `postprocess_app::AwsKeySlotDto`. */
@@ -700,7 +698,7 @@ export const setHostedPinnedQuestion = (
     request: { observed_state_revision: observedStateRevision, template },
   });
 
-/** Non-secret AWS setup facts: which `~/.aws` profiles exist and which Keychain slots hold a value. */
+/** The `~/.aws` profile names available on this machine. */
 export const listAwsCredentialOptions = (): Promise<AwsCredentialOptionsDto> =>
   invoke<AwsCredentialOptionsDto>("list_aws_credential_options");
 

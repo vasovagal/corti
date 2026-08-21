@@ -74,9 +74,9 @@ export function HostedBedrockCredentials({
   }, [scope?.region]);
 
   const keys = {
-    hasAccessKeyId: options?.has_access_key_id ?? bedrock.has_access_key_id,
-    hasSecretAccessKey: options?.has_secret_access_key ?? bedrock.has_secret_access_key,
-    hasSessionToken: options?.has_session_token ?? bedrock.has_session_token,
+    hasAccessKeyId: bedrock.has_access_key_id,
+    hasSecretAccessKey: bedrock.has_secret_access_key,
+    hasSessionToken: bedrock.has_session_token,
   };
   const missing = bedrockModeRequirements(mode, { profile, roleArn, region }, keys);
   const changed =
@@ -90,7 +90,10 @@ export function HostedBedrockCredentials({
       ? sessionExpiryLabel(credential.expires_at_unix_ms, Date.now())
       : null;
   const profiles = options?.profiles ?? [];
-  const needsProfile = mode === "profile" || mode === "sso";
+  // Assume-role resolves a base credential first, and that base can be a named profile, so the field is
+  // offered there too — optional rather than required.
+  const showsProfile = mode === "profile" || mode === "sso" || mode === "assume_role";
+  const profileLabel = mode === "assume_role" ? "Base AWS profile (optional)" : "AWS profile";
 
   function save(event: FormEvent) {
     event.preventDefault();
@@ -121,16 +124,18 @@ export function HostedBedrockCredentials({
       </fieldset>
 
       <form className="hosted-bedrock-fields" onSubmit={save}>
-        {needsProfile &&
+        {showsProfile &&
           (profiles.length > 0 ? (
             <label>
-              <span>AWS profile</span>
+              <span>{profileLabel}</span>
               <select
                 value={profiles.includes(profile) ? profile : ""}
                 disabled={actions.busy}
                 onChange={(event) => setProfile(event.target.value)}
               >
-                <option value="">Select a profile…</option>
+                <option value="">
+                  {mode === "assume_role" ? "Default chain" : "Select a profile…"}
+                </option>
                 {profiles.map((name) => (
                   <option key={name} value={name}>
                     {name}
@@ -140,7 +145,7 @@ export function HostedBedrockCredentials({
             </label>
           ) : (
             <label>
-              <span>AWS profile</span>
+              <span>{profileLabel}</span>
               <input
                 type="text"
                 value={profile}

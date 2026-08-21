@@ -1236,7 +1236,9 @@ summary:focus-visible,
 }
 .hosted-key-slots li > div:first-child {
   display: grid;
-  gap: 2px;
+  gap: 3px;
+  /* The pill is inline-flex, so it would otherwise stretch to the whole grid column. */
+  justify-items: start;
   min-width: 0;
   font-size: 12px;
 }
@@ -1633,6 +1635,10 @@ summary:focus-visible,
   .hosted-segmented {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  /* Five modes leave a hole in the last row; the odd one out fills it instead. */
+  .hosted-segmented label:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
   }
   .hosted-key-slots li {
     align-items: flex-start;

@@ -698,14 +698,11 @@ pub(crate) fn get_hosted_assistant(
         .map_err(|_| "hosted coordinator stopped".to_string())
 }
 
-/// Non-secret AWS setup facts the Bedrock pane needs: which `~/.aws` profiles exist, and which Keychain
-/// slots hold a value. Presence is a boolean; no key material is ever projected.
+/// The `~/.aws` profile names the Bedrock pane offers. Keychain presence deliberately lives only on the
+/// settings document, so the pane has one source of truth for it rather than two that can disagree.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AwsCredentialOptionsDto {
     pub(crate) profiles: Vec<String>,
-    pub(crate) has_access_key_id: bool,
-    pub(crate) has_secret_access_key: bool,
-    pub(crate) has_session_token: bool,
 }
 
 /// Which stored AWS secret a command refers to. The webview can name a slot but never read or write one.
@@ -801,9 +798,6 @@ pub(crate) fn list_aws_credential_options(
     require_hosted_window(&window, &["settings"])?;
     Ok(AwsCredentialOptionsDto {
         profiles: crate::settings::list_aws_profiles(),
-        has_access_key_id: crate::keychain::is_present(SecretPurpose::AwsAccessKeyId),
-        has_secret_access_key: crate::keychain::is_present(SecretPurpose::AwsSecretAccessKey),
-        has_session_token: crate::keychain::is_present(SecretPurpose::AwsSessionToken),
     })
 }
 

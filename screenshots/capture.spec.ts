@@ -1,5 +1,9 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import {
+  syntheticBedrockAssumedRoleSettings,
+  syntheticBedrockKeypairSettings,
+  syntheticBedrockProfileSettings,
+  syntheticBedrockRejectedSsoSettings,
   syntheticGapEvent,
   syntheticGapSnapshot,
   syntheticLiveOverrides,
@@ -458,4 +462,102 @@ test("Vertex warning and recovery", async ({ page }) => {
 
   await page.setViewportSize({ width: 1200, height: 1000 });
   await captureElement(vertexCard, "vertex-recovery-desktop.png");
+});
+
+/** Bedrock's card, with the sticky chrome pinned so element captures aren't overlaid. */
+async function bedrockCard(page: Page) {
+  await page.addStyleTag({
+    content: ".settings-tabs, .hosted-status-banner { position: static !important; }",
+  });
+  return page.locator(".hosted-provider-card").filter({
+    has: page.getByRole("heading", { name: "Amazon Bedrock" }),
+  });
+}
+
+/**
+ * Swap the settings document and let the pane pick it up the way it does in the app — through a
+ * coordinator event, not the Refresh button, which stays disabled until a scope is configured.
+ */
+async function applySettings(page: Page, settings: unknown) {
+  await setFixture(page, "get_hosted_settings", settings);
+  await emitFixture(page, "hosted-state-changed", { event: "provider_state" });
+}
+
+test("Bedrock credential modes", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  const card = await bedrockCard(page);
+
+  // Default chain: the pane is legible before any AWS setup exists.
+  await expect(card.getByRole("radio", { name: "Default chain" })).toBeChecked();
+  await expect(card.getByText("No credential", { exact: true })).toBeVisible();
+
+  await applySettings(page, syntheticBedrockProfileSettings);
+  await expect(card.getByRole("radio", { name: "Named profile" })).toBeChecked();
+  await expect(card.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(card.getByText("a named AWS profile", { exact: false })).toBeVisible();
+  await expect(card.locator("select").first()).toHaveValue("corti-screenshot");
+  await captureElement(card, "bedrock-profile-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(card, "bedrock-profile-narrow.png");
+});
+
+test("Bedrock key pair and assumed role", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  const card = await bedrockCard(page);
+
+  await applySettings(page, syntheticBedrockKeypairSettings);
+  await expect(card.getByRole("radio", { name: "Key pair" })).toBeChecked();
+  // Presence only: the pane can say "Stored", never show a value.
+  await expect(card.getByText("Stored", { exact: true })).toHaveCount(2);
+  await expect(card.getByText("Not set (optional)", { exact: true })).toBeVisible();
+  await expect(card.getByRole("button", { name: "Replace…" })).toHaveCount(2);
+  await captureElement(card, "bedrock-keypair-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(card, "bedrock-keypair-narrow.png");
+
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await applySettings(page, syntheticBedrockAssumedRoleSettings);
+  await expect(card.getByRole("radio", { name: "Assume role" })).toBeChecked();
+  await expect(card.getByText("Session renews in 47 min", { exact: true })).toBeVisible();
+  await expect(card.getByText("an assumed IAM role", { exact: false })).toBeVisible();
+  await captureElement(card, "bedrock-assumed-role-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(card, "bedrock-assumed-role-narrow.png");
+});
+
+test("Bedrock expired SSO reads as recoverable", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  const card = await bedrockCard(page);
+
+  await applySettings(page, syntheticBedrockRejectedSsoSettings);
+  await expect(card.getByRole("radio", { name: "SSO" })).toBeChecked();
+  await expect(card.getByText("Rejected", { exact: true })).toBeVisible();
+  await expect(card.getByText("aws sso login --profile corti-sso", { exact: true })).toBeVisible();
+  await captureElement(card, "bedrock-sso-rejected-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(card, "bedrock-sso-rejected-narrow.png");
+});
+
+test("provider key entry uses the native sheet, never a browser field", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  const openAiCard = page.locator(".hosted-provider-card").filter({
+    has: page.getByRole("heading", { name: "OpenAI direct API" }),
+  });
+  // The button was hard-disabled before the native surface existed.
+  const replace = openAiCard.getByRole("button", { name: "Replace key…" });
+  await expect(replace).toBeEnabled();
+  await replace.click();
+  await expect.poll(() => invocationCount(page, "prompt_for_provider_secret")).toBe(1);
+  expect(await lastInvocation(page, "prompt_for_provider_secret")).toMatchObject({
+    args: { request: { provider: "open_ai" } },
+  });
+  // No password input exists anywhere on the page; the value is typed into AppKit.
+  await expect(page.locator("input[type='password']")).toHaveCount(0);
 });
