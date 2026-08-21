@@ -11,6 +11,7 @@ use url::Url;
 use zeroize::Zeroize;
 
 const MAX_API_KEY_BYTES: usize = 16 * 1024;
+const MAX_ACCESS_TOKEN_BYTES: usize = 64 * 1024;
 const UREQ_READ_CHUNK_BYTES: usize = 16 * 1024;
 
 /// An API key owned by the native provider edge.
@@ -69,6 +70,58 @@ pub enum ApiKeyError {
     #[error("API key is too long")]
     TooLong,
     #[error("API key cannot be represented as an HTTP header value")]
+    InvalidHeaderValue,
+}
+
+/// An OAuth access token owned by an injected credential edge.
+///
+/// Like [`ApiKey`], this type deliberately implements neither `Clone`, `Display`, nor serialization. Its
+/// allocation is zeroized on drop and its debug form is always redacted. In particular, the Vertex adapter
+/// can accept an ADC-produced access token without learning or persisting ADC refresh credentials.
+pub struct AccessToken(String);
+
+impl AccessToken {
+    pub fn new(value: impl Into<String>) -> Result<Self, AccessTokenError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(AccessTokenError::Empty);
+        }
+        if value.len() > MAX_ACCESS_TOKEN_BYTES {
+            return Err(AccessTokenError::TooLong);
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(AccessTokenError::InvalidHeaderValue);
+        }
+        Ok(Self(value))
+    }
+
+    fn into_secret_header(self, prefix: &str) -> SecretString {
+        let mut value = String::with_capacity(prefix.len().saturating_add(self.0.len()));
+        value.push_str(prefix);
+        value.push_str(&self.0);
+        SecretString(value)
+    }
+}
+
+impl fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccessToken(<redacted>)")
+    }
+}
+
+impl Drop for AccessToken {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AccessTokenError {
+    #[error("access token is empty")]
+    Empty,
+    #[error("access token is too long")]
+    TooLong,
+    #[error("access token cannot be represented as an HTTP header value")]
     InvalidHeaderValue,
 }
 
@@ -252,6 +305,17 @@ impl HttpRequest {
     ) -> Result<Self, HttpBuildError> {
         self.headers
             .push(HttpHeader::secret(name, key.into_secret_header(prefix))?);
+        Ok(self)
+    }
+
+    pub fn with_access_token_header(
+        mut self,
+        name: impl Into<String>,
+        token: AccessToken,
+        prefix: &str,
+    ) -> Result<Self, HttpBuildError> {
+        self.headers
+            .push(HttpHeader::secret(name, token.into_secret_header(prefix))?);
         Ok(self)
     }
 
@@ -613,6 +677,17 @@ mod tests {
         assert_eq!(
             ApiKey::new("synthetic\r\nforged").unwrap_err(),
             ApiKeyError::InvalidHeaderValue
+        );
+    }
+
+    #[test]
+    fn access_tokens_are_redacted_and_reject_header_injection() {
+        let sentinel = "synthetic-access-token-never-render";
+        let token = AccessToken::new(sentinel).unwrap();
+        assert!(!format!("{token:?}").contains(sentinel));
+        assert_eq!(
+            AccessToken::new("synthetic\nforged").unwrap_err(),
+            AccessTokenError::InvalidHeaderValue
         );
     }
 }

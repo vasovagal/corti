@@ -1,6 +1,6 @@
 [package]
 name = "corti-postprocess-providers"
-description = "Injected direct-provider adapters for Corti hosted transcript post-processing."
+description = "Injected provider and authentication edges for Corti hosted transcript post-processing."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,5 +18,6 @@ zeroize = { workspace = true }
 
 [features]
 default = []
-# Reserved off-by-default marker only. Codex remains experimental and has no adapter in this slice.
+# Experimental broker/device-code interfaces only. Still requires an explicit runtime product-approval gate;
+# no production provider factory or ambient Codex process launcher is supplied.
 codex-experimental = []

@@ -26,6 +26,10 @@ const OPENAI_MODEL_LIST: &str = r#"{
 }"#;
 
 const ANTHROPIC_MODEL_ID: &str = "claude-haiku-4-5-20251001";
+const VERTEX_MODEL_ID: &str = "gemini-synthetic-001";
+const VERTEX_PROJECT_ID: &str = "synthetic-project";
+const VERTEX_REGION: &str = "us-central1";
+const VERTEX_QUOTA_PROJECT_ID: &str = "synthetic-quota-project";
 const ANTHROPIC_MODEL_LIST: &str = r#"{
   "data":[{
     "id":"claude-haiku-4-5-20251001",
@@ -74,6 +78,23 @@ impl ApiKeySource for FakeCredentials {
     fn resolve(&mut self) -> Result<ApiKey, CredentialError> {
         self.state.resolves.fetch_add(1, Ordering::SeqCst);
         ApiKey::new("synthetic-fixture-api-key").map_err(|_| CredentialError::Unavailable)
+    }
+
+    fn mark_rejected(&mut self) {
+        self.state.rejected.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct FakeAdcCredentials {
+    state: Arc<CredentialState>,
+}
+
+impl AdcAccessTokenSource for FakeAdcCredentials {
+    fn resolve_access_token(&mut self) -> Result<AdcAccessToken, CredentialError> {
+        self.state.resolves.fetch_add(1, Ordering::SeqCst);
+        let token = AccessToken::new("synthetic-fixture-adc-access-token")
+            .map_err(|_| CredentialError::Unavailable)?;
+        Ok(AdcAccessToken::new(token, Some(9_999_999)))
     }
 
     fn mark_rejected(&mut self) {
@@ -315,6 +336,13 @@ fn scope() -> ProviderScope {
     }
 }
 
+fn vertex_scope() -> ProviderScope {
+    ProviderScope {
+        connection_scope_id: ConnectionScopeId::new("synthetic-vertex-scope-id").unwrap(),
+        region: Some(VERTEX_REGION.to_owned()),
+    }
+}
+
 fn hosted_request(
     transport: KnownTransport,
     model: &str,
@@ -438,6 +466,54 @@ fn openai_stream() -> Vec<Vec<u8>> {
     ]
 }
 
+fn vertex_stream() -> Vec<Vec<u8>> {
+    let output = r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Synthetic corrected sentence."}]}"#;
+    let split = output.find("corrected").unwrap();
+    let mut wire = Vec::new();
+    wire.extend(
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "candidates":[{
+                    "index":0,
+                    "content":{"role":"model","parts":[{"text":&output[..split]}]}
+                }],
+                "modelVersion":VERTEX_MODEL_ID
+            }))
+            .unwrap()
+        )
+        .into_bytes(),
+    );
+    wire.extend(
+        format!(
+            "data: {}\n\n",
+            serde_json::to_string(&json!({
+                "candidates":[{
+                    "index":0,
+                    "content":{"role":"model","parts":[{"text":&output[split..]}]},
+                    "finishReason":"STOP"
+                }],
+                "usageMetadata":{
+                    "promptTokenCount":31,
+                    "candidatesTokenCount":11,
+                    "cachedContentTokenCount":13,
+                    "thoughtsTokenCount":2,
+                    "totalTokenCount":44
+                },
+                "modelVersion":VERTEX_MODEL_ID
+            }))
+            .unwrap()
+        )
+        .into_bytes(),
+    );
+    wire.extend_from_slice(b"data: [DONE]\n\n");
+    vec![
+        wire[..23].to_vec(),
+        wire[23..151].to_vec(),
+        wire[151..].to_vec(),
+    ]
+}
+
 fn anthropic_stream() -> Vec<Vec<u8>> {
     let output = r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Synthetic corrected sentence."}]}"#;
     let split = output.find("corrected").unwrap();
@@ -518,6 +594,32 @@ fn anthropic_adapter(scripts: Vec<Script>) -> (FakeTransportHandle, AnthropicMes
         credentials,
     );
     (handle, adapter)
+}
+
+fn vertex_adapter(
+    scripts: Vec<Script>,
+) -> (FakeTransportHandle, Arc<CredentialState>, VertexRestAdapter) {
+    let (handle, transport) = FakeTransportHandle::new(scripts);
+    let state = Arc::new(CredentialState::default());
+    let metadata = VertexProjectMetadata::new(
+        VERTEX_PROJECT_ID,
+        VERTEX_REGION,
+        Some(VERTEX_QUOTA_PROJECT_ID.to_owned()),
+    )
+    .unwrap();
+    let model =
+        VertexModel::new(ModelId::new(VERTEX_MODEL_ID).unwrap(), 1_000_000, 64_000).unwrap();
+    let adapter = VertexRestAdapter::new(
+        Box::new(transport),
+        Box::new(FakeClock::new(100)),
+        Box::new(FakeAdcCredentials {
+            state: state.clone(),
+        }),
+        metadata,
+        [model],
+    )
+    .unwrap();
+    (handle, state, adapter)
 }
 
 #[test]
@@ -645,6 +747,159 @@ fn anthropic_messages_shape_reconciles_terminal_usage_and_cache_classes() {
     assert_eq!(body["output_config"]["format"]["type"], "json_schema");
     assert!(body.get("tools").is_none());
     assert_eq!(captured[1].secret_headers, ["x-api-key"]);
+}
+
+#[test]
+fn vertex_rest_shape_normalizes_stream_usage_and_quota_metadata() {
+    let (handle, credential_state, mut adapter) =
+        vertex_adapter(vec![Script::sse(vertex_stream())]);
+    let catalog = adapter.catalog(&vertex_scope()).unwrap();
+    assert_eq!(catalog.models.len(), 1);
+    let descriptor = &catalog.models[0];
+    assert_eq!(descriptor.exact_model_id.as_str(), VERTEX_MODEL_ID);
+    assert_eq!(descriptor.region.as_deref(), Some(VERTEX_REGION));
+    assert!(descriptor.capabilities.implicit_cache_may_apply);
+    assert!(!descriptor.capabilities.explicit_prefix_cache);
+    assert!(!descriptor.benchmarked_for_live);
+
+    let request = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_MODEL_ID,
+        ProviderCacheMode::UnavoidableImplicit,
+    );
+    let sink = CollectingSink::default();
+    let terminal = adapter
+        .execute(&request, &CancellationToken::new(), &sink)
+        .unwrap();
+    assert_eq!(terminal.usage.input_tokens, Some(31));
+    assert_eq!(terminal.usage.output_tokens, Some(11));
+    assert_eq!(terminal.usage.cached_read_tokens, Some(13));
+    assert_eq!(terminal.usage.cached_write_tokens, None);
+    assert_eq!(terminal.usage.reasoning_tokens, Some(2));
+    assert!(terminal.usage.usage_complete);
+    assert_eq!(
+        terminal.cache,
+        corti_postprocess::CacheObservation::ProviderImplicit
+    );
+    assert_eq!(credential_state.resolves.load(Ordering::SeqCst), 1);
+
+    let captured = handle.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, HttpMethod::Post);
+    assert_eq!(
+        captured[0].url,
+        format!(
+            "https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/projects/{VERTEX_PROJECT_ID}/locations/{VERTEX_REGION}/publishers/google/models/{VERTEX_MODEL_ID}:streamGenerateContent?alt=sse"
+        )
+    );
+    assert_eq!(captured[0].secret_headers, ["authorization"]);
+    assert!(captured[0].public_headers.iter().any(|(name, value)| {
+        name == "x-goog-user-project" && value == VERTEX_QUOTA_PROJECT_ID
+    }));
+    let body = captured[0].body.as_ref().unwrap();
+    assert_eq!(
+        body["systemInstruction"]["parts"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert_eq!(body["contents"][0]["parts"].as_array().unwrap().len(), 3);
+    assert_eq!(body["generationConfig"]["candidateCount"], 1);
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 8 * 1024);
+    assert_eq!(
+        body["generationConfig"]["responseMimeType"],
+        "application/json"
+    );
+    assert_eq!(
+        body["generationConfig"]["responseJsonSchema"]["type"],
+        "object"
+    );
+    assert!(body.get("tools").is_none());
+    assert!(sink.events().iter().any(|event| matches!(
+        event.kind,
+        ProviderEventKind::CacheObserved(corti_postprocess::CacheObservation::ProviderImplicit)
+    )));
+}
+
+#[test]
+fn vertex_service_errors_are_sanitized_and_do_not_confuse_quota_with_auth() {
+    let provider_body = r#"{
+        "error":{
+            "code":429,
+            "status":"RESOURCE_EXHAUSTED",
+            "message":"synthetic personal provider text must not escape",
+            "details":[{"reason":"QUOTA_EXCEEDED"}]
+        }
+    }"#;
+    let (_, credential_state, mut adapter) =
+        vertex_adapter(vec![Script::status(429, provider_body)]);
+    adapter.catalog(&vertex_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_MODEL_ID,
+        ProviderCacheMode::UnavoidableImplicit,
+    );
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::Quota);
+    assert_eq!(credential_state.rejected.load(Ordering::SeqCst), 0);
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains("personal provider text"));
+    assert!(!rendered.contains(VERTEX_PROJECT_ID));
+
+    let (_, credential_state, mut adapter) = vertex_adapter(vec![Script::status(
+        401,
+        r#"{"error":{"code":401,"status":"UNAUTHENTICATED","message":"do not retain"}}"#,
+    )]);
+    adapter.catalog(&vertex_scope()).unwrap();
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::AuthRejected);
+    assert_eq!(credential_state.rejected.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn vertex_metadata_and_cache_policy_fail_closed_before_egress() {
+    assert!(VertexProjectMetadata::new("project\nforged", VERTEX_REGION, None).is_err());
+    assert!(VertexProjectMetadata::new(VERTEX_PROJECT_ID, "region/forged", None).is_err());
+    assert!(
+        VertexProjectMetadata::new(
+            VERTEX_PROJECT_ID,
+            VERTEX_REGION,
+            Some("quota\rforged".to_owned())
+        )
+        .is_err()
+    );
+
+    let (handle, _, mut adapter) = vertex_adapter(Vec::new());
+    assert_eq!(
+        adapter.catalog(&scope()).unwrap_err().code,
+        corti_postprocess::ErrorCode::PolicyBlocked
+    );
+    adapter.catalog(&vertex_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::PolicyBlocked);
+    assert!(handle.captured().is_empty());
 }
 
 #[test]
