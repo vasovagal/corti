@@ -218,12 +218,11 @@ impl LiveTranscriber {
         // Zero-copy batch path: with nothing carried, feed whole windows straight from the input slice and
         // buffer only the sub-window remainder — a whole-channel push copies just the tail, not the channel.
         if self.win.buf.is_empty() {
-            let mut windows = samples_16k.chunks_exact(VAD_WINDOW);
-            for window in windows.by_ref() {
+            let (windows, remainder) = samples_16k.as_chunks::<VAD_WINDOW>();
+            for window in windows {
                 vad.accept_waveform(window);
                 drain_regions(vad, &rec, pending, self.vad_base_samples);
             }
-            let remainder = windows.remainder();
             self.win.fed += (samples_16k.len() - remainder.len()) as u64;
             self.win.buf.extend_from_slice(remainder);
             return;
@@ -233,7 +232,7 @@ impl LiveTranscriber {
             return;
         }
         let block = self.win.take_windows();
-        for window in block.chunks_exact(VAD_WINDOW) {
+        for window in block.as_chunks::<VAD_WINDOW>().0 {
             vad.accept_waveform(window);
             drain_regions(vad, &rec, pending, self.vad_base_samples);
         }
