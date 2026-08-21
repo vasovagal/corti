@@ -71,17 +71,12 @@ pub enum InputTokenAccounting {
 }
 
 /// Whether a provider's output total already includes separately reported reasoning/thinking tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputTokenAccounting {
+    #[default]
     IncludesReasoning,
     ClassesDisjoint,
-}
-
-impl Default for OutputTokenAccounting {
-    fn default() -> Self {
-        Self::IncludesReasoning
-    }
 }
 
 /// Currency code constrained to three uppercase ASCII letters.

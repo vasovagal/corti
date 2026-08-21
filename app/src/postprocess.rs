@@ -877,7 +877,7 @@ pub(crate) enum CoordinatorEventDto {
     LaneState(LaneStateEventDto),
     ProviderState(Box<ProviderStateDto>),
     Notice(NoticeDto),
-    Accounting(AccountingEventDto),
+    Accounting(Box<AccountingEventDto>),
     Terminal(Box<TerminalTelemetryDto>),
     PersistenceWarning { code: ErrorCode },
 }
@@ -2500,16 +2500,18 @@ impl PostprocessCoordinator {
                     );
                     let recording_id = active.recording_id.clone();
                     let fence = event.context.fence.clone();
-                    self.push_event(CoordinatorEventDto::Accounting(AccountingEventDto {
-                        call_id,
-                        recording_id,
-                        lane: event.context.lane,
-                        fence,
-                        finality: AccountingFinalityDto::Provisional,
-                        usage,
-                        cost,
-                        late: false,
-                    }));
+                    self.push_event(CoordinatorEventDto::Accounting(Box::new(
+                        AccountingEventDto {
+                            call_id,
+                            recording_id,
+                            lane: event.context.lane,
+                            fence,
+                            finality: AccountingFinalityDto::Provisional,
+                            usage,
+                            cost,
+                            late: false,
+                        },
+                    )));
                 }
             }
             ProviderEventKind::Completed(usage) => {
@@ -3317,16 +3319,18 @@ impl PostprocessCoordinator {
         telemetry: &TerminalTelemetryDto,
         finality: AccountingFinalityDto,
     ) {
-        self.push_event(CoordinatorEventDto::Accounting(AccountingEventDto {
-            call_id: telemetry.call_id.clone(),
-            recording_id: telemetry.recording_id.clone(),
-            lane: telemetry.lane,
-            fence: telemetry.fence.clone(),
-            finality,
-            usage: telemetry.usage,
-            cost: telemetry.cost.clone(),
-            late: telemetry.late_content_discarded,
-        }));
+        self.push_event(CoordinatorEventDto::Accounting(Box::new(
+            AccountingEventDto {
+                call_id: telemetry.call_id.clone(),
+                recording_id: telemetry.recording_id.clone(),
+                lane: telemetry.lane,
+                fence: telemetry.fence.clone(),
+                finality,
+                usage: telemetry.usage,
+                cost: telemetry.cost.clone(),
+                late: telemetry.late_content_discarded,
+            },
+        )));
         self.push_event(CoordinatorEventDto::Terminal(Box::new(telemetry.clone())));
     }
 
@@ -3454,6 +3458,7 @@ fn validate_output(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn estimate_cost(
     pricing: &dyn PricingCatalog,
     descriptor: &ProviderDescriptor,

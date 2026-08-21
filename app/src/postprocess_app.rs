@@ -1509,7 +1509,10 @@ impl StoredProviderOutput {
 
 enum RuntimeStorePersistence {
     Memory,
-    Encrypted { path: PathBuf, cipher: StoreCipher },
+    Encrypted {
+        path: PathBuf,
+        cipher: Box<StoreCipher>,
+    },
 }
 
 struct StoreCipher {
@@ -1603,7 +1606,7 @@ impl RuntimeStore {
         outbox: Arc<TelemetryOutbox>,
         pipeline_tx: Sender<PipelineMsg>,
     ) -> Result<Self> {
-        let cipher = StoreCipher::new(key)?;
+        let cipher = Box::new(StoreCipher::new(key)?);
         let state = match read_private(&path, "encrypted hosted store", MAX_STORE_BYTES)? {
             Some(bytes) => cipher.open(&bytes)?,
             None => RuntimeStoreState::default(),
@@ -5213,7 +5216,7 @@ mod tests {
         std::fs::write(&blocker, b"block").unwrap();
         recovered.persistence = RuntimeStorePersistence::Encrypted {
             path: blocker.join("store.enc"),
-            cipher: StoreCipher::new([81; 32]).unwrap(),
+            cipher: Box::new(StoreCipher::new([81; 32]).unwrap()),
         };
         assert_eq!(
             recovered.mark_final_group_applied(&[first.clone(), second.clone()]),
