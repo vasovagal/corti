@@ -1,4 +1,5 @@
 import type {
+  AwsCredentialMode,
   HostedBillingBasis,
   HostedCredentialState,
   HostedErrorCode,
@@ -46,6 +47,11 @@ const PRESENTATION: Record<string, ProviderPresentation> = {
     shortName: "Claude subscription",
     auth: "No credential import permitted",
   },
+  bedrock_runtime: {
+    name: "Amazon Bedrock",
+    shortName: "Bedrock",
+    auth: "AWS credentials: default chain, profile, key pair, assumed role, or SSO",
+  },
 };
 
 export function providerPresentation(provider: string, transport: string): ProviderPresentation {
@@ -89,7 +95,89 @@ function credentialSourceLabel(source: Extract<HostedCredentialState, { state: "
       return "Application Default Credentials";
     case "broker_keyring":
       return "broker-owned OS keyring";
+    case "aws_default_chain":
+      return "the default AWS credential chain";
+    case "aws_profile":
+      return "a named AWS profile";
+    case "aws_static_keychain":
+      return "an AWS key pair in the macOS Keychain";
+    case "aws_assumed_role":
+      return "an assumed IAM role";
+    case "aws_sso":
+      return "AWS IAM Identity Center (SSO)";
   }
+}
+
+/** Human wording for one AWS credential mode, used by the mode picker and the readiness line. */
+export function awsCredentialModeLabel(mode: AwsCredentialMode): string {
+  switch (mode) {
+    case "default_chain":
+      return "Default chain";
+    case "profile":
+      return "Named profile";
+    case "static_keychain":
+      return "Key pair";
+    case "assume_role":
+      return "Assume role";
+    case "sso":
+      return "SSO";
+  }
+}
+
+export function awsCredentialModeDescription(mode: AwsCredentialMode): string {
+  switch (mode) {
+    case "default_chain":
+      return "Whatever the AWS SDK would resolve: environment variables, then ~/.aws, then any instance role.";
+    case "profile":
+      return "A named profile from ~/.aws/config or ~/.aws/credentials.";
+    case "static_keychain":
+      return "An access key ID and secret stored in the macOS Keychain. A session token is optional.";
+    case "assume_role":
+      return "Resolve a base credential, then assume this role. Corti renews the session before it lapses.";
+    case "sso":
+      return "An IAM Identity Center profile. Corti reads the token the AWS CLI cached; it never performs the login.";
+  }
+}
+
+/** What still has to be filled in before this Bedrock mode can be saved. Empty means the mode is ready. */
+export function bedrockModeRequirements(
+  mode: AwsCredentialMode,
+  draft: { profile: string; roleArn: string; region: string },
+  keys: { hasAccessKeyId: boolean; hasSecretAccessKey: boolean },
+): string[] {
+  const missing: string[] = [];
+  if (!draft.region.trim()) missing.push("a Bedrock region");
+  if ((mode === "profile" || mode === "sso") && !draft.profile.trim()) {
+    missing.push("a profile name");
+  }
+  if (mode === "assume_role") {
+    const arn = draft.roleArn.trim();
+    if (!arn) missing.push("a role ARN");
+    else if (!arn.startsWith("arn:") || !arn.includes(":role/")) missing.push("a valid IAM role ARN");
+  }
+  if (mode === "static_keychain") {
+    if (!keys.hasAccessKeyId) missing.push("an access key ID");
+    if (!keys.hasSecretAccessKey) missing.push("a secret access key");
+  }
+  return missing;
+}
+
+/** Countdown wording for an assumed-role or SSO session. Returns null when there is no expiry. */
+export function sessionExpiryLabel(
+  expiresAtUnixMs: number | null | undefined,
+  nowUnixMs: number,
+): string | null {
+  if (expiresAtUnixMs == null) return null;
+  const remainingMs = expiresAtUnixMs - nowUnixMs;
+  if (remainingMs <= 0) return "Session expired";
+  const minutes = Math.floor(remainingMs / 60_000);
+  if (minutes < 1) return "Session renews in under a minute";
+  if (minutes < 60) return `Session renews in ${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest === 0
+    ? `Session renews in ${hours} h`
+    : `Session renews in ${hours} h ${rest} min`;
 }
 
 export function credentialSummary(
@@ -98,13 +186,16 @@ export function credentialSummary(
 ): CredentialSummary {
   const vertex = transport === "vertex_api";
   const codex = transport === "codex_app_server";
+  const bedrock = transport === "bedrock_runtime";
   switch (credential.state) {
     case "absent":
       return {
         label: vertex ? "Unarmed" : codex ? "Disconnected" : "No credential",
         detail: vertex
           ? "No memory-only ADC access token is ready."
-          : "No backend-managed credential is ready.",
+          : bedrock
+            ? "No AWS credential resolved for the selected mode."
+            : "No backend-managed credential is ready.",
         tone: "muted",
       };
     case "resolving":
@@ -134,13 +225,17 @@ export function credentialSummary(
     case "refreshing":
       return {
         label: "Refreshing",
-        detail: "The existing credential is being refreshed in its backend owner.",
+        detail: bedrock
+          ? "The session is close to expiry and is being renewed before the next request."
+          : "The existing credential is being refreshed in its backend owner.",
         tone: "caution",
       };
     case "rejected":
       return {
         label: "Rejected",
-        detail: "Authentication was rejected. Service readiness is checked separately.",
+        detail: bedrock
+          ? "AWS refused the credential. An expired SSO session is the usual cause."
+          : "Authentication was rejected. Service readiness is checked separately.",
         tone: "error",
       };
     case "unsupported":

@@ -149,6 +149,12 @@ pub trait ApiKeySource: Send {
 pub struct SecretString(String);
 
 impl SecretString {
+    /// Wraps a value derived from a credential. Used by SigV4, whose `Authorization` value is computed
+    /// from the secret access key and therefore must never reach a log or debug rendering.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     /// Exposes the value only to the injected transport that must place it on the wire.
     pub fn expose_secret(&self) -> &str {
         &self.0
@@ -316,6 +322,15 @@ impl HttpRequest {
     ) -> Result<Self, HttpBuildError> {
         self.headers
             .push(HttpHeader::secret(name, token.into_secret_header(prefix))?);
+        Ok(self)
+    }
+
+    pub fn with_secret_header(
+        mut self,
+        name: impl Into<String>,
+        value: SecretString,
+    ) -> Result<Self, HttpBuildError> {
+        self.headers.push(HttpHeader::secret(name, value)?);
         Ok(self)
     }
 
@@ -500,6 +515,18 @@ impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
     }
 }
 
+/// Injected wall clock. A SigV4 signature is timestamped and scoped to a UTC date, which a monotonic
+/// clock cannot supply; tests pin this to a fixed instant to reproduce AWS's published test vectors.
+pub trait WallClock: Send + Sync {
+    fn unix_seconds(&self) -> i64;
+}
+
+impl<T: WallClock + ?Sized> WallClock for std::sync::Arc<T> {
+    fn unix_seconds(&self) -> i64 {
+        (**self).unix_seconds()
+    }
+}
+
 #[derive(Debug)]
 pub struct SystemClock {
     epoch: Instant,
@@ -522,6 +549,16 @@ impl Default for SystemClock {
 impl Clock for SystemClock {
     fn monotonic_micros(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+}
+
+impl WallClock for SystemClock {
+    fn unix_seconds(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+            .unwrap_or(0)
     }
 }
 

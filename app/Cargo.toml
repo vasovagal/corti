@@ -75,6 +75,8 @@ aws-config = { version = "1", optional = true }
 # STS GetCallerIdentity powers the Settings "Test credentials" button. Already resolved transitively via
 # aws-config; declared direct here so the app can call it.
 aws-sdk-sts = { version = "1", optional = true }
+# `ProvideCredentials`, so the Bedrock resolver can drive the chain the same way the SDK clients do.
+aws-credential-types = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt", "time", "net"], optional = true }
 
 # Local on-device backend. Parakeet-TDT runs through sherpa-onnx/CPU or transcribe.cpp/Metal — see
@@ -91,14 +93,27 @@ ureq = { version = "2", optional = true }
 # Activate NSApplication explicitly on the main thread before focusing every singleton utility window.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication"] }
+# NSApplication activation for tray-opened windows, plus the NSAlert + NSSecureTextField secure-entry
+# sheet that keeps provider keys out of the webview (ADR 0015 §5).
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSAlert",
+    "NSControl",
+    "NSResponder",
+    "NSSecureTextField",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSString"] }
 
 # Both backends ship in every build (dev + the default-feature release bundle): the active one is chosen at
 # runtime in Settings. `local` stays a named feature so a minimal `--no-default-features` build is still
 # possible (and CI exercises it), but it is on by default — Parakeet is always available.
 [features]
 default = ["aws", "local", "local-ggml"]
-aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:tokio"]
+aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:aws-credential-types", "dep:tokio"]
 local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
 # ADR 0011: compile in the transcribe.cpp (GGML/Metal) ASR engine. Standard app/release builds include it;
 # a minimal `--no-default-features --features local` build keeps the old sherpa-only posture.

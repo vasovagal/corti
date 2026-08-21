@@ -274,7 +274,12 @@ export type HostedCredentialSource =
   | "keychain"
   | "workload_identity"
   | "application_default_credentials"
-  | "broker_keyring";
+  | "broker_keyring"
+  | "aws_default_chain"
+  | "aws_profile"
+  | "aws_static_keychain"
+  | "aws_assumed_role"
+  | "aws_sso";
 export type HostedLocalCacheMode = "reusable" | "recovery_only" | "memory_only";
 export type HostedProviderCacheMode =
   | "off"
@@ -388,6 +393,43 @@ export interface HostedProviderScope {
   quota_project: string | null;
 }
 
+/** Mirror of Rust `postprocess_config::AwsCredentialMode`. */
+export type AwsCredentialMode =
+  | "default_chain"
+  | "profile"
+  | "static_keychain"
+  | "assume_role"
+  | "sso";
+
+/** Mirror of Rust `postprocess_app::BedrockCredentialDto`. The `has_*` flags are presence only — no key
+ * material can be represented here, and none crosses the IPC boundary in either direction. */
+export interface BedrockCredentialDto {
+  mode: AwsCredentialMode;
+  profile: string | null;
+  role_arn: string | null;
+  has_access_key_id: boolean;
+  has_secret_access_key: boolean;
+  has_session_token: boolean;
+}
+
+/** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Keychain presence is not here: it comes
+ * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
+export interface AwsCredentialOptionsDto {
+  profiles: string[];
+}
+
+/** Mirror of Rust `postprocess_app::AwsKeySlotDto`. */
+export type AwsKeySlot = "access_key_id" | "secret_access_key" | "session_token";
+
+/** Mirror of Rust `postprocess_app::SecretSlotRequest`. */
+export type SecretSlotRequest =
+  | { provider: "open_ai" }
+  | { provider: "anthropic" }
+  | { provider: "aws"; slot: AwsKeySlot };
+
+/** Mirror of Rust `postprocess_app::SecretEntryResultDto`. */
+export type SecretEntryResult = "stored" | "cancelled" | "rejected";
+
 /** Mirror of Rust `postprocess_app::HostedSettingsDto`; it is deliberately secret-free. */
 export interface HostedSettingsDto {
   state_revision: number;
@@ -395,6 +437,7 @@ export interface HostedSettingsDto {
   control: HostedControlSnapshot;
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
+  bedrock: BedrockCredentialDto;
   default_steering: string;
   word_bank: {
     revision: number;
@@ -654,6 +697,33 @@ export const setHostedPinnedQuestion = (
   invoke<HostedMutationResult>("set_hosted_pinned_question", {
     request: { observed_state_revision: observedStateRevision, template },
   });
+
+/** The `~/.aws` profile names available on this machine. */
+export const listAwsCredentialOptions = (): Promise<AwsCredentialOptionsDto> =>
+  invoke<AwsCredentialOptionsDto>("list_aws_credential_options");
+
+export const setBedrockCredentialMode = (
+  observedStateRevision: number,
+  mode: AwsCredentialMode,
+  profile: string | null,
+  roleArn: string | null,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("set_bedrock_credential_mode", {
+    request: {
+      observed_state_revision: observedStateRevision,
+      mode,
+      profile,
+      role_arn: roleArn,
+    },
+  });
+
+/** Opens the native secure-entry sheet. The typed value goes straight to the Keychain; this call only
+ * ever learns whether it was stored, cancelled, or rejected. */
+export const promptForProviderSecret = (request: SecretSlotRequest): Promise<SecretEntryResult> =>
+  invoke<SecretEntryResult>("prompt_for_provider_secret", { request });
+
+export const clearProviderSecret = (request: SecretSlotRequest): Promise<void> =>
+  invoke<void>("clear_provider_secret", { request });
 
 export const getHostedAssistant = (): Promise<HostedAssistantSnapshot> =>
   invoke<HostedAssistantSnapshot>("get_hosted_assistant");

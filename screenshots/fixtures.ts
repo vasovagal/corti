@@ -154,6 +154,61 @@ const openAiDirect = {
   service_error: null,
 };
 
+const bedrockModels = [
+  {
+    provider: "amazon",
+    transport: "bedrock_runtime",
+    support_tier: "documented",
+    exact_model_id: "anthropic.claude-sonnet-4-20250514-v1:0",
+    account_scoped_available: true,
+    region: "us-east-1",
+    max_context_tokens: 32_000,
+    max_output_tokens: 4_096,
+    capabilities: {
+      text_input: true,
+      text_output: true,
+      streaming: true,
+      structured_output: true,
+      explicit_prefix_cache: false,
+      implicit_cache_may_apply: false,
+    },
+    billing_basis: "metered_estimate",
+    tariff_version: null,
+    deprecated: false,
+    benchmarked_for_live: false,
+  },
+  {
+    provider: "amazon",
+    transport: "bedrock_runtime",
+    support_tier: "documented",
+    exact_model_id: "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    account_scoped_available: true,
+    region: "us-east-1",
+    max_context_tokens: 32_000,
+    max_output_tokens: 4_096,
+    capabilities: {
+      text_input: true,
+      text_output: true,
+      streaming: true,
+      structured_output: true,
+      explicit_prefix_cache: false,
+      implicit_cache_may_apply: false,
+    },
+    billing_basis: "metered_estimate",
+    tariff_version: null,
+    deprecated: false,
+    benchmarked_for_live: false,
+  },
+];
+
+const bedrockDescriptor = {
+  provider: "amazon",
+  transport: "bedrock_runtime",
+  support_tier: "documented",
+  billing_basis: "metered_estimate",
+  adapter_available: true,
+};
+
 export const hostedSettings = {
   state_revision: 12,
   preferences_revision: 7,
@@ -249,6 +304,12 @@ export const hostedSettings = {
       service_error: null,
     },
     openAiDirect,
+    {
+      descriptor: bedrockDescriptor,
+      credential: { state: "absent" },
+      models: [],
+      service_error: null,
+    },
   ],
   scopes: [
     {
@@ -278,7 +339,24 @@ export const hostedSettings = {
       region: null,
       quota_project: null,
     },
+    {
+      provider: "amazon",
+      transport: "bedrock_runtime",
+      configured: false,
+      alias: null,
+      project: null,
+      region: null,
+      quota_project: null,
+    },
   ],
+  bedrock: {
+    mode: "default_chain",
+    profile: null,
+    role_arn: null,
+    has_access_key_id: false,
+    has_secret_access_key: false,
+    has_session_token: false,
+  },
   default_steering: "Preserve speaker intent; correct only clear recognition errors.",
   word_bank: {
     revision: 7,
@@ -330,6 +408,110 @@ export const syntheticVertexReadySettings = {
   ),
 };
 
+/** Bedrock connected through a named `~/.aws` profile. */
+export const syntheticBedrockProfileSettings = {
+  ...hostedSettings,
+  state_revision: 14,
+  providers: hostedSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? {
+          ...provider,
+          credential: {
+            state: "ready",
+            expires_at_unix_ms: null,
+            source: "aws_profile",
+          },
+          models: bedrockModels,
+        }
+      : provider,
+  ),
+  scopes: hostedSettings.scopes.map((scope) =>
+    scope.transport === "bedrock_runtime"
+      ? { ...scope, configured: true, alias: "Screenshot Bedrock", region: "us-east-1" }
+      : scope,
+  ),
+  bedrock: {
+    mode: "profile",
+    profile: "corti-screenshot",
+    role_arn: null,
+    has_access_key_id: false,
+    has_secret_access_key: false,
+    has_session_token: false,
+  },
+};
+
+/** The static key-pair mode, with both Keychain slots filled and the session token left unset. */
+export const syntheticBedrockKeypairSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 15,
+  bedrock: {
+    mode: "static_keychain",
+    profile: null,
+    role_arn: null,
+    has_access_key_id: true,
+    has_secret_access_key: true,
+    has_session_token: false,
+  },
+  providers: syntheticBedrockProfileSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? {
+          ...provider,
+          credential: {
+            state: "ready",
+            expires_at_unix_ms: null,
+            source: "aws_static_keychain",
+          },
+        }
+      : provider,
+  ),
+};
+
+/** An assumed role whose session is counting down. The fixed capture clock makes the label stable. */
+export const syntheticBedrockAssumedRoleSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 16,
+  bedrock: {
+    mode: "assume_role",
+    profile: "corti-screenshot",
+    role_arn: "arn:aws:iam::123456789012:role/corti-bedrock-invoke",
+    has_access_key_id: false,
+    has_secret_access_key: false,
+    has_session_token: false,
+  },
+  providers: syntheticBedrockProfileSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? {
+          ...provider,
+          credential: {
+            // 47 minutes after the capture clock's fixed instant.
+            state: "ready",
+            expires_at_unix_ms: new Date("2026-08-18T20:47:00-04:00").getTime(),
+            source: "aws_assumed_role",
+          },
+        }
+      : provider,
+  ),
+};
+
+/** An expired IAM Identity Center session — the case that must read as recoverable, not broken. */
+export const syntheticBedrockRejectedSsoSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 17,
+  bedrock: {
+    mode: "sso",
+    profile: "corti-sso",
+    role_arn: null,
+    has_access_key_id: false,
+    has_secret_access_key: false,
+    has_session_token: false,
+  },
+  providers: syntheticBedrockProfileSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? { ...provider, credential: { state: "rejected" }, models: [] }
+      : provider,
+  ),
+};
+
 export const fixtures: Record<string, unknown> = {
   get_live_transcript: liveTranscript,
   start_live_test: null,
@@ -371,6 +553,12 @@ export const fixtures: Record<string, unknown> = {
   replace_hosted_word_bank: { status: "unchanged", settings: hostedSettings },
   update_hosted_provider_scope: { status: "unchanged", settings: hostedSettings },
   refresh_hosted_provider: openAiDirect,
+  list_aws_credential_options: {
+    profiles: ["default", "corti-screenshot", "corti-sso"],
+  },
+  set_bedrock_credential_mode: { status: "unchanged", settings: hostedSettings },
+  prompt_for_provider_secret: "stored",
+  clear_provider_secret: null,
   set_hosted_pinned_question: { status: "unchanged", settings: hostedSettings },
   get_hosted_assistant: {
     pinned_run_count: 0,

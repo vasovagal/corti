@@ -8,31 +8,13 @@ import {
   type ModelStatus,
   type SettingsDto,
 } from "../lib/api";
+import { AWS_REGIONS } from "../lib/awsRegions";
 
 interface Props {
   cfg: SettingsDto;
   backends: BackendInfo[];
   onChange: (next: SettingsDto) => void;
 }
-
-// Common AWS commercial regions for the selector; the current value is injected if it isn't in the list.
-const AWS_REGIONS = [
-  "us-east-1",
-  "us-east-2",
-  "us-west-1",
-  "us-west-2",
-  "ca-central-1",
-  "eu-west-1",
-  "eu-west-2",
-  "eu-central-1",
-  "eu-north-1",
-  "ap-south-1",
-  "ap-southeast-1",
-  "ap-southeast-2",
-  "ap-northeast-1",
-  "ap-northeast-2",
-  "sa-east-1",
-];
 
 // The Transcription section: a direct editor over the persisted AppConfig fields. A field pinned by a
 // `CORTI_*` env var is shown disabled with a "managed by env" badge. The AWS sub-section additionally
