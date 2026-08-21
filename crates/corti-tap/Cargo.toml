@@ -34,6 +34,10 @@ corti-transcribe-local = { workspace = true, optional = true }
 corti-aec = { workspace = true, optional = true }
 
 [features]
-default = ["inbox"]
-inbox = ["dep:corti-transcribe", "dep:corti-transcribe-aws", "dep:corti-vagus", "dep:serde_json", "dep:aws-config", "dep:tokio"]
+# Everything the README advertises is in the default build: both `--inbox` backends and `--live`.
+default = ["inbox-aws", "inbox-local", "live"]
+# Backend-agnostic filing: transcript → vagus note. Selecting a backend is the two features below.
+inbox = ["dep:corti-transcribe", "dep:corti-vagus", "dep:serde_json"]
+inbox-aws = ["inbox", "dep:corti-transcribe-aws", "dep:aws-config", "dep:tokio"]
+inbox-local = ["inbox", "dep:corti-transcribe-local"]
 live = ["dep:corti-transcribe-local", "dep:corti-aec"]

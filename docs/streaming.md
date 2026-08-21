@@ -105,7 +105,7 @@ capture HAL callbacks only ever hand work to a channel. `tokio`/`futures-core` a
 
 ## First consumer — `corti-tap --live`
 
-`corti-tap --live` (build with `--features live`) wires the whole path end-to-end (`run_live`,
+`corti-tap --live` (in the default build) wires the whole path end-to-end (`run_live`,
 `crates/corti-tap/src/main.rs:176`): bounded tee → optional `StreamingAec::push` on the mic (skipped under
 `--no-mic`) → two `LiveTranscriber`s (mic → `Me`, tap → `Them`) → words to stdout, flushed per line. AEC
 lookahead (`CORTI_AEC_LOOKAHEAD_SECS`, default 5 s) warms the filter, so the **first mic words are delayed** by
