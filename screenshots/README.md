@@ -20,6 +20,11 @@ Generated Retina PNGs land in ignored `screenshots/output/`:
 - `live-transcript.png`
 - `live-rewriting-assistant.png`
 - `live-assistant-drawer.png`
+- `live-diff-cost-{desktop,narrow}.png`
+- `assistant-pinned-{desktop,narrow}.png`
+- `preferences-{desktop,narrow}.png`
+- `vertex-{warning,recovery}-{desktop,narrow}.png`
+- `reduced-motion-{desktop,narrow}.png`
 - `recording-queue.png`
 - `pipeline.png`
 - `settings-local.png`

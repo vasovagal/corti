@@ -1,10 +1,11 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import {
   syntheticGapEvent,
   syntheticGapSnapshot,
   syntheticLiveOverrides,
   syntheticLiveTerminal,
   syntheticVertexNotice,
+  syntheticVertexReadySettings,
 } from "./fixtures.js";
 import { buildInitScript } from "./tauri-mock.js";
 
@@ -17,6 +18,10 @@ test.beforeEach(async ({ page }, testInfo) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const liveExperience = [
     "live rewrite changes and assistant",
+    "live diff and cost narrow",
+    "desktop sidebar and pinned answer",
+    "reduced motion live rewrite desktop",
+    "reduced motion live rewrite narrow",
     "repairs revision gaps and shows the exact warning",
     "narrow assistant drawer restores focus",
     "accepted rewrite wash is one shot",
@@ -26,12 +31,33 @@ test.beforeEach(async ({ page }, testInfo) => {
   await page.addInitScript({
     content: buildInitScript(liveExperience ? syntheticLiveOverrides : undefined),
   });
+  // Product captures are fixture-only. Even if the machine has ambient provider
+  // credentials, the browser may talk only to the loopback Vite server.
+  await page.route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      ["127.0.0.1", "localhost", "::1"].includes(url.hostname)
+    ) {
+      await route.continue();
+      return;
+    }
+    await route.abort("blockedbyclient");
+  });
 });
 
 async function capture(page: Page, filename: string, fullPage = false) {
   await page.screenshot({
     path: `output/${filename}`,
     fullPage,
+    animations: "disabled",
+    caret: "hide",
+  });
+}
+
+async function captureElement(locator: Locator, filename: string) {
+  await locator.screenshot({
+    path: `output/${filename}`,
     animations: "disabled",
     caret: "hide",
   });
@@ -102,6 +128,38 @@ test("live rewrite changes and assistant", async ({ page }) => {
   await expect(page.locator(".live-answer-failed")).toContainText("Earlier transcript omitted");
   await expect(page.locator(".live-line-active")).toHaveCSS("animation-name", "none");
   await capture(page, "live-rewriting-assistant.png");
+  await capture(page, "live-diff-cost-desktop.png");
+});
+
+test("live diff and cost narrow", async ({ page }) => {
+  await page.setViewportSize({ width: 430, height: 932 });
+  await prepareLiveRewrite(page);
+  await expect(page.locator("del[data-diff-kind='removed']")).toContainText("teh");
+  await expect(page.locator(".live-call-cost")).toContainText("Estimated $0.0012");
+  await capture(page, "live-diff-cost-narrow.png");
+});
+
+test("desktop sidebar and pinned answer", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 800 });
+  await page.goto(`${BASE_URL}/?view=live`);
+  await expect(page.getByRole("heading", { name: "Synthetic planning call · live transcript" })).toBeVisible();
+  await expect(page.getByText("The fixture supports a Friday release", { exact: false })).toBeVisible();
+  await capture(page, "assistant-pinned-desktop.png");
+});
+
+test("reduced motion live rewrite desktop", async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await prepareLiveRewrite(page, false);
+  await expect(page.locator(".live-line-active")).toHaveCSS("animation-name", "none");
+  await expect(page.locator(".live-scroll")).toHaveCSS("scroll-behavior", "auto");
+  await capture(page, "reduced-motion-desktop.png");
+});
+
+test("reduced motion live rewrite narrow", async ({ page }) => {
+  await page.setViewportSize({ width: 430, height: 800 });
+  await prepareLiveRewrite(page, false);
+  await expect(page.locator(".live-line-active")).toHaveCSS("animation-name", "none");
+  await capture(page, "reduced-motion-narrow.png");
 });
 
 test("repairs revision gaps and shows the exact warning", async ({ page }) => {
@@ -129,7 +187,7 @@ test("repairs revision gaps and shows the exact warning", async ({ page }) => {
 });
 
 test("narrow assistant drawer restores focus", async ({ page }) => {
-  await page.setViewportSize({ width: 700, height: 700 });
+  await page.setViewportSize({ width: 430, height: 900 });
   await page.goto(`${BASE_URL}/?view=live`);
   const trigger = page.getByRole("button", { name: /Assistant/u });
   await expect(trigger).toBeVisible();
@@ -141,7 +199,9 @@ test("narrow assistant drawer restores focus", async ({ page }) => {
   await expect(drawer).toBeHidden();
   await expect(trigger).toBeFocused();
   await trigger.click();
+  await expect(page.getByText("The fixture supports a Friday release", { exact: false })).toBeVisible();
   await capture(page, "live-assistant-drawer.png");
+  await capture(page, "assistant-pinned-narrow.png");
 });
 
 test("accepted rewrite wash is one shot", async ({ page }) => {
@@ -250,6 +310,42 @@ test("local settings", async ({ page }) => {
   await capture(page, "settings-local.png");
 });
 
+async function prepareLiveRewrite(page: Page, terminal = true) {
+  await page.goto(`${BASE_URL}/?view=live`);
+  await expect(page.getByText("Raw text appears first", { exact: false })).toBeVisible();
+  await emitFixture(page, "hosted-state-changed", {
+    event: "lane_state",
+    lane: "live",
+    state: "rewriting",
+    code: null,
+  });
+  await emitFixture(page, "hosted-state-changed", {
+    event: "accounting",
+    call_id: "synthetic-live-call-42",
+    lane: "live",
+    finality: "provisional",
+    usage: {
+      input_tokens: 160,
+      output_tokens: 12,
+      cached_read_tokens: 96,
+      cached_write_tokens: null,
+      reasoning_tokens: null,
+      usage_complete: false,
+    },
+    cost: {
+      billing_basis: "metered_estimate",
+      cost_micros: 600,
+      currency: "USD",
+      pricing_catalog_version: "synthetic-tariff-v1",
+      tariff_id: "synthetic-live-rate",
+      tariff_effective_at_unix_ms: 1787000000000,
+    },
+    late: false,
+  });
+  if (terminal) await emitFixture(page, "hosted-state-changed", syntheticLiveTerminal);
+  await page.getByRole("radio", { name: "Changes" }).click();
+}
+
 function syntheticLiveTranscriptEventBase() {
   return {
     protocol_version: 2,
@@ -298,11 +394,57 @@ async function emitFixture(page: Page, event: string, payload: unknown) {
   );
 }
 
+async function setFixture(page: Page, command: string, value: unknown) {
+  await page.evaluate(
+    ({ fixtureCommand, fixtureValue }) => {
+      const bridge = window as unknown as {
+        __cortiSetFixture: (name: string, next: unknown) => void;
+      };
+      bridge.__cortiSetFixture(fixtureCommand, fixtureValue);
+    },
+    { fixtureCommand: command, fixtureValue: value },
+  );
+}
+
 test("hosted rewrite preferences", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
   await expect(page.getByRole("heading", { name: "Hosted rewrite", exact: true })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveText("gcloud token isn't armed");
   await expect(page.locator("#hosted-model-final")).toHaveValue("gpt-5.6-luna");
+  await capture(page, "preferences-desktop.png");
   await capture(page, "settings-hosted.png", true);
+});
+
+test("hosted rewrite preferences narrow", async ({ page }) => {
+  await page.setViewportSize({ width: 430, height: 900 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await expect(page.getByRole("heading", { name: "Hosted rewrite", exact: true })).toBeVisible();
+  await capture(page, "preferences-narrow.png");
+});
+
+test("Vertex warning and recovery", async ({ page }) => {
+  const vertexCard = page.locator(".hosted-provider-card").filter({
+    has: page.getByRole("heading", { name: "Google Vertex direct API" }),
+  });
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  // Element screenshots can be taller than the viewport; keep the sticky tab
+  // bar from overlaying the card while Playwright scrolls it into view.
+  await page.addStyleTag({
+    content: ".settings-tabs, .hosted-status-banner { position: static !important; }",
+  });
+  await expect(vertexCard.getByRole("alert")).toHaveText("gcloud token isn't armed");
+  await captureElement(vertexCard, "vertex-warning-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(vertexCard, "vertex-warning-narrow.png");
+  await setFixture(page, "get_hosted_settings", syntheticVertexReadySettings);
+  await vertexCard.getByRole("button", { name: "Refresh status & catalog" }).click();
+  await expect(vertexCard.getByText("Armed · token only", { exact: true })).toBeVisible();
+  await expect(vertexCard.getByRole("alert")).toHaveCount(0);
+  await captureElement(vertexCard, "vertex-recovery-narrow.png");
+
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await captureElement(vertexCard, "vertex-recovery-desktop.png");
 });

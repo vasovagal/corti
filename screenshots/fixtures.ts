@@ -289,6 +289,47 @@ export const hostedSettings = {
   show_live_metrics_by_default: false,
 };
 
+export const syntheticVertexReadySettings = {
+  ...hostedSettings,
+  state_revision: 13,
+  providers: hostedSettings.providers.map((provider) =>
+    provider.descriptor.transport === "vertex_api"
+      ? {
+          ...provider,
+          credential: {
+            state: "ready",
+            expires_at_unix_ms: 1_787_000_900_000,
+            source: "application_default_credentials",
+          },
+          models: [
+            {
+              provider: "google",
+              transport: "vertex_api",
+              support_tier: "documented",
+              exact_model_id: "gemini-synthetic-live-001",
+              account_scoped_available: true,
+              region: "global",
+              max_context_tokens: 1_000_000,
+              max_output_tokens: 65_536,
+              capabilities: {
+                text_input: true,
+                text_output: true,
+                streaming: true,
+                structured_output: true,
+                explicit_prefix_cache: false,
+                implicit_cache_may_apply: true,
+              },
+              billing_basis: "metered_estimate",
+              tariff_version: null,
+              deprecated: false,
+              benchmarked_for_live: false,
+            },
+          ],
+        }
+      : provider,
+  ),
+};
+
 export const fixtures: Record<string, unknown> = {
   get_live_transcript: liveTranscript,
   start_live_test: null,
