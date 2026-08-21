@@ -192,15 +192,28 @@ export type LiveTranscriptStatus =
   | "unavailable"
   | "error";
 
+export type HostedRewriteState = "raw" | "clean";
+
 export interface LiveTranscriptLine {
   seq: number;
+  /** Stable backend identity. Optional while opening snapshots from the protocol-v1 app. */
+  row_id?: string;
   speaker: string;
   start_sec: number;
   end_sec: number;
+  /** Immutable ASR text. Clean text must never replace this field. */
   text: string;
+  clean_text?: string | null;
+  rewrite_state?: HostedRewriteState;
+  /** Changes only when a newly accepted rewrite is committed; used for one-shot presentation. */
+  commit_epoch?: number;
 }
 
 export interface LiveTranscriptSnapshot {
+  /** Protocol-v2 monotonic identity is mandatory at the transcript/webview boundary. */
+  protocol_version: number;
+  process_epoch: number;
+  session_generation: number;
   revision: number;
   session_id: string | null;
   mode: LiveTranscriptMode;
@@ -214,6 +227,8 @@ export interface LiveTranscriptSnapshot {
 }
 
 export interface LiveTranscriptEvent extends Omit<LiveTranscriptSnapshot, "lines"> {
+  /** Must equal the frontend's current revision before the delta is applied. */
+  from_revision: number;
   reset: boolean;
   line: LiveTranscriptLine | null;
 }
@@ -228,6 +243,431 @@ export const onLiveTranscriptChanged = (
   handler: (event: LiveTranscriptEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<LiveTranscriptEvent>("live-transcript-changed", (event) => handler(event.payload));
+
+// ----- Hosted post-processing preferences -----
+
+export type HostedSupportTier = "documented" | "experimental" | "blocked";
+export type HostedBillingBasis =
+  | "metered_estimate"
+  | "included_subscription"
+  | "no_provider_request"
+  | "unknown";
+export type HostedErrorCode =
+  | "auth_unarmed"
+  | "auth_rejected"
+  | "permission"
+  | "quota"
+  | "rate_limited"
+  | "model_unavailable"
+  | "network"
+  | "timeout"
+  | "canceled"
+  | "superseded"
+  | "policy_blocked"
+  | "cache"
+  | "malformed_output"
+  | "provider"
+  | "broker_exited"
+  | "ambiguous_dispatch"
+  | "internal";
+export type HostedCredentialSource =
+  | "keychain"
+  | "workload_identity"
+  | "application_default_credentials"
+  | "broker_keyring";
+export type HostedLocalCacheMode = "reusable" | "recovery_only" | "memory_only";
+export type HostedProviderCacheMode =
+  | "off"
+  | "explicit_stable_prefix"
+  | "unavoidable_implicit"
+  | "unavailable";
+export type HostedLane = "live" | "final" | "question";
+
+/** Mirrors `corti_postprocess::ProviderDescriptor`; support status always comes from Rust. */
+export interface HostedProviderDescriptor {
+  provider: string;
+  transport: string;
+  support_tier: HostedSupportTier;
+  billing_basis: HostedBillingBasis;
+  adapter_available: boolean;
+}
+
+export interface HostedModelCapabilities {
+  text_input: boolean;
+  text_output: boolean;
+  streaming: boolean;
+  structured_output: boolean;
+  explicit_prefix_cache: boolean;
+  implicit_cache_may_apply: boolean;
+}
+
+/** One exact account/region-scoped model returned by the backend catalog. */
+export interface HostedModelDescriptor {
+  provider: string;
+  transport: string;
+  support_tier: HostedSupportTier;
+  exact_model_id: string;
+  account_scoped_available: boolean;
+  region: string | null;
+  max_context_tokens: number;
+  max_output_tokens: number;
+  capabilities: HostedModelCapabilities;
+  billing_basis: HostedBillingBasis;
+  tariff_version: string | null;
+  deprecated: boolean;
+  benchmarked_for_live: boolean;
+}
+
+/** Secret-free credential projection. No key or token value can be represented by this union. */
+export type HostedCredentialState =
+  | { state: "absent" }
+  | { state: "resolving" }
+  | {
+      state: "ready";
+      expires_at_unix_ms: number | null;
+      source: HostedCredentialSource;
+    }
+  | { state: "awaiting_user" }
+  | {
+      state: "device_authorization";
+      verification_url: string;
+      user_code: string;
+      login_id: string;
+    }
+  | { state: "refreshing" }
+  | { state: "rejected" }
+  | { state: "unsupported"; code: HostedErrorCode }
+  | { state: "error"; code: HostedErrorCode };
+
+export interface HostedProviderState {
+  descriptor: HostedProviderDescriptor;
+  credential: HostedCredentialState;
+  models: HostedModelDescriptor[];
+  service_error: HostedErrorCode | null;
+}
+
+export interface HostedLaneSelection {
+  provider: string | null;
+  transport: string | null;
+  model: string | null;
+  cache_policy: {
+    local: HostedLocalCacheMode;
+    provider: HostedProviderCacheMode;
+  };
+}
+
+export interface HostedLaneControl {
+  enabled: boolean;
+  revision: number;
+  selection: HostedLaneSelection;
+}
+
+export interface HostedControlSnapshot {
+  process_epoch: number;
+  session_generation: number;
+  control_revision: number;
+  steering_revision: number;
+  bank_revision: number;
+  pinned_question_revision: number;
+  master_enabled: boolean;
+  egress_acknowledged: boolean;
+  pinned_auto_enabled: boolean;
+  codex_experimental_approved: boolean;
+  live: HostedLaneControl;
+  final_lane: HostedLaneControl;
+  questions: HostedLaneControl;
+}
+
+export interface HostedProviderScope {
+  provider: string;
+  transport: string;
+  configured: boolean;
+  alias: string | null;
+  project: string | null;
+  region: string | null;
+  quota_project: string | null;
+}
+
+/** Mirror of Rust `postprocess_app::HostedSettingsDto`; it is deliberately secret-free. */
+export interface HostedSettingsDto {
+  state_revision: number;
+  preferences_revision: number;
+  control: HostedControlSnapshot;
+  providers: HostedProviderState[];
+  scopes: HostedProviderScope[];
+  default_steering: string;
+  word_bank: {
+    revision: number;
+    entries: string[];
+  };
+  final_deadline_seconds: number;
+  show_history_diagnostics: boolean;
+  show_live_metrics_by_default: boolean;
+}
+
+export interface HostedSelectionInput {
+  provider: string | null;
+  transport: string | null;
+  model: string | null;
+  local_cache: HostedLocalCacheMode;
+  provider_cache: HostedProviderCacheMode;
+}
+
+export type HostedPatchInput =
+  | { kind: "set_egress_acknowledged"; acknowledged: boolean }
+  | { kind: "set_master"; enabled: boolean }
+  | { kind: "set_lane_enabled"; lane: HostedLane; enabled: boolean }
+  | { kind: "set_lane_selection"; lane: HostedLane; selection: HostedSelectionInput }
+  | { kind: "set_pinned_auto"; enabled: boolean; acknowledged: boolean }
+  | { kind: "set_codex_experimental_approved"; approved: boolean }
+  | {
+      kind: "set_display_preferences";
+      show_history_diagnostics: boolean;
+      show_live_metrics_by_default: boolean;
+    };
+
+export type HostedMutationResult =
+  | { status: "applied"; settings: HostedSettingsDto }
+  | { status: "unchanged"; settings: HostedSettingsDto }
+  | { status: "conflict"; settings: HostedSettingsDto }
+  | {
+      status: "disabled_for_session";
+      settings: HostedSettingsDto;
+      code: HostedErrorCode;
+    };
+
+export interface HostedProviderScopeUpdate {
+  provider: string;
+  transport: string;
+  alias: string | null;
+  project: string | null;
+  region: string | null;
+  quota_project: string | null;
+}
+
+export type HostedCallLane = "live" | "final" | "ad_hoc_question" | "pinned_question";
+export type HostedLaneState =
+  | "disabled"
+  | "waiting_for_phrase"
+  | "debouncing"
+  | "queued"
+  | "arming"
+  | "catching_up"
+  | "rewriting"
+  | "finalizing"
+  | "clean"
+  | "using_raw"
+  | "failed";
+export type HostedQuestionStatus =
+  | "queued"
+  | "waiting_for_credential"
+  | "running"
+  | "completed"
+  | "canceled"
+  | "failed";
+export type HostedCacheObservation =
+  | "none"
+  | "local"
+  | "provider_read"
+  | "provider_write"
+  | "provider_implicit";
+
+export interface HostedNormalizedUsage {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_read_tokens: number | null;
+  cached_write_tokens: number | null;
+  reasoning_tokens: number | null;
+  usage_complete: boolean;
+}
+
+export interface HostedCostEstimate {
+  billing_basis: HostedBillingBasis;
+  cost_micros: number | null;
+  currency: string | null;
+  pricing_catalog_version: string | null;
+  tariff_id: string | null;
+  tariff_effective_at_unix_ms: number | null;
+}
+
+export interface HostedLatencyFields {
+  queue_us: number | null;
+  auth_us: number | null;
+  cache_lookup_us: number | null;
+  connect_us: number | null;
+  ttfb_us: number | null;
+  ttft_us: number | null;
+  stream_us: number | null;
+  parse_us: number | null;
+  cache_commit_us: number | null;
+  total_us: number | null;
+}
+
+export interface HostedRequestFence {
+  process_epoch: number;
+  session_generation: number;
+  transcript_revision: number;
+  control_revision: number;
+  lane_revision: number;
+  steering_revision: number;
+  bank_revision: number;
+  question_revision: number | null;
+}
+
+export interface HostedAccountingEvent {
+  event: "accounting";
+  call_id: string;
+  recording_id: string;
+  lane: HostedCallLane;
+  fence: HostedRequestFence;
+  finality: "provisional" | "final";
+  usage: HostedNormalizedUsage;
+  cost: HostedCostEstimate;
+  late: boolean;
+}
+
+export interface HostedTerminalEvent {
+  event: "terminal";
+  call_id: string;
+  recording_id: string;
+  request_group_id: string;
+  target_id: string | null;
+  lane: HostedCallLane;
+  attempt_no: number;
+  fence: HostedRequestFence;
+  provider: string;
+  transport: string;
+  model: string;
+  support_tier: HostedSupportTier;
+  adapter_version: number;
+  prompt_version: number;
+  output_schema_version: number;
+  outcome: "completed" | "failed" | "canceled" | "superseded" | "timeout";
+  error: HostedErrorCode | null;
+  provider_request_sent: boolean;
+  late_content_discarded: boolean;
+  cache: HostedCacheObservation;
+  usage: HostedNormalizedUsage;
+  cost: HostedCostEstimate;
+  latency: HostedLatencyFields;
+  queued_at_unix_ms: number;
+  dispatched_at_unix_ms: number | null;
+  completed_at_unix_ms: number;
+}
+
+export type HostedCoordinatorEvent =
+  | ({ event: "control_changed" } & HostedControlSnapshot)
+  | ({ event: "provider_state" } & HostedProviderState)
+  | {
+      event: "lane_state";
+      lane: HostedCallLane;
+      state: HostedLaneState;
+      code: HostedErrorCode | null;
+      fence: Pick<
+        HostedRequestFence,
+        "process_epoch" | "session_generation" | "control_revision" | "lane_revision"
+      >;
+    }
+  | {
+      event: "notice";
+      role: "alert";
+      visible_message: string;
+      episode: number;
+    }
+  | HostedAccountingEvent
+  | HostedTerminalEvent
+  | { event: "persistence_warning"; code: HostedErrorCode }
+  | { event: string; [field: string]: unknown };
+
+export interface HostedAssistantExchange {
+  call_id: string;
+  as_of_revision: number;
+  status: HostedQuestionStatus;
+  error: HostedErrorCode | null;
+  question: string;
+  answer: string | null;
+  cost_label: string | null;
+  /** Protocol-v2 additions are optional against an older coordinator. */
+  context_truncated?: boolean;
+  usage?: HostedNormalizedUsage | null;
+  cache?: HostedCacheObservation | null;
+}
+
+export interface HostedAssistantSnapshot {
+  pinned_run_count: number;
+  pinned: HostedAssistantExchange | null;
+  exchanges: HostedAssistantExchange[];
+}
+
+export const getHostedSettings = (): Promise<HostedSettingsDto> =>
+  invoke<HostedSettingsDto>("get_hosted_settings");
+
+export const patchHostedSettings = (
+  observedStateRevision: number,
+  patch: HostedPatchInput,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("patch_hosted_settings", {
+    request: { observed_state_revision: observedStateRevision, patch },
+  });
+
+export const updateHostedSteering = (
+  observedStateRevision: number,
+  text: string,
+  persistAsDefault: boolean,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("update_hosted_steering", {
+    request: {
+      observed_state_revision: observedStateRevision,
+      text,
+      persist_as_default: persistAsDefault,
+    },
+  });
+
+export const replaceHostedWordBank = (
+  observedStateRevision: number,
+  entries: string[],
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("replace_hosted_word_bank", {
+    request: { observed_state_revision: observedStateRevision, entries },
+  });
+
+export const updateHostedProviderScope = (
+  observedStateRevision: number,
+  update: HostedProviderScopeUpdate,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("update_hosted_provider_scope", {
+    request: { observed_state_revision: observedStateRevision, ...update },
+  });
+
+export const refreshHostedProvider = (
+  provider: string,
+  transport: string,
+): Promise<HostedProviderState> =>
+  invoke<HostedProviderState>("refresh_hosted_provider", {
+    request: { provider, transport },
+  });
+
+export const setHostedPinnedQuestion = (
+  observedStateRevision: number,
+  template: string,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("set_hosted_pinned_question", {
+    request: { observed_state_revision: observedStateRevision, template },
+  });
+
+export const getHostedAssistant = (): Promise<HostedAssistantSnapshot> =>
+  invoke<HostedAssistantSnapshot>("get_hosted_assistant");
+
+export const submitHostedQuestion = (question: string): Promise<string> =>
+  invoke<string>("submit_hosted_question", { question });
+
+export const cancelHostedQuestion = (callId: string): Promise<void> =>
+  invoke<void>("cancel_hosted_question", { callId });
+
+export const onHostedStateChanged = (
+  handler: (event: HostedCoordinatorEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<HostedCoordinatorEvent>("hosted-state-changed", (event) => handler(event.payload));
 
 // ----- Recording Queue window -----
 

@@ -1,0 +1,23 @@
+[package]
+name = "corti-postprocess-providers"
+description = "Injected provider and authentication edges for Corti hosted transcript post-processing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+corti-postprocess = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { version = "2", default-features = true }
+url = "2"
+zeroize = { workspace = true }
+
+[features]
+default = []
+# Experimental broker/device-code interfaces only. Still requires an explicit runtime product-approval gate;
+# no production provider factory or ambient Codex process launcher is supplied.
+codex-experimental = []

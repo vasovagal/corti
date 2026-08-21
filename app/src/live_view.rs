@@ -6,15 +6,20 @@
 //! the store mutex is held.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use corti_core::{Speaker, TranscriptSegment};
+use corti_postprocess::{RowId, TranscriptRow};
 use corti_transcribe::segment::{SEGMENT_GAP, Word, words_to_segments};
 use serde::Serialize;
 use tauri::{Emitter, State};
 
 /// Event listened to by the Live Transcript webview.
 pub(crate) const LIVE_TRANSCRIPT_EVENT: &str = "live-transcript-changed";
+const LIVE_TRANSCRIPT_PROTOCOL_VERSION: u32 = 2;
+static PROCESS_EPOCH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// UI history is independent of call length. Text plus conservative per-row overhead stays under ~1 MiB.
 const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 /// A second independent bound protects against pathological streams of tiny rows.
@@ -43,18 +48,34 @@ pub(crate) enum LiveTranscriptStatus {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HostedRewriteState {
+    Raw,
+    Clean,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct LiveTranscriptLine {
     /// Process-monotonic row id. It does not reset between sessions, so stale events are unambiguous.
     pub seq: u64,
+    /// Stable typed identity shared by raw UI publication and hosted scheduling.
+    pub row_id: RowId,
     pub speaker: String,
     pub start_sec: f64,
     pub end_sec: f64,
+    /// Immutable ASR text. Existing frontend consumers keep using this field as their raw authority.
     pub text: String,
+    pub clean_text: Option<String>,
+    pub rewrite_state: HostedRewriteState,
+    pub commit_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LiveTranscriptSnapshot {
+    pub protocol_version: u32,
+    pub process_epoch: u64,
+    pub session_generation: u64,
     pub revision: u64,
     pub session_id: Option<String>,
     pub mode: LiveTranscriptMode,
@@ -71,6 +92,10 @@ pub(crate) struct LiveTranscriptSnapshot {
 /// `reset` clears rows for a new session; `retained_from_seq` trims rows evicted by either hard cap.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LiveTranscriptEvent {
+    pub protocol_version: u32,
+    pub process_epoch: u64,
+    pub session_generation: u64,
+    pub from_revision: u64,
     pub revision: u64,
     pub session_id: Option<String>,
     pub mode: LiveTranscriptMode,
@@ -97,6 +122,8 @@ pub(crate) struct LiveTranscriptStore {
 }
 
 struct Inner {
+    process_epoch: u64,
+    session_generation: u64,
     revision: u64,
     next_seq: u64,
     session_id: Option<String>,
@@ -113,6 +140,8 @@ struct Inner {
 impl Default for Inner {
     fn default() -> Self {
         Self {
+            process_epoch: new_process_epoch(),
+            session_generation: 0,
             revision: 0,
             next_seq: 1,
             session_id: None,
@@ -135,6 +164,9 @@ impl Inner {
 
     fn snapshot(&self) -> LiveTranscriptSnapshot {
         LiveTranscriptSnapshot {
+            protocol_version: LIVE_TRANSCRIPT_PROTOCOL_VERSION,
+            process_epoch: self.process_epoch,
+            session_generation: self.session_generation,
             revision: self.revision,
             session_id: self.session_id.clone(),
             mode: self.mode,
@@ -148,8 +180,17 @@ impl Inner {
         }
     }
 
-    fn event(&self, reset: bool, line: Option<LiveTranscriptLine>) -> LiveTranscriptEvent {
+    fn event(
+        &self,
+        from_revision: u64,
+        reset: bool,
+        line: Option<LiveTranscriptLine>,
+    ) -> LiveTranscriptEvent {
         LiveTranscriptEvent {
+            protocol_version: LIVE_TRANSCRIPT_PROTOCOL_VERSION,
+            process_epoch: self.process_epoch,
+            session_generation: self.session_generation,
+            from_revision,
             revision: self.revision,
             session_id: self.session_id.clone(),
             mode: self.mode,
@@ -168,7 +209,7 @@ impl Inner {
 impl LiveTranscriptStore {
     pub(crate) fn for_app(app: tauri::AppHandle) -> Self {
         Self::with_notifier(Arc::new(move |event| {
-            let _ = app.emit(LIVE_TRANSCRIPT_EVENT, event);
+            let _ = app.emit_to("live", LIVE_TRANSCRIPT_EVENT, event);
         }))
     }
 
@@ -187,6 +228,10 @@ impl LiveTranscriptStore {
 
     pub(crate) fn snapshot(&self) -> LiveTranscriptSnapshot {
         self.inner.lock().unwrap().snapshot()
+    }
+
+    pub(crate) fn process_epoch(&self) -> corti_postprocess::ProcessEpoch {
+        corti_postprocess::ProcessEpoch(self.inner.lock().unwrap().process_epoch)
     }
 
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
@@ -249,7 +294,9 @@ impl LiveTranscriptStore {
         let _publish = self.publish.lock().unwrap();
         let event = {
             let mut inner = self.inner.lock().unwrap();
+            let from_revision = inner.revision;
             inner.revision = inner.revision.saturating_add(1);
+            inner.session_generation = inner.session_generation.saturating_add(1).max(1);
             inner.session_id = Some(id.to_string());
             inner.mode = mode;
             inner.status = status;
@@ -262,7 +309,7 @@ impl LiveTranscriptStore {
             inner.lines.clear();
             inner.retained_bytes = 0;
             inner.evicted_lines = 0;
-            inner.event(true, None)
+            inner.event(from_revision, true, None)
         };
         (self.notify)(event);
     }
@@ -312,32 +359,40 @@ impl LiveTranscriptStore {
             if inner.session_id.as_deref() != Some(id) {
                 return;
             }
+            let from_revision = inner.revision;
             inner.revision = inner.revision.saturating_add(1);
             inner.status = status;
             inner.active = active;
             inner.detail = detail;
-            inner.event(false, None)
+            inner.event(from_revision, false, None)
         };
         (self.notify)(event);
     }
 
-    /// Convert one closed VAD region's words into human-sized rows and publish them. The same words continue
-    /// into the durable rolling writer; this observer neither consumes nor modifies that path.
-    pub(crate) fn append_words(&self, id: &str, speaker: Speaker, words: &[Word]) {
+    /// Convert one closed VAD region's words into stable rows and publish raw UI deltas. The returned hosted
+    /// envelopes are minted in the same critical section, so callers can fan them out only after raw is
+    /// visible without asking another store to invent identity.
+    pub(crate) fn append_words(
+        &self,
+        id: &str,
+        speaker: Speaker,
+        words: &[Word],
+    ) -> Vec<TranscriptRow> {
         if words.is_empty() {
-            return;
+            return Vec::new();
         }
-        self.append_segments(id, words_to_segments(words, speaker, SEGMENT_GAP));
+        self.append_segments(id, words_to_segments(words, speaker, SEGMENT_GAP))
     }
 
-    fn append_segments(&self, id: &str, segments: Vec<TranscriptSegment>) {
+    fn append_segments(&self, id: &str, segments: Vec<TranscriptSegment>) -> Vec<TranscriptRow> {
         let _publish = self.publish.lock().unwrap();
-        let events = {
+        let (events, hosted_rows) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.session_id.as_deref() != Some(id) {
-                return;
+                return Vec::new();
             }
             let mut events = Vec::with_capacity(segments.len());
+            let mut hosted_rows = Vec::with_capacity(segments.len());
             for segment in segments {
                 let text = cap_utf8(segment.text.trim(), MAX_RETAINED_BYTES / 2);
                 if text.is_empty() {
@@ -351,13 +406,26 @@ impl LiveTranscriptStore {
                 } else {
                     cap_utf8(displayed_speaker, MAX_SPEAKER_BYTES)
                 };
+                let row_id = RowId::new(format!("live-row-{:016}", inner.next_seq))
+                    .expect("process-monotonic live row id is valid");
                 let line = LiveTranscriptLine {
                     seq: inner.next_seq,
-                    speaker,
+                    row_id: row_id.clone(),
+                    speaker: speaker.clone(),
                     start_sec,
                     end_sec,
-                    text,
+                    text: text.clone(),
+                    clean_text: None,
+                    rewrite_state: HostedRewriteState::Raw,
+                    commit_epoch: 0,
                 };
+                hosted_rows.push(TranscriptRow {
+                    row_id,
+                    speaker,
+                    start_ms: seconds_to_millis(start_sec),
+                    end_ms: seconds_to_millis(end_sec).max(seconds_to_millis(start_sec)),
+                    text,
+                });
                 inner.next_seq = inner.next_seq.saturating_add(1);
                 inner.retained_bytes = inner.retained_bytes.saturating_add(line_cost(&line));
                 inner.lines.push_back(line.clone());
@@ -370,8 +438,67 @@ impl LiveTranscriptStore {
                     inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
                     inner.evicted_lines = inner.evicted_lines.saturating_add(1);
                 }
+                let from_revision = inner.revision;
                 inner.revision = inner.revision.saturating_add(1);
-                events.push(inner.event(false, Some(line)));
+                events.push(inner.event(from_revision, false, Some(line)));
+            }
+            (events, hosted_rows)
+        };
+        for event in events {
+            (self.notify)(event);
+        }
+        hosted_rows
+    }
+
+    /// Apply a validated, currently-fenced cleanup to retained transient rows. Missing/evicted rows are a
+    /// safe no-op; immutable raw text is never replaced or deleted.
+    pub(crate) fn apply_hosted_rows(&self, id: &str, rows: &[TranscriptRow], commit_epoch: u64) {
+        if rows.is_empty() {
+            return;
+        }
+        let _publish = self.publish.lock().unwrap();
+        let events = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.session_id.as_deref() != Some(id) {
+                return;
+            }
+            let mut events = Vec::new();
+            for row in rows {
+                let Some(index) = inner
+                    .lines
+                    .iter()
+                    .position(|line| line.row_id == row.row_id)
+                else {
+                    continue;
+                };
+                let old_cost = line_cost(&inner.lines[index]);
+                let line = &mut inner.lines[index];
+                if line.speaker != row.speaker
+                    || seconds_to_millis(line.start_sec) != row.start_ms
+                    || seconds_to_millis(line.end_sec) != row.end_ms
+                {
+                    continue;
+                }
+                line.clean_text = Some(row.text.clone());
+                line.rewrite_state = HostedRewriteState::Clean;
+                line.commit_epoch = commit_epoch;
+                let line = line.clone();
+                inner.retained_bytes = inner
+                    .retained_bytes
+                    .saturating_sub(old_cost)
+                    .saturating_add(line_cost(&line));
+                while inner.lines.len() > MAX_RETAINED_LINES
+                    || inner.retained_bytes > MAX_RETAINED_BYTES
+                {
+                    let Some(evicted) = inner.lines.pop_front() else {
+                        break;
+                    };
+                    inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
+                    inner.evicted_lines = inner.evicted_lines.saturating_add(1);
+                }
+                let from_revision = inner.revision;
+                inner.revision = inner.revision.saturating_add(1);
+                events.push(inner.event(from_revision, false, Some(line)));
             }
             events
         };
@@ -379,6 +506,16 @@ impl LiveTranscriptStore {
             (self.notify)(event);
         }
     }
+}
+
+fn new_process_epoch() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let sequence = PROCESS_EPOCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    (time.rotate_left(17) ^ u64::from(std::process::id()).rotate_left(41) ^ sequence).max(1)
 }
 
 fn finite_nonnegative(value: f64) -> f64 {
@@ -389,10 +526,19 @@ fn finite_nonnegative(value: f64) -> f64 {
     }
 }
 
+fn seconds_to_millis(value: f64) -> u64 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else {
+        (value * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64
+    }
+}
+
 fn line_cost(line: &LiveTranscriptLine) -> usize {
     LINE_OVERHEAD_BYTES
         .saturating_add(line.speaker.len())
         .saturating_add(line.text.len())
+        .saturating_add(line.clean_text.as_ref().map_or(0, String::len))
 }
 
 fn cap_utf8(value: &str, max_bytes: usize) -> String {
@@ -407,8 +553,18 @@ fn cap_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 #[tauri::command]
-pub(crate) fn get_live_transcript(store: State<'_, LiveTranscriptStore>) -> LiveTranscriptSnapshot {
-    store.snapshot()
+pub(crate) fn get_live_transcript(
+    store: State<'_, LiveTranscriptStore>,
+    window: tauri::WebviewWindow,
+) -> Result<LiveTranscriptSnapshot, String> {
+    if !window_may_read_live(window.label()) {
+        return Err("live transcript content is available only in the live window".to_string());
+    }
+    Ok(store.snapshot())
+}
+
+fn window_may_read_live(label: &str) -> bool {
+    label == "live"
 }
 
 #[cfg(test)]
@@ -420,6 +576,17 @@ mod tests {
             start,
             end,
             text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn content_commands_are_allowlisted_to_the_live_window() {
+        assert!(window_may_read_live("live"));
+        for denied in ["queue", "settings", "console", "how"] {
+            assert!(
+                !window_may_read_live(denied),
+                "{denied} unexpectedly gained transcript access"
+            );
         }
     }
 
@@ -444,19 +611,53 @@ mod tests {
         );
 
         let snapshot = store.snapshot();
+        assert_eq!(snapshot.protocol_version, LIVE_TRANSCRIPT_PROTOCOL_VERSION);
+        assert_eq!(snapshot.process_epoch, store.process_epoch().0);
+        assert_eq!(snapshot.session_generation, 1);
         assert_eq!(snapshot.lines.len(), 2);
         assert_eq!(snapshot.lines[0].speaker, "Me");
         assert_eq!(snapshot.lines[0].start_sec, 12.25);
         assert_eq!(snapshot.lines[0].end_sec, 13.0);
         assert_eq!(snapshot.lines[0].text, "Hello there");
         assert_eq!(snapshot.lines[1].speaker, "Them 1");
+        let events = events.lock().unwrap();
         assert!(
             events
-                .lock()
-                .unwrap()
                 .windows(2)
                 .all(|pair| pair[0].revision < pair[1].revision)
         );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.from_revision + 1 == event.revision)
+        );
+    }
+
+    #[test]
+    fn stable_hosted_envelope_is_returned_after_raw_event_and_clean_never_replaces_raw() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let store = LiveTranscriptStore::with_notifier(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        }));
+        store.begin_call("call", "Fixture");
+        let rows = store.append_words("call", Speaker::Me, &[word(1.0, 2.0, "raw fixture words")]);
+        assert_eq!(rows.len(), 1);
+        let raw_event = events.lock().unwrap().last().unwrap().clone();
+        assert_eq!(raw_event.line.as_ref().unwrap().row_id, rows[0].row_id);
+        assert_eq!(raw_event.line.as_ref().unwrap().text, "raw fixture words");
+        assert_eq!(raw_event.line.as_ref().unwrap().clean_text, None);
+
+        let mut clean = rows[0].clone();
+        clean.text = "clean fixture words".into();
+        store.apply_hosted_rows("call", &[clean], 7);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.lines[0].text, "raw fixture words");
+        assert_eq!(
+            snapshot.lines[0].clean_text.as_deref(),
+            Some("clean fixture words")
+        );
+        assert_eq!(snapshot.lines[0].commit_epoch, 7);
     }
 
     #[test]

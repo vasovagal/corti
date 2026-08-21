@@ -51,7 +51,7 @@ pub fn read_two_track(path: &Path) -> Result<TwoTrack> {
         2 => {
             let mut mic = Vec::with_capacity(samples.len() / 2);
             let mut them = Vec::with_capacity(samples.len() / 2);
-            for frame in samples.chunks_exact(2) {
+            for frame in samples.as_chunks::<2>().0 {
                 mic.push(frame[0]);
                 them.push(frame[1]);
             }

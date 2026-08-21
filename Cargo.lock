@@ -1393,6 +1393,8 @@ dependencies = [
  "corti-core",
  "corti-detect",
  "corti-jobs",
+ "corti-postprocess",
+ "corti-postprocess-providers",
  "corti-queue",
  "corti-transcribe",
  "corti-transcribe-aws",
@@ -1404,18 +1406,24 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "rfd",
+ "ring",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-macos-permissions",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.2",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-segmentation",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]
@@ -1499,6 +1507,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "corti-postprocess"
+version = "0.13.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac 0.12.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "unicode-casefold",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "zeroize",
+]
+
+[[package]]
+name = "corti-postprocess-providers"
+version = "0.13.0"
+dependencies = [
+ "corti-postprocess",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "ureq",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "corti-queue"
 version = "0.13.0"
 dependencies = [
@@ -1506,7 +1543,9 @@ dependencies = [
  "chrono",
  "corti-core",
  "corti-jobs",
+ "corti-postprocess",
  "rusqlite",
+ "serde",
  "serde_json",
  "tracing",
 ]
@@ -1580,6 +1619,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "corti-core",
+ "corti-postprocess",
  "serde",
  "serde_json",
 ]
@@ -6313,10 +6353,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

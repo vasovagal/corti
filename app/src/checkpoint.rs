@@ -4,18 +4,22 @@
 //! work is filing the transcript. It lives beside the raw recording (outside any vault), is written
 //! atomically, and is removed only after the queue durably reaches `Done`.
 
-use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use corti_core::DiarizedTranscript;
-use corti_vagus::provenance::{GenerationMode, TranscriptProvenance};
+use corti_postprocess::CallId;
+use corti_vagus::provenance::{
+    AppliedPostprocessProvenance, GenerationMode, ProvenanceFingerprint, TranscriptProvenance,
+};
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const LEGACY_VERSION: u32 = 1;
 const AWS_STAGING_VERSION: u32 = 1;
+const MAX_FINAL_ATTEMPT_CALL_IDS: usize = 64;
+const MAX_FILING_CHECKPOINT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_AWS_STAGING_BYTES: usize = 1024 * 1024;
 
 fn legacy_batch_provenance() -> TranscriptProvenance {
     TranscriptProvenance::legacy_unknown(GenerationMode::Batch)
@@ -71,12 +75,14 @@ impl AwsStaging {
                 staging: self.clone(),
             },
             "AWS staging marker",
+            MAX_AWS_STAGING_BYTES,
         )
     }
 
     pub(crate) fn load(audio: &Path) -> Result<Self> {
         let path = aws_staging_path_for(audio);
-        let marker: AwsStagingMarker = load_json(&path, "AWS staging marker")?;
+        let marker: AwsStagingMarker =
+            load_json(&path, "AWS staging marker", MAX_AWS_STAGING_BYTES)?;
         if marker.version != AWS_STAGING_VERSION {
             bail!(
                 "unsupported AWS staging marker version {} in {} (expected {})",
@@ -114,6 +120,16 @@ pub(crate) struct FilingCheckpoint {
     pub(crate) provenance: TranscriptProvenance,
     /// Present only for an AWS transcript whose staged input/output have not yet been deleted.
     pub(crate) aws_staging: Option<AwsStaging>,
+    /// Exact hosted metadata for text that was applied (or a content-free settled no-apply outcome). A v1
+    /// checkpoint defaults to unrecorded `none`; filing never rebuilds this from current preferences.
+    #[serde(default)]
+    pub(crate) applied_postprocess: AppliedPostprocessProvenance,
+    /// Optional HMAC-derived identity of the raw source transcript. Never a plaintext digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_transcript_fingerprint: Option<ProvenanceFingerprint>,
+    /// Bounded, content-free provider-call identities associated with the settled final attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) final_attempt_call_ids: Vec<CallId>,
 }
 
 impl FilingCheckpoint {
@@ -129,6 +145,9 @@ impl FilingCheckpoint {
             note_canonical: false,
             provenance: legacy_batch_provenance(),
             aws_staging,
+            applied_postprocess: AppliedPostprocessProvenance::none(),
+            source_transcript_fingerprint: None,
+            final_attempt_call_ids: Vec::new(),
         }
     }
 
@@ -144,27 +163,115 @@ impl FilingCheckpoint {
         self.note_canonical = true;
     }
 
-    pub(crate) fn set_provenance(&mut self, provenance: TranscriptProvenance) {
+    pub(crate) fn set_provenance(&mut self, mut provenance: TranscriptProvenance) {
+        if let Some(applied) = provenance.postprocess().cloned() {
+            self.applied_postprocess = applied;
+        } else if !self.applied_postprocess.is_unrecorded_none() {
+            provenance
+                .set_postprocess(self.applied_postprocess.clone())
+                .expect("checkpoint already holds validated applied provenance");
+        }
         self.provenance = provenance;
     }
 
-    /// Atomically replace the checkpoint beside `audio` and fsync the file before publishing it.
+    // This phase lands the durable boundary before the provider coordinator populates it.
+    #[allow(dead_code)]
+    pub(crate) fn set_applied_postprocess(
+        &mut self,
+        applied: AppliedPostprocessProvenance,
+    ) -> Result<()> {
+        applied
+            .validate()
+            .context("validating applied postprocess provenance")?;
+        self.provenance
+            .set_postprocess(applied.clone())
+            .context("attaching applied postprocess provenance")?;
+        self.applied_postprocess = applied;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_source_transcript_fingerprint(&mut self, fingerprint: ProvenanceFingerprint) {
+        self.source_transcript_fingerprint = Some(fingerprint);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_final_attempt_call_ids(&mut self, call_ids: Vec<CallId>) -> Result<()> {
+        if call_ids.len() > MAX_FINAL_ATTEMPT_CALL_IDS {
+            bail!(
+                "filing checkpoint final attempt list exceeds {MAX_FINAL_ATTEMPT_CALL_IDS} calls"
+            );
+        }
+        self.final_attempt_call_ids = call_ids;
+        Ok(())
+    }
+
+    /// Atomically replace the checkpoint beside `audio` and fsync the file before publishing it. A
+    /// checkpoint loaded from v1 is always re-emitted as v2.
     pub(crate) fn store(&self, audio: &Path) -> Result<()> {
-        atomic_store_json(&path_for(audio), self, "filing checkpoint")
+        let mut current = self.clone();
+        current.version = VERSION;
+        current
+            .validate_and_reconcile()
+            .context("validating filing checkpoint v2")?;
+        atomic_store_json(
+            &path_for(audio),
+            &current,
+            "filing checkpoint",
+            MAX_FILING_CHECKPOINT_BYTES,
+        )
     }
 
     pub(crate) fn load(audio: &Path) -> Result<Self> {
         let path = path_for(audio);
-        let checkpoint: Self = load_json(&path, "filing checkpoint")?;
-        if checkpoint.version != VERSION {
+        let mut checkpoint: Self =
+            load_json(&path, "filing checkpoint", MAX_FILING_CHECKPOINT_BYTES)?;
+        if !matches!(checkpoint.version, LEGACY_VERSION | VERSION) {
             bail!(
-                "unsupported filing checkpoint version {} in {} (expected {})",
+                "unsupported filing checkpoint version {} in {} (expected {} or {})",
                 checkpoint.version,
                 path.display(),
+                LEGACY_VERSION,
                 VERSION
             );
         }
+        checkpoint
+            .validate_and_reconcile()
+            .with_context(|| format!("validating filing checkpoint {}", path.display()))?;
+        // Normalize in memory so every later store emits v2 even when the bytes loaded were v1.
+        checkpoint.version = VERSION;
         Ok(checkpoint)
+    }
+
+    fn validate_and_reconcile(&mut self) -> Result<()> {
+        self.applied_postprocess
+            .validate()
+            .context("validating checkpoint applied postprocess provenance")?;
+        if let Some(applied) = self.provenance.postprocess() {
+            applied
+                .validate()
+                .context("validating transcript applied postprocess provenance")?;
+        }
+        if self.final_attempt_call_ids.len() > MAX_FINAL_ATTEMPT_CALL_IDS {
+            bail!(
+                "filing checkpoint final attempt list exceeds {MAX_FINAL_ATTEMPT_CALL_IDS} calls"
+            );
+        }
+        match (
+            self.provenance.postprocess().cloned(),
+            self.applied_postprocess.is_unrecorded_none(),
+        ) {
+            (Some(in_provenance), true) => self.applied_postprocess = in_provenance,
+            (Some(in_provenance), false) if in_provenance != self.applied_postprocess => {
+                bail!("filing checkpoint contains conflicting applied postprocess provenance")
+            }
+            (None, false) => self
+                .provenance
+                .set_postprocess(self.applied_postprocess.clone())
+                .context("restoring applied postprocess provenance into transcript provenance")?,
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -199,54 +306,27 @@ pub(crate) fn has_unresolved_aws_staging(audio: &Path) -> bool {
     }
 }
 
-fn atomic_store_json<T: Serialize + ?Sized>(path: &Path, value: &T, label: &str) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {label} directory {}", parent.display()))?;
-
+fn atomic_store_json<T: Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+    label: &str,
+    max_bytes: usize,
+) -> Result<()> {
     let bytes = serde_json::to_vec(value).with_context(|| format!("serializing {label}"))?;
-    let tmp = temp_path(path);
-    let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .with_context(|| format!("creating temporary {label} {}", tmp.display()))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("writing temporary {label} {}", tmp.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing temporary {label} {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!("publishing {label} {} -> {}", tmp.display(), path.display())
-        })?;
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if bytes.len() > max_bytes {
+        bail!("refusing oversized {label} {}", path.display());
     }
-    write_result
+    crate::private_file::atomic_write_private(path, &bytes, label)
 }
 
-fn load_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {label} {}", path.display()))?
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {label} {}", path.display()))?;
+fn load_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<T> {
+    let bytes = crate::private_file::read_private_migrating_mode(path, label, max_bytes)?
+        .with_context(|| format!("opening {label} {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {label} {}", path.display()))
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name: OsString = path.as_os_str().to_os_string();
-    name.push(format!(".tmp-{}", std::process::id()));
-    PathBuf::from(name)
 }
 
 /// Temporary checkpoint files left by a process death before the atomic rename.
@@ -293,6 +373,11 @@ pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use corti_core::{Speaker, TranscriptSegment};
+    use corti_postprocess::SupportTier;
+    use corti_vagus::provenance::{
+        AppliedCacheSource, AppliedPostprocessDetails, AppliedPostprocessState,
+        AppliedWordBankProvenance, FinalPostprocessOutcome,
+    };
 
     fn dir(name: &str) -> PathBuf {
         let dir =
@@ -347,7 +432,49 @@ mod tests {
         cleaned.aws_staging = None;
         cleaned.store(&audio).unwrap();
         assert_eq!(FilingCheckpoint::load(&audio).unwrap(), cleaned);
-        assert!(!temp_path(&path_for(&audio)).exists());
+        assert!(temporary_paths(&audio).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn v2_round_trips_applied_provenance_and_content_free_recovery_ids() {
+        let dir = dir("postprocess-v2");
+        let audio = dir.join("recording.wav");
+        let fingerprint =
+            |byte: char| ProvenanceFingerprint::new(byte.to_string().repeat(43)).unwrap();
+        let applied = AppliedPostprocessProvenance::applied(
+            AppliedPostprocessState::Final,
+            AppliedPostprocessDetails {
+                provider: "fixture-provider".into(),
+                transport: "fixture-transport".into(),
+                support_tier: SupportTier::Documented,
+                model: "fixture-model".into(),
+                adapter_version: 1,
+                prompt_version: 1,
+                output_schema_version: 1,
+                word_bank: AppliedWordBankProvenance {
+                    revision: 4,
+                    fingerprint: fingerprint('A'),
+                    count: 2,
+                },
+                steering_fingerprint: fingerprint('B'),
+                cache_source: AppliedCacheSource::Local,
+                live_revision_summary: None,
+                final_outcome: Some(FinalPostprocessOutcome::Applied),
+            },
+        )
+        .unwrap();
+        let mut expected = checkpoint(None);
+        expected.set_applied_postprocess(applied.clone()).unwrap();
+        expected.set_source_transcript_fingerprint(fingerprint('C'));
+        expected
+            .set_final_attempt_call_ids(vec![CallId::new("fixture-call").unwrap()])
+            .unwrap();
+
+        expected.store(&audio).unwrap();
+        let loaded = FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(loaded.provenance.postprocess(), Some(&applied));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -367,18 +494,89 @@ mod tests {
     }
 
     #[test]
-    fn pre_provenance_checkpoint_loads_as_explicit_unknown() {
-        let dir = dir("legacy-provenance");
+    fn checkpoint_v1_loads_as_no_postprocess_and_rewrites_as_v2() {
+        let dir = dir("legacy-v1");
         let audio = dir.join("recording.wav");
         std::fs::write(
             path_for(&audio),
             r#"{"version":1,"transcript":{"segments":[]},"note_path":null,"aws_staging":null}"#,
         )
         .unwrap();
+
         let loaded = FilingCheckpoint::load(&audio).unwrap();
         assert_eq!(loaded.provenance.version, "unknown");
         assert_eq!(loaded.provenance.backend, "unknown");
         assert_eq!(loaded.provenance.mode, GenerationMode::Batch);
+        assert_eq!(
+            loaded.applied_postprocess.state(),
+            corti_vagus::provenance::AppliedPostprocessState::None
+        );
+        assert!(loaded.applied_postprocess.is_unrecorded_none());
+        assert_eq!(loaded.source_transcript_fingerprint, None);
+        assert!(loaded.final_attempt_call_ids.is_empty());
+
+        loaded.store(&audio).unwrap();
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path_for(&audio)).unwrap()).unwrap();
+        assert_eq!(rewritten["version"], VERSION);
+        assert_eq!(rewritten["applied_postprocess"]["state"], "none");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_files_are_private_bounded_and_never_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = dir("private-boundary");
+        let audio = dir.join("recording.wav");
+        let expected = checkpoint(None);
+        expected.store(&audio).unwrap();
+        assert_eq!(
+            std::fs::metadata(path_for(&audio))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let target = dir.join("outside.json");
+        std::fs::write(&target, b"do not read").unwrap();
+        std::fs::remove_file(path_for(&audio)).unwrap();
+        std::os::unix::fs::symlink(&target, path_for(&audio)).unwrap();
+        assert!(FilingCheckpoint::load(&audio).is_err());
+
+        std::fs::remove_file(path_for(&audio)).unwrap();
+        std::fs::write(
+            path_for(&audio),
+            vec![b'x'; MAX_FILING_CHECKPOINT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(FilingCheckpoint::load(&audio).is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn legacy_checkpoint_mode_is_migrated_before_parsing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = dir("legacy-mode");
+        let audio = dir.join("recording.wav");
+        std::fs::write(
+            path_for(&audio),
+            r#"{"version":1,"transcript":{"segments":[]},"note_path":null,"aws_staging":null}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(path_for(&audio), std::fs::Permissions::from_mode(0o644)).unwrap();
+        FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(
+            std::fs::metadata(path_for(&audio))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -13,8 +13,9 @@
 //! [`flip_state`] seeks and overwrites only those bytes: no rename, no truncation, no full-file
 //! rewrite, so a `tail -f` follower keeps its inode and never observes the file shrink mid-stream.
 
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
@@ -25,6 +26,45 @@ pub const STATE_TRANSCRIBING: &str = "State: transcribing";
 /// Final state line. The trailing space pads it to the byte width of [`STATE_TRANSCRIBING`] so the
 /// flip is a same-width in-place overwrite.
 pub const STATE_TRANSCRIBED: &str = "State: transcribed ";
+
+/// Opaque authority for the one note path returned for the current recording.
+///
+/// The handle intentionally exposes no vault discovery, sibling traversal, general read, or path accessor.
+/// It can only perform Corti's bounded-prefix, same-inode transcript/provenance rewrite. Provider adapters
+/// accept typed transcript rows and therefore have no reason or API surface to receive this handle.
+#[derive(Clone)]
+pub struct CurrentNote {
+    path: PathBuf,
+}
+
+impl CurrentNote {
+    /// Bind the exact path returned by `vagus add-note --print-path` or recovered from this recording's
+    /// durable checkpoint. Callers remain responsible for preserving that ownership chain.
+    pub fn from_returned_path(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        ensure!(
+            !path.as_os_str().is_empty(),
+            "current-note path must not be empty"
+        );
+        Ok(Self { path })
+    }
+
+    /// Replace this recording's transcript body and Corti provenance while preserving the note inode and
+    /// bounded frontmatter/title prefix. The helper reads only that prefix; it never returns vault text.
+    pub fn rewrite_transcript(
+        &self,
+        new_body: &str,
+        provenance: &TranscriptProvenance,
+    ) -> Result<()> {
+        rewrite_body_with_provenance(&self.path, new_body, provenance)
+    }
+}
+
+impl fmt::Debug for CurrentNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CurrentNote(<opaque-current-path>)")
+    }
+}
 
 /// Append `text` to the note as one durable chunk. [`File::sync_all`](std::fs::File::sync_all) is the
 /// explicit crash boundary: after this returns, an app or macOS crash may lose a later in-memory chunk but
@@ -359,6 +399,25 @@ mod tests {
         let p = test_note("flip-missing", "---\na: b\n---\n\n# T\n\nno state here\n");
         let err = flip_state(&p).unwrap_err().to_string();
         assert!(err.contains("no state line"), "got: {err}");
+    }
+
+    #[test]
+    fn current_note_handle_rewrites_only_the_owned_note_and_redacts_its_path() {
+        let p = test_note("current-handle", &live_note_content());
+        let ino = std::fs::metadata(&p).unwrap().ino();
+        let current = CurrentNote::from_returned_path(p.clone()).unwrap();
+        let provenance =
+            crate::provenance::TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+
+        current
+            .rewrite_transcript("State: transcribed \n\nsynthetic final body\n", &provenance)
+            .unwrap();
+
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().ino(), ino);
+        assert!(got.ends_with("State: transcribed \n\nsynthetic final body\n"));
+        let debug = format!("{current:?}");
+        assert!(!debug.contains(p.to_string_lossy().as_ref()));
     }
 
     #[test]

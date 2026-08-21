@@ -18,9 +18,17 @@ The harness uses `http://127.0.0.1:1425` so it can run beside `cargo tauri dev` 
 Generated Retina PNGs land in ignored `screenshots/output/`:
 
 - `live-transcript.png`
+- `live-rewriting-assistant.png`
+- `live-assistant-drawer.png`
+- `live-diff-cost-{desktop,narrow}.png`
+- `assistant-pinned-{desktop,narrow}.png`
+- `preferences-{desktop,narrow}.png`
+- `vertex-{warning,recovery}-{desktop,narrow}.png`
+- `reduced-motion-{desktop,narrow}.png`
 - `recording-queue.png`
 - `pipeline.png`
 - `settings-local.png`
+- `settings-hosted.png`
 
 Dates, relative times, color scheme, viewport, reduced motion, and all IPC results are fixed. Fixture text is intentionally synthetic and safe to publish.
 
@@ -41,4 +49,4 @@ That captures all views and copies the PNGs into `vasovagal.github.io/assets/scr
 3. Run `npm run capture` and inspect the image at 100%.
 4. Reference the image from the site, then run `update_site.py` on future refreshes.
 
-An unhandled IPC command logs a browser warning and returns `null`; required fixture drift should therefore fail a visibility assertion rather than silently publish a loading screen.
+An unhandled IPC command returns `null`; required fixture drift should therefore fail a visibility assertion rather than silently publish a loading screen. Tests can update fixture values and emit synthetic Tauri events through the injected bridge without touching ambient credentials or provider networks.
