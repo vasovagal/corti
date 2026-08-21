@@ -199,3 +199,18 @@ Physical free space moved from 97,068,976 KiB (92.572 GiB) to 107,575,720 KiB (1
 | **Reported total through Hardening** | **260,187,373** |
 
 A verification-phase token value was not exposed by the runtime, so none is invented.
+
+## Workflow continuation token ledger — Delivery cutoff
+
+This separately supplied continuation ledger records the phase counters available at the Delivery cutoff; it
+does not revise the earlier runtime-reported row.
+
+| Phase | Tokens |
+|---|---:|
+| Core Recovery | 30,062,684 |
+| App Backend | 88,295,232 |
+| React Experience | 29,011,598 |
+| Adversarial Review | 24,892,287 |
+| Hardening | 66,120,369 |
+| Verification | 8,764,006 |
+| **Continuation total at Delivery cutoff** | **247,146,176** |
