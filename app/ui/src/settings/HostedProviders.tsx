@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
+  AwsCredentialOptionsDto,
+  BedrockCredentialDto,
   HostedPatchInput,
   HostedProviderScope,
   HostedProviderScopeUpdate,
   HostedProviderState,
+  SecretSlotRequest,
 } from "../lib/api";
 import {
   VERTEX_UNARMED_WARNING,
@@ -13,6 +16,7 @@ import {
   providerPresentation,
   supportTierLabel,
 } from "../lib/hosted";
+import { HostedBedrockCredentials, type BedrockActions } from "./HostedBedrock";
 import { HostedSwitch } from "./HostedCommon";
 
 interface ProviderActions {
@@ -21,15 +25,23 @@ interface ProviderActions {
   onRefresh: (provider: string, transport: string) => Promise<boolean>;
   onScope: (update: HostedProviderScopeUpdate) => Promise<boolean>;
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
+  /** Opens the native secure-entry sheet; the key never returns through this callback. */
+  onPromptSecret: (request: SecretSlotRequest) => Promise<boolean>;
+  onClearSecret: (request: SecretSlotRequest) => Promise<boolean>;
+  bedrock: BedrockActions;
 }
 
 export function HostedProviders({
   providers,
   scopes,
+  bedrock,
+  awsOptions,
   actions,
 }: {
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
+  bedrock: BedrockCredentialDto;
+  awsOptions: AwsCredentialOptionsDto | null;
   actions: ProviderActions;
 }) {
   return (
@@ -51,6 +63,8 @@ export function HostedProviders({
                 candidate.provider === provider.descriptor.provider &&
                 candidate.transport === provider.descriptor.transport,
             )}
+            bedrock={bedrock}
+            awsOptions={awsOptions}
             actions={actions}
           />
         ))}
@@ -62,10 +76,14 @@ export function HostedProviders({
 function HostedProviderCard({
   state,
   scope,
+  bedrock,
+  awsOptions,
   actions,
 }: {
   state: HostedProviderState;
   scope?: HostedProviderScope;
+  bedrock: BedrockCredentialDto;
+  awsOptions: AwsCredentialOptionsDto | null;
   actions: ProviderActions;
 }) {
   const { descriptor, credential } = state;
@@ -75,6 +93,9 @@ function HostedProviderCard({
   const isDirectKey = descriptor.transport === "openai_api" || descriptor.transport === "anthropic_api";
   const isCodex = descriptor.transport === "codex_app_server";
   const isClaudeSubscription = descriptor.transport === "claude_subscription";
+  const isBedrock = descriptor.transport === "bedrock_runtime";
+  const directSlot: SecretSlotRequest =
+    descriptor.transport === "openai_api" ? { provider: "open_ai" } : { provider: "anthropic" };
   const canRefresh =
     Boolean(scope?.configured) &&
     (descriptor.support_tier === "documented" ||
@@ -188,20 +209,40 @@ function HostedProviderCard({
       {isDirectKey && (
         <div className="hosted-native-auth">
           <div className="other-row">
-            <button className="btn-secondary" type="button" disabled>
+            <button
+              className="btn-secondary"
+              type="button"
+              disabled={actions.busy}
+              onClick={() => void actions.onPromptSecret(directSlot)}
+            >
               {credential.state === "ready" ? "Replace key…" : "Add key…"}
             </button>
             {credential.state === "ready" && (
-              <button className="btn-secondary" type="button" disabled>
+              <button
+                className="btn-secondary"
+                type="button"
+                disabled={actions.busy}
+                onClick={() => void actions.onClearSecret(directSlot)}
+              >
                 Remove key
               </button>
             )}
           </div>
           <p className="muted small">
-            Key changes require the native secure-entry / Keychain command surface, which this build does not
-            expose to React. No browser field accepts a key.
+            The key is typed into a native macOS sheet and written straight to the Keychain. This window
+            never receives it, and no browser field accepts a key.
           </p>
         </div>
+      )}
+
+      {isBedrock && (
+        <HostedBedrockCredentials
+          bedrock={bedrock}
+          scope={scope}
+          credential={credential}
+          options={awsOptions}
+          actions={actions.bedrock}
+        />
       )}
 
       {scope && descriptor.support_tier === "documented" && (

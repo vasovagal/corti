@@ -1,17 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  clearProviderSecret,
   getHostedSettings,
+  listAwsCredentialOptions,
   onHostedStateChanged,
   patchHostedSettings,
+  promptForProviderSecret,
   refreshHostedProvider,
   replaceHostedWordBank,
+  setBedrockCredentialMode,
   setHostedPinnedQuestion,
   updateHostedProviderScope,
   updateHostedSteering,
+  type AwsCredentialMode,
+  type AwsCredentialOptionsDto,
+  type AwsKeySlot,
   type HostedMutationResult,
   type HostedPatchInput,
   type HostedProviderScopeUpdate,
   type HostedSettingsDto,
+  type SecretSlotRequest,
 } from "../lib/api";
 import { shouldInstallHostedSettings } from "../lib/liveHosted";
 import { HostedDialog, HostedSwitch } from "./HostedCommon";
@@ -27,6 +35,17 @@ export default function HostedPreferences() {
   const [status, setStatus] = useState("");
   const [loadError, setLoadError] = useState("");
   const [masterDisclosure, setMasterDisclosure] = useState(false);
+  const [awsOptions, setAwsOptions] = useState<AwsCredentialOptionsDto | null>(null);
+
+  // Profile names and Keychain presence are read separately from the settings document: they describe the
+  // machine, not the saved preferences, and an older backend simply leaves them null.
+  const refreshAwsOptions = useCallback(async () => {
+    try {
+      setAwsOptions(await listAwsCredentialOptions());
+    } catch {
+      setAwsOptions(null);
+    }
+  }, []);
 
   const installSettings = useCallback((next: HostedSettingsDto) => {
     if (!shouldInstallHostedSettings(settingsRef.current, next)) return;
@@ -42,6 +61,10 @@ export default function HostedPreferences() {
       setLoadError(`Failed to load hosted preferences: ${String(error)}`);
     }
   }, [installSettings]);
+
+  useEffect(() => {
+    void refreshAwsOptions();
+  }, [refreshAwsOptions]);
 
   useEffect(() => {
     let active = true;
@@ -128,6 +151,74 @@ export default function HostedPreferences() {
     runMutation("Connection update", "Connection scope saved; Master and lanes were not changed.", (revision) =>
       updateHostedProviderScope(revision, update),
     );
+
+  const onBedrockMode = (
+    mode: AwsCredentialMode,
+    profile: string | null,
+    roleArn: string | null,
+  ) =>
+    runMutation(
+      "Credential update",
+      "AWS credential mode saved; Master and lanes were not changed.",
+      (revision) => setBedrockCredentialMode(revision, mode, profile, roleArn),
+    );
+
+  const onBedrockRegion = (region: string | null, alias: string | null) =>
+    onScope({
+      provider: "amazon",
+      transport: "bedrock_runtime",
+      alias,
+      project: null,
+      region,
+      quota_project: null,
+    });
+
+  /// The sheet is native; only its outcome comes back, never the value the user typed.
+  async function onPromptSecret(request: SecretSlotRequest): Promise<boolean> {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    setBusy("Secure entry");
+    setStatus("");
+    try {
+      const outcome = await promptForProviderSecret(request);
+      setStatus(
+        outcome === "stored"
+          ? "Stored in the macOS Keychain. No lane was enabled."
+          : outcome === "rejected"
+            ? "That value cannot be a credential; nothing was stored."
+            : "Cancelled; nothing was stored.",
+      );
+      return outcome === "stored";
+    } catch (error) {
+      setStatus(`Secure entry failed: ${String(error)}`);
+      return false;
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+      await refreshAwsOptions();
+      await reload();
+    }
+  }
+
+  async function onClearSecret(request: SecretSlotRequest): Promise<boolean> {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    setBusy("Remove credential");
+    setStatus("");
+    try {
+      await clearProviderSecret(request);
+      setStatus("Removed from the macOS Keychain.");
+      return true;
+    } catch (error) {
+      setStatus(`Removal failed: ${String(error)}`);
+      return false;
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+      await refreshAwsOptions();
+      await reload();
+    }
+  }
 
   async function onRefreshProvider(provider: string, transport: string): Promise<boolean> {
     if (busyRef.current) return false;
@@ -229,6 +320,15 @@ export default function HostedPreferences() {
     onRefresh: onRefreshProvider,
     onScope,
     onPatch,
+    onPromptSecret,
+    onClearSecret,
+    bedrock: {
+      busy: isBusy,
+      onMode: onBedrockMode,
+      onScopeRegion: onBedrockRegion,
+      onPromptKey: (slot: AwsKeySlot) => onPromptSecret({ provider: "aws", slot }),
+      onClearKey: (slot: AwsKeySlot) => onClearSecret({ provider: "aws", slot }),
+    },
   };
 
   return (
@@ -307,7 +407,13 @@ export default function HostedPreferences() {
         </div>
       )}
 
-      <HostedProviders providers={settings.providers} scopes={settings.scopes} actions={providerActions} />
+      <HostedProviders
+        providers={settings.providers}
+        scopes={settings.scopes}
+        bedrock={settings.bedrock}
+        awsOptions={awsOptions}
+        actions={providerActions}
+      />
       <HostedLanes settings={settings} busy={isBusy} onPatch={onPatch} />
       <HostedLanguagePreferences settings={settings} actions={languageActions} />
       <HostedDiagnostics settings={settings} busy={isBusy} onPatch={onPatch} />

@@ -1112,6 +1112,138 @@ summary:focus-visible,
 .hosted-scope .hosted-field-error {
   align-self: end;
 }
+.hosted-bedrock {
+  border-top: 1px solid var(--border);
+  margin-top: 12px;
+  padding-top: 12px;
+  display: grid;
+  gap: 12px;
+}
+.hosted-bedrock-modes {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 7px;
+}
+.hosted-bedrock-modes legend {
+  padding: 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.hosted-segmented {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-sunken, var(--bg-card));
+  padding: 3px;
+}
+.hosted-segmented label {
+  flex: 1 1 auto;
+  border-radius: 6px;
+  padding: 6px 9px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.hosted-segmented label.is-selected {
+  background: var(--bg-card);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 18%);
+  color: var(--fg);
+}
+/* The radio stays focusable for keyboard and screen readers; only its default box is hidden. */
+.hosted-segmented input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.hosted-segmented label:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.hosted-bedrock-fields,
+.hosted-bedrock-region {
+  display: grid;
+  gap: 9px;
+  align-items: end;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.hosted-bedrock-fields > p,
+.hosted-bedrock-region > p {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.hosted-bedrock-fields label,
+.hosted-bedrock-region label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.hosted-bedrock-fields input,
+.hosted-bedrock-fields select,
+.hosted-bedrock-region select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--fg);
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.hosted-bedrock-fields button,
+.hosted-bedrock-region button {
+  justify-self: start;
+}
+.hosted-bedrock-region {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.hosted-bedrock-expiry {
+  margin: 0;
+}
+.hosted-key-slots {
+  display: grid;
+  gap: 8px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.hosted-key-slots li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.hosted-key-slots li > div:first-child {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+}
+.hosted-key-slots .other-row {
+  display: flex;
+  gap: 6px;
+}
 .hosted-catalog {
   border-top: 1px solid var(--border);
   margin-top: 12px;
@@ -1493,8 +1625,18 @@ summary:focus-visible,
     flex-direction: column;
     gap: 8px;
   }
-  .hosted-scope {
+  .hosted-scope,
+  .hosted-bedrock-fields,
+  .hosted-bedrock-region {
     grid-template-columns: 1fr;
+  }
+  .hosted-segmented {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .hosted-key-slots li {
+    align-items: flex-start;
+    flex-direction: column;
   }
   .hosted-scope-head {
     grid-column: auto;
@@ -1532,6 +1674,7 @@ summary:focus-visible,
   .hosted-state-off,
   .hosted-configured,
   .hosted-lane-state,
+  .hosted-segmented label.is-selected,
   .hosted-vertex-warning {
     border: 1px solid CanvasText;
   }
