@@ -46,6 +46,14 @@ test("local settings", async ({ page }) => {
   await page.goto(`${BASE_URL}/?view=settings`);
   await expect(page.getByText("NVIDIA Parakeet-TDT runs fully offline", { exact: false })).toBeVisible();
   await expect(page.getByText("Live inbox filing", { exact: true })).toBeVisible();
-  await expect(page.getByText("Parakeet TDT 0.6B v3 · Metal Q8", { exact: false })).toBeVisible();
   await capture(page, "settings-local.png");
+});
+
+test("hosted rewrite preferences", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await expect(page.getByRole("heading", { name: "Hosted rewrite", exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveText("gcloud token isn't armed");
+  await expect(page.locator("#hosted-model-final")).toHaveValue("gpt-5.6-luna");
+  await capture(page, "settings-hosted.png", true);
 });

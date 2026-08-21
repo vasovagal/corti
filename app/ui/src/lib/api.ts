@@ -229,6 +229,272 @@ export const onLiveTranscriptChanged = (
 ): Promise<UnlistenFn> =>
   listen<LiveTranscriptEvent>("live-transcript-changed", (event) => handler(event.payload));
 
+// ----- Hosted post-processing preferences -----
+
+export type HostedSupportTier = "documented" | "experimental" | "blocked";
+export type HostedBillingBasis =
+  | "metered_estimate"
+  | "included_subscription"
+  | "no_provider_request"
+  | "unknown";
+export type HostedErrorCode =
+  | "auth_unarmed"
+  | "auth_rejected"
+  | "permission"
+  | "quota"
+  | "rate_limited"
+  | "model_unavailable"
+  | "network"
+  | "timeout"
+  | "canceled"
+  | "superseded"
+  | "policy_blocked"
+  | "cache"
+  | "malformed_output"
+  | "provider"
+  | "broker_exited"
+  | "ambiguous_dispatch"
+  | "internal";
+export type HostedCredentialSource =
+  | "keychain"
+  | "workload_identity"
+  | "application_default_credentials"
+  | "broker_keyring";
+export type HostedLocalCacheMode = "reusable" | "recovery_only" | "memory_only";
+export type HostedProviderCacheMode =
+  | "off"
+  | "explicit_stable_prefix"
+  | "unavoidable_implicit"
+  | "unavailable";
+export type HostedLane = "live" | "final" | "question";
+
+/** Mirrors `corti_postprocess::ProviderDescriptor`; support status always comes from Rust. */
+export interface HostedProviderDescriptor {
+  provider: string;
+  transport: string;
+  support_tier: HostedSupportTier;
+  billing_basis: HostedBillingBasis;
+  adapter_available: boolean;
+}
+
+export interface HostedModelCapabilities {
+  text_input: boolean;
+  text_output: boolean;
+  streaming: boolean;
+  structured_output: boolean;
+  explicit_prefix_cache: boolean;
+  implicit_cache_may_apply: boolean;
+}
+
+/** One exact account/region-scoped model returned by the backend catalog. */
+export interface HostedModelDescriptor {
+  provider: string;
+  transport: string;
+  support_tier: HostedSupportTier;
+  exact_model_id: string;
+  account_scoped_available: boolean;
+  region: string | null;
+  max_context_tokens: number;
+  max_output_tokens: number;
+  capabilities: HostedModelCapabilities;
+  billing_basis: HostedBillingBasis;
+  tariff_version: string | null;
+  deprecated: boolean;
+  benchmarked_for_live: boolean;
+}
+
+/** Secret-free credential projection. No key or token value can be represented by this union. */
+export type HostedCredentialState =
+  | { state: "absent" }
+  | { state: "resolving" }
+  | {
+      state: "ready";
+      expires_at_unix_ms: number | null;
+      source: HostedCredentialSource;
+    }
+  | { state: "awaiting_user" }
+  | {
+      state: "device_authorization";
+      verification_url: string;
+      user_code: string;
+      login_id: string;
+    }
+  | { state: "refreshing" }
+  | { state: "rejected" }
+  | { state: "unsupported"; code: HostedErrorCode }
+  | { state: "error"; code: HostedErrorCode };
+
+export interface HostedProviderState {
+  descriptor: HostedProviderDescriptor;
+  credential: HostedCredentialState;
+  models: HostedModelDescriptor[];
+  service_error: HostedErrorCode | null;
+}
+
+export interface HostedLaneSelection {
+  provider: string | null;
+  transport: string | null;
+  model: string | null;
+  cache_policy: {
+    local: HostedLocalCacheMode;
+    provider: HostedProviderCacheMode;
+  };
+}
+
+export interface HostedLaneControl {
+  enabled: boolean;
+  revision: number;
+  selection: HostedLaneSelection;
+}
+
+export interface HostedControlSnapshot {
+  process_epoch: number;
+  session_generation: number;
+  control_revision: number;
+  steering_revision: number;
+  bank_revision: number;
+  pinned_question_revision: number;
+  master_enabled: boolean;
+  egress_acknowledged: boolean;
+  pinned_auto_enabled: boolean;
+  codex_experimental_approved: boolean;
+  live: HostedLaneControl;
+  final_lane: HostedLaneControl;
+  questions: HostedLaneControl;
+}
+
+export interface HostedProviderScope {
+  provider: string;
+  transport: string;
+  configured: boolean;
+  alias: string | null;
+  project: string | null;
+  region: string | null;
+  quota_project: string | null;
+}
+
+/** Mirror of Rust `postprocess_app::HostedSettingsDto`; it is deliberately secret-free. */
+export interface HostedSettingsDto {
+  state_revision: number;
+  preferences_revision: number;
+  control: HostedControlSnapshot;
+  providers: HostedProviderState[];
+  scopes: HostedProviderScope[];
+  default_steering: string;
+  word_bank: {
+    revision: number;
+    entries: string[];
+  };
+  final_deadline_seconds: number;
+  show_history_diagnostics: boolean;
+  show_live_metrics_by_default: boolean;
+}
+
+export interface HostedSelectionInput {
+  provider: string | null;
+  transport: string | null;
+  model: string | null;
+  local_cache: HostedLocalCacheMode;
+  provider_cache: HostedProviderCacheMode;
+}
+
+export type HostedPatchInput =
+  | { kind: "set_egress_acknowledged"; acknowledged: boolean }
+  | { kind: "set_master"; enabled: boolean }
+  | { kind: "set_lane_enabled"; lane: HostedLane; enabled: boolean }
+  | { kind: "set_lane_selection"; lane: HostedLane; selection: HostedSelectionInput }
+  | { kind: "set_pinned_auto"; enabled: boolean; acknowledged: boolean }
+  | { kind: "set_codex_experimental_approved"; approved: boolean }
+  | {
+      kind: "set_display_preferences";
+      show_history_diagnostics: boolean;
+      show_live_metrics_by_default: boolean;
+    };
+
+export type HostedMutationResult =
+  | { status: "applied"; settings: HostedSettingsDto }
+  | { status: "unchanged"; settings: HostedSettingsDto }
+  | { status: "conflict"; settings: HostedSettingsDto }
+  | {
+      status: "disabled_for_session";
+      settings: HostedSettingsDto;
+      code: HostedErrorCode;
+    };
+
+export interface HostedProviderScopeUpdate {
+  provider: string;
+  transport: string;
+  alias: string | null;
+  project: string | null;
+  region: string | null;
+  quota_project: string | null;
+}
+
+export type HostedCoordinatorEvent =
+  | {
+      event: "notice";
+      role: "alert";
+      visible_message: string;
+      episode: number;
+    }
+  | { event: string; [field: string]: unknown };
+
+export const getHostedSettings = (): Promise<HostedSettingsDto> =>
+  invoke<HostedSettingsDto>("get_hosted_settings");
+
+export const patchHostedSettings = (
+  observedStateRevision: number,
+  patch: HostedPatchInput,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("patch_hosted_settings", {
+    request: { observed_state_revision: observedStateRevision, patch },
+  });
+
+export const updateHostedSteering = (
+  observedStateRevision: number,
+  text: string,
+  persistAsDefault: boolean,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("update_hosted_steering", {
+    request: {
+      observed_state_revision: observedStateRevision,
+      text,
+      persist_as_default: persistAsDefault,
+    },
+  });
+
+export const replaceHostedWordBank = (
+  observedStateRevision: number,
+  entries: string[],
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("replace_hosted_word_bank", {
+    request: { observed_state_revision: observedStateRevision, entries },
+  });
+
+export const updateHostedProviderScope = (
+  observedStateRevision: number,
+  update: HostedProviderScopeUpdate,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("update_hosted_provider_scope", {
+    request: { observed_state_revision: observedStateRevision, ...update },
+  });
+
+export const refreshHostedProvider = (
+  provider: string,
+  transport: string,
+): Promise<HostedProviderState> =>
+  invoke<HostedProviderState>("refresh_hosted_provider", {
+    request: { provider, transport },
+  });
+
+export const setHostedPinnedQuestion = (template: string): Promise<void> =>
+  invoke<void>("set_hosted_pinned_question", { template });
+
+export const onHostedStateChanged = (
+  handler: (event: HostedCoordinatorEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<HostedCoordinatorEvent>("hosted-state-changed", (event) => handler(event.payload));
+
 // ----- Recording Queue window -----
 
 /** Mirror of Rust `queue_ui::RecordingDto`. */

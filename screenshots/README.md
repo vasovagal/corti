@@ -21,6 +21,7 @@ Generated Retina PNGs land in ignored `screenshots/output/`:
 - `recording-queue.png`
 - `pipeline.png`
 - `settings-local.png`
+- `settings-hosted.png`
 
 Dates, relative times, color scheme, viewport, reduced motion, and all IPC results are fixed. Fixture text is intentionally synthetic and safe to publish.
 
