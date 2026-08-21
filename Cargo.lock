@@ -1527,8 +1527,10 @@ name = "corti-postprocess-providers"
 version = "0.13.0"
 dependencies = [
  "corti-postprocess",
+ "hmac 0.12.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "ureq",
  "url",

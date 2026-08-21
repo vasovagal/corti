@@ -145,6 +145,11 @@ enum Script {
         content_type: &'static str,
         chunks: Vec<Vec<u8>>,
     },
+    /// A modelled AWS error reply, which carries its shape name in `x-amzn-errortype`.
+    AwsError {
+        status: u16,
+        error_type: &'static str,
+    },
     Error(TransportError),
 }
 
@@ -161,6 +166,14 @@ impl Script {
         Self::Response {
             status: 200,
             content_type: "text/event-stream; charset=utf-8",
+            chunks,
+        }
+    }
+
+    fn event_stream(chunks: Vec<Vec<u8>>) -> Self {
+        Self::Response {
+            status: 200,
+            content_type: "application/vnd.amazon.eventstream",
             chunks,
         }
     }
@@ -245,6 +258,17 @@ impl HttpTransport for FakeTransport {
                 [("content-type".to_owned(), content_type.to_owned())],
                 Box::new(ChunkBody {
                     chunks: chunks.into(),
+                    canceled: false,
+                }),
+            )),
+            Script::AwsError { status, error_type } => Ok(HttpResponse::new(
+                status,
+                [
+                    ("content-type".to_owned(), "application/json".to_owned()),
+                    ("x-amzn-errortype".to_owned(), error_type.to_owned()),
+                ],
+                Box::new(ChunkBody {
+                    chunks: VecDeque::from(vec![b"{}".to_vec()]),
                     canceled: false,
                 }),
             )),
@@ -1341,3 +1365,667 @@ const _: () = {
     assert!(CODEX_APP_SERVER_COMPILED == cfg!(feature = "codex-experimental"));
     assert!(CLAUDE_SUBSCRIPTION_ADAPTER_BLOCKED);
 };
+
+// ----- Amazon Bedrock -----
+
+const BEDROCK_REGION: &str = "us-east-1";
+const BEDROCK_MODEL_ID: &str = "anthropic.claude-sonnet-4-20250514-v1:0";
+const BEDROCK_PROFILE_ID: &str = "us.anthropic.claude-sonnet-4-20250514-v1:0";
+
+const BEDROCK_FOUNDATION_MODELS: &str = r#"{
+  "modelSummaries":[
+    {
+      "modelId":"anthropic.claude-sonnet-4-20250514-v1:0",
+      "modelName":"Claude Sonnet 4",
+      "providerName":"Anthropic",
+      "inputModalities":["TEXT"],
+      "outputModalities":["TEXT"],
+      "responseStreamingSupported":true,
+      "modelLifecycle":{"status":"ACTIVE"}
+    },
+    {
+      "modelId":"amazon.titan-image-v1",
+      "modelName":"Titan Image",
+      "providerName":"Amazon",
+      "inputModalities":["TEXT"],
+      "outputModalities":["IMAGE"],
+      "responseStreamingSupported":true,
+      "modelLifecycle":{"status":"ACTIVE"}
+    },
+    {
+      "modelId":"anthropic.claude-v2",
+      "modelName":"Claude v2",
+      "providerName":"Anthropic",
+      "inputModalities":["TEXT"],
+      "outputModalities":["TEXT"],
+      "responseStreamingSupported":true,
+      "modelLifecycle":{"status":"LEGACY"}
+    },
+    {
+      "modelId":"amazon.titan-embed-v1",
+      "modelName":"Titan Embeddings",
+      "providerName":"Amazon",
+      "inputModalities":["TEXT"],
+      "outputModalities":["TEXT"],
+      "responseStreamingSupported":false,
+      "modelLifecycle":{"status":"ACTIVE"}
+    }
+  ]
+}"#;
+
+const BEDROCK_INFERENCE_PROFILES: &str = r#"{
+  "inferenceProfileSummaries":[
+    {
+      "inferenceProfileId":"us.anthropic.claude-sonnet-4-20250514-v1:0",
+      "inferenceProfileName":"US Claude Sonnet 4",
+      "status":"ACTIVE",
+      "type":"SYSTEM_DEFINED"
+    },
+    {
+      "inferenceProfileId":"us.retired-profile-v1:0",
+      "inferenceProfileName":"Retired",
+      "status":"INACTIVE",
+      "type":"SYSTEM_DEFINED"
+    }
+  ]
+}"#;
+
+struct FakeWallClock;
+
+impl WallClock for FakeWallClock {
+    fn unix_seconds(&self) -> i64 {
+        // 2026-08-18T20:00:00Z — fixed so every signature in these tests is reproducible.
+        1_787_097_600
+    }
+}
+
+struct FakeAwsCredentials {
+    state: Arc<CredentialState>,
+    session_token: Option<String>,
+}
+
+impl AwsCredentialSource for FakeAwsCredentials {
+    fn resolve(&mut self) -> Result<AwsCredentials, CredentialError> {
+        self.state.resolves.fetch_add(1, Ordering::SeqCst);
+        AwsCredentials::new(
+            "AKIDSYNTHETICFIXTURE",
+            "synthetic-fixture-secret-access-key",
+            self.session_token.clone(),
+            None,
+        )
+        .map_err(|_| CredentialError::Unavailable)
+    }
+
+    fn mark_rejected(&mut self) {
+        self.state.rejected.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn bedrock_scope() -> ProviderScope {
+    ProviderScope {
+        connection_scope_id: ConnectionScopeId::new("synthetic-bedrock-scope-id").unwrap(),
+        region: Some(BEDROCK_REGION.to_owned()),
+    }
+}
+
+fn bedrock_adapter(
+    scripts: Vec<Script>,
+) -> (
+    FakeTransportHandle,
+    Arc<CredentialState>,
+    BedrockConverseAdapter,
+) {
+    bedrock_adapter_with_session(scripts, None)
+}
+
+fn bedrock_adapter_with_session(
+    scripts: Vec<Script>,
+    session_token: Option<String>,
+) -> (
+    FakeTransportHandle,
+    Arc<CredentialState>,
+    BedrockConverseAdapter,
+) {
+    let (handle, transport) = FakeTransportHandle::new(scripts);
+    let state = Arc::new(CredentialState::default());
+    let adapter = BedrockConverseAdapter::new(
+        Box::new(transport),
+        Box::new(FakeClock::new(100)),
+        Box::new(FakeWallClock),
+        Box::new(FakeAwsCredentials {
+            state: state.clone(),
+            session_token,
+        }),
+    );
+    (handle, state, adapter)
+}
+
+/// Encode one `vnd.amazon.eventstream` frame with string headers, as Bedrock sends them.
+fn bedrock_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    let mut header_bytes = Vec::new();
+    for (name, value) in headers {
+        header_bytes.push(name.len() as u8);
+        header_bytes.extend_from_slice(name.as_bytes());
+        header_bytes.push(7);
+        header_bytes.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        header_bytes.extend_from_slice(value.as_bytes());
+    }
+    let total = 16 + header_bytes.len() + payload.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    let prelude_crc = crc32(&out[0..8]);
+    out.extend_from_slice(&prelude_crc.to_be_bytes());
+    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(payload);
+    let message_crc = crc32(&out);
+    out.extend_from_slice(&message_crc.to_be_bytes());
+    out
+}
+
+fn bedrock_event(event_type: &str, payload: Value) -> Vec<u8> {
+    bedrock_frame(
+        &[
+            (":message-type", "event"),
+            (":event-type", event_type),
+            (":content-type", "application/json"),
+        ],
+        payload.to_string().as_bytes(),
+    )
+}
+
+/// A complete forced-tool-use stream whose tool input is the rewrite output object.
+fn bedrock_stream() -> Vec<Vec<u8>> {
+    let fragments = [
+        r#"{"schema":1,"replace"#,
+        r#"ments":[{"row_id":"r-000001","#,
+        r#""text":"Synthetic cleaned sentence."}]}"#,
+    ];
+    let mut chunks = vec![
+        bedrock_event("messageStart", json!({"role": "assistant"})),
+        bedrock_event(
+            "contentBlockStart",
+            json!({
+                "contentBlockIndex": 0,
+                "start": {"toolUse": {"toolUseId": "synthetic-tool-use", "name": "corti_rewrite_v1"}}
+            }),
+        ),
+    ];
+    for fragment in fragments {
+        chunks.push(bedrock_event(
+            "contentBlockDelta",
+            json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": fragment}}}),
+        ));
+    }
+    chunks.push(bedrock_event(
+        "contentBlockStop",
+        json!({"contentBlockIndex": 0}),
+    ));
+    chunks.push(bedrock_event(
+        "messageStop",
+        json!({"stopReason": "tool_use"}),
+    ));
+    chunks.push(bedrock_event(
+        "metadata",
+        json!({
+            "usage": {
+                "inputTokens": 140,
+                "outputTokens": 24,
+                "totalTokens": 164,
+                "cacheReadInputTokens": 12,
+                "cacheWriteInputTokens": 0
+            },
+            "metrics": {"latencyMs": 512}
+        }),
+    ));
+    chunks
+}
+
+#[test]
+fn bedrock_catalog_merges_foundation_models_and_inference_profiles_region_tagged() {
+    let (handle, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+    ]);
+    let catalog = adapter.catalog(&bedrock_scope()).unwrap();
+
+    let ids = catalog
+        .models
+        .iter()
+        .map(|model| model.exact_model_id.as_str())
+        .collect::<Vec<_>>();
+    // Image-output, non-streaming, and inactive-profile entries are all filtered out.
+    assert_eq!(
+        ids,
+        [BEDROCK_MODEL_ID, "anthropic.claude-v2", BEDROCK_PROFILE_ID]
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .all(|model| model.region.as_deref() == Some(BEDROCK_REGION))
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .all(|model| !model.capabilities.explicit_prefix_cache)
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .all(|model| model.capabilities.structured_output)
+    );
+    // LEGACY lifecycle is surfaced as deprecated rather than hidden.
+    assert!(!catalog.models[0].deprecated);
+    assert!(catalog.models[1].deprecated);
+    assert!(!catalog.models[2].deprecated);
+    assert_eq!(
+        catalog.models[0].max_output_tokens,
+        BEDROCK_CONSERVATIVE_MAX_OUTPUT_TOKENS
+    );
+
+    let captured = handle.captured();
+    assert_eq!(captured.len(), 2);
+    assert!(
+        captured[0]
+            .url
+            .starts_with("https://bedrock.us-east-1.amazonaws.com/foundation-models?")
+    );
+    assert!(captured[0].url.contains("byOutputModality=TEXT"));
+    assert!(captured[1].url.contains("/inference-profiles?"));
+    // Every control-plane call is SigV4 signed; the signature never appears as a public header.
+    for request in &captured {
+        assert_eq!(request.secret_headers, ["authorization"]);
+    }
+}
+
+#[test]
+fn bedrock_catalog_requires_a_region_before_any_request_is_made() {
+    let (handle, _, mut adapter) = bedrock_adapter(Vec::new());
+    let error = adapter
+        .catalog(&ProviderScope {
+            connection_scope_id: ConnectionScopeId::new("synthetic-bedrock-scope-id").unwrap(),
+            region: None,
+        })
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::ModelUnavailable);
+    assert!(handle.captured().is_empty());
+}
+
+#[test]
+fn bedrock_converse_stream_shape_yields_text_deltas_and_terminal_usage() {
+    let (handle, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+        Script::event_stream(bedrock_stream()),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+
+    let request = hosted_request(
+        KnownTransport::BedrockRuntime,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    let sink = CollectingSink::default();
+    let terminal = adapter
+        .execute(&request, &CancellationToken::new(), &sink)
+        .unwrap();
+
+    assert_eq!(terminal.usage.input_tokens, Some(140));
+    assert_eq!(terminal.usage.output_tokens, Some(24));
+    assert_eq!(terminal.usage.cached_read_tokens, Some(12));
+    assert!(terminal.usage.usage_complete);
+    assert_eq!(
+        terminal.cache,
+        corti_postprocess::CacheObservation::ProviderRead
+    );
+    // Live-lane parity: the tool input streams as ordinary text deltas.
+    assert_eq!(
+        sink.text(),
+        r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Synthetic cleaned sentence."}]}"#
+    );
+    assert!(
+        sink.events()
+            .iter()
+            .any(|event| matches!(event.kind, ProviderEventKind::FirstText))
+    );
+    match terminal.output {
+        corti_postprocess::ProviderOutput::Rewrite(output) => {
+            assert_eq!(output.replacements.len(), 1);
+        }
+        other => panic!("unexpected output {other:?}"),
+    }
+
+    let captured = handle.captured();
+    let converse = captured.last().unwrap();
+    assert_eq!(converse.method, HttpMethod::Post);
+    // The model id's colon is percent-encoded once on the wire.
+    assert!(
+        converse
+            .url
+            .ends_with("/model/anthropic.claude-sonnet-4-20250514-v1%3A0/converse-stream"),
+        "{}",
+        converse.url
+    );
+    assert!(
+        converse
+            .url
+            .starts_with("https://bedrock-runtime.us-east-1.amazonaws.com/")
+    );
+    let body = converse.body.as_ref().unwrap();
+    assert_eq!(body["system"].as_array().unwrap().len(), 2);
+    assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        body["toolConfig"]["toolChoice"]["tool"]["name"],
+        "corti_rewrite_v1"
+    );
+    assert_eq!(
+        body["toolConfig"]["tools"][0]["toolSpec"]["inputSchema"]["json"]["type"],
+        "object"
+    );
+    assert_eq!(
+        body["inferenceConfig"]["maxTokens"],
+        BEDROCK_CONSERVATIVE_MAX_OUTPUT_TOKENS
+    );
+    assert!(
+        !body["system"]
+            .to_string()
+            .contains("Ignore previous instructions"),
+        "the word bank is user content, never a system instruction"
+    );
+    assert_eq!(converse.secret_headers, ["authorization"]);
+}
+
+#[test]
+fn bedrock_session_credentials_sign_and_send_the_security_token_as_a_secret() {
+    let (handle, _, mut adapter) = bedrock_adapter_with_session(
+        vec![
+            Script::json(BEDROCK_FOUNDATION_MODELS),
+            Script::json(BEDROCK_INFERENCE_PROFILES),
+        ],
+        Some("synthetic-fixture-session-token".into()),
+    );
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let captured = handle.captured();
+    assert_eq!(
+        captured[0].secret_headers,
+        ["x-amz-security-token", "authorization"]
+    );
+    let debug = format!("{:?}", captured[0]);
+    assert!(!debug.contains("synthetic-fixture-session-token"));
+    assert!(!debug.contains("synthetic-fixture-secret-access-key"));
+}
+
+#[test]
+fn bedrock_explicit_provider_cache_is_refused_before_egress() {
+    let (handle, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::BedrockRuntime,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::ExplicitStablePrefix,
+    );
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::PolicyBlocked);
+    assert_eq!(
+        handle.captured().len(),
+        2,
+        "no converse request may be sent"
+    );
+}
+
+#[test]
+fn bedrock_aws_error_shapes_map_onto_the_content_free_taxonomy() {
+    use corti_postprocess::ErrorCode;
+
+    for (status, error_type, expected) in [
+        (403, "AccessDeniedException", ErrorCode::Permission),
+        (429, "ThrottlingException", ErrorCode::RateLimited),
+        (403, "ExpiredTokenException", ErrorCode::AuthRejected),
+        (403, "UnrecognizedClientException", ErrorCode::AuthRejected),
+        (400, "ServiceQuotaExceededException", ErrorCode::Quota),
+        (
+            404,
+            "ResourceNotFoundException",
+            ErrorCode::ModelUnavailable,
+        ),
+        (400, "ValidationException", ErrorCode::Provider),
+    ] {
+        let (_, credential_state, mut adapter) =
+            bedrock_adapter(vec![Script::AwsError { status, error_type }]);
+        let error = adapter.catalog(&bedrock_scope()).unwrap_err();
+        assert_eq!(error.code, expected, "{error_type}");
+        assert_eq!(
+            error.to_string(),
+            expected.to_string(),
+            "error text is the taxonomy label, never the AWS message"
+        );
+        assert_eq!(
+            credential_state.rejected.load(Ordering::SeqCst),
+            usize::from(expected == ErrorCode::AuthRejected)
+        );
+    }
+}
+
+#[test]
+fn bedrock_in_stream_exceptions_are_sanitized_and_reject_the_credential_once() {
+    use corti_postprocess::ErrorCode;
+
+    for (exception, expected) in [
+        ("ThrottlingException", ErrorCode::RateLimited),
+        (
+            "com.amazon.coral.service#ExpiredTokenException",
+            ErrorCode::AuthRejected,
+        ),
+        ("ModelStreamErrorException", ErrorCode::Provider),
+        ("ModelTimeoutException", ErrorCode::Timeout),
+    ] {
+        let stream = vec![
+            bedrock_event("messageStart", json!({"role": "assistant"})),
+            bedrock_frame(
+                &[
+                    (":message-type", "exception"),
+                    (":exception-type", exception),
+                ],
+                br#"{"message":"synthetic provider detail never surfaced"}"#,
+            ),
+        ];
+        let (_, credential_state, mut adapter) = bedrock_adapter(vec![
+            Script::json(BEDROCK_FOUNDATION_MODELS),
+            Script::json(BEDROCK_INFERENCE_PROFILES),
+            Script::event_stream(stream),
+        ]);
+        adapter.catalog(&bedrock_scope()).unwrap();
+        let request = hosted_request(
+            KnownTransport::BedrockRuntime,
+            BEDROCK_MODEL_ID,
+            ProviderCacheMode::Off,
+        );
+        let sink = CollectingSink::default();
+        let error = adapter
+            .execute(&request, &CancellationToken::new(), &sink)
+            .unwrap_err();
+        assert_eq!(error.code, expected, "{exception}");
+        let rendered = format!("{error:?} {:?}", sink.events());
+        assert!(!rendered.contains("synthetic provider detail"));
+        assert_eq!(
+            credential_state.rejected.load(Ordering::SeqCst),
+            usize::from(expected == ErrorCode::AuthRejected)
+        );
+    }
+}
+
+#[test]
+fn bedrock_truncated_and_corrupt_frames_fail_closed_without_applying_partial_text() {
+    let complete = bedrock_stream().concat();
+
+    // A stream cut mid-frame is malformed, never a partially applied rewrite.
+    let (_, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+        Script::event_stream(vec![complete[..complete.len() - 20].to_vec()]),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::BedrockRuntime,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::MalformedOutput);
+
+    // A CRC-corrupt frame is likewise malformed output, not a panic.
+    let mut corrupt = complete.clone();
+    let index = corrupt.len() / 2;
+    corrupt[index] ^= 0xFF;
+    let (_, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+        Script::event_stream(vec![corrupt]),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::MalformedOutput);
+}
+
+#[test]
+fn bedrock_cancellation_after_dispatch_discloses_possible_billing() {
+    let (_, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+        Script::event_stream(bedrock_stream()),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::BedrockRuntime,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    let cancel = CancellationToken::new();
+    let sink = CancelingSink {
+        events: Mutex::new(Vec::new()),
+        cancel: cancel.clone(),
+    };
+    let error = adapter.execute(&request, &cancel, &sink).unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::Canceled);
+    assert!(sink.events.lock().unwrap().iter().any(|event| matches!(
+        event.kind,
+        ProviderEventKind::Canceled {
+            provider_billing_may_still_occur: true,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn bedrock_model_ids_are_never_substituted_and_a_wrong_transport_is_refused() {
+    let (handle, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+
+    let unknown = hosted_request(
+        KnownTransport::BedrockRuntime,
+        "anthropic.claude-sonnet-4",
+        ProviderCacheMode::Off,
+    );
+    assert_eq!(
+        adapter
+            .execute(
+                &unknown,
+                &CancellationToken::new(),
+                &CollectingSink::default()
+            )
+            .unwrap_err()
+            .code,
+        corti_postprocess::ErrorCode::ModelUnavailable
+    );
+
+    let wrong_transport = hosted_request(
+        KnownTransport::AnthropicDirect,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    assert_eq!(
+        adapter
+            .execute(
+                &wrong_transport,
+                &CancellationToken::new(),
+                &CollectingSink::default()
+            )
+            .unwrap_err()
+            .code,
+        corti_postprocess::ErrorCode::PolicyBlocked
+    );
+    assert_eq!(handle.captured().len(), 2, "neither request may be sent");
+}
+
+#[test]
+fn bedrock_non_event_stream_content_type_is_refused() {
+    let (_, _, mut adapter) = bedrock_adapter(vec![
+        Script::json(BEDROCK_FOUNDATION_MODELS),
+        Script::json(BEDROCK_INFERENCE_PROFILES),
+        Script::json(r#"{"output":{"message":{"content":[{"text":"not a stream"}]}}}"#),
+    ]);
+    adapter.catalog(&bedrock_scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::BedrockRuntime,
+        BEDROCK_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    assert_eq!(
+        adapter
+            .execute(
+                &request,
+                &CancellationToken::new(),
+                &CollectingSink::default()
+            )
+            .unwrap_err()
+            .code,
+        corti_postprocess::ErrorCode::MalformedOutput
+    );
+}
+
+#[test]
+fn bedrock_adapter_debug_never_renders_credentials_or_content() {
+    let (_, _, adapter) = bedrock_adapter(Vec::new());
+    let rendered = format!("{adapter:?}");
+    assert!(rendered.contains("<injected>"));
+    assert!(!rendered.contains("AKID"));
+    assert!(!rendered.contains("synthetic-fixture-secret-access-key"));
+}
