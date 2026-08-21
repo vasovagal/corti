@@ -1394,6 +1394,7 @@ dependencies = [
  "corti-detect",
  "corti-jobs",
  "corti-postprocess",
+ "corti-postprocess-providers",
  "corti-queue",
  "corti-transcribe",
  "corti-transcribe-aws",
@@ -1411,11 +1412,13 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-macos-permissions",
+ "thiserror 2.0.18",
  "tokio",
  "toml 0.8.2",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-segmentation",
  "ureq",
 ]
 

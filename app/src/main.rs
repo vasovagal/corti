@@ -37,6 +37,8 @@ mod permissions;
 #[cfg(target_os = "macos")]
 mod pipeline;
 #[cfg(target_os = "macos")]
+mod postprocess;
+#[cfg(target_os = "macos")]
 mod postprocess_config;
 #[cfg(target_os = "macos")]
 mod private_file;

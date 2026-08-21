@@ -25,6 +25,7 @@ corti-detect = { workspace = true }
 corti-queue = { workspace = true }
 corti-jobs = { workspace = true }
 corti-postprocess = { workspace = true }
+corti-postprocess-providers = { workspace = true }
 corti-transcribe = { workspace = true }
 corti-vagus = { workspace = true }
 
@@ -33,6 +34,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
+unicode-segmentation = { workspace = true }
 # Persisted, hand-editable config file (`~/.local/share/corti/config.toml`). Flat scalar struct only.
 toml = "0.8"
 
