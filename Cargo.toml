@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/corti-core",
+    "crates/corti-postprocess",
+    "crates/corti-postprocess-providers",
     "crates/corti-vagus",
     "crates/corti-coreaudio",
     "crates/corti-capture",
@@ -29,6 +31,8 @@ rust-version = "1.96"
 # Internal crates. `version` is required alongside `path` so the crates are publishable to crates.io
 # (publish rewrites path deps to version deps).
 corti-core = { path = "crates/corti-core", version = "0.13.0" }
+corti-postprocess = { path = "crates/corti-postprocess", version = "0.13.0" }
+corti-postprocess-providers = { path = "crates/corti-postprocess-providers", version = "0.13.0" }
 corti-vagus = { path = "crates/corti-vagus", version = "0.13.0" }
 corti-coreaudio = { path = "crates/corti-coreaudio", version = "0.13.0" }
 corti-capture = { path = "crates/corti-capture", version = "0.13.0" }
@@ -46,6 +50,13 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+unicode-normalization = "0.1"
+unicode-casefold = "0.2"
+unicode-segmentation = "1"
 # Bundled SQLite (vendored, compiled from source) so there's no system-libsqlite dependency. One pin
 # shared by corti-queue and corti-jobs — they borrow the same live Connection, so the types must match.
 rusqlite = { version = "0.40", features = ["bundled"] }
