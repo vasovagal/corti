@@ -796,9 +796,13 @@ pub(crate) fn list_aws_credential_options(
     window: tauri::WebviewWindow,
 ) -> Result<AwsCredentialOptionsDto, String> {
     require_hosted_window(&window, &["settings"])?;
-    Ok(AwsCredentialOptionsDto {
-        profiles: crate::settings::list_aws_profiles(),
-    })
+    // Profile discovery belongs to the Transcribe backend's `aws` feature; a build without it can still
+    // reach Bedrock through a key pair, so offer an empty profile list rather than failing the command.
+    #[cfg(feature = "aws")]
+    let profiles = crate::settings::list_aws_profiles();
+    #[cfg(not(feature = "aws"))]
+    let profiles = Vec::new();
+    Ok(AwsCredentialOptionsDto { profiles })
 }
 
 #[tauri::command]

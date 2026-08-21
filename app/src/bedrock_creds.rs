@@ -18,7 +18,10 @@ use crate::{
 /// Refresh this far ahead of expiry so a session cannot lapse mid-stream.
 const EXPIRY_SKEW_MS: i64 = 5 * 60 * 1000;
 /// Assumed-role sessions are deliberately short; the resolver renews them rather than holding a long one.
+/// Only the `aws` feature can call `sts:AssumeRole`.
+#[cfg(feature = "aws")]
 const ASSUME_ROLE_DURATION_SECONDS: i32 = 60 * 60;
+#[cfg(feature = "aws")]
 const ROLE_SESSION_NAME: &str = "corti-hosted-postprocess";
 
 /// The non-secret half of a Bedrock connection, snapshotted from `hosted.toml`.
