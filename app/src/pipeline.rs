@@ -23,7 +23,7 @@ use corti_core::{JobStatus, RecordingMeta};
 use corti_jobs::{Backoff, ClaimedJob, FailOutcome};
 use corti_queue::{Job, JobUpdate, Queue};
 use corti_vagus::Vagus;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::{AwsStaging, FilingCheckpoint, OwnedNote, path_for as checkpoint_path};
@@ -123,6 +123,9 @@ pub enum PipelineMsg {
         note_path: PathBuf,
         error: String,
     },
+    /// Wake the sole queue writer to import and acknowledge content-free hosted telemetry. The durable
+    /// outbox remains authoritative when this best-effort wake races recording-row creation.
+    ImportPostprocessOutbox,
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -148,6 +151,9 @@ pub(crate) struct Ctx {
     /// #87: recording-scoped live sessions. The detector delivers terminal verdicts; the worker collects
     /// finished IDs and owns any last-resort discard cleanup.
     pub(crate) live: Arc<crate::live::LiveManager>,
+    /// Managed hosted coordinator handle. It owns no provider runtime on this serial queue thread; only the
+    /// bounded final wait and content-free outbox import cross this seam.
+    pub(crate) hosted: crate::postprocess_app::HostedHandle,
 }
 
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
@@ -159,6 +165,7 @@ pub fn run(
     rx: Receiver<PipelineMsg>,
     stats: crate::stats::StatsBuffer,
     live: Arc<crate::live::LiveManager>,
+    hosted: crate::postprocess_app::HostedHandle,
 ) {
     let queue = match Queue::open() {
         Ok(q) => q,
@@ -191,9 +198,11 @@ pub fn run(
         backend_label,
         config: config.clone(),
         live,
+        hosted,
     };
 
     seed_history(&ctx);
+    import_hosted_outbox(&ctx);
     match ctx.queue.jobs().recover_running() {
         Ok(0) => {}
         Ok(n) => eprintln!("[corti] re-queued {n} background job(s) orphaned by the last shutdown"),
@@ -405,12 +414,30 @@ pub fn run(
                 note_path,
                 error,
             }) => live_discard_cleanup(&ctx, &meta, &note_path, &error),
+            Ok(PipelineMsg::ImportPostprocessOutbox) => import_hosted_outbox(&ctx),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        // Retry pending FK-dependent telemetry after every recording/control wake. Import is idempotent and
+        // acknowledges only rows whose recording already exists.
+        import_hosted_outbox(&ctx);
         drain_due_jobs(&mut ctx);
+    }
+}
+
+fn import_hosted_outbox(ctx: &Ctx) {
+    match ctx.hosted.import_outbox(&ctx.queue) {
+        Ok(imported) if imported > 0 => {
+            let _ = ctx.app.emit("queue-changed", "hosted-history");
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            target: "corti::hosted",
+            error = %format!("{error:#}"),
+            "hosted history outbox import deferred"
+        ),
     }
 }
 
@@ -1269,7 +1296,32 @@ pub(crate) fn transcribe_and_file(
     ctx.stats
         .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
     let transcribe_secs = t0.elapsed().as_secs_f64();
-    let (transcript, _input) = transcribed.context("transcription failed")?;
+    let (raw_transcript, _input) = transcribed.context("transcription failed")?;
+
+    // Hosted final runs strictly after ASR and before the first post-ASR checkpoint. It owns no audio and
+    // every disabled/auth/deadline/error/stale outcome returns this immutable raw transcript. Confirm the
+    // complete generation fence immediately before selecting hosted text for durability.
+    let hosted_snapshot = ctx.hosted.snapshot();
+    if hosted_snapshot.control.master_enabled && hosted_snapshot.control.final_lane.enabled {
+        ctx.queue
+            .set_postprocess_state(id, Some(corti_queue::PostprocessState::Finalizing))
+            .context("publishing final postprocess projection")?;
+    }
+    let mut settled = ctx.hosted.finalize(id, raw_transcript.clone(), false);
+    let mut final_applied = settled.hosted_text_applied;
+    if final_applied && ctx.hosted.mark_final_applied(&settled.call_ids).is_err() {
+        ctx.hosted.abandon_final_result(&settled.call_ids);
+        settled.transcript = raw_transcript;
+        settled.hosted_text_applied = false;
+        settled.fallback_code = Some(corti_postprocess::ErrorCode::Superseded);
+        settled.applied_postprocess =
+            corti_vagus::provenance::AppliedPostprocessProvenance::not_applied(
+                corti_vagus::provenance::FinalPostprocessOutcome::Failed,
+            )
+            .unwrap_or_else(|_| corti_vagus::provenance::AppliedPostprocessProvenance::none());
+        final_applied = false;
+    }
+    let transcript = settled.transcript.clone();
 
     // A recording-scoped live outcome is authoritative when supplied: checkpoint it directly so a second
     // queue read failure cannot lose ownership after expensive ASR. Row-only paths are legacy partials.
@@ -1290,14 +1342,44 @@ pub(crate) fn transcribe_and_file(
         ctx.backend
             .provenance(corti_vagus::provenance::GenerationMode::Batch),
     );
+    checkpoint
+        .set_applied_postprocess(settled.applied_postprocess)
+        .context("attaching settled hosted provenance to checkpoint")?;
+    if let Some(fingerprint) = settled.source_transcript_fingerprint {
+        checkpoint.set_source_transcript_fingerprint(fingerprint);
+    }
+    checkpoint
+        .set_final_attempt_call_ids(settled.call_ids.clone())
+        .context("attaching hosted final call ids to checkpoint")?;
     if let Some(note) = owned_note
         && note.canonical
     {
         checkpoint.set_canonical_note(note.path);
     }
-    checkpoint
+    if let Err(error) = checkpoint
         .store(audio)
-        .context("persisting transcript checkpoint")?;
+        .context("persisting transcript checkpoint")
+    {
+        if final_applied {
+            ctx.hosted.abandon_final_result(&settled.call_ids);
+        }
+        return Err(error);
+    }
+    if final_applied {
+        ctx.hosted.mark_final_checkpointed(&settled.call_ids);
+    }
+    if hosted_snapshot.control.master_enabled && hosted_snapshot.control.final_lane.enabled {
+        ctx.queue
+            .set_postprocess_state(
+                id,
+                Some(if final_applied {
+                    corti_queue::PostprocessState::Complete
+                } else {
+                    corti_queue::PostprocessState::Fallback
+                }),
+            )
+            .context("settling final postprocess projection")?;
+    }
 
     ctx.queue
         .update(

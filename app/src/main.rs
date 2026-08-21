@@ -39,6 +39,8 @@ mod pipeline;
 #[cfg(target_os = "macos")]
 mod postprocess;
 #[cfg(target_os = "macos")]
+mod postprocess_app;
+#[cfg(target_os = "macos")]
 mod postprocess_config;
 #[cfg(target_os = "macos")]
 mod private_file;
@@ -293,9 +295,20 @@ pub(crate) mod imp {
                 crate::stats::get_stats,
                 crate::activity::get_pipeline_activity,
                 crate::live_view::get_live_transcript,
+                crate::postprocess_app::get_hosted_settings,
+                crate::postprocess_app::patch_hosted_settings,
+                crate::postprocess_app::update_hosted_steering,
+                crate::postprocess_app::replace_hosted_word_bank,
+                crate::postprocess_app::update_hosted_provider_scope,
+                crate::postprocess_app::refresh_hosted_provider,
+                crate::postprocess_app::submit_hosted_question,
+                crate::postprocess_app::cancel_hosted_question,
+                crate::postprocess_app::set_hosted_pinned_question,
+                crate::postprocess_app::get_hosted_assistant,
                 crate::live_test::start_live_test,
                 crate::live_test::stop_live_test,
                 crate::queue_ui::list_recordings,
+                crate::queue_ui::get_recording_postprocess_history,
                 crate::queue_ui::retry_recording,
                 crate::queue_ui::open_note,
                 crate::queue_ui::reveal_audio,
@@ -363,14 +376,25 @@ pub(crate) mod imp {
             reload_tx: Mutex::new(pipe_tx.clone()),
         });
 
+        // Hosted coordinator state is separate from AppConfig and starts fail-closed. It owns its bounded
+        // control thread before any live/pipeline producer receives a handle.
+        let (hosted_state, hosted) = crate::postprocess_app::start(
+            app.handle().clone(),
+            live_transcript.clone(),
+            pipe_tx.clone(),
+        )
+        .context("starting hosted post-processing coordinator")?;
+        app.manage(hosted_state);
+
         // Tray + blink (icons swap on the main thread).
         tray::build_tray(app.handle()).context("building tray")?;
         tray::spawn_blink(app.handle().clone());
 
         // Live-filing sessions (#87): the detector hook owns spawn/terminal verdict delivery; the
         // pipeline collects recording-scoped outcomes and owns durable fallback cleanup.
-        let live_manager = Arc::new(crate::live::LiveManager::with_transcript(
+        let live_manager = Arc::new(crate::live::LiveManager::with_transcript_and_hosted(
             live_transcript.clone(),
+            hosted.clone(),
         ));
         app.manage(crate::live_test::LiveTestManager::new(
             live_manager.clone(),
@@ -385,9 +409,10 @@ pub(crate) mod imp {
             let shared_cfg = shared_cfg.clone();
             let stats = stats_buffer.clone();
             let live = live_manager.clone();
+            let hosted = hosted.clone();
             std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
-                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats, live))
+                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats, live, hosted))
                 .context("spawning pipeline worker")?;
         }
 

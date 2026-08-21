@@ -68,6 +68,9 @@ const MAX_DIARIZATION_AUDIO_BYTES: usize = 128 * 1024 * 1024;
 /// Independent cap for recognized words awaiting the next durable append. ASR output per minute is tiny in
 /// practice, but a hard cap makes the memory contract hold even for malformed/model-pathological output.
 const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+/// Bounded in-memory canonical-row assembly used only for the optional final pass after every raw window is
+/// already synced. Exceeding it disables that pass and leaves the existing raw note path unchanged.
+const MAX_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 
 /// How a live session ended, collected by the pipeline worker at `Process` time.
 #[derive(Debug)]
@@ -116,6 +119,7 @@ enum Verdict {
 pub struct LiveManager {
     inner: Mutex<Inner>,
     transcript: LiveTranscriptStore,
+    hosted: Option<crate::postprocess_app::HostedHandle>,
 }
 
 #[derive(Default)]
@@ -247,6 +251,18 @@ impl LiveManager {
         Self {
             inner: Mutex::new(Inner::default()),
             transcript,
+            hosted: None,
+        }
+    }
+
+    pub(crate) fn with_transcript_and_hosted(
+        transcript: LiveTranscriptStore,
+        hosted: crate::postprocess_app::HostedHandle,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            transcript,
+            hosted: Some(hosted),
         }
     }
 
@@ -317,6 +333,7 @@ impl LiveManager {
             let publisher = StorePublisher {
                 store: self.transcript.clone(),
                 id: id.clone(),
+                hosted: self.hosted.clone(),
             };
             let thread = std::thread::Builder::new().name("corti-live".into()).spawn(
                 move || -> LiveOutcome {
@@ -750,6 +767,11 @@ fn session_thread(
     pipe_tx: Sender<PipelineMsg>,
     publisher: StorePublisher,
 ) -> LiveOutcome {
+    // Hosted session setup is off capture/ASR and fails closed. Raw publication and filing do not depend on
+    // this reply; the bounded row handoff below simply remains unavailable for this recording.
+    if let Some(hosted) = publisher.hosted.as_ref() {
+        let _ = hosted.begin_live_session(&publisher.id);
+    }
     let provenance =
         crate::provenance::from_config(&cfg, corti_vagus::provenance::GenerationMode::Live);
     let mut writer =
@@ -774,6 +796,9 @@ fn session_thread(
         LiveOutcome::Fallback { reason, .. } => publisher.error(format!(
             "Live transcript stopped ({reason}); Corti will rebuild it from the recording."
         )),
+    }
+    if let Some(hosted) = publisher.hosted.as_ref() {
+        hosted.end_live_session(&publisher.id);
     }
     outcome
 }
@@ -1169,7 +1194,34 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
 
     match writer.path().cloned() {
         Some(note_path) if quality.dropped_chunks == 0 => {
+            let mut applied_call_ids = Vec::new();
+            if let (Some(hosted), Some(recording_id), Some(raw_transcript)) = (
+                publisher.hosted(),
+                publisher.recording_id(),
+                writer.final_transcript(),
+            ) {
+                let settled = hosted.finalize(recording_id, raw_transcript, true);
+                // A disabled default has no calls and preserves the exact historical flip-only behavior.
+                // An attempted final (success or typed fallback) rewrites once while still transcribing so
+                // provenance and the selected safe body become durable before publication.
+                if settled.hosted_text_applied {
+                    if hosted.mark_final_applied(&settled.call_ids).is_ok() {
+                        if let Err(error) = writer.rewrite_settled_final(&settled) {
+                            hosted.abandon_final_result(&settled.call_ids);
+                            return Err(error);
+                        }
+                        applied_call_ids = settled.call_ids;
+                    } else {
+                        hosted.abandon_final_result(&settled.call_ids);
+                    }
+                } else if !settled.call_ids.is_empty() {
+                    writer.rewrite_settled_final(&settled)?;
+                }
+            }
             corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
+            if let Some(hosted) = publisher.hosted() {
+                hosted.mark_final_checkpointed(&applied_call_ids);
+            }
             info!(
                 target: "corti::live",
                 note_path = %note_path.display(),
@@ -1192,11 +1244,20 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
 
 trait TranscriptPublisher {
     fn words(&self, speaker: Speaker, words: &[Word]);
+
+    fn hosted(&self) -> Option<&crate::postprocess_app::HostedHandle> {
+        None
+    }
+
+    fn recording_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 struct StorePublisher {
     store: LiveTranscriptStore,
     id: String,
+    hosted: Option<crate::postprocess_app::HostedHandle>,
 }
 
 impl StorePublisher {
@@ -1218,7 +1279,22 @@ impl StorePublisher {
 
 impl TranscriptPublisher for StorePublisher {
     fn words(&self, speaker: Speaker, words: &[Word]) {
-        self.store.append_words(&self.id, speaker, words);
+        // Mint/publish the raw rows first. Hosted fan-out is a bounded try_send afterward and can never
+        // delay capture or ASR; saturation merely marks the optional final ledger incomplete.
+        let rows = self.store.append_words(&self.id, speaker, words);
+        if !rows.is_empty()
+            && let Some(hosted) = self.hosted.as_ref()
+        {
+            let _ = hosted.try_observe_finalized_rows(&self.id, rows);
+        }
+    }
+
+    fn hosted(&self) -> Option<&crate::postprocess_app::HostedHandle> {
+        self.hosted.as_ref()
+    }
+
+    fn recording_id(&self) -> Option<&str> {
+        Some(&self.id)
     }
 }
 
@@ -1313,6 +1389,9 @@ struct NoteWriter<F: NoteFiler> {
     provenance: corti_vagus::provenance::TranscriptProvenance,
     pipe_tx: Option<Sender<PipelineMsg>>,
     note: Option<PathBuf>,
+    final_segments: Vec<TranscriptSegment>,
+    final_transcript_bytes: usize,
+    final_transcript_incomplete: bool,
 }
 
 impl<F: NoteFiler> NoteWriter<F> {
@@ -1340,6 +1419,9 @@ impl<F: NoteFiler> NoteWriter<F> {
             provenance,
             pipe_tx,
             note: None,
+            final_segments: Vec::new(),
+            final_transcript_bytes: 0,
+            final_transcript_incomplete: false,
         }
     }
 
@@ -1353,7 +1435,53 @@ impl<F: NoteFiler> NoteWriter<F> {
             self.create()?;
         }
         let chunk = DiarizedTranscript::new(segments.to_vec()).to_markdown();
-        corti_vagus::note::append(self.note.as_ref().expect("just created"), &chunk)
+        corti_vagus::note::append(self.note.as_ref().expect("just created"), &chunk)?;
+        // Record canonical post-diarization rows only after the raw append is durable. This optional
+        // bounded assembly can be dropped wholesale without weakening the note's crash safety.
+        if !self.final_transcript_incomplete {
+            let added = segments.iter().fold(0usize, |total, segment| {
+                total
+                    .saturating_add(segment.text.len())
+                    .saturating_add(segment.speaker.display().len())
+                    .saturating_add(std::mem::size_of::<TranscriptSegment>())
+            });
+            if self.final_transcript_bytes.saturating_add(added) > MAX_FINAL_TRANSCRIPT_BYTES {
+                self.final_segments.clear();
+                self.final_transcript_bytes = 0;
+                self.final_transcript_incomplete = true;
+            } else {
+                self.final_transcript_bytes = self.final_transcript_bytes.saturating_add(added);
+                self.final_segments.extend_from_slice(segments);
+            }
+        }
+        Ok(())
+    }
+
+    fn final_transcript(&self) -> Option<DiarizedTranscript> {
+        (!self.final_transcript_incomplete)
+            .then(|| DiarizedTranscript::new(self.final_segments.clone()))
+    }
+
+    fn rewrite_settled_final(
+        &mut self,
+        settled: &crate::postprocess_app::SettledFinalTranscript,
+    ) -> Result<()> {
+        let path = self.note.as_ref().context("live note is not owned")?;
+        let mut provenance = self.provenance.clone();
+        provenance
+            .set_postprocess(settled.applied_postprocess.clone())
+            .context("attaching live final postprocess provenance")?;
+        let final_body = corti_vagus::recording_body(&self.meta, &settled.transcript);
+        let in_progress_body = final_body.replacen(
+            corti_vagus::note::STATE_TRANSCRIBED,
+            corti_vagus::note::STATE_TRANSCRIBING,
+            1,
+        );
+        corti_vagus::note::CurrentNote::from_returned_path(path.clone())?
+            .rewrite_transcript(&in_progress_body, &provenance)
+            .context("rewriting the live note before final state publication")?;
+        self.provenance = provenance;
+        Ok(())
     }
 
     #[cfg(test)]

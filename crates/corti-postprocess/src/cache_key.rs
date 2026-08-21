@@ -21,6 +21,12 @@ impl DigestKey {
         Self(bytes)
     }
 
+    /// Derive a persistable opaque identity for canonical content. Callers choose a versioned domain and
+    /// never receive either the HMAC key or intermediate canonical bytes.
+    pub fn fingerprint(&self, domain: &[u8], canonical_content: &[u8]) -> KeyedFingerprint {
+        KeyedFingerprint::derive(self, domain, canonical_content)
+    }
+
     pub(crate) fn hmac(&self, domain: &[u8]) -> HmacSha256 {
         let mut mac =
             HmacSha256::new_from_slice(&self.0).expect("SHA-256 HMAC accepts any key size");

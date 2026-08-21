@@ -38,7 +38,7 @@ use corti_postprocess_providers::{
     VertexCredentialState, VertexDispatchDisposition, VertexResolutionAttempt,
     VertexResolutionOutcome, VertexResolverError,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -96,7 +96,7 @@ impl LaneFamily {
         )
     }
 
-    const fn of(lane: Lane) -> Self {
+    pub(crate) const fn of(lane: Lane) -> Self {
         match lane {
             Lane::Live => Self::Live,
             Lane::Final => Self::Final,
@@ -227,6 +227,9 @@ pub(crate) enum ControlPatch {
     },
     SetPinnedAuto(bool),
     SetCodexExperimentalApproved(bool),
+    /// Non-secret provider scope (account alias/project/region) changed. It fences every lane because more
+    /// than one lane may select the same transport.
+    ProviderScopeChanged,
     SteeringChanged,
     BankChanged,
     /// Session-only steering never enters the persisted hosted document, but still fences the next request.
@@ -369,6 +372,10 @@ impl PostprocessControl {
                     return Ok((next, CancellationScope::None));
                 }
                 next.codex_experimental_approved = *approved;
+                bump(&mut next.control_revision)?;
+                CancellationScope::All(CancellationReason::ModelChanged)
+            }
+            ControlPatch::ProviderScopeChanged => {
                 bump(&mut next.control_revision)?;
                 CancellationScope::All(CancellationReason::ModelChanged)
             }
@@ -631,7 +638,7 @@ pub(crate) enum FinalRecoveryDirective {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TerminalOutcomeDto {
     Completed,
@@ -642,17 +649,22 @@ pub(crate) enum TerminalOutcomeDto {
 }
 
 /// Content-free terminal telemetry suitable for the encrypted outbox and eventual queue import.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TerminalTelemetryDto {
     pub(crate) call_id: CallId,
     pub(crate) recording_id: String,
+    pub(crate) request_group_id: corti_postprocess::RequestGroupId,
+    pub(crate) target_id: Option<corti_postprocess::TargetId>,
     pub(crate) lane: Lane,
+    pub(crate) attempt_no: u64,
     pub(crate) fence: RequestFence,
     pub(crate) provider: ProviderId,
     pub(crate) transport: TransportId,
     pub(crate) model: ModelId,
     pub(crate) support_tier: SupportTier,
     pub(crate) adapter_version: u32,
+    pub(crate) prompt_version: u32,
+    pub(crate) output_schema_version: u32,
     pub(crate) outcome: TerminalOutcomeDto,
     pub(crate) error: Option<ErrorCode>,
     pub(crate) provider_request_sent: bool,
@@ -661,7 +673,9 @@ pub(crate) struct TerminalTelemetryDto {
     pub(crate) usage: NormalizedUsage,
     pub(crate) cost: CostEstimate,
     pub(crate) latency: LatencyFields,
-    pub(crate) queued_at_micros: u64,
+    /// Wall time captured when the call entered the coordinator. Monotonic time remains the scheduling
+    /// authority, but durable history needs a process-independent UTC timestamp.
+    pub(crate) queued_at_unix_ms: i64,
     pub(crate) dispatched_at_unix_ms: Option<i64>,
     pub(crate) completed_at_unix_ms: i64,
 }
@@ -932,6 +946,7 @@ enum QueueStage {
 struct QueuedCall {
     sequence: u64,
     queued_at_micros: u64,
+    queued_at_unix_ms: i64,
     eligible_at_micros: u64,
     watermark: TranscriptWatermark,
     descriptor: ProviderDescriptor,
@@ -945,6 +960,7 @@ impl fmt::Debug for QueuedCall {
         f.debug_struct("QueuedCall")
             .field("sequence", &self.sequence)
             .field("queued_at_micros", &self.queued_at_micros)
+            .field("queued_at_unix_ms", &self.queued_at_unix_ms)
             .field("eligible_at_micros", &self.eligible_at_micros)
             .field("watermark", &self.watermark)
             .field("descriptor", &self.descriptor)
@@ -1013,6 +1029,7 @@ pub(crate) struct DispatchTicket {
     descriptor: ProviderDescriptor,
     cancel: CancellationToken,
     queued_at_micros: u64,
+    queued_at_unix_ms: i64,
 }
 
 impl fmt::Debug for DispatchTicket {
@@ -1024,6 +1041,7 @@ impl fmt::Debug for DispatchTicket {
             .field("descriptor", &self.descriptor)
             .field("cancel", &self.cancel)
             .field("queued_at_micros", &self.queued_at_micros)
+            .field("queued_at_unix_ms", &self.queued_at_unix_ms)
             .finish()
     }
 }
@@ -1165,8 +1183,32 @@ impl PostprocessCoordinator {
         providers: Box<dyn ProviderAccess>,
         pricing: Arc<dyn PricingCatalog>,
     ) -> Self {
-        let control = PostprocessControl::new(process_epoch);
-        let session_generation = control.snapshot().session_generation;
+        Self::new_with_snapshot(
+            ControlSnapshotDto::defaults(process_epoch),
+            None,
+            clock,
+            persistence,
+            store,
+            providers,
+            pricing,
+        )
+    }
+
+    /// Restore the already-validated, secret-free hosted document at process startup. This avoids replaying
+    /// Settings patches (and rewriting the file) merely to seed runtime state. Callers must always supply
+    /// the current process epoch; stale persisted epochs are never accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_snapshot(
+        snapshot: ControlSnapshotDto,
+        pinned_template: Option<String>,
+        clock: Arc<dyn CoordinatorClock>,
+        persistence: Box<dyn ControlPersistence>,
+        store: Box<dyn EncryptedPostprocessStore>,
+        providers: Box<dyn ProviderAccess>,
+        pricing: Arc<dyn PricingCatalog>,
+    ) -> Self {
+        let session_generation = snapshot.session_generation;
+        let control = PostprocessControl { snapshot };
         let vertex = VertexCredentialResolver::new(Box::new(VertexClock(clock.clone())));
         let provider_states = provider_support_catalog()
             .into_iter()
@@ -1207,7 +1249,9 @@ impl PostprocessCoordinator {
             last_progress_at_micros: 0,
             pinned: PinnedProgress::new(session_generation),
             pending_pinned_edit: None,
-            pinned_template: None,
+            pinned_template: pinned_template
+                .filter(|text| !text.trim().is_empty())
+                .map(SensitiveText::new),
             ad_hoc: VecDeque::new(),
             awaiting_final_apply: HashMap::new(),
             events: VecDeque::new(),
@@ -1220,6 +1264,61 @@ impl PostprocessCoordinator {
 
     pub(crate) fn provider_states(&self) -> impl Iterator<Item = &ProviderStateDto> {
         self.provider_states.values()
+    }
+
+    pub(crate) fn watermark(&self) -> TranscriptWatermark {
+        self.watermark
+    }
+
+    /// Explicit Settings refresh. Catalog discovery remains injected and returns only typed descriptors;
+    /// credential bytes and provider response bodies can never cross this boundary.
+    pub(crate) fn refresh_provider(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+        scope: &ProviderScope,
+    ) -> Result<ProviderStateDto, ErrorCode> {
+        let descriptor = self
+            .providers
+            .descriptor(provider, transport)
+            .ok_or(ErrorCode::PolicyBlocked)?;
+        if descriptor.support_tier == SupportTier::Blocked
+            || (descriptor.support_tier == SupportTier::Experimental
+                && !(CODEX_APP_SERVER_COMPILED
+                    && self.control.snapshot().codex_experimental_approved))
+        {
+            return Err(ErrorCode::PolicyBlocked);
+        }
+        let credential = if descriptor.transport
+            == corti_postprocess::KnownTransport::VertexDirect
+                .descriptor()
+                .transport
+        {
+            self.vertex.state().credential_state()
+        } else {
+            self.providers.credential_state(provider, transport)
+        };
+        let models = match &credential {
+            CredentialState::Ready { .. } => {
+                self.providers
+                    .catalog(provider, transport, scope)
+                    .map_err(|error| error.code)?
+                    .models
+            }
+            _ => Vec::new(),
+        };
+        let state = ProviderStateDto {
+            descriptor: descriptor.clone(),
+            credential,
+            models,
+            service_error: None,
+        };
+        self.provider_states.insert(
+            (descriptor.provider.clone(), descriptor.transport.clone()),
+            state.clone(),
+        );
+        self.push_event(CoordinatorEventDto::ProviderState(Box::new(state.clone())));
+        Ok(state)
     }
 
     pub(crate) fn take_events(&mut self) -> Vec<CoordinatorEventDto> {
@@ -1242,7 +1341,17 @@ impl PostprocessCoordinator {
                 | ControlPatch::SetLaneEnabled { enabled: false, .. }
                 | ControlPatch::SetPinnedAuto(false)
         );
-        let session_only = matches!(patch, ControlPatch::SessionSteeringChanged);
+        // These payloads are persisted by their narrow owner before this fence-only patch reaches the
+        // coordinator (hosted preferences for scope/default steering, private word-bank document for bank).
+        // Session steering is intentionally memory-only. Rewriting hosted.toml here adds no durability and
+        // could leave newly persisted semantics active under an old fence if that unrelated write failed.
+        let externally_persisted = matches!(
+            patch,
+            ControlPatch::ProviderScopeChanged
+                | ControlPatch::SteeringChanged
+                | ControlPatch::BankChanged
+                | ControlPatch::SessionSteeringChanged
+        );
 
         if disable_first {
             self.control.commit(proposed.clone());
@@ -1258,7 +1367,7 @@ impl PostprocessCoordinator {
                 });
             }
         } else {
-            if !session_only {
+            if !externally_persisted {
                 self.persistence
                     .persist(&proposed)
                     .map_err(|_| ControlError::Persistence)?;
@@ -1310,6 +1419,9 @@ impl PostprocessCoordinator {
         let snapshot = self.control.begin_session()?;
         self.queue.clear();
         self.ad_hoc.clear();
+        for boundary in self.awaiting_final_apply.values() {
+            let _ = self.store.abandon_final(boundary);
+        }
         self.awaiting_final_apply.clear();
         self.vertex.clear_pending();
         self.watermark = TranscriptWatermark::initial(snapshot.session_generation);
@@ -1569,6 +1681,7 @@ impl PostprocessCoordinator {
             .ok_or(SubmitError::ProviderBlocked)?;
         submission.request.fence = self.control.fence(lane, watermark, question_revision);
         let now = self.clock.monotonic_micros();
+        let queued_at_unix_ms = self.clock.unix_millis();
         if lane.is_question() {
             submission.request.deadline = MonotonicDeadline(
                 submission
@@ -1582,6 +1695,7 @@ impl PostprocessCoordinator {
         self.queue.push_back(QueuedCall {
             sequence,
             queued_at_micros: now,
+            queued_at_unix_ms,
             eligible_at_micros: now.saturating_add(debounce_micros),
             watermark,
             descriptor,
@@ -1841,6 +1955,23 @@ impl PostprocessCoordinator {
             state.clone(),
         );
         self.push_event(CoordinatorEventDto::ProviderState(Box::new(state)));
+    }
+
+    /// Clear account/project-scoped catalog data after Settings changes a connection scope. Credential
+    /// readiness may remain valid (notably Vertex ADC), but model availability must be refreshed for the
+    /// new exact scope before another Settings selection is accepted.
+    pub(crate) fn invalidate_provider_scope(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) {
+        let key = (provider.clone(), transport.clone());
+        if let Some(state) = self.provider_states.get_mut(&key) {
+            state.models.clear();
+            state.service_error = None;
+            let state = state.clone();
+            self.push_event(CoordinatorEventDto::ProviderState(Box::new(state)));
+        }
     }
 
     /// Re-check direct credentials only after an injected auth manager reports a change. There is no ambient
@@ -2144,6 +2275,7 @@ impl PostprocessCoordinator {
             descriptor: queued.descriptor,
             cancel,
             queued_at_micros: queued.queued_at_micros,
+            queued_at_unix_ms: queued.queued_at_unix_ms,
         })
     }
 
@@ -2609,21 +2741,38 @@ impl PostprocessCoordinator {
     }
 
     pub(crate) fn mark_final_applied(&mut self, call_id: &CallId) -> Result<(), CoordinatorError> {
-        let Some(boundary) = self.awaiting_final_apply.get(call_id) else {
-            return Err(CoordinatorError::UnknownCall);
-        };
-        if !self
-            .control
-            .fence_controls_are_current(Lane::Final, &boundary.fence)
-        {
-            self.store
-                .abandon_final(boundary)
-                .map_err(|_| CoordinatorError::Store)?;
-            return Err(CoordinatorError::StaleApplication);
+        self.mark_final_group_applied(std::slice::from_ref(call_id))
+    }
+
+    /// Validate every chunk fence before moving any journal row to Applied. Final chunking is
+    /// all-or-nothing; a stale member must not leave a partially-applied journal group.
+    pub(crate) fn mark_final_group_applied(
+        &mut self,
+        call_ids: &[CallId],
+    ) -> Result<(), CoordinatorError> {
+        let mut boundaries = Vec::with_capacity(call_ids.len());
+        for call_id in call_ids {
+            let Some(boundary) = self.awaiting_final_apply.get(call_id) else {
+                return Err(CoordinatorError::UnknownCall);
+            };
+            if !self
+                .control
+                .fence_controls_are_current(Lane::Final, &boundary.fence)
+            {
+                for boundary in &boundaries {
+                    let _ = self.store.abandon_final(boundary);
+                }
+                let _ = self.store.abandon_final(boundary);
+                return Err(CoordinatorError::StaleApplication);
+            }
+            boundaries.push(boundary.clone());
         }
-        self.store
-            .mark_final_applied(boundary)
-            .map_err(|_| CoordinatorError::Store)
+        for boundary in &boundaries {
+            self.store
+                .mark_final_applied(boundary)
+                .map_err(|_| CoordinatorError::Store)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_final_checkpointed(
@@ -3005,13 +3154,18 @@ impl PostprocessCoordinator {
         TerminalTelemetryDto {
             call_id: queued.submission.request.call_id.clone(),
             recording_id: queued.submission.recording_id.clone(),
+            request_group_id: queued.submission.request.group_id.clone(),
+            target_id: queued.submission.request.target_id.clone(),
             lane: queued.submission.request.lane,
+            attempt_no: 1,
             fence: queued.submission.request.fence.clone(),
             provider: queued.submission.request.provider.clone(),
             transport: queued.submission.request.transport.clone(),
             model: queued.submission.request.model.clone(),
             support_tier: queued.descriptor.support_tier,
             adapter_version: queued.submission.adapter_version,
+            prompt_version: corti_postprocess::PROMPT_TEMPLATE_VERSION,
+            output_schema_version: corti_postprocess::OUTPUT_SCHEMA_VERSION,
             outcome,
             error,
             provider_request_sent,
@@ -3020,7 +3174,7 @@ impl PostprocessCoordinator {
             usage,
             cost,
             latency,
-            queued_at_micros: queued.queued_at_micros,
+            queued_at_unix_ms: queued.queued_at_unix_ms,
             dispatched_at_unix_ms,
             completed_at_unix_ms: self.clock.unix_millis(),
         }
@@ -3043,13 +3197,18 @@ impl PostprocessCoordinator {
         TerminalTelemetryDto {
             call_id: ticket.call.request.call_id.clone(),
             recording_id: ticket.call.recording_id.clone(),
+            request_group_id: ticket.call.request.group_id.clone(),
+            target_id: ticket.call.request.target_id.clone(),
             lane: ticket.call.request.lane,
+            attempt_no: 1,
             fence: ticket.call.request.fence.clone(),
             provider: ticket.call.request.provider.clone(),
             transport: ticket.call.request.transport.clone(),
             model: ticket.call.request.model.clone(),
             support_tier: ticket.descriptor.support_tier,
             adapter_version: ticket.call.adapter_version,
+            prompt_version: corti_postprocess::PROMPT_TEMPLATE_VERSION,
+            output_schema_version: corti_postprocess::OUTPUT_SCHEMA_VERSION,
             outcome,
             error,
             provider_request_sent,
@@ -3058,7 +3217,7 @@ impl PostprocessCoordinator {
             usage,
             cost,
             latency,
-            queued_at_micros: ticket.queued_at_micros,
+            queued_at_unix_ms: ticket.queued_at_unix_ms,
             dispatched_at_unix_ms,
             completed_at_unix_ms: self.clock.unix_millis(),
         }
@@ -3252,7 +3411,10 @@ impl Clone for CoordinatorIngress {
 }
 
 pub(crate) enum HotPathCommand {
-    FinalizedRows(Vec<TranscriptRow>),
+    FinalizedRows {
+        recording_id: String,
+        rows: Vec<TranscriptRow>,
+    },
     LiveRequest {
         submission: Box<RequestSubmission>,
         watermark: TranscriptWatermark,
@@ -3262,8 +3424,9 @@ pub(crate) enum HotPathCommand {
 impl fmt::Debug for HotPathCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FinalizedRows(rows) => f
+            Self::FinalizedRows { recording_id, rows } => f
                 .debug_struct("FinalizedRows")
+                .field("recording_id", recording_id)
                 .field("row_count", &rows.len())
                 .finish(),
             Self::LiveRequest {
@@ -4813,18 +4976,14 @@ mod tests {
         assert!(!format!("{apply:?}").contains(sensitive_fixture));
 
         let (ingress, receiver) = CoordinatorIngress::bounded(1);
-        ingress
-            .try_send(HotPathCommand::FinalizedRows(Vec::new()))
-            .unwrap();
-        assert_eq!(
-            ingress.try_send(HotPathCommand::FinalizedRows(Vec::new())),
-            Err(IngressError::Full)
-        );
+        let command = || HotPathCommand::FinalizedRows {
+            recording_id: "fixture-recording".into(),
+            rows: Vec::new(),
+        };
+        ingress.try_send(command()).unwrap();
+        assert_eq!(ingress.try_send(command()), Err(IngressError::Full));
         drop(receiver);
-        assert_eq!(
-            ingress.try_send(HotPathCommand::FinalizedRows(Vec::new())),
-            Err(IngressError::Disconnected)
-        );
+        assert_eq!(ingress.try_send(command()), Err(IngressError::Disconnected));
 
         assert_eq!(
             KnownTransport::ClaudeSubscription.descriptor().support_tier,

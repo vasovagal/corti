@@ -38,6 +38,7 @@ pub(crate) enum SecretBackend {
 /// constants and reports presence separately; TOML never contains key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)] // Explicit Key suffixes keep fixed Keychain slots unambiguous.
 pub(crate) enum SecretPurpose {
     OpenAiApiKey,
     AnthropicApiKey,
