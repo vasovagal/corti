@@ -9,10 +9,13 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: bridge.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: bridge.listen }));
 
 import {
+  cancelHostedQuestion,
+  getHostedAssistant,
   patchHostedSettings,
   refreshHostedProvider,
   replaceHostedWordBank,
   setHostedPinnedQuestion,
+  submitHostedQuestion,
   updateHostedProviderScope,
   updateHostedSteering,
 } from "./api";
@@ -78,6 +81,21 @@ describe("hosted Tauri command bindings", () => {
     await setHostedPinnedQuestion("Synthetic pinned question");
     expect(bridge.invoke).toHaveBeenLastCalledWith("set_hosted_pinned_question", {
       template: "Synthetic pinned question",
+    });
+  });
+
+  it("keeps session-only assistant content inside live-window commands", async () => {
+    await getHostedAssistant();
+    expect(bridge.invoke).toHaveBeenLastCalledWith("get_hosted_assistant");
+
+    await submitHostedQuestion("Synthetic bounded question");
+    expect(bridge.invoke).toHaveBeenLastCalledWith("submit_hosted_question", {
+      question: "Synthetic bounded question",
+    });
+
+    await cancelHostedQuestion("fixture-call-id");
+    expect(bridge.invoke).toHaveBeenLastCalledWith("cancel_hosted_question", {
+      callId: "fixture-call-id",
     });
   });
 });

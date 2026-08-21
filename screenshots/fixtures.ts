@@ -154,7 +154,7 @@ const openAiDirect = {
   service_error: null,
 };
 
-const hostedSettings = {
+export const hostedSettings = {
   state_revision: 12,
   preferences_revision: 7,
   control: {
@@ -331,6 +331,13 @@ export const fixtures: Record<string, unknown> = {
   update_hosted_provider_scope: { status: "unchanged", settings: hostedSettings },
   refresh_hosted_provider: openAiDirect,
   set_hosted_pinned_question: null,
+  get_hosted_assistant: {
+    pinned_run_count: 0,
+    pinned: null,
+    exchanges: [],
+  },
+  submit_hosted_question: "synthetic-question-call",
+  cancel_hosted_question: null,
   get_aws_status: {
     profiles: ["default"],
     selected_profile: null,
@@ -389,4 +396,258 @@ export const fixtures: Record<string, unknown> = {
   reveal_path: null,
   set_models_dir: null,
   download_model: null,
+};
+
+export const syntheticLiveSettings = {
+  ...hostedSettings,
+  state_revision: 24,
+  show_live_metrics_by_default: true,
+  control: {
+    ...hostedSettings.control,
+    process_epoch: 71,
+    session_generation: 3,
+    master_enabled: true,
+    live: {
+      enabled: true,
+      revision: 6,
+      selection: {
+        provider: "openai",
+        transport: "openai_api",
+        model: "fixture-live-v1",
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+    final_lane: {
+      ...hostedSettings.control.final_lane,
+      enabled: true,
+    },
+    questions: {
+      ...hostedSettings.control.questions,
+      enabled: true,
+    },
+  },
+};
+
+export const syntheticLiveTranscript = {
+  protocol_version: 2,
+  process_epoch: 71,
+  session_generation: 3,
+  revision: 42,
+  session_id: "synthetic-live-session",
+  mode: "call",
+  status: "listening",
+  title: "Synthetic planning call · live transcript",
+  detail: "Recording · raw rows publish before optional cleanup",
+  active: true,
+  evicted_lines: 0,
+  retained_from_seq: 1,
+  lines: [
+    {
+      seq: 1,
+      row_id: "synthetic-row-1",
+      speaker: "Me",
+      start_sec: 3.2,
+      end_sec: 7.8,
+      text: "The synthetic inbox note is ready for this fixture.",
+      clean_text: "The synthetic inbox note is ready for this fixture.",
+      rewrite_state: "clean",
+      commit_epoch: 38,
+    },
+    {
+      seq: 2,
+      row_id: "synthetic-row-2",
+      speaker: "Them 1",
+      start_sec: 8.4,
+      end_sec: 13.6,
+      text: "We should ship teh fixture Friday.",
+      clean_text: "We should ship the fixture on Friday.",
+      rewrite_state: "clean",
+      commit_epoch: 42,
+    },
+    {
+      seq: 3,
+      row_id: "synthetic-row-3",
+      speaker: "Me",
+      start_sec: 14.1,
+      end_sec: 20.3,
+      text: "Raw text appears first while the next cleanup is queued.",
+      clean_text: null,
+      rewrite_state: "raw",
+      commit_epoch: 0,
+    },
+  ],
+};
+
+export const syntheticAssistant = {
+  pinned_run_count: 3,
+  pinned: {
+    call_id: "synthetic-pinned-3",
+    as_of_revision: 42,
+    status: "completed",
+    error: null,
+    question: "What decision is currently supported?",
+    answer: "The fixture supports a Friday release after the deterministic checks pass.",
+    cost_label: "Estimated $0.0012",
+    context_truncated: false,
+    usage: {
+      input_tokens: 140,
+      output_tokens: 18,
+      cached_read_tokens: 96,
+      cached_write_tokens: null,
+      reasoning_tokens: null,
+      usage_complete: true,
+    },
+    cache: "provider_read",
+  },
+  exchanges: [
+    {
+      call_id: "synthetic-question-1",
+      as_of_revision: 39,
+      status: "completed",
+      error: null,
+      question: "What remains before release?",
+      answer: "Run the deterministic UI checks and review the raw fallback.",
+      cost_label: "Local cache · no provider request",
+      context_truncated: false,
+      cache: "local",
+    },
+    {
+      call_id: "synthetic-question-2",
+      as_of_revision: 42,
+      status: "running",
+      error: null,
+      question: "Is the newest row clean yet?",
+      answer: null,
+      cost_label: null,
+      context_truncated: false,
+      cache: "none",
+    },
+    {
+      call_id: "synthetic-question-3",
+      as_of_revision: 40,
+      status: "canceled",
+      error: "canceled",
+      question: "Cancel this synthetic question.",
+      answer: null,
+      cost_label: "Cost unavailable",
+      context_truncated: false,
+      cache: "none",
+    },
+    {
+      call_id: "synthetic-question-4",
+      as_of_revision: 41,
+      status: "failed",
+      error: "timeout",
+      question: "Exercise the safe fallback state.",
+      answer: null,
+      cost_label: "Cost unavailable",
+      context_truncated: true,
+      cache: "none",
+    },
+  ],
+};
+
+export const syntheticLiveOverrides: Record<string, unknown> = {
+  get_live_transcript: syntheticLiveTranscript,
+  get_hosted_settings: syntheticLiveSettings,
+  get_hosted_assistant: syntheticAssistant,
+  patch_hosted_settings: { status: "unchanged", settings: syntheticLiveSettings },
+  update_hosted_steering: { status: "unchanged", settings: syntheticLiveSettings },
+};
+
+export const syntheticLiveTerminal = {
+  event: "terminal",
+  call_id: "synthetic-live-call-42",
+  recording_id: "synthetic-live-session",
+  request_group_id: "synthetic-live-group-42",
+  target_id: "synthetic-target-42",
+  lane: "live",
+  attempt_no: 1,
+  fence: {
+    process_epoch: 71,
+    session_generation: 3,
+    transcript_revision: 42,
+    control_revision: 8,
+    lane_revision: 6,
+    steering_revision: 4,
+    bank_revision: 7,
+    question_revision: null,
+  },
+  provider: "openai",
+  transport: "openai_api",
+  model: "fixture-live-v1",
+  support_tier: "documented",
+  adapter_version: 1,
+  prompt_version: 1,
+  output_schema_version: 1,
+  outcome: "completed",
+  error: null,
+  provider_request_sent: true,
+  late_content_discarded: false,
+  cache: "provider_read",
+  usage: {
+    input_tokens: 180,
+    output_tokens: 21,
+    cached_read_tokens: 128,
+    cached_write_tokens: null,
+    reasoning_tokens: null,
+    usage_complete: true,
+  },
+  cost: {
+    billing_basis: "metered_estimate",
+    cost_micros: 1200,
+    currency: "USD",
+    pricing_catalog_version: "synthetic-tariff-v1",
+    tariff_id: "synthetic-live-rate",
+    tariff_effective_at_unix_ms: 1787000000000,
+  },
+  latency: {
+    queue_us: 5000,
+    auth_us: null,
+    cache_lookup_us: 900,
+    connect_us: 14000,
+    ttfb_us: 45000,
+    ttft_us: 80000,
+    stream_us: 210000,
+    parse_us: 1500,
+    cache_commit_us: 2200,
+    total_us: 313600,
+  },
+  queued_at_unix_ms: 1787000000000,
+  dispatched_at_unix_ms: 1787000000005,
+  completed_at_unix_ms: 1787000000314,
+};
+
+export const syntheticGapSnapshot = {
+  ...syntheticLiveTranscript,
+  revision: 44,
+  lines: [
+    ...syntheticLiveTranscript.lines,
+    {
+      seq: 4,
+      row_id: "synthetic-row-4",
+      speaker: "Them 1",
+      start_sec: 21,
+      end_sec: 23,
+      text: "The repaired synthetic row is contiguous again.",
+      clean_text: null,
+      rewrite_state: "raw",
+      commit_epoch: 0,
+    },
+  ],
+};
+
+export const syntheticGapEvent = {
+  ...syntheticGapSnapshot,
+  from_revision: 43,
+  reset: false,
+  line: syntheticGapSnapshot.lines[3],
+  lines: undefined,
+};
+
+export const syntheticVertexNotice = {
+  event: "notice",
+  role: "alert",
+  visible_message: "gcloud token isn't armed",
+  episode: 4,
 };

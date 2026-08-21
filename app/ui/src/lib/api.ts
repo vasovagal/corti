@@ -192,15 +192,28 @@ export type LiveTranscriptStatus =
   | "unavailable"
   | "error";
 
+export type HostedRewriteState = "raw" | "clean";
+
 export interface LiveTranscriptLine {
   seq: number;
+  /** Stable backend identity. Optional while opening snapshots from the protocol-v1 app. */
+  row_id?: string;
   speaker: string;
   start_sec: number;
   end_sec: number;
+  /** Immutable ASR text. Clean text must never replace this field. */
   text: string;
+  clean_text?: string | null;
+  rewrite_state?: HostedRewriteState;
+  /** Changes only when a newly accepted rewrite is committed; used for one-shot presentation. */
+  commit_epoch?: number;
 }
 
 export interface LiveTranscriptSnapshot {
+  /** Protocol-v2 identity fields are optional until every app build emits them. */
+  protocol_version?: number;
+  process_epoch?: number;
+  session_generation?: number;
   revision: number;
   session_id: string | null;
   mode: LiveTranscriptMode;
@@ -214,6 +227,8 @@ export interface LiveTranscriptSnapshot {
 }
 
 export interface LiveTranscriptEvent extends Omit<LiveTranscriptSnapshot, "lines"> {
+  /** When present, this must equal the frontend's current revision before the delta is applied. */
+  from_revision?: number;
   reset: boolean;
   line: LiveTranscriptLine | null;
 }
@@ -430,14 +445,153 @@ export interface HostedProviderScopeUpdate {
   quota_project: string | null;
 }
 
+export type HostedCallLane = "live" | "final" | "ad_hoc_question" | "pinned_question";
+export type HostedLaneState =
+  | "disabled"
+  | "waiting_for_phrase"
+  | "debouncing"
+  | "queued"
+  | "arming"
+  | "catching_up"
+  | "rewriting"
+  | "finalizing"
+  | "clean"
+  | "using_raw"
+  | "failed";
+export type HostedQuestionStatus =
+  | "queued"
+  | "waiting_for_credential"
+  | "running"
+  | "completed"
+  | "canceled"
+  | "failed";
+export type HostedCacheObservation =
+  | "none"
+  | "local"
+  | "provider_read"
+  | "provider_write"
+  | "provider_implicit";
+
+export interface HostedNormalizedUsage {
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cached_read_tokens: number | null;
+  cached_write_tokens: number | null;
+  reasoning_tokens: number | null;
+  usage_complete: boolean;
+}
+
+export interface HostedCostEstimate {
+  billing_basis: HostedBillingBasis;
+  cost_micros: number | null;
+  currency: string | null;
+  pricing_catalog_version: string | null;
+  tariff_id: string | null;
+  tariff_effective_at_unix_ms: number | null;
+}
+
+export interface HostedLatencyFields {
+  queue_us: number | null;
+  auth_us: number | null;
+  cache_lookup_us: number | null;
+  connect_us: number | null;
+  ttfb_us: number | null;
+  ttft_us: number | null;
+  stream_us: number | null;
+  parse_us: number | null;
+  cache_commit_us: number | null;
+  total_us: number | null;
+}
+
+export interface HostedRequestFence {
+  process_epoch: number;
+  session_generation: number;
+  transcript_revision: number;
+  control_revision: number;
+  lane_revision: number;
+  steering_revision: number;
+  bank_revision: number;
+  question_revision: number | null;
+}
+
+export interface HostedAccountingEvent {
+  event: "accounting";
+  call_id: string;
+  lane: HostedCallLane;
+  finality: "provisional" | "final";
+  usage: HostedNormalizedUsage;
+  cost: HostedCostEstimate;
+  late: boolean;
+}
+
+export interface HostedTerminalEvent {
+  event: "terminal";
+  call_id: string;
+  recording_id: string;
+  request_group_id: string;
+  target_id: string | null;
+  lane: HostedCallLane;
+  attempt_no: number;
+  fence: HostedRequestFence;
+  provider: string;
+  transport: string;
+  model: string;
+  support_tier: HostedSupportTier;
+  adapter_version: number;
+  prompt_version: number;
+  output_schema_version: number;
+  outcome: "completed" | "failed" | "canceled" | "superseded" | "timeout";
+  error: HostedErrorCode | null;
+  provider_request_sent: boolean;
+  late_content_discarded: boolean;
+  cache: HostedCacheObservation;
+  usage: HostedNormalizedUsage;
+  cost: HostedCostEstimate;
+  latency: HostedLatencyFields;
+  queued_at_unix_ms: number;
+  dispatched_at_unix_ms: number | null;
+  completed_at_unix_ms: number;
+}
+
 export type HostedCoordinatorEvent =
+  | ({ event: "control_changed" } & HostedControlSnapshot)
+  | ({ event: "provider_state" } & HostedProviderState)
+  | {
+      event: "lane_state";
+      lane: HostedCallLane;
+      state: HostedLaneState;
+      code: HostedErrorCode | null;
+    }
   | {
       event: "notice";
       role: "alert";
       visible_message: string;
       episode: number;
     }
+  | HostedAccountingEvent
+  | HostedTerminalEvent
+  | { event: "persistence_warning"; code: HostedErrorCode }
   | { event: string; [field: string]: unknown };
+
+export interface HostedAssistantExchange {
+  call_id: string;
+  as_of_revision: number;
+  status: HostedQuestionStatus;
+  error: HostedErrorCode | null;
+  question: string;
+  answer: string | null;
+  cost_label: string | null;
+  /** Protocol-v2 additions are optional against an older coordinator. */
+  context_truncated?: boolean;
+  usage?: HostedNormalizedUsage | null;
+  cache?: HostedCacheObservation | null;
+}
+
+export interface HostedAssistantSnapshot {
+  pinned_run_count: number;
+  pinned: HostedAssistantExchange | null;
+  exchanges: HostedAssistantExchange[];
+}
 
 export const getHostedSettings = (): Promise<HostedSettingsDto> =>
   invoke<HostedSettingsDto>("get_hosted_settings");
@@ -489,6 +643,15 @@ export const refreshHostedProvider = (
 
 export const setHostedPinnedQuestion = (template: string): Promise<void> =>
   invoke<void>("set_hosted_pinned_question", { template });
+
+export const getHostedAssistant = (): Promise<HostedAssistantSnapshot> =>
+  invoke<HostedAssistantSnapshot>("get_hosted_assistant");
+
+export const submitHostedQuestion = (question: string): Promise<string> =>
+  invoke<string>("submit_hosted_question", { question });
+
+export const cancelHostedQuestion = (callId: string): Promise<void> =>
+  invoke<void>("cancel_hosted_question", { callId });
 
 export const onHostedStateChanged = (
   handler: (event: HostedCoordinatorEvent) => void,

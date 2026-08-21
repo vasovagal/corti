@@ -3,6 +3,7 @@ import type { LiveTranscriptEvent, LiveTranscriptSnapshot } from "./api";
 import {
   applyLiveEvent,
   applyLiveSnapshot,
+  reduceLiveEvent,
   formatLiveRange,
   formatLiveTimestamp,
 } from "./liveTranscript";
@@ -115,6 +116,65 @@ describe("live transcript race/retention reducer", () => {
       }),
     );
     expect(next.lines.map((line) => line.text)).toEqual(["earlier", "later"]);
+  });
+
+  it("retains raw rows and requests repair on revision gaps or process changes", () => {
+    const current = snapshot({
+      process_epoch: 10,
+      revision: 8,
+      lines: [{ seq: 8, speaker: "Me", start_sec: 1, end_sec: 2, text: "raw retained" }],
+    });
+    const gap = reduceLiveEvent(current, event({ revision: 10, process_epoch: 10 }));
+    expect(gap.outcome).toBe("gap");
+    expect(gap.snapshot).toBe(current);
+    expect(gap.snapshot?.lines[0].text).toBe("raw retained");
+
+    const process = reduceLiveEvent(current, event({ revision: 1, process_epoch: 11 }));
+    expect(process.outcome).toBe("process_change");
+    expect(process.snapshot).toBe(current);
+  });
+
+  it("uses from_revision when supplied and never lets a clean upsert mutate immutable raw text", () => {
+    const current = snapshot({
+      revision: 8,
+      lines: [
+        {
+          seq: 1,
+          row_id: "row-1",
+          speaker: "Me",
+          start_sec: 1,
+          end_sec: 2,
+          text: "immutable raw",
+        },
+      ],
+    });
+    const reduced = reduceLiveEvent(
+      current,
+      event({
+        from_revision: 8,
+        revision: 10,
+        line: {
+          seq: 1,
+          row_id: "row-1",
+          speaker: "Changed speaker",
+          start_sec: 9,
+          end_sec: 10,
+          text: "attempted replacement",
+          clean_text: "accepted clean",
+          rewrite_state: "clean",
+          commit_epoch: 10,
+        },
+      }),
+    );
+    expect(reduced.outcome).toBe("applied");
+    expect(reduced.snapshot?.lines[0]).toMatchObject({
+      speaker: "Me",
+      start_sec: 1,
+      end_sec: 2,
+      text: "immutable raw",
+      clean_text: "accepted clean",
+      commit_epoch: 10,
+    });
   });
 });
 
