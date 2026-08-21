@@ -34,8 +34,8 @@ shipping providers would misstate product/legal support and cost.
 3. **Keep Vagus authority narrow.** Only `corti-vagus` may read/rewrite the path Vagus returned for the current
    recording. Provider adapters receive typed rows and return typed replacements/metadata; they never see a
    note path or touch Vagus/index state. No other vault read/write is permitted.
-4. **Make provider support status part of the contract.** Vertex direct API, OpenAI direct API, and Anthropic
-   direct API are documented transports. Codex app-server/device code is compile- and approval-gated
+4. **Make provider support status part of the contract.** Vertex direct API, OpenAI direct API, Anthropic
+   direct API, and Amazon Bedrock are documented transports. Codex app-server/device code is compile- and approval-gated
    experimental support; it owns token persistence/refresh and must use local stdio, a dedicated private home,
    OS keyring, an empty private cwd, and denied tools/approvals. Claude subscription routing is blocked with no
    adapter/import command absent written Anthropic permission. Direct API billing must not masquerade as
@@ -62,6 +62,21 @@ shipping providers would misstate product/legal support and cost.
    never HAL/capture/writer/live-ASR threads. The pipeline remains the sole `queue.db` writer and may wait for
    a final response without performing network/auth work itself.
 
+### Amendment — Amazon Bedrock joins the documented transports (2026-08-21)
+
+Bedrock is a fifth documented transport. Decision 4's list now includes it, and decision 8's split is
+preserved rather than excepted: `ConverseStream` is SigV4-signed over the existing sync `HttpTransport`
+rather than through `aws-sdk-bedrockruntime`, which would pull the Smithy async runtime into the
+runtime-free provider crate. AWS credential *resolution* stays in the app layer, where `aws-config`
+already lives for the Transcribe backend, and reaches the adapter through an injected trait — the
+provider crate still performs no ambient discovery.
+
+Bedrock's credential surface is wider than one pasted key: default chain, named profile, static key pair,
+assumed role, and IAM Identity Center. That made it the work that finally builds the secure-entry sheet and
+Keychain wrapper decision 5 approved, which also retires the disabled OpenAI/Anthropic key buttons.
+`hosted.toml` gains the credential mode, profile name, region, and role ARN; key material stays in the
+Keychain, unchanged in kind from the other direct providers.
+
 ## Consequences
 
 - Live cleanup latency is phrase-closure latency; Corti does not invent unstable ASR partials.
@@ -73,6 +88,9 @@ shipping providers would misstate product/legal support and cost.
   experimental until OpenAI approves and supports the use.
 - Keychain/AppKit integration and an encrypted cache store add macOS-specific code, but they prevent secret
   exposure to the webview/config and preserve Corti's Apple-only platform stance.
+- SigV4 and the `vnd.amazon.eventstream` decoder are Corti's own ~350 lines rather than an AWS dependency.
+  They are pure and table-tested against AWS's published vectors, but they must track any future change to
+  the signing or framing contract.
 - Provider retention, training, residency, and regulated-data suitability remain account/model release gates.
   Corti cannot erase provider-side cache or guarantee cancellation prevented billing.
 - Queue schema additions are content-free and additive; existing recording status strings remain unchanged so
