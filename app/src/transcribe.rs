@@ -175,7 +175,6 @@ impl Backend {
 
         let cfg = LocalConfig {
             model_dir: self.cfg.local_model_dir.clone(),
-            provider: self.cfg.local_provider.clone(),
             num_threads: self.cfg.local_threads,
             diarize_far_end: self.cfg.local_diarize_far_end,
             embedding_model: self.cfg.local_embedding_model.clone(),

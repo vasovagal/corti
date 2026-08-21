@@ -61,9 +61,6 @@ pub struct AppConfig {
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_model_dir: Option<PathBuf>,
-    /// ONNX Runtime provider for the local backend (`CORTI_LOCAL_PROVIDER`, default `cpu`; `coreml` opt-in).
-    #[cfg_attr(not(feature = "local"), allow(dead_code))]
-    pub local_provider: String,
     /// Local inference thread count for sherpa or transcribe.cpp (`CORTI_LOCAL_THREADS`, default 4).
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub local_threads: i32,
@@ -140,7 +137,6 @@ impl Default for AppConfig {
             aws_profile: None,
             aws_region: None,
             local_model_dir: None,
-            local_provider: "cpu".to_string(),
             local_threads: 4,
             local_diarize_far_end: false,
             local_embedding_model: default_embedding_model(),
@@ -198,9 +194,6 @@ impl AppConfig {
         }
         if let Some(v) = env_non_empty("CORTI_LOCAL_MODEL_DIR") {
             cfg.local_model_dir = Some(PathBuf::from(v));
-        }
-        if let Some(v) = env_non_empty("CORTI_LOCAL_PROVIDER") {
-            cfg.local_provider = v;
         }
         if let Some(n) = env_non_empty("CORTI_LOCAL_THREADS")
             .and_then(|s| s.parse::<i32>().ok())
@@ -361,7 +354,6 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_AWS_BUCKET", "aws_bucket"),
         ("CORTI_LANGUAGE", "language"),
         ("CORTI_LOCAL_MODEL_DIR", "local_model_dir"),
-        ("CORTI_LOCAL_PROVIDER", "local_provider"),
         ("CORTI_LOCAL_THREADS", "local_threads"),
         ("CORTI_LOCAL_DIARIZE", "local_diarize_far_end"),
         ("CORTI_LOCAL_EMBEDDING", "local_embedding_model"),
@@ -458,7 +450,6 @@ mod tests {
             "CORTI_AWS_BUCKET",
             "CORTI_LANGUAGE",
             "CORTI_LOCAL_MODEL_DIR",
-            "CORTI_LOCAL_PROVIDER",
             "CORTI_LOCAL_THREADS",
             "CORTI_LOCAL_DIARIZE",
             "CORTI_LOCAL_EMBEDDING",
@@ -489,7 +480,6 @@ mod tests {
             aws_profile: Some("scientist".into()),
             aws_region: Some("us-west-2".into()),
             local_model_dir: Some(PathBuf::from("/tmp/models")),
-            local_provider: "coreml".into(),
             local_threads: 8,
             local_diarize_far_end: true,
             local_embedding_model: "wespeaker-resnet34".into(),
@@ -529,11 +519,24 @@ mod tests {
         let cfg: AppConfig = toml::from_str("language = \"fr-FR\"\n").unwrap();
         let d = AppConfig::default();
         assert_eq!(cfg.language, "fr-FR"); // the one present key
-        assert_eq!(cfg.local_provider, d.local_provider); // everything else = default
-        assert_eq!(cfg.local_threads, d.local_threads);
+        assert_eq!(cfg.local_threads, d.local_threads); // everything else = default
         assert_eq!(cfg.aec_enabled, d.aec_enabled);
         assert_eq!(cfg.transcribe_backend, d.transcribe_backend);
         assert_eq!(cfg.aws_bucket, None);
+    }
+
+    /// A `config.toml` written before CoreML was retired still carries `local_provider`. The container's
+    /// `#[serde(default)]` has no `deny_unknown_fields`, so the removed key is ignored rather than failing
+    /// the load and silently resetting every other setting to its default.
+    #[test]
+    fn retired_local_provider_key_still_loads() {
+        let cfg: AppConfig =
+            toml::from_str("local_provider = \"coreml\"\nlocal_threads = 8\n").unwrap();
+        assert_eq!(cfg.local_threads, 8);
+        assert_eq!(
+            cfg.transcribe_backend,
+            AppConfig::default().transcribe_backend
+        );
     }
 
     #[test]

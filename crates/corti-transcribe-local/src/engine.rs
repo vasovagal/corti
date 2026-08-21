@@ -26,6 +26,9 @@ use crate::models::Models;
 
 /// All ONNX models run at 16 kHz mono.
 pub(crate) const TARGET_RATE: i32 = 16_000;
+/// ONNX Runtime execution provider. CPU is the only one corti ships — CoreML was measured slower and is
+/// impossible with the static onnxruntime lib we link (design/adr/0003, 2026-08-21 addendum).
+const PROVIDER: &str = "cpu";
 /// Silero VAD window (samples at 16 kHz). 512 is the value Silero v4/v5 expect.
 pub(crate) const VAD_WINDOW: usize = 512;
 /// Cap a single speech segment so ASR stays under Parakeet's offline clip limit (~30 s).
@@ -41,14 +44,13 @@ pub fn resample_to_16k(samples: &[f32], from_hz: i32) -> Result<Vec<f32>> {
     Ok(resampler.resample(samples, true))
 }
 
-/// Build the Parakeet-TDT offline recognizer (CPU by default; `coreml` opt-in via `provider`).
+/// Build the Parakeet-TDT offline recognizer.
 ///
 /// Decoding overrides are optional: `decoding = None` (and the other `None`s) leaves sherpa-onnx's defaults
 /// untouched (today's greedy path, byte-identical). `Some("modified_beam_search")` + `max_active_paths`
 /// enables beam search; `blank_penalty` tunes the transducer's blank bias.
 pub fn build_recognizer(
     m: &Models,
-    provider: &str,
     num_threads: i32,
     decoding: Option<&str>,
     max_active_paths: Option<i32>,
@@ -62,7 +64,7 @@ pub fn build_recognizer(
     };
     config.model_config.tokens = Some(path_str(&m.parakeet_tokens));
     config.model_config.model_type = Some("nemo_transducer".to_string());
-    config.model_config.provider = Some(provider.to_string());
+    config.model_config.provider = Some(PROVIDER.to_string());
     config.model_config.num_threads = num_threads;
     if let Some(d) = decoding {
         config.decoding_method = Some(d.to_string());
@@ -75,11 +77,11 @@ pub fn build_recognizer(
     }
     let started = std::time::Instant::now();
     let rec = OfflineRecognizer::create(&config)
-        .context("failed to create the Parakeet recognizer (check model files / provider)")?;
+        .context("failed to create the Parakeet recognizer (check model files)")?;
     tracing::info!(
         target: "corti::transcribe::local",
         model = "parakeet",
-        provider,
+        provider = PROVIDER,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "model loaded"
     );
@@ -89,12 +91,7 @@ pub fn build_recognizer(
 /// Build a fresh Silero VAD (stateful — one per channel). `threshold` is the speech-probability cutoff and
 /// `min_silence` the trailing-silence (seconds) that closes a speech region; both default to Silero's
 /// values (0.5 / 0.25) at the [`crate::LocalConfig`] level so behaviour is unchanged unless tuned.
-pub fn build_vad(
-    m: &Models,
-    provider: &str,
-    threshold: f32,
-    min_silence: f32,
-) -> Result<VoiceActivityDetector> {
+pub fn build_vad(m: &Models, threshold: f32, min_silence: f32) -> Result<VoiceActivityDetector> {
     let silero = SileroVadModelConfig {
         model: Some(path_str(&m.vad)),
         threshold,
@@ -108,7 +105,7 @@ pub fn build_vad(
         ten_vad: Default::default(),
         sample_rate: TARGET_RATE,
         num_threads: 1,
-        provider: Some(provider.to_string()),
+        provider: Some(PROVIDER.to_string()),
         debug: false,
     };
     // Buffer up to MAX_SPEECH_SECONDS of audio internally.
@@ -118,7 +115,7 @@ pub fn build_vad(
     tracing::info!(
         target: "corti::transcribe::local",
         model = "silero_vad",
-        provider,
+        provider = PROVIDER,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "model loaded"
     );
@@ -131,7 +128,6 @@ pub fn build_vad(
 /// speakers), lower splits more; tunable via `CORTI_LOCAL_DIARIZE_THRESHOLD` to address over-clustering (#18).
 pub fn build_diarizer(
     m: &Models,
-    provider: &str,
     num_threads: i32,
     threshold: f32,
     num_clusters: i32,
@@ -145,13 +141,13 @@ pub fn build_diarizer(
             },
             num_threads,
             debug: false,
-            provider: Some(provider.to_string()),
+            provider: Some(PROVIDER.to_string()),
         },
         embedding: SpeakerEmbeddingExtractorConfig {
             model: Some(path_str(&m.embedding)),
             num_threads,
             debug: false,
-            provider: Some(provider.to_string()),
+            provider: Some(PROVIDER.to_string()),
         },
         // `num_clusters < 0` (default) estimates the far-end speaker count via the clustering `threshold`;
         // a value `> 0` pins a known count.
@@ -168,7 +164,7 @@ pub fn build_diarizer(
     tracing::info!(
         target: "corti::transcribe::local",
         model = "diarizer",
-        provider,
+        provider = PROVIDER,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "model loaded"
     );
@@ -337,7 +333,7 @@ mod tests {
                 embedding,
                 vad: PathBuf::new(),
             };
-            let diar = build_diarizer(&m, "cpu", 1, 0.5, -1, 0.3, 0.5);
+            let diar = build_diarizer(&m, 1, 0.5, -1, 0.3, 0.5);
             assert!(
                 diar.is_ok(),
                 "embedding {id} ({}) failed to load: {:?}",

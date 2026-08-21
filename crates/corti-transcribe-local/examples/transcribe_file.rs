@@ -4,9 +4,8 @@
 //! ```sh
 //! # models default to ~/Library/Caches/corti/models (fetch once with fetch-models.sh):
 //! cargo run -p corti-transcribe-local --example transcribe_file -- /path/to/recording.wav
-//! # or point at an explicit model dir, and pick the provider:
-//! CORTI_LOCAL_PROVIDER=cpu \
-//!   cargo run -p corti-transcribe-local --example transcribe_file -- recording.wav /path/to/models
+//! # or point at an explicit model dir:
+//! cargo run -p corti-transcribe-local --example transcribe_file -- recording.wav /path/to/models
 //! ```
 
 use std::path::PathBuf;
@@ -26,7 +25,6 @@ fn main() -> Result<()> {
 
     let cfg = LocalConfig {
         model_dir,
-        provider: std::env::var("CORTI_LOCAL_PROVIDER").unwrap_or_else(|_| "cpu".to_string()),
         ..LocalConfig::default()
     };
 
@@ -38,11 +36,7 @@ fn main() -> Result<()> {
         audio_path: audio.clone(),
     };
 
-    eprintln!(
-        "transcribing {} locally (provider={})…",
-        audio.display(),
-        cfg.provider
-    );
+    eprintln!("transcribing {} locally…", audio.display());
     let transcript = LocalTranscriber::new(cfg).transcribe(&audio, &meta)?;
     print!("{}", transcript.to_markdown());
     Ok(())

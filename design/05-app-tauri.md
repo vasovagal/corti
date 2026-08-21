@@ -184,7 +184,7 @@ Crate `app/` = package `corti-app`, binary `corti` (`publish = false`). Layout:
 - `src/transcribe.rs` — runtime backend dispatch (`Backend::transcribe` matches a `BackendKind`); AWS
   builds `SdkConfig` once and passes the recording id as the stable `AwsOptions.job_name`.
 - `src/config.rs` — env config (`CORTI_TRANSCRIBE_BACKEND`, `CORTI_AWS_BUCKET`, `CORTI_LANGUAGE`,
-  `CORTI_LOCAL_MODEL_DIR`, `CORTI_LOCAL_PROVIDER`, `CORTI_LOCAL_THREADS`).
+  `CORTI_LOCAL_MODEL_DIR`, `CORTI_LOCAL_THREADS`).
 - `src/permissions.rs` — startup mic check via `tauri-plugin-macos-permissions` (host-side, no JS); only
   *requests* when running bundled (calling `request_microphone_permission` unbundled crashes — no plist).
 - `Info.plist` (auto-merged: `LSUIElement`, `NSAudioCaptureUsageDescription`, `NSMicrophoneUsageDescription`),

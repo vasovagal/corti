@@ -64,14 +64,6 @@ fn local(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
         "asr_engine".into(),
         Value::String(cfg.local_asr_engine.clone()),
     );
-    configuration.insert(
-        "provider".into(),
-        Value::String(if wants_ggml {
-            "metal".to_string()
-        } else {
-            corti_transcribe_local::effective_provider(&cfg.local_provider).to_string()
-        }),
-    );
     configuration.insert("threads".into(), Value::from(i64::from(cfg.local_threads)));
     configuration.insert(
         "diarize_far_end".into(),
@@ -248,7 +240,7 @@ mod tests {
             provenance.models.speaker_embedding.as_ref().unwrap().id,
             "wespeaker-resnet34"
         );
-        assert_eq!(provenance.configuration["provider"], "metal");
+        assert_eq!(provenance.configuration["asr_engine"], "ggml");
         assert_eq!(provenance.configuration["threads"], 6);
         assert_eq!(provenance.configuration["live_buffer_minutes"], 3);
         assert_eq!(provenance.configuration["input"], "live_pcm_stream");

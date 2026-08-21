@@ -123,3 +123,26 @@ sherpa-onnx remains Corti's Silero VAD and optional pyannote/embedding diarizati
 upgrade-safe ASR config default so existing installs do not suddenly require a new 740 MB model. Standard
 builds expose both ASR choices; see ADR 0011 for the exact upstream revision, model digest, benchmark, and
 real-call gate before any future default flip.
+
+## Addendum (2026-08-21): the CoreML escape hatch is removed — CPU is the only ONNX provider
+
+**Supersedes** the Decision's "Default execution provider `cpu`; `coreml` is an opt-in config knob" and the
+2026-06-08 addendum's `coreml-lib` escape hatch. Both are withdrawn; the provider is no longer configurable.
+
+Nothing above is retracted on the merits — the 2026-06-08 measurements stand, and they are the reason. A knob
+whose only reachable value is `cpu` costs a config field, an env var, a cargo feature, a `build.rs`, a
+provenance field, and a fallback-mapping function to express a constant. That surface has never been used to
+ship anything and, per the same addendum, *cannot* be without first replacing the static onnxruntime lib.
+
+Removed: the `coreml-lib` cargo feature and `crates/corti-transcribe-local/build.rs`; `LocalConfig::provider`
+and the `provider` threading through `engine::build_{recognizer,vad,diarizer}` (now the private
+`engine::PROVIDER` constant); `resolve_provider` / `effective_provider`; `AppConfig::local_provider`,
+`CORTI_LOCAL_PROVIDER`, and the `--provider` flag on `corti-bench`; the `provider` key in transcript
+provenance, which `asr_engine` already implies (`sherpa` ⇒ ONNX/CPU, `ggml` ⇒ GGML/Metal).
+
+A persisted `config.toml` carrying `local_provider` still loads: `AppConfig` is `#[serde(default)]` without
+`deny_unknown_fields`, so the retired key is ignored rather than failing the load
+(`config.rs::retired_local_provider_key_still_loads`).
+
+Re-evaluating CoreML now means reverting this addendum on top of the 2026-06-08 recipe, not flipping a knob.
+The prerequisite is unchanged and unmet: a CoreML-capable sherpa-onnx lib.

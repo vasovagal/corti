@@ -822,7 +822,6 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
 
     let local_cfg = LocalConfig {
         model_dir: cfg.local_model_dir.clone(),
-        provider: cfg.local_provider.clone(),
         num_threads: cfg.local_threads,
         diarize_far_end: cfg.local_diarize_far_end,
         embedding_model: cfg.local_embedding_model.clone(),

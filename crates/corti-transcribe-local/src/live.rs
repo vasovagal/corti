@@ -272,7 +272,6 @@ fn absolute_offset_sec(vad_base_samples: u64, segment_start: u64) -> f64 {
 pub struct LiveEngine {
     rec: Arc<Asr>,
     models: crate::models::Models,
-    provider: String,
     vad_threshold: f32,
     vad_min_silence: f32,
     diarizer: Option<OfflineSpeakerDiarization>,
@@ -282,7 +281,6 @@ impl LiveEngine {
     pub(crate) fn new(
         rec: Asr,
         models: crate::models::Models,
-        provider: String,
         vad_threshold: f32,
         vad_min_silence: f32,
         diarizer: Option<OfflineSpeakerDiarization>,
@@ -290,7 +288,6 @@ impl LiveEngine {
         Self {
             rec: Arc::new(rec),
             models,
-            provider,
             vad_threshold,
             vad_min_silence,
             diarizer,
@@ -299,12 +296,7 @@ impl LiveEngine {
 
     /// Spawn a [`LiveTranscriber`] for one channel: a fresh Silero VAD sharing the resident recognizer.
     pub fn channel(&self) -> Result<LiveTranscriber> {
-        let vad = engine::build_vad(
-            &self.models,
-            &self.provider,
-            self.vad_threshold,
-            self.vad_min_silence,
-        )?;
+        let vad = engine::build_vad(&self.models, self.vad_threshold, self.vad_min_silence)?;
         Ok(LiveTranscriber::new(self.rec.clone(), vad))
     }
 
@@ -455,9 +447,9 @@ mod tests {
         let m = crate::models::discover_for(dir, engine != "ggml", false, "titanet")
             .expect("discover models");
         let rec = match engine.as_str() {
-            "sherpa" => Asr::Sherpa(
-                engine::build_recognizer(&m, "cpu", 4, None, None, None).expect("recognizer"),
-            ),
+            "sherpa" => {
+                Asr::Sherpa(engine::build_recognizer(&m, 4, None, None, None).expect("recognizer"))
+            }
             #[cfg(feature = "ggml")]
             "ggml" => {
                 let path = crate::ggml::resolve_gguf(None, dir).expect("resolve GGUF");
@@ -594,18 +586,14 @@ mod tests {
         let (m, rec) = verify_engine(&dir);
 
         // Whole-channel push (the batch path).
-        let mut whole = LiveTranscriber::new(
-            rec.clone(),
-            engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"),
-        );
+        let mut whole =
+            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
         whole.push(&mono, rate);
         let words_whole = whole.finish();
 
         // Same audio in irregular chunks straddling 512-sample window boundaries.
-        let mut chunked = LiveTranscriber::new(
-            rec.clone(),
-            engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"),
-        );
+        let mut chunked =
+            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
         let mut i = 0;
         for (n, step) in [377usize, 512, 100, 999, 1, 4096]
             .iter()
@@ -647,8 +635,7 @@ mod tests {
         let rec = Arc::new(Asr::Ggml(
             crate::ggml::GgmlAsr::load(&path, 4).expect("GGML recognizer"),
         ));
-        let mut live =
-            LiveTranscriber::new(rec, engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"));
+        let mut live = LiveTranscriber::new(rec, engine::build_vad(&m, 0.5, 1.0).expect("vad"));
 
         let boundary = (rate as usize * 60).min(mono.len() / 2);
         let end = (boundary + rate as usize * 60).min(mono.len());
@@ -696,10 +683,8 @@ mod tests {
         );
 
         let (m, rec) = verify_engine(&dir);
-        let mut live = LiveTranscriber::new(
-            rec.clone(),
-            engine::build_vad(&m, "cpu", 0.5, 1.0).expect("vad"),
-        );
+        let mut live =
+            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
 
         // First half at the source rate (builds a resampler), then the rest pre-resampled to 16 kHz and
         // pushed as 16 kHz — the switch that must flush the resampler's held tail in order.

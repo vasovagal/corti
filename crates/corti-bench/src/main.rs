@@ -62,8 +62,6 @@ struct ProcessArgs {
     keep_clean: bool,
 
     // --- LocalConfig knobs ---
-    #[arg(long, default_value = "cpu")]
-    provider: String,
     #[arg(long, default_value_t = 4)]
     threads: i32,
     /// Diarize the far-end channel into Them 1/2/… (loads pyannote + embedding models).
@@ -250,7 +248,6 @@ fn run_process(a: ProcessArgs) -> Result<()> {
 
 fn local_config(a: &ProcessArgs) -> LocalConfig {
     let mut c = LocalConfig {
-        provider: a.provider.clone(),
         num_threads: a.threads,
         diarize_far_end: a.diarize,
         asr_engine: a.asr_engine.clone(),
@@ -295,7 +292,6 @@ fn local_config(a: &ProcessArgs) -> LocalConfig {
 
 fn local_config_json(c: &LocalConfig) -> serde_json::Value {
     serde_json::json!({
-        "provider": c.provider,
         "num_threads": c.num_threads,
         "diarize_far_end": c.diarize_far_end,
         "embedding_model": c.embedding_model,
