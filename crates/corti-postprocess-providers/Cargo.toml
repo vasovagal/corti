@@ -1,6 +1,6 @@
 [package]
 name = "corti-postprocess-providers"
-description = "Injected HTTP and broker adapters for Corti hosted transcript post-processing."
+description = "Injected direct-provider adapters for Corti hosted transcript post-processing."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 corti-postprocess = { workspace = true }
-base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,6 +18,5 @@ zeroize = { workspace = true }
 
 [features]
 default = []
-# Codex app-server is experimental and unsupported for production workloads. Compiling this feature
-# does not approve or enable it; construction also requires an explicit product-approval value.
+# Reserved off-by-default marker only. Codex remains experimental and has no adapter in this slice.
 codex-experimental = []

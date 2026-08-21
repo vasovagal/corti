@@ -1518,7 +1518,6 @@ dependencies = [
 name = "corti-postprocess-providers"
 version = "0.13.0"
 dependencies = [
- "base64 0.22.1",
  "corti-postprocess",
  "serde",
  "serde_json",
