@@ -37,7 +37,8 @@ signals. Exactly what this app does: audio → notes.
   engine in Settings (or with `CORTI_TRANSCRIBE_BACKEND` / `CORTI_LOCAL_ASR_ENGINE`).
 - **Standalone `corti-tap` CLI.** Force-tap system audio to a WAV on demand
   (`corti-tap --inbox` to transcribe + file, `--no-mic` for listen-only webinars,
-  `--label` to name it).
+  `--label` to name it). `--inbox` transcribes locally unless
+  `CORTI_TRANSCRIBE_BACKEND=aws` picks the cloud backend.
 - **Timestamped live reader + microphone test.** During a local call, choose **Read live transcript…**
   from the tray to follow call-relative **Me** / **Them 1** rows as speech regions close. While idle, the same
   tray action runs an ephemeral microphone/ASR test: microphone only, with no audio file, queue row, or note.

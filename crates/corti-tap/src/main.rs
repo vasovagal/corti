@@ -324,30 +324,77 @@ fn print_words(label: &str, words: &[corti_transcribe_local::Word]) {
     let _ = out.flush();
 }
 
+/// Which backend `--inbox` transcribes with. Variants track the compiled features so a slim build cannot
+/// name a backend it does not link.
+#[cfg(feature = "inbox")]
+#[derive(Clone, Copy)]
+enum InboxBackend {
+    #[cfg(feature = "inbox-aws")]
+    Aws,
+    #[cfg(feature = "inbox-local")]
+    Local,
+}
+
+/// Resolve the backend from `CORTI_TRANSCRIBE_BACKEND`, reusing the app's `aws` | `local` grammar. Unset
+/// prefers `local` exactly as the app does, so the CLI transcribes with no cloud account out of the box.
+#[cfg(feature = "inbox")]
+fn inbox_backend() -> anyhow::Result<InboxBackend> {
+    match std::env::var("CORTI_TRANSCRIBE_BACKEND")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some("aws") => {
+            #[cfg(feature = "inbox-aws")]
+            return Ok(InboxBackend::Aws);
+            #[cfg(not(feature = "inbox-aws"))]
+            anyhow::bail!("CORTI_TRANSCRIBE_BACKEND=aws needs a build with `--features inbox-aws`");
+        }
+        Some("local") => {
+            #[cfg(feature = "inbox-local")]
+            return Ok(InboxBackend::Local);
+            #[cfg(not(feature = "inbox-local"))]
+            anyhow::bail!(
+                "CORTI_TRANSCRIBE_BACKEND=local needs a build with `--features inbox-local`"
+            );
+        }
+        Some(other) => {
+            anyhow::bail!("unknown CORTI_TRANSCRIBE_BACKEND `{other}` (expected `aws` or `local`)")
+        }
+        None => {
+            #[cfg(feature = "inbox-local")]
+            return Ok(InboxBackend::Local);
+            #[cfg(all(not(feature = "inbox-local"), feature = "inbox-aws"))]
+            return Ok(InboxBackend::Aws);
+            #[cfg(all(not(feature = "inbox-local"), not(feature = "inbox-aws")))]
+            anyhow::bail!("--inbox needs a build with `inbox-aws` or `inbox-local`");
+        }
+    }
+}
+
 #[cfg(feature = "inbox")]
 fn preflight_inbox() -> anyhow::Result<()> {
     use anyhow::Context;
-    std::env::var("CORTI_AWS_BUCKET").context("--inbox requires CORTI_AWS_BUCKET")?;
+
+    match inbox_backend()? {
+        // The local backend resolves its own model cache; only the cloud path needs configuration here.
+        #[cfg(feature = "inbox-local")]
+        InboxBackend::Local => {}
+        #[cfg(feature = "inbox-aws")]
+        InboxBackend::Aws => {
+            std::env::var("CORTI_AWS_BUCKET")
+                .context("--inbox with the AWS backend requires CORTI_AWS_BUCKET")?;
+        }
+    }
     corti_vagus::Vagus::discover().context("--inbox requires vagus on PATH")?;
     Ok(())
 }
 
 #[cfg(feature = "inbox")]
 fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use aws_config::BehaviorVersion;
     use corti_core::{OwningApp, RecordingMeta};
-    use corti_transcribe::Transcriber;
-    use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
     use corti_vagus::Vagus;
-
-    let bucket = std::env::var("CORTI_AWS_BUCKET").unwrap();
-    let language = std::env::var("CORTI_LANGUAGE").unwrap_or_else(|_| "en-US".to_string());
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let sdk = rt.block_on(async { aws_config::defaults(BehaviorVersion::latest()).load().await });
 
     let meta = RecordingMeta {
         started_at: chrono::Local::now(),
@@ -359,18 +406,33 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
         audio_path: wav.to_path_buf(),
     };
 
-    eprintln!("transcribing via AWS Transcribe…");
-    let opts = AwsOptions {
-        language: language.clone(),
-        ..AwsOptions::new(bucket)
+    let (transcript, provenance) = match inbox_backend()? {
+        #[cfg(feature = "inbox-local")]
+        InboxBackend::Local => transcribe_local(wav, &meta)?,
+        #[cfg(feature = "inbox-aws")]
+        InboxBackend::Aws => transcribe_aws(wav, &meta)?,
     };
-    let transcript = AwsTranscriber::new(&sdk, opts)
-        .transcribe(wav, &meta)
-        .context("transcription failed")?;
 
     eprintln!("filing note…");
+    let vagus = Vagus::discover()?;
+    let note = vagus.file_recording(&meta, &transcript, &provenance)?;
+    eprintln!("note: {}", note.display());
+
+    Ok(())
+}
+
+/// Shared provenance fields for both backends: this CLI never runs AEC and always files a completed file.
+#[cfg(feature = "inbox")]
+fn base_configuration(
+    language: Option<&str>,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut configuration = std::collections::BTreeMap::new();
-    configuration.insert("language".into(), serde_json::Value::String(language));
+    if let Some(language) = language {
+        configuration.insert(
+            "language".into(),
+            serde_json::Value::String(language.to_string()),
+        );
+    }
     configuration.insert(
         "input".into(),
         serde_json::Value::String("completed_recording".into()),
@@ -379,27 +441,125 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
         "aec".into(),
         serde_json::json!({ "enabled": false, "mode": "disabled" }),
     );
+    configuration
+}
+
+#[cfg(feature = "inbox-aws")]
+fn transcribe_aws(
+    wav: &std::path::Path,
+    meta: &corti_core::RecordingMeta,
+) -> anyhow::Result<(
+    corti_core::DiarizedTranscript,
+    corti_vagus::provenance::TranscriptProvenance,
+)> {
+    use anyhow::Context;
+    use aws_config::BehaviorVersion;
+    use corti_transcribe::Transcriber;
+    use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
+    use corti_vagus::provenance::{
+        GenerationMode, ModelIdentity, TranscriptModels, TranscriptProvenance,
+    };
+
+    let bucket = std::env::var("CORTI_AWS_BUCKET").unwrap();
+    let language = std::env::var("CORTI_LANGUAGE").unwrap_or_else(|_| "en-US".to_string());
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let sdk = rt.block_on(async { aws_config::defaults(BehaviorVersion::latest()).load().await });
+
+    eprintln!("transcribing via AWS Transcribe…");
+    let opts = AwsOptions {
+        language: language.clone(),
+        ..AwsOptions::new(bucket)
+    };
+    let transcript = AwsTranscriber::new(&sdk, opts)
+        .transcribe(wav, meta)
+        .context("transcription failed")?;
+
+    let mut configuration = base_configuration(Some(&language));
     configuration.insert(
         "speaker_attribution".into(),
         serde_json::Value::String("channel_identification_for_multichannel".into()),
     );
-    let provenance = corti_vagus::provenance::TranscriptProvenance::new(
-        corti_vagus::provenance::GenerationMode::Batch,
+    let provenance = TranscriptProvenance::new(
+        GenerationMode::Batch,
         "aws",
-        corti_vagus::provenance::TranscriptModels {
-            asr: corti_vagus::provenance::ModelIdentity::new(
-                "aws/transcribe-default",
-                None::<String>,
-            ),
+        TranscriptModels {
+            asr: ModelIdentity::new("aws/transcribe-default", None::<String>),
             vad: None,
             diarization: None,
             speaker_embedding: None,
         },
         configuration,
     );
-    let vagus = Vagus::discover()?;
-    let note = vagus.file_recording(&meta, &transcript, &provenance)?;
-    eprintln!("note: {}", note.display());
+    Ok((transcript, provenance))
+}
 
-    Ok(())
+#[cfg(feature = "inbox-local")]
+fn transcribe_local(
+    wav: &std::path::Path,
+    meta: &corti_core::RecordingMeta,
+) -> anyhow::Result<(
+    corti_core::DiarizedTranscript,
+    corti_vagus::provenance::TranscriptProvenance,
+)> {
+    use anyhow::Context;
+    use corti_transcribe::Transcriber;
+    use corti_transcribe_local::{LocalConfig, LocalTranscriber, models};
+    use corti_vagus::provenance::{
+        GenerationMode, ModelIdentity, TranscriptModels, TranscriptProvenance,
+    };
+
+    // The same `CORTI_LOCAL_*` knobs the app reads; everything else stays at the shipping defaults.
+    let asr_engine = std::env::var("CORTI_LOCAL_ASR_ENGINE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| LocalConfig::default().asr_engine);
+    let cfg = LocalConfig {
+        model_dir: std::env::var_os("CORTI_LOCAL_MODEL_DIR").map(std::path::PathBuf::from),
+        asr_engine: asr_engine.clone(),
+        ..LocalConfig::default()
+    };
+    let wants_ggml = asr_engine == models::GGML_ASR_ENGINE;
+
+    eprintln!(
+        "transcribing locally via Parakeet ({})…",
+        if wants_ggml { "Metal" } else { "CPU" }
+    );
+    let transcript = LocalTranscriber::new(cfg)
+        .transcribe(wav, meta)
+        .context("transcription failed")?;
+
+    let mut configuration = base_configuration(None);
+    configuration.insert(
+        "asr_engine".into(),
+        serde_json::Value::String(asr_engine.clone()),
+    );
+    configuration.insert(
+        "speaker_attribution".into(),
+        serde_json::Value::String("channels".into()),
+    );
+    let provenance = TranscriptProvenance::new(
+        GenerationMode::Batch,
+        "local",
+        TranscriptModels {
+            asr: ModelIdentity::new(
+                models::PARAKEET_MODEL_ID,
+                Some(if wants_ggml {
+                    models::GGML_FILE.to_string()
+                } else {
+                    models::PARAKEET_DIR.to_string()
+                }),
+            ),
+            vad: Some(ModelIdentity::new(
+                models::VAD_MODEL_ID,
+                Some(models::VAD_FILE),
+            )),
+            diarization: None,
+            speaker_embedding: None,
+        },
+        configuration,
+    );
+    Ok((transcript, provenance))
 }
