@@ -70,6 +70,20 @@ pub enum InputTokenAccounting {
     ClassesDisjoint,
 }
 
+/// Whether a provider's output total already includes separately reported reasoning/thinking tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputTokenAccounting {
+    IncludesReasoning,
+    ClassesDisjoint,
+}
+
+impl Default for OutputTokenAccounting {
+    fn default() -> Self {
+        Self::IncludesReasoning
+    }
+}
+
 /// Currency code constrained to three uppercase ASCII letters.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CurrencyCode(String);
@@ -139,6 +153,10 @@ pub struct Tariff {
     pub effective_until_unix_ms: Option<i64>,
     pub currency: CurrencyCode,
     pub input_accounting: InputTokenAccounting,
+    /// Provider-specific semantics prevent reasoning tokens from being charged twice when they are a subset
+    /// of the reported output total. Default preserves the conservative v1 interpretation for old catalogs.
+    #[serde(default)]
+    pub output_accounting: OutputTokenAccounting,
     pub rates: TariffRates,
 }
 
@@ -202,17 +220,26 @@ impl Tariff {
             }
         };
 
+        let billable_output = match self.output_accounting {
+            OutputTokenAccounting::ClassesDisjoint => output,
+            OutputTokenAccounting::IncludesReasoning => output
+                .checked_sub(reasoning_tokens)
+                .ok_or(PricingError::InconsistentUsage)?,
+        };
+
         let Some(input_rate) = required_rate(uncached_input, self.rates.input_micros_per_million)
         else {
             return Ok(None);
         };
-        let Some(output_rate) = required_rate(output, self.rates.output_micros_per_million) else {
+        let Some(output_rate) =
+            required_rate(billable_output, self.rates.output_micros_per_million)
+        else {
             return Ok(None);
         };
 
         let classes = [
             (uncached_input, input_rate),
-            (output, output_rate),
+            (billable_output, output_rate),
             (cached_read_tokens, cached_read_rate),
             (cached_write_tokens, cached_write_rate),
             (reasoning_tokens, reasoning_rate),
@@ -458,6 +485,7 @@ mod tests {
                 effective_until_unix_ms: Some(1_500),
                 currency: CurrencyCode::usd(),
                 input_accounting: InputTokenAccounting::IncludesCached,
+                output_accounting: OutputTokenAccounting::IncludesReasoning,
                 rates: TariffRates {
                     input_micros_per_million: Some(2_000_000),
                     output_micros_per_million: Some(4_000_000),
@@ -511,6 +539,31 @@ mod tests {
         assert_eq!(estimate.cost_micros(), Some(2_200));
         assert_eq!(estimate.render(), "Estimated $0.0022");
         assert_eq!(estimate.pricing_catalog_version(), Some("pricing-test-v1"));
+    }
+
+    #[test]
+    fn output_accounting_does_not_double_charge_reasoning_subsets() {
+        let provider = ProviderId::new("provider-a").unwrap();
+        let model = ModelId::new("model-a").unwrap();
+        let usage = NormalizedUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(100),
+            cached_read_tokens: Some(0),
+            cached_write_tokens: Some(0),
+            reasoning_tokens: Some(25),
+            usage_complete: true,
+        };
+        let mut includes = catalog();
+        includes.tariffs[0].rates.reasoning_micros_per_million = Some(8_000_000);
+        let included = includes.estimate(query(&provider, &model), &usage).unwrap();
+        // 75 ordinary output at $4/M + 25 reasoning at $8/M.
+        assert_eq!(included.cost_micros(), Some(500));
+
+        let mut disjoint = includes;
+        disjoint.tariffs[0].output_accounting = OutputTokenAccounting::ClassesDisjoint;
+        let disjoint = disjoint.estimate(query(&provider, &model), &usage).unwrap();
+        // Vertex-style candidates and thoughts are separate classes: 100 output + 25 reasoning.
+        assert_eq!(disjoint.cost_micros(), Some(600));
     }
 
     #[test]

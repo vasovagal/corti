@@ -37,6 +37,8 @@ import {
 } from "./lib/liveTranscript";
 import {
   applyHostedCallEvent,
+  hostedUiFenceMatches,
+  shouldInstallHostedSettings,
   type LiveCallDetail,
 } from "./lib/liveHosted";
 import { Assistant } from "./live/Assistant";
@@ -92,6 +94,7 @@ export default function LiveTranscript() {
   const mainSurface = useRef<HTMLDivElement>(null);
 
   const installSettings = useCallback((next: HostedSettingsDto) => {
+    if (!shouldInstallHostedSettings(settingsRef.current, next)) return;
     settingsRef.current = next;
     setSettings(next);
     setHostedError("");
@@ -272,12 +275,19 @@ export default function LiveTranscript() {
 
     function receive(event: HostedCoordinatorEvent) {
       if (!active) return;
-      if (event.event === "lane_state" && "lane" in event && "state" in event) {
-        const lane = event.lane as HostedCallLane;
+      if (
+        event.event === "lane_state" &&
+        "lane" in event &&
+        "state" in event &&
+        "fence" in event
+      ) {
+        const laneEvent = event as Extract<HostedCoordinatorEvent, { event: "lane_state" }>;
+        const lane = laneEvent.lane as HostedCallLane;
+        if (!hostedUiFenceMatches(settingsRef.current, lane, laneEvent.fence)) return;
         if (lane === "live" || lane === "final") {
           setLaneStates((current) => ({
             ...current,
-            [lane]: event.state as HostedLaneState,
+            [lane]: laneEvent.state as HostedLaneState,
           }));
         }
         if (lane === "ad_hoc_question" || lane === "pinned_question") scheduleAssistant();
@@ -288,6 +298,7 @@ export default function LiveTranscript() {
         const currentSnapshot = snapshotRef.current;
         setCalls((current) =>
           applyHostedCallEvent(current, accounting, {
+            processEpoch: settingsRef.current?.control.process_epoch ?? null,
             sessionId: currentSnapshot?.session_id ?? null,
             sessionGeneration: settingsRef.current?.control.session_generation ?? null,
           }),
@@ -300,6 +311,7 @@ export default function LiveTranscript() {
         const currentSnapshot = snapshotRef.current;
         setCalls((current) =>
           applyHostedCallEvent(current, terminal, {
+            processEpoch: settingsRef.current?.control.process_epoch ?? null,
             sessionId: currentSnapshot?.session_id ?? null,
             sessionGeneration: settingsRef.current?.control.session_generation ?? null,
           }),

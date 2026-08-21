@@ -364,9 +364,6 @@ impl VertexRestAdapter {
             )
             .unwrap_or_default();
             let code = vertex_error_code(exchange.response.status(), &bytes).unwrap_or(fallback);
-            if code == ErrorCode::AuthRejected {
-                self.credentials.mark_rejected();
-            }
             return Err(ExecFailure::new(code, true));
         }
         validate_event_stream_response(&exchange.response)
@@ -526,6 +523,9 @@ impl ProviderAdapter for VertexRestAdapter {
                 Ok(terminal)
             }
             Err(failure) => {
+                if failure.code == ErrorCode::AuthRejected {
+                    self.credentials.mark_rejected();
+                }
                 if let Some(reason) = cancel.reason() {
                     emit(
                         sink,
@@ -597,11 +597,11 @@ fn vertex_request_body(
     max_output_tokens: u64,
 ) -> Result<Vec<u8>, PostprocessError> {
     let prompt = request.prompt.messages();
-    let system_parts = prompt[..3]
+    let system_parts = prompt[..2]
         .iter()
         .map(|message| json!({"text": message.content()}))
         .collect::<Vec<_>>();
-    let user_parts = prompt[3..]
+    let user_parts = prompt[2..]
         .iter()
         .map(|message| json!({"text": message.content()}))
         .collect::<Vec<_>>();

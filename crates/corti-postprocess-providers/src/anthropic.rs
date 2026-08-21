@@ -251,9 +251,6 @@ impl AnthropicMessagesAdapter {
         timing.exchange = Some(exchange.times);
         if exchange.response.status() != 200 {
             let code = http_status_code(exchange.response.status());
-            if code == ErrorCode::AuthRejected {
-                self.credentials.mark_rejected();
-            }
             return Err(ExecFailure::new(code, true));
         }
         validate_event_stream_response(&exchange.response)
@@ -401,6 +398,10 @@ impl ProviderAdapter for AnthropicMessagesAdapter {
                 Ok(terminal)
             }
             Err(failure) => {
+                // One terminal edge owns rejection for both HTTP and in-stream authentication failures.
+                if failure.code == ErrorCode::AuthRejected {
+                    self.credentials.mark_rejected();
+                }
                 if let Some(reason) = cancel.reason() {
                     emit(
                         sink,
@@ -461,17 +462,20 @@ fn anthropic_request_body(
 ) -> Result<Vec<u8>, PostprocessError> {
     let cache_enabled = request.cache_policy.provider == ProviderCacheMode::ExplicitStablePrefix;
     let prompt = request.prompt.messages();
-    let mut system = Vec::with_capacity(3);
-    for (index, message) in prompt[..3].iter().enumerate() {
-        let mut block = json!({"type": "text", "text": message.content()});
-        if cache_enabled && index == 2 {
-            block["cache_control"] = json!({"type": "ephemeral", "ttl": "5m"});
-        }
-        system.push(block);
-    }
-    let dynamic = prompt[3..]
+    let system = prompt[..2]
         .iter()
         .map(|message| json!({"type": "text", "text": message.content()}))
+        .collect::<Vec<_>>();
+    let dynamic = prompt[2..]
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut block = json!({"type": "text", "text": message.content()});
+            if cache_enabled && index == 0 {
+                block["cache_control"] = json!({"type": "ephemeral", "ttl": "5m"});
+            }
+            block
+        })
         .collect::<Vec<_>>();
     let mut body = json!({
         "model": request.model.as_str(),

@@ -99,7 +99,7 @@ pub(crate) fn validate_prompt_layout(request: &HostedRequest) -> Result<(), Post
         || messages[0].section() != PromptSection::ImmutablePolicy
         || messages[1].role() != PromptRole::Developer
         || messages[1].section() != PromptSection::OutputSchema
-        || messages[2].role() != PromptRole::Developer
+        || messages[2].role() != PromptRole::User
         || messages[2].section() != PromptSection::WordBank
         || messages[3].role() != PromptRole::User
         || messages[3].section() != PromptSection::Steering

@@ -81,11 +81,14 @@ test("live rewrite changes and assistant", async ({ page }) => {
     lane: "live",
     state: "rewriting",
     code: null,
+    fence: syntheticLiveTerminal.fence,
   });
   await emitFixture(page, "hosted-state-changed", {
     event: "accounting",
     call_id: "synthetic-live-call-42",
+    recording_id: "synthetic-live-session",
     lane: "live",
+    fence: syntheticLiveTerminal.fence,
     finality: "provisional",
     usage: {
       input_tokens: 160,
@@ -276,7 +279,12 @@ test("live controls and pinned debounce use narrow commands", async ({ page }) =
   expect(await invocationCount(page, "set_hosted_pinned_question")).toBe(0);
   await expect.poll(() => invocationCount(page, "set_hosted_pinned_question")).toBe(1);
   expect(await lastInvocation(page, "set_hosted_pinned_question")).toMatchObject({
-    args: { template: "What is the debounced synthetic answer?" },
+    args: {
+      request: {
+        observed_state_revision: 24,
+        template: "What is the debounced synthetic answer?",
+      },
+    },
   });
 });
 
@@ -318,11 +326,14 @@ async function prepareLiveRewrite(page: Page, terminal = true) {
     lane: "live",
     state: "rewriting",
     code: null,
+    fence: syntheticLiveTerminal.fence,
   });
   await emitFixture(page, "hosted-state-changed", {
     event: "accounting",
     call_id: "synthetic-live-call-42",
+    recording_id: "synthetic-live-session",
     lane: "live",
+    fence: syntheticLiveTerminal.fence,
     finality: "provisional",
     usage: {
       input_tokens: 160,

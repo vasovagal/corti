@@ -210,10 +210,10 @@ export interface LiveTranscriptLine {
 }
 
 export interface LiveTranscriptSnapshot {
-  /** Protocol-v2 identity fields are optional until every app build emits them. */
-  protocol_version?: number;
-  process_epoch?: number;
-  session_generation?: number;
+  /** Protocol-v2 monotonic identity is mandatory at the transcript/webview boundary. */
+  protocol_version: number;
+  process_epoch: number;
+  session_generation: number;
   revision: number;
   session_id: string | null;
   mode: LiveTranscriptMode;
@@ -227,8 +227,8 @@ export interface LiveTranscriptSnapshot {
 }
 
 export interface LiveTranscriptEvent extends Omit<LiveTranscriptSnapshot, "lines"> {
-  /** When present, this must equal the frontend's current revision before the delta is applied. */
-  from_revision?: number;
+  /** Must equal the frontend's current revision before the delta is applied. */
+  from_revision: number;
   reset: boolean;
   line: LiveTranscriptLine | null;
 }
@@ -517,7 +517,9 @@ export interface HostedRequestFence {
 export interface HostedAccountingEvent {
   event: "accounting";
   call_id: string;
+  recording_id: string;
   lane: HostedCallLane;
+  fence: HostedRequestFence;
   finality: "provisional" | "final";
   usage: HostedNormalizedUsage;
   cost: HostedCostEstimate;
@@ -561,6 +563,10 @@ export type HostedCoordinatorEvent =
       lane: HostedCallLane;
       state: HostedLaneState;
       code: HostedErrorCode | null;
+      fence: Pick<
+        HostedRequestFence,
+        "process_epoch" | "session_generation" | "control_revision" | "lane_revision"
+      >;
     }
   | {
       event: "notice";
@@ -641,8 +647,13 @@ export const refreshHostedProvider = (
     request: { provider, transport },
   });
 
-export const setHostedPinnedQuestion = (template: string): Promise<void> =>
-  invoke<void>("set_hosted_pinned_question", { template });
+export const setHostedPinnedQuestion = (
+  observedStateRevision: number,
+  template: string,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("set_hosted_pinned_question", {
+    request: { observed_state_revision: observedStateRevision, template },
+  });
 
 export const getHostedAssistant = (): Promise<HostedAssistantSnapshot> =>
   invoke<HostedAssistantSnapshot>("get_hosted_assistant");

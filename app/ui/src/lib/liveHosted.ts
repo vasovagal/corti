@@ -7,6 +7,8 @@ import type {
   HostedLaneState,
   HostedLatencyFields,
   HostedNormalizedUsage,
+  HostedRequestFence,
+  HostedSettingsDto,
   HostedTerminalEvent,
 } from "./api";
 
@@ -34,8 +36,43 @@ export interface LiveCallDetail {
 }
 
 export interface HostedCallContext {
+  processEpoch: number | null;
   sessionId: string | null;
   sessionGeneration: number | null;
+}
+
+/** A delayed invoke response may install only within its process and at a nondecreasing backend revision. */
+export function shouldInstallHostedSettings(
+  current: HostedSettingsDto | null,
+  incoming: HostedSettingsDto,
+): boolean {
+  if (!current) return true;
+  if (current.control.process_epoch !== incoming.control.process_epoch) return true;
+  return incoming.state_revision >= current.state_revision;
+}
+
+export function hostedUiFenceMatches(
+  settings: HostedSettingsDto | null,
+  lane: HostedCallLane,
+  fence: Pick<
+    HostedRequestFence,
+    "process_epoch" | "session_generation" | "control_revision" | "lane_revision"
+  >,
+): boolean {
+  if (!settings) return false;
+  const control = settings.control;
+  const laneRevision =
+    lane === "live"
+      ? control.live.revision
+      : lane === "final"
+        ? control.final_lane.revision
+        : control.questions.revision;
+  return (
+    fence.process_epoch === control.process_epoch &&
+    fence.session_generation === control.session_generation &&
+    fence.control_revision === control.control_revision &&
+    fence.lane_revision === laneRevision
+  );
 }
 
 /** Content-free event reducer. Final accounting wins over late provisional events for the same call. */
@@ -44,6 +81,20 @@ export function applyHostedCallEvent(
   event: HostedAccountingEvent | HostedTerminalEvent,
   context: HostedCallContext,
 ): LiveCallDetail[] {
+  if (
+    context.processEpoch !== null &&
+    event.fence.process_epoch !== context.processEpoch
+  ) {
+    return current;
+  }
+  if (context.sessionId && event.recording_id !== context.sessionId) return current;
+  if (
+    context.sessionGeneration !== null &&
+    event.fence.session_generation !== context.sessionGeneration
+  ) {
+    return current;
+  }
+
   const existing = current.find((call) => call.call_id === event.call_id);
   if (event.event === "accounting") {
     if (existing?.finality === "final" && event.finality === "provisional") return current;
@@ -59,13 +110,6 @@ export function applyHostedCallEvent(
     return prependBounded(current, next);
   }
 
-  if (context.sessionId && event.recording_id !== context.sessionId) return current;
-  if (
-    context.sessionGeneration !== null &&
-    event.fence.session_generation !== context.sessionGeneration
-  ) {
-    return current;
-  }
   const next: LiveCallDetail = {
     ...existing,
     call_id: event.call_id,

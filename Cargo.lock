@@ -1406,6 +1406,9 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "rfd",
+ "ring",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1420,6 +1423,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "ureq",
+ "zeroize",
 ]
 
 [[package]]

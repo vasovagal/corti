@@ -371,7 +371,7 @@ export const fixtures: Record<string, unknown> = {
   replace_hosted_word_bank: { status: "unchanged", settings: hostedSettings },
   update_hosted_provider_scope: { status: "unchanged", settings: hostedSettings },
   refresh_hosted_provider: openAiDirect,
-  set_hosted_pinned_question: null,
+  set_hosted_pinned_question: { status: "unchanged", settings: hostedSettings },
   get_hosted_assistant: {
     pinned_run_count: 0,
     pinned: null,
@@ -594,6 +594,7 @@ export const syntheticLiveOverrides: Record<string, unknown> = {
   get_hosted_assistant: syntheticAssistant,
   patch_hosted_settings: { status: "unchanged", settings: syntheticLiveSettings },
   update_hosted_steering: { status: "unchanged", settings: syntheticLiveSettings },
+  set_hosted_pinned_question: { status: "unchanged", settings: syntheticLiveSettings },
 };
 
 export const syntheticLiveTerminal = {
@@ -619,7 +620,7 @@ export const syntheticLiveTerminal = {
   model: "fixture-live-v1",
   support_tier: "documented",
   adapter_version: 1,
-  prompt_version: 1,
+  prompt_version: 2,
   output_schema_version: 1,
   outcome: "completed",
   error: null,

@@ -13,6 +13,7 @@ import {
   type HostedProviderScopeUpdate,
   type HostedSettingsDto,
 } from "../lib/api";
+import { shouldInstallHostedSettings } from "../lib/liveHosted";
 import { HostedDialog, HostedSwitch } from "./HostedCommon";
 import { HostedLanguagePreferences } from "./HostedLanguage";
 import { HostedLanes } from "./HostedLanes";
@@ -28,6 +29,7 @@ export default function HostedPreferences() {
   const [masterDisclosure, setMasterDisclosure] = useState(false);
 
   const installSettings = useCallback((next: HostedSettingsDto) => {
+    if (!shouldInstallHostedSettings(settingsRef.current, next)) return;
     settingsRef.current = next;
     setSettings(next);
     setLoadError("");
@@ -153,10 +155,14 @@ export default function HostedPreferences() {
     setBusy("Pinned question update");
     setStatus("");
     try {
-      await setHostedPinnedQuestion(template);
-      await reload();
-      setStatus(template.trim() ? "Pinned question template saved." : "Pinned question template cleared.");
-      return true;
+      const current = settingsRef.current;
+      if (!current) return false;
+      const result = await setHostedPinnedQuestion(current.state_revision, template);
+      const accepted = acceptMutation(
+        result,
+        template.trim() ? "Pinned question template saved." : "Pinned question template cleared.",
+      );
+      return accepted;
     } catch (error) {
       setStatus(`Pinned question update failed: ${String(error)}`);
       return false;

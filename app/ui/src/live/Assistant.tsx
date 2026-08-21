@@ -77,10 +77,20 @@ export function Assistant({
     const sequence = ++pinnedSaveSequence.current;
     setPinnedSaveState("Waiting to save…");
     const timer = window.setTimeout(() => {
+      const observedRevision = settings?.state_revision;
+      if (observedRevision === undefined) {
+        setPinnedSaveState("Save unavailable");
+        return;
+      }
       setPinnedSaveState("Saving…");
-      void setHostedPinnedQuestion(pinnedDraft)
-        .then(async () => {
+      void setHostedPinnedQuestion(observedRevision, pinnedDraft)
+        .then(async (result) => {
           if (pinnedSaveSequence.current !== sequence) return;
+          if (result.status === "conflict") {
+            setPinnedSaveState("Settings changed; review and try again");
+            await onRefresh();
+            return;
+          }
           setPinnedDirty(false);
           setPinnedSaveState(pinnedDraft.trim() ? "Saved" : "Cleared");
           await onRefresh();
@@ -92,7 +102,7 @@ export function Assistant({
         });
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [onRefresh, pinnedDirty, pinnedDraft]);
+  }, [onRefresh, pinnedDirty, pinnedDraft, settings?.state_revision]);
 
   const exchanges = useMemo(
     () => boundAssistantExchanges(snapshot?.exchanges ?? []),

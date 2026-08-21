@@ -10,9 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError, sync_channel,
-};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,13 +22,15 @@ use corti_postprocess::{
     ConnectionScopeId, CostEstimate, CredentialState, DigestKey, ErrorCode, HostedRequest, Lane,
     LocalCacheMode, ModelCatalog, ModelId, MonotonicDeadline, OUTPUT_SCHEMA_VERSION,
     PROMPT_TEMPLATE_VERSION, PricingCatalog, PricingError, PricingQuery, ProcessEpoch,
-    ProviderCacheMode, ProviderDescriptor, ProviderEventSink, ProviderId, ProviderScope,
-    ProviderTerminal, RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial, RowId,
-    SupportTier, TargetId, TranscriptRow, TransportId, WordBankDocument,
+    ProviderAdapter, ProviderCacheMode, ProviderDescriptor, ProviderEventSink, ProviderId,
+    ProviderScope, ProviderTerminal, RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial,
+    RowId, SupportTier, TargetId, TranscriptRow, TransportId, WordBankDocument,
 };
 use corti_postprocess_providers::{
-    ANTHROPIC_MESSAGES_ADAPTER_VERSION, OPENAI_RESPONSES_ADAPTER_VERSION,
-    VERTEX_REST_ADAPTER_VERSION, VertexResolutionAttempt, VertexResolutionOutcome,
+    ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
+    CredentialError, HttpTransport, OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter,
+    SystemClock as ProviderSystemClock, UreqTransport, VERTEX_REST_ADAPTER_VERSION,
+    VertexResolutionAttempt, VertexResolutionOutcome,
 };
 use corti_queue::{
     PostprocessCacheSource, PostprocessCallRecord, PostprocessCost, PostprocessOutcome, Queue,
@@ -49,10 +49,10 @@ use crate::postprocess::{
     CompletionOutcome, ControlError, ControlPatch, ControlPersistence, ControlSnapshotDto,
     CoordinatorClock, CoordinatorEventDto, CoordinatorIngress, DispatchOutcome, DispatchTicket,
     EncryptedPostprocessStore, ExactLookup, FinalJournalBoundary, FinalJournalState,
-    FinalRecoveryRecord, HotPathCommand, IngressError, LaneControlDto, LaneFamily,
-    LaneSelectionDto, PatchOutcome, PostprocessCoordinator, ProviderAccess, ProviderStateDto,
-    QuestionStatusDto, RequestSubmission, StoreCommit, SubmitError, TerminalOutcomeDto,
-    TerminalTelemetryDto, TranscriptWatermark,
+    FinalRecoveryDirective, FinalRecoveryRecord, HotPathCommand, IngressError, LaneControlDto,
+    LaneFamily, LaneSelectionDto, PatchOutcome, PostprocessCoordinator, ProviderAccess,
+    ProviderStateDto, QuestionStatusDto, RequestSubmission, StoreCommit, SubmitError,
+    TerminalOutcomeDto, TerminalTelemetryDto, TranscriptWatermark,
 };
 use crate::postprocess_config::{
     EGRESS_DISCLOSURE_VERSION, HostedPreferences, PINNED_AUTO_DISCLOSURE_VERSION,
@@ -63,14 +63,36 @@ use crate::private_file::{atomic_write_private, read_private};
 pub(crate) const HOSTED_STATE_CHANGED_EVENT: &str = "hosted-state-changed";
 const SERVICE_COMMAND_CAPACITY: usize = 256;
 const SERVICE_TICK: Duration = Duration::from_millis(20);
-const REQUEST_CHUNK_BYTES: usize = 64 * 1024;
+const SERVICE_IDLE_POLL: Duration = Duration::from_millis(2);
+const MAX_PRIORITY_DRAIN: usize = 32;
+const MAX_COMMAND_DRAIN: usize = 32;
+const MAX_INGRESS_DRAIN: usize = 64;
+const MAX_PROVIDER_EVENT_DRAIN: usize = 64;
+const MAX_WORKER_DRAIN: usize = 32;
+const MAX_VERTEX_DRAIN: usize = 8;
+const MAX_DISPATCH_DRAIN: usize = 16;
 const MAX_FINAL_CHUNKS: usize = 64;
+const MAX_FINAL_INPUT_TOKENS: u64 = 16 * 1024;
+const DEFAULT_INPUT_TOKEN_BUDGET: u64 = 8 * 1024;
+const PROMPT_TOKEN_RESERVE: u64 = 2 * 1024;
 const MAX_LIVE_TARGET_BYTES: usize = 4 * 1024;
 const MAX_LIVE_TARGET_ROWS: usize = 8;
 const MAX_CONTEXT_ROWS: usize = 8;
 const MAX_SESSION_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 const OUTBOX_SCHEMA: u32 = 1;
 const MAX_OUTBOX_BYTES: usize = 16 * 1024 * 1024;
+const STORE_SCHEMA: u32 = 1;
+const STORE_MAGIC: &[u8] = b"CORTIPPE1";
+const STORE_AAD: &[u8] = b"corti-hosted-store-v1";
+const STORE_NONCE_BYTES: usize = 12;
+const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STORE_JOURNALS: usize = 1_024;
+const MAX_STORE_CACHE_ENTRIES: usize = 1_024;
+const HOSTED_KEYCHAIN_SERVICE: &str = "com.vasovagal.corti.hosted";
+const HOSTED_MASTER_KEY_ACCOUNT: &str = "encrypted-store-master-v1";
+const OPENAI_API_KEY_ACCOUNT: &str = "openai-api-key-v1";
+const ANTHROPIC_API_KEY_ACCOUNT: &str = "anthropic-api-key-v1";
+const PRODUCTION_ARM_ENV: &str = "CORTI_HOSTED_PRODUCTION_ARMED";
 const FINGERPRINT_DOMAIN: &[u8] = b"corti-app-provenance-v1\0";
 
 /// Managed Tauri state. The handle is cloneable; the coordinator itself never leaves its owner thread.
@@ -88,6 +110,7 @@ impl HostedState {
 #[derive(Clone)]
 pub(crate) struct HostedHandle {
     command_tx: SyncSender<ServiceCommand>,
+    priority_tx: Sender<ServiceCommand>,
     ingress: CoordinatorIngress,
     snapshot: Arc<Mutex<HostedSettingsDto>>,
     ingress_incomplete: Arc<AtomicBool>,
@@ -136,26 +159,26 @@ impl HostedHandle {
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub(crate) fn begin_live_session(&self, recording_id: &str) -> Result<(), ErrorCode> {
         self.ingress_incomplete.store(false, Ordering::Release);
-        let (reply, _discarded_reply) = std::sync::mpsc::channel();
-        self.command_tx
-            .try_send(ServiceCommand::BeginSession {
-                recording_id: recording_id.to_owned(),
-                reply,
-            })
-            .map_err(|error| {
-                self.ingress_incomplete.store(true, Ordering::Release);
-                match error {
-                    TrySendError::Full(_) => ErrorCode::RateLimited,
-                    TrySendError::Disconnected(_) => ErrorCode::Internal,
-                }
-            })
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send_priority(ServiceCommand::BeginSession {
+            recording_id: recording_id.to_owned(),
+            reply: reply_tx,
+        })?;
+        let result = reply_rx.recv().unwrap_or(Err(ErrorCode::Internal));
+        if result.is_err() {
+            self.ingress_incomplete.store(true, Ordering::Release);
+        }
+        result
     }
 
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
-    pub(crate) fn end_live_session(&self, recording_id: &str) {
-        let _ = self.command_tx.try_send(ServiceCommand::EndSession {
+    pub(crate) fn end_live_session(&self, recording_id: &str) -> Result<(), ErrorCode> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send_priority(ServiceCommand::EndSession {
             recording_id: recording_id.to_owned(),
-        });
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
     }
 
     /// Raw/UI publication must happen before this call. This method can never block.
@@ -215,32 +238,36 @@ impl HostedHandle {
             return Ok(());
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.send(ServiceCommand::MarkFinalApplied {
+        self.send_priority(ServiceCommand::MarkFinalApplied {
             call_ids: call_ids.to_vec(),
             reply: reply_tx,
         })?;
         reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
     }
 
-    pub(crate) fn abandon_final_result(&self, call_ids: &[CallId]) {
+    pub(crate) fn abandon_final_result(&self, call_ids: &[CallId]) -> Result<(), ErrorCode> {
         if call_ids.is_empty() {
-            return;
+            return Ok(());
         }
-        let _ = self.command_tx.try_send(ServiceCommand::AbandonFinal {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send_priority(ServiceCommand::AbandonFinal {
             call_ids: call_ids.to_vec(),
-        });
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
     }
 
     /// Acknowledge only after the FilingCheckpoint or live-note final state is durable.
-    pub(crate) fn mark_final_checkpointed(&self, call_ids: &[CallId]) {
+    pub(crate) fn mark_final_checkpointed(&self, call_ids: &[CallId]) -> Result<(), ErrorCode> {
         if call_ids.is_empty() {
-            return;
+            return Ok(());
         }
-        let _ = self
-            .command_tx
-            .try_send(ServiceCommand::MarkFinalCheckpointed {
-                call_ids: call_ids.to_vec(),
-            });
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send_priority(ServiceCommand::MarkFinalCheckpointed {
+            call_ids: call_ids.to_vec(),
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
     }
 
     pub(crate) fn import_outbox(&self, queue: &Queue) -> Result<usize> {
@@ -262,6 +289,12 @@ impl HostedHandle {
 
     fn send(&self, command: ServiceCommand) -> Result<(), ErrorCode> {
         self.command_tx
+            .send(command)
+            .map_err(|_| ErrorCode::Internal)
+    }
+
+    fn send_priority(&self, command: ServiceCommand) -> Result<(), ErrorCode> {
+        self.priority_tx
             .send(command)
             .map_err(|_| ErrorCode::Internal)
     }
@@ -402,6 +435,12 @@ pub(crate) struct ProviderRefreshRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub(crate) struct PinnedQuestionUpdateRequest {
+    pub(crate) observed_state_revision: u64,
+    pub(crate) template: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct ProviderScopeUpdateRequest {
     pub(crate) observed_state_revision: u64,
     pub(crate) provider: String,
@@ -445,15 +484,21 @@ pub(crate) struct AssistantSnapshotDto {
 }
 
 #[tauri::command]
-pub(crate) fn get_hosted_settings(state: State<'_, HostedState>) -> HostedSettingsDto {
-    state.handle.snapshot()
+pub(crate) fn get_hosted_settings(
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<HostedSettingsDto, String> {
+    require_hosted_window(&window, &["live", "settings"])?;
+    Ok(state.handle.snapshot())
 }
 
 #[tauri::command]
 pub(crate) fn patch_hosted_settings(
     request: HostedPatchRequest,
     state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["live", "settings"])?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
@@ -472,7 +517,9 @@ pub(crate) fn patch_hosted_settings(
 pub(crate) fn update_hosted_steering(
     request: SteeringUpdateRequest,
     state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["live", "settings"])?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
@@ -491,7 +538,9 @@ pub(crate) fn update_hosted_steering(
 pub(crate) fn replace_hosted_word_bank(
     request: WordBankUpdateRequest,
     state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["settings"])?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
@@ -510,7 +559,9 @@ pub(crate) fn replace_hosted_word_bank(
 pub(crate) fn update_hosted_provider_scope(
     request: ProviderScopeUpdateRequest,
     state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["settings"])?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
@@ -529,7 +580,9 @@ pub(crate) fn update_hosted_provider_scope(
 pub(crate) fn refresh_hosted_provider(
     request: ProviderRefreshRequest,
     state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
 ) -> Result<ProviderStateDto, String> {
+    require_hosted_window(&window, &["settings"])?;
     let provider = ProviderId::new(request.provider).map_err(|_| "invalid provider".to_string())?;
     let transport =
         TransportId::new(request.transport).map_err(|_| "invalid transport".to_string())?;
@@ -594,14 +647,16 @@ pub(crate) fn cancel_hosted_question(
 
 #[tauri::command]
 pub(crate) fn set_hosted_pinned_question(
-    template: String,
+    request: PinnedQuestionUpdateRequest,
     state: State<'_, HostedState>,
-) -> Result<(), String> {
+    window: tauri::WebviewWindow,
+) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["live", "settings"])?;
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
         .send(ServiceCommand::SetPinnedTemplate {
-            template,
+            request,
             reply: reply_tx,
         })
         .map_err(sanitized_error)?;
@@ -628,20 +683,32 @@ pub(crate) fn get_hosted_assistant(
 }
 
 fn require_live_window(window: &tauri::WebviewWindow) -> Result<(), String> {
-    if window.label() == "live" {
+    require_hosted_window(window, &["live"])
+}
+
+fn require_hosted_window(
+    window: &tauri::WebviewWindow,
+    allowed_labels: &[&str],
+) -> Result<(), String> {
+    if hosted_window_allowed(window.label(), allowed_labels) {
         Ok(())
     } else {
-        Err("assistant content is available only in the live window".to_string())
+        Err("hosted command is unavailable from this window".to_string())
     }
+}
+
+fn hosted_window_allowed(label: &str, allowed_labels: &[&str]) -> bool {
+    allowed_labels.contains(&label)
 }
 
 fn sanitized_error(code: ErrorCode) -> String {
     code.to_string()
 }
 
-/// Start production wiring. No production executor can make a provider request in this slice: documented
-/// transports report truthful unarmed/absent state, Codex stays experimental/off, and Claude subscription
-/// remains blocked. Tests inject every credential/catalog/transport result explicitly.
+/// Start production wiring. Paid egress remains deny-by-default and is enabled only by the exact explicit
+/// production arm gate plus the persisted disclosure/lane controls. The approved factory supports direct
+/// OpenAI/Anthropic API keys from non-synchronizing Keychain items; Claude subscriptions stay blocked and
+/// Codex app-server remains experimental/off. Tests inject transports and secrets and never use ambient keys.
 pub(crate) fn start(
     app: AppHandle,
     live_view: LiveTranscriptStore,
@@ -664,23 +731,75 @@ pub(crate) fn start(
         WordBankDocument::empty()
     });
     let outbox = Arc::new(TelemetryOutbox::open(default_outbox_path()?)?);
-    let notifier: EventNotifier = Arc::new(move |event| {
-        let _ = app.emit(HOSTED_STATE_CHANGED_EVENT, event);
+    let durable = load_or_create_master_keys().and_then(|keys| {
+        let store = RuntimeStore::open_encrypted(
+            default_store_path()?,
+            keys.encryption,
+            outbox.clone(),
+            pipeline_tx.clone(),
+        )?;
+        Ok((
+            keys.digest,
+            Box::new(store) as Box<dyn EncryptedPostprocessStore>,
+        ))
     });
+    let (digest_key, store, durable_store_armed) = match durable {
+        Ok((digest_key, store)) => (digest_key, store, true),
+        Err(_) => {
+            // A locked/missing Keychain or unreadable authenticated store must not brick raw capture, but it
+            // must make paid egress impossible for this process. Never replace or bypass the suspect store.
+            tracing::warn!(
+                target: "corti::hosted",
+                "durable hosted store is unavailable; hosted egress remains off"
+            );
+            let mut digest = [0u8; 32];
+            random_bytes(&mut digest)?;
+            (
+                DigestKey::new(digest),
+                Box::new(RuntimeStore::memory(outbox.clone(), pipeline_tx.clone()))
+                    as Box<dyn EncryptedPostprocessStore>,
+                false,
+            )
+        }
+    };
+    let notifier: EventNotifier = Arc::new(move |event| {
+        let _ = app.emit_to("live", HOSTED_STATE_CHANGED_EVENT, event);
+        let _ = app.emit_to("settings", HOSTED_STATE_CHANGED_EVENT, event);
+    });
+    let approval = durable_store_armed
+        .then(ProductionApproval::from_environment)
+        .flatten();
+    let (executor, providers) = approval.map_or_else(
+        || {
+            (
+                Arc::new(DenyExecutor) as Arc<dyn TicketExecutor>,
+                Box::new(UnavailableProviders) as Box<dyn ProviderAccess>,
+            )
+        },
+        |approval| {
+            approved_direct_components(
+                approval,
+                Arc::new(ProductionTransportFactory),
+                Arc::new(KeychainDirectSecretStore),
+            )
+        },
+    );
+    let process_epoch = live_view.process_epoch();
     start_with_components(
         preferences,
         word_bank,
         live_view,
         pipeline_tx,
         outbox,
-        Arc::new(DenyExecutor),
-        Box::new(UnavailableProviders),
+        executor,
+        providers,
         Arc::new(NoPricing),
         Arc::new(UnarmedVertex),
         notifier,
-        system_digest_key()?,
-        process_epoch()?,
+        digest_key,
+        process_epoch,
         true,
+        Some(store),
         None,
     )
 }
@@ -702,6 +821,7 @@ fn start_with_components(
     digest_key: DigestKey,
     process_epoch: ProcessEpoch,
     persist_to_disk: bool,
+    store_override: Option<Box<dyn EncryptedPostprocessStore>>,
     clock_override: Option<Arc<dyn CoordinatorClock>>,
 ) -> Result<(HostedState, HostedHandle)> {
     let preferences = Arc::new(Mutex::new(preferences));
@@ -723,7 +843,10 @@ fn start_with_components(
         preferences: preferences.clone(),
         persist_to_disk,
     });
-    let store = Box::new(RuntimeStore::new(outbox.clone(), pipeline_tx.clone()));
+    let store = store_override.unwrap_or_else(|| {
+        Box::new(RuntimeStore::memory(outbox.clone(), pipeline_tx.clone()))
+            as Box<dyn EncryptedPostprocessStore>
+    });
     let clock: Arc<dyn CoordinatorClock> =
         clock_override.unwrap_or_else(|| Arc::new(SystemCoordinatorClock::new()));
     let pinned = preferences
@@ -743,12 +866,14 @@ fn start_with_components(
     );
     let (ingress, ingress_rx) = CoordinatorIngress::standard();
     let (command_tx, command_rx) = sync_channel(SERVICE_COMMAND_CAPACITY);
+    let (priority_tx, priority_rx) = std::sync::mpsc::channel();
     let (worker_tx, worker_rx) = std::sync::mpsc::channel();
     let (vertex_tx, vertex_rx) = std::sync::mpsc::channel();
     let (event_sink, provider_event_rx) = crate::postprocess::BoundedProviderEventSink::channel();
     let ingress_incomplete = Arc::new(AtomicBool::new(false));
     let handle = HostedHandle {
         command_tx,
+        priority_tx,
         ingress,
         snapshot: snapshot.clone(),
         ingress_incomplete: ingress_incomplete.clone(),
@@ -787,7 +912,7 @@ fn start_with_components(
     };
     std::thread::Builder::new()
         .name("corti-hosted-control".into())
-        .spawn(move || service.run(command_rx, ingress_rx))
+        .spawn(move || service.run(command_rx, priority_rx, ingress_rx))
         .context("spawning hosted coordinator")?;
     Ok((
         HostedState {
@@ -829,16 +954,61 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn process_epoch() -> Result<ProcessEpoch> {
-    let mut bytes = [0u8; 8];
-    random_bytes(&mut bytes)?;
-    Ok(ProcessEpoch(u64::from_le_bytes(bytes).max(1)))
+struct MasterKeys {
+    digest: DigestKey,
+    encryption: [u8; 32],
 }
 
-fn system_digest_key() -> Result<DigestKey> {
-    let mut bytes = [0u8; 32];
-    random_bytes(&mut bytes)?;
-    Ok(DigestKey::new(bytes))
+fn load_or_create_master_keys() -> Result<MasterKeys> {
+    use security_framework::passwords::{
+        PasswordOptions, generic_password, set_generic_password_options,
+    };
+    use security_framework_sys::base::errSecItemNotFound;
+    use zeroize::Zeroize as _;
+
+    let options = || {
+        let mut options = PasswordOptions::new_generic_password(
+            HOSTED_KEYCHAIN_SERVICE,
+            HOSTED_MASTER_KEY_ACCOUNT,
+        );
+        // Explicit false is important: this key must never enter iCloud Keychain synchronization.
+        options.set_access_synchronized(Some(false));
+        options
+    };
+    let mut master = match generic_password(options()) {
+        Ok(value) => value,
+        Err(error) if error.code() == errSecItemNotFound => {
+            let mut value = vec![0u8; 32];
+            random_bytes(&mut value)?;
+            set_generic_password_options(&value, options())
+                .context("storing non-synchronizing hosted master key")?;
+            value
+        }
+        Err(error) => return Err(error).context("reading non-synchronizing hosted master key"),
+    };
+    if master.len() != 32 {
+        master.zeroize();
+        bail!("hosted master key has an invalid length");
+    }
+    let digest = derive_master_subkey(&master, b"corti-hosted-digest-v1");
+    let encryption = derive_master_subkey(&master, b"corti-hosted-encryption-v1");
+    master.zeroize();
+    Ok(MasterKeys {
+        digest: DigestKey::new(digest),
+        encryption,
+    })
+}
+
+fn derive_master_subkey(master: &[u8], domain: &[u8]) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(domain);
+    context.update(&[0]);
+    context.update(master);
+    context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 is 32 bytes")
 }
 
 fn random_bytes(bytes: &mut [u8]) -> Result<()> {
@@ -871,7 +1041,9 @@ fn control_from_preferences(
     };
     ControlSnapshotDto {
         process_epoch,
-        session_generation: 1,
+        // No recording exists at startup. The first LiveTranscriptStore begin and coordinator begin_session
+        // both advance to generation 1 under the shared process epoch.
+        session_generation: 0,
         control_revision: revision,
         steering_revision: revision,
         bank_revision,
@@ -975,6 +1147,246 @@ trait TicketExecutor: Send + Sync {
     ) -> Result<ProviderTerminal, corti_postprocess::PostprocessError>;
 }
 
+struct ProductionApproval(());
+
+impl ProductionApproval {
+    fn from_environment() -> Option<Self> {
+        (std::env::var(PRODUCTION_ARM_ENV).ok().as_deref() == Some("1")).then_some(Self(()))
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self(())
+    }
+}
+
+trait DirectTransportFactory: Send + Sync {
+    fn openai(&self) -> Box<dyn HttpTransport>;
+    fn anthropic(&self) -> Box<dyn HttpTransport>;
+}
+
+struct ProductionTransportFactory;
+
+impl DirectTransportFactory for ProductionTransportFactory {
+    fn openai(&self) -> Box<dyn HttpTransport> {
+        Box::new(UreqTransport::new())
+    }
+
+    fn anthropic(&self) -> Box<dyn HttpTransport> {
+        Box::new(UreqTransport::new())
+    }
+}
+
+trait DirectSecretStore: Send + Sync {
+    fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError>;
+}
+
+struct KeychainDirectSecretStore;
+
+impl DirectSecretStore for KeychainDirectSecretStore {
+    fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+        use security_framework::passwords::{PasswordOptions, generic_password};
+        use security_framework_sys::base::errSecItemNotFound;
+
+        let mut options = PasswordOptions::new_generic_password(HOSTED_KEYCHAIN_SERVICE, account);
+        options.set_access_synchronized(Some(false));
+        match generic_password(options) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.code() == errSecItemNotFound => Ok(None),
+            Err(_) => Err(CredentialError::Unavailable),
+        }
+    }
+}
+
+struct DirectCredential {
+    secrets: Arc<dyn DirectSecretStore>,
+    account: &'static str,
+    rejected: AtomicBool,
+}
+
+impl DirectCredential {
+    fn new(secrets: Arc<dyn DirectSecretStore>, account: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            secrets,
+            account,
+            rejected: AtomicBool::new(false),
+        })
+    }
+
+    fn state(&self) -> CredentialState {
+        use zeroize::Zeroize as _;
+
+        if self.rejected.load(Ordering::Acquire) {
+            return CredentialState::Rejected;
+        }
+        match self.secrets.read(self.account) {
+            Ok(Some(mut bytes)) => {
+                let ready = !bytes.is_empty();
+                bytes.zeroize();
+                if ready {
+                    CredentialState::Ready {
+                        expires_at_unix_ms: None,
+                        source: corti_postprocess::CredentialSourceKind::Keychain,
+                    }
+                } else {
+                    CredentialState::Absent
+                }
+            }
+            Ok(None) => CredentialState::Absent,
+            Err(_) => CredentialState::Error {
+                code: ErrorCode::AuthUnarmed,
+            },
+        }
+    }
+
+    fn api_key(&self) -> Result<ApiKey, CredentialError> {
+        use zeroize::Zeroize as _;
+
+        if self.rejected.load(Ordering::Acquire) {
+            return Err(CredentialError::Rejected);
+        }
+        let bytes = self
+            .secrets
+            .read(self.account)?
+            .ok_or(CredentialError::Absent)?;
+        let value = String::from_utf8(bytes).map_err(|error| {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            CredentialError::Unavailable
+        })?;
+        ApiKey::new(value).map_err(|_| CredentialError::Unavailable)
+    }
+}
+
+struct DirectApiKeySource(Arc<DirectCredential>);
+
+impl ApiKeySource for DirectApiKeySource {
+    fn resolve(&mut self) -> Result<ApiKey, CredentialError> {
+        self.0.api_key()
+    }
+
+    fn mark_rejected(&mut self) {
+        self.0.rejected.store(true, Ordering::Release);
+    }
+}
+
+type SharedAdapter = Arc<Mutex<Box<dyn ProviderAdapter>>>;
+
+struct ApprovedProviderDirectory {
+    adapters: HashMap<(ProviderId, TransportId), SharedAdapter>,
+    credentials: HashMap<(ProviderId, TransportId), Arc<DirectCredential>>,
+}
+
+struct ApprovedProviderAccess(Arc<ApprovedProviderDirectory>);
+
+impl ProviderAccess for ApprovedProviderAccess {
+    fn descriptor(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) -> Option<ProviderDescriptor> {
+        known_descriptor(provider, transport)
+    }
+
+    fn credential_state(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) -> CredentialState {
+        let key = (provider.clone(), transport.clone());
+        if let Some(credential) = self.0.credentials.get(&key) {
+            return credential.state();
+        }
+        match known_descriptor(provider, transport).map(|descriptor| descriptor.support_tier) {
+            Some(SupportTier::Blocked | SupportTier::Experimental) | None => {
+                CredentialState::Unsupported {
+                    code: ErrorCode::PolicyBlocked,
+                }
+            }
+            Some(SupportTier::Documented) => CredentialState::Absent,
+        }
+    }
+
+    fn catalog(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+        scope: &ProviderScope,
+    ) -> Result<ModelCatalog, corti_postprocess::PostprocessError> {
+        let adapter = self
+            .0
+            .adapters
+            .get(&(provider.clone(), transport.clone()))
+            .ok_or_else(|| corti_postprocess::PostprocessError::from(ErrorCode::AuthUnarmed))?;
+        adapter
+            .lock()
+            .map_err(|_| corti_postprocess::PostprocessError::from(ErrorCode::Internal))?
+            .catalog(scope)
+    }
+}
+
+struct ApprovedTicketExecutor(Arc<ApprovedProviderDirectory>);
+
+impl TicketExecutor for ApprovedTicketExecutor {
+    fn execute(
+        &self,
+        ticket: &DispatchTicket,
+        sink: &dyn ProviderEventSink,
+    ) -> Result<ProviderTerminal, corti_postprocess::PostprocessError> {
+        let request = ticket.request();
+        let adapter = self
+            .0
+            .adapters
+            .get(&(request.provider.clone(), request.transport.clone()))
+            .ok_or_else(|| corti_postprocess::PostprocessError::from(ErrorCode::PolicyBlocked))?;
+        ticket.execute_with(
+            adapter
+                .lock()
+                .map_err(|_| corti_postprocess::PostprocessError::from(ErrorCode::Internal))?
+                .as_mut(),
+            sink,
+        )
+    }
+}
+
+fn approved_direct_components(
+    _approval: ProductionApproval,
+    transports: Arc<dyn DirectTransportFactory>,
+    secrets: Arc<dyn DirectSecretStore>,
+) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
+    let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
+    let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
+    let openai: Box<dyn ProviderAdapter> = Box::new(OpenAiResponsesAdapter::new(
+        transports.openai(),
+        Box::new(ProviderSystemClock::new()),
+        Box::new(DirectApiKeySource(openai_credential.clone())),
+    ));
+    let anthropic: Box<dyn ProviderAdapter> = Box::new(AnthropicMessagesAdapter::new(
+        transports.anthropic(),
+        Box::new(ProviderSystemClock::new()),
+        Box::new(DirectApiKeySource(anthropic_credential.clone())),
+    ));
+    let mut adapters = HashMap::new();
+    let mut credentials = HashMap::new();
+    for (adapter, credential) in [
+        (openai, openai_credential),
+        (anthropic, anthropic_credential),
+    ] {
+        let descriptor = adapter.descriptor();
+        let key = (descriptor.provider, descriptor.transport);
+        adapters.insert(key.clone(), Arc::new(Mutex::new(adapter)));
+        credentials.insert(key, credential);
+    }
+    let directory = Arc::new(ApprovedProviderDirectory {
+        adapters,
+        credentials,
+    });
+    (
+        Arc::new(ApprovedTicketExecutor(directory.clone())),
+        Box::new(ApprovedProviderAccess(directory)),
+    )
+}
+
 struct DenyExecutor;
 
 impl TicketExecutor for DenyExecutor {
@@ -1015,20 +1427,193 @@ struct RuntimeStore {
     outbox: Arc<TelemetryOutbox>,
     pipeline_tx: Sender<PipelineMsg>,
     state: RuntimeStoreState,
+    persistence: RuntimeStorePersistence,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeStoreState {
-    journals: HashMap<CallId, (FinalJournalBoundary, FinalJournalState)>,
+    journals: Vec<StoredFinalJournal>,
+    exact_cache: HashMap<String, StoredProviderOutput>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeStoreDocument {
+    schema: u32,
+    state: RuntimeStoreState,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredFinalJournal {
+    recording_id: String,
+    request_group_id: RequestGroupId,
+    call_id: CallId,
+    request_key: String,
+    fence: RequestFence,
+    state: FinalJournalState,
+    output: Option<StoredProviderOutput>,
+}
+
+impl StoredFinalJournal {
+    fn from_boundary(boundary: &FinalJournalBoundary) -> Self {
+        Self {
+            recording_id: boundary.recording_id.clone(),
+            request_group_id: boundary.request_group_id.clone(),
+            call_id: boundary.call_id.clone(),
+            request_key: boundary.request_key.to_base64url(),
+            fence: boundary.fence.clone(),
+            state: FinalJournalState::Prepared,
+            output: None,
+        }
+    }
+
+    fn matches(&self, boundary: &FinalJournalBoundary) -> bool {
+        self.recording_id == boundary.recording_id
+            && self.request_group_id == boundary.request_group_id
+            && self.call_id == boundary.call_id
+            && self.request_key == boundary.request_key.to_base64url()
+            && self.fence == boundary.fence
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredProviderOutput {
+    Rewrite(corti_postprocess::RewriteOutput),
+    Question(corti_postprocess::QuestionOutput),
+}
+
+impl StoredProviderOutput {
+    fn from_output(output: &corti_postprocess::ProviderOutput) -> Self {
+        match output {
+            corti_postprocess::ProviderOutput::Rewrite(output) => Self::Rewrite(output.clone()),
+            corti_postprocess::ProviderOutput::Question(output) => {
+                Self::Question(output.output.clone())
+            }
+        }
+    }
+
+    fn into_output(self) -> corti_postprocess::ProviderOutput {
+        match self {
+            Self::Rewrite(output) => corti_postprocess::ProviderOutput::Rewrite(output),
+            Self::Question(output) => {
+                corti_postprocess::ProviderOutput::Question(corti_postprocess::QuestionTerminal {
+                    output,
+                })
+            }
+        }
+    }
+}
+
+enum RuntimeStorePersistence {
+    Memory,
+    Encrypted { path: PathBuf, cipher: StoreCipher },
+}
+
+struct StoreCipher {
+    key: ring::aead::LessSafeKey,
+}
+
+impl StoreCipher {
+    fn new(key: [u8; 32]) -> Result<Self> {
+        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &key)
+            .map_err(|_| anyhow::anyhow!("invalid hosted store encryption key"))?;
+        Ok(Self {
+            key: ring::aead::LessSafeKey::new(key),
+        })
+    }
+
+    fn seal(&self, mut plaintext: Vec<u8>) -> Result<Vec<u8>> {
+        use zeroize::Zeroize as _;
+
+        let mut nonce_bytes = [0u8; STORE_NONCE_BYTES];
+        random_bytes(&mut nonce_bytes)?;
+        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+        if self
+            .key
+            .seal_in_place_append_tag(nonce, ring::aead::Aad::from(STORE_AAD), &mut plaintext)
+            .is_err()
+        {
+            plaintext.zeroize();
+            bail!("encrypting hosted store failed");
+        }
+        let mut envelope = Vec::with_capacity(
+            STORE_MAGIC
+                .len()
+                .saturating_add(STORE_NONCE_BYTES)
+                .saturating_add(plaintext.len()),
+        );
+        envelope.extend_from_slice(STORE_MAGIC);
+        envelope.extend_from_slice(&nonce_bytes);
+        envelope.extend_from_slice(&plaintext);
+        plaintext.zeroize();
+        Ok(envelope)
+    }
+
+    fn open(&self, envelope: &[u8]) -> Result<RuntimeStoreState> {
+        use zeroize::Zeroize as _;
+
+        let prefix = STORE_MAGIC.len().saturating_add(STORE_NONCE_BYTES);
+        if envelope.len() < prefix.saturating_add(ring::aead::AES_256_GCM.tag_len())
+            || !envelope.starts_with(STORE_MAGIC)
+        {
+            bail!("hosted store envelope is invalid");
+        }
+        let nonce_bytes: [u8; STORE_NONCE_BYTES] = envelope[STORE_MAGIC.len()..prefix]
+            .try_into()
+            .context("reading hosted store nonce")?;
+        let mut ciphertext = envelope[prefix..].to_vec();
+        let plaintext_len = self
+            .key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce_bytes),
+                ring::aead::Aad::from(STORE_AAD),
+                &mut ciphertext,
+            )
+            .map_err(|_| anyhow::anyhow!("hosted store authentication failed"))?
+            .len();
+        let parsed = serde_json::from_slice::<RuntimeStoreDocument>(&ciphertext[..plaintext_len])
+            .context("parsing encrypted hosted store")
+            .and_then(|document| {
+                if document.schema != STORE_SCHEMA {
+                    bail!("unsupported hosted store schema");
+                }
+                Ok(document.state)
+            });
+        ciphertext.zeroize();
+        parsed
+    }
 }
 
 impl RuntimeStore {
-    fn new(outbox: Arc<TelemetryOutbox>, pipeline_tx: Sender<PipelineMsg>) -> Self {
+    fn memory(outbox: Arc<TelemetryOutbox>, pipeline_tx: Sender<PipelineMsg>) -> Self {
         Self {
             outbox,
             pipeline_tx,
             state: RuntimeStoreState::default(),
+            persistence: RuntimeStorePersistence::Memory,
         }
+    }
+
+    fn open_encrypted(
+        path: PathBuf,
+        key: [u8; 32],
+        outbox: Arc<TelemetryOutbox>,
+        pipeline_tx: Sender<PipelineMsg>,
+    ) -> Result<Self> {
+        let cipher = StoreCipher::new(key)?;
+        let state = match read_private(&path, "encrypted hosted store", MAX_STORE_BYTES)? {
+            Some(bytes) => cipher.open(&bytes)?,
+            None => RuntimeStoreState::default(),
+        };
+        Ok(Self {
+            outbox,
+            pipeline_tx,
+            state,
+            persistence: RuntimeStorePersistence::Encrypted { path, cipher },
+        })
     }
 
     fn terminal(&self, telemetry: &TerminalTelemetryDto) -> Result<(), ErrorCode> {
@@ -1036,82 +1621,257 @@ impl RuntimeStore {
         let _ = self.pipeline_tx.send(PipelineMsg::ImportPostprocessOutbox);
         Ok(())
     }
-}
 
-impl EncryptedPostprocessStore for RuntimeStore {
-    fn lookup_exact(&mut self, _key: RequestKey) -> Result<ExactLookup, ErrorCode> {
-        // Reusable encrypted cache is not armed in this wiring slice. A miss is safe; production provider
-        // execution is independently denied until the real encrypted store/keychain factory is installed.
-        Ok(ExactLookup::Miss)
+    fn persist_state(&self) -> Result<(), ErrorCode> {
+        let RuntimeStorePersistence::Encrypted { path, cipher } = &self.persistence else {
+            return Ok(());
+        };
+        use zeroize::Zeroize as _;
+
+        let mut plaintext = serde_json::to_vec(&RuntimeStoreDocument {
+            schema: STORE_SCHEMA,
+            state: self.state.clone(),
+        })
+        .map_err(|_| ErrorCode::Cache)?;
+        if plaintext.len() > MAX_STORE_BYTES {
+            plaintext.zeroize();
+            return Err(ErrorCode::Cache);
+        }
+        let envelope = cipher.seal(plaintext).map_err(|_| ErrorCode::Cache)?;
+        atomic_write_private(path, &envelope, "encrypted hosted store")
+            .map_err(|_| ErrorCode::Cache)
     }
 
-    fn evict_corrupt(&mut self, _key: RequestKey) -> Result<(), ErrorCode> {
-        Ok(())
-    }
-
-    fn prepare_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
-        self.state.journals.insert(
-            boundary.call_id.clone(),
-            (boundary.clone(), FinalJournalState::Prepared),
-        );
-        Ok(())
-    }
-
-    fn mark_final_dispatched(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
-        if let Some((_, state)) = self.state.journals.get_mut(&boundary.call_id) {
-            *state = FinalJournalState::Dispatched;
+    fn transaction(
+        &mut self,
+        update: impl FnOnce(&mut RuntimeStoreState) -> Result<(), ErrorCode>,
+    ) -> Result<(), ErrorCode> {
+        let before = self.state.clone();
+        update(&mut self.state)?;
+        if let Err(error) = self.persist_state() {
+            self.state = before;
+            return Err(error);
         }
         Ok(())
     }
 
-    fn commit_validated(&mut self, commit: StoreCommit<'_>) -> Result<(), ErrorCode> {
-        self.terminal(commit.telemetry)?;
-        if let Some(boundary) = commit.final_boundary
-            && let Some((_, state)) = self.state.journals.get_mut(&boundary.call_id)
+    fn journal_mut<'a>(
+        state: &'a mut RuntimeStoreState,
+        boundary: &FinalJournalBoundary,
+    ) -> Result<&'a mut StoredFinalJournal, ErrorCode> {
+        state
+            .journals
+            .iter_mut()
+            .find(|journal| journal.call_id == boundary.call_id && journal.matches(boundary))
+            .ok_or(ErrorCode::Cache)
+    }
+
+    fn update_group(
+        &mut self,
+        boundaries: &[FinalJournalBoundary],
+        next: FinalJournalState,
+    ) -> Result<(), ErrorCode> {
+        if boundaries.is_empty() {
+            return Ok(());
+        }
+        let group_id = &boundaries[0].request_group_id;
+        if boundaries
+            .iter()
+            .any(|boundary| &boundary.request_group_id != group_id)
         {
-            *state = FinalJournalState::ResultCached;
+            return Err(ErrorCode::Cache);
+        }
+        let expected = match next {
+            FinalJournalState::Applied => FinalJournalState::ResultCached,
+            FinalJournalState::Checkpointed => FinalJournalState::Applied,
+            _ => return Err(ErrorCode::Cache),
+        };
+        self.transaction(|state| {
+            // Validate the complete group and every source state before mutating a single journal row.
+            for boundary in boundaries {
+                if Self::journal_mut(state, boundary)?.state != expected {
+                    return Err(ErrorCode::Cache);
+                }
+            }
+            for boundary in boundaries {
+                Self::journal_mut(state, boundary)?.state = next;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl EncryptedPostprocessStore for RuntimeStore {
+    fn lookup_exact(&mut self, key: RequestKey) -> Result<ExactLookup, ErrorCode> {
+        let key = key.to_base64url();
+        let output = self.state.exact_cache.get(&key).cloned().or_else(|| {
+            self.state.journals.iter().rev().find_map(|journal| {
+                (journal.request_key == key
+                    && matches!(
+                        journal.state,
+                        FinalJournalState::ResultCached
+                            | FinalJournalState::Applied
+                            | FinalJournalState::Checkpointed
+                    ))
+                .then(|| journal.output.clone())
+                .flatten()
+            })
+        });
+        Ok(output.map_or(ExactLookup::Miss, |output| {
+            ExactLookup::Hit(output.into_output())
+        }))
+    }
+
+    fn evict_corrupt(&mut self, key: RequestKey) -> Result<(), ErrorCode> {
+        let key = key.to_base64url();
+        self.transaction(|state| {
+            state.exact_cache.remove(&key);
+            for journal in &mut state.journals {
+                if journal.request_key == key {
+                    journal.output = None;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
+        self.transaction(|state| {
+            if state
+                .journals
+                .iter()
+                .any(|journal| journal.call_id == boundary.call_id)
+            {
+                return Err(ErrorCode::Cache);
+            }
+            if state.journals.len() >= MAX_STORE_JOURNALS {
+                let removable = state.journals.iter().position(|journal| {
+                    matches!(
+                        journal.state,
+                        FinalJournalState::Checkpointed | FinalJournalState::Abandoned
+                    )
+                });
+                let Some(index) = removable else {
+                    return Err(ErrorCode::Cache);
+                };
+                state.journals.remove(index);
+            }
+            state
+                .journals
+                .push(StoredFinalJournal::from_boundary(boundary));
+            Ok(())
+        })
+    }
+
+    fn mark_final_dispatched(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
+        self.transaction(|state| {
+            let journal = Self::journal_mut(state, boundary)?;
+            if journal.state != FinalJournalState::Prepared {
+                return Err(ErrorCode::Cache);
+            }
+            journal.state = FinalJournalState::Dispatched;
+            Ok(())
+        })
+    }
+
+    fn commit_validated(&mut self, commit: StoreCommit<'_>) -> Result<(), ErrorCode> {
+        let key = commit.request_key.to_base64url();
+        let output = StoredProviderOutput::from_output(commit.cache_output);
+        self.transaction(|state| {
+            if commit.local_cache_mode == LocalCacheMode::Reusable {
+                if state.exact_cache.len() >= MAX_STORE_CACHE_ENTRIES
+                    && !state.exact_cache.contains_key(&key)
+                {
+                    return Err(ErrorCode::Cache);
+                }
+                state.exact_cache.insert(key.clone(), output.clone());
+            }
+            if let Some(boundary) = commit.final_boundary {
+                let journal = Self::journal_mut(state, boundary)?;
+                journal.output = Some(output.clone());
+                journal.state = FinalJournalState::ResultCached;
+            }
+            Ok(())
+        })?;
+        // The encrypted result is the crash boundary. A content-free outbox failure must not make the
+        // coordinator discard already-durable output and repeat a paid request.
+        if self.terminal(commit.telemetry).is_err() {
+            tracing::warn!(
+                target: "corti::hosted",
+                call_id = %commit.telemetry.call_id,
+                "hosted result is durable but history outbox persistence failed"
+            );
         }
         Ok(())
     }
 
     fn abandon_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
-        if let Some((_, state)) = self.state.journals.get_mut(&boundary.call_id) {
-            *state = FinalJournalState::Abandoned;
-        }
-        Ok(())
+        self.transaction(|state| {
+            let journal = Self::journal_mut(state, boundary)?;
+            if journal.state != FinalJournalState::Checkpointed {
+                journal.state = FinalJournalState::Abandoned;
+            }
+            Ok(())
+        })
     }
 
-    fn mark_final_applied(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
-        if let Some((_, state)) = self.state.journals.get_mut(&boundary.call_id) {
-            *state = FinalJournalState::Applied;
-        }
-        Ok(())
-    }
-
-    fn mark_final_checkpointed(
+    fn mark_final_group_applied(
         &mut self,
-        boundary: &FinalJournalBoundary,
+        boundaries: &[FinalJournalBoundary],
     ) -> Result<(), ErrorCode> {
-        if let Some((_, state)) = self.state.journals.get_mut(&boundary.call_id) {
-            *state = FinalJournalState::Checkpointed;
-        }
-        Ok(())
+        self.update_group(boundaries, FinalJournalState::Applied)
+    }
+
+    fn mark_final_group_checkpointed(
+        &mut self,
+        boundaries: &[FinalJournalBoundary],
+    ) -> Result<(), ErrorCode> {
+        self.update_group(boundaries, FinalJournalState::Checkpointed)
     }
 
     fn recover_final(
         &mut self,
         recording_id: &str,
     ) -> Result<Option<FinalRecoveryRecord>, ErrorCode> {
-        Ok(self
+        let Some(latest) = self
             .state
             .journals
-            .values()
-            .filter(|(boundary, _)| boundary.recording_id == recording_id)
-            .max_by_key(|(boundary, _)| boundary.call_id.as_str())
-            .map(|(boundary, state)| FinalRecoveryRecord {
-                call_id: boundary.call_id.clone(),
-                state: *state,
-            }))
+            .iter()
+            .rev()
+            .find(|journal| journal.recording_id == recording_id)
+        else {
+            return Ok(None);
+        };
+        let group = self
+            .state
+            .journals
+            .iter()
+            .filter(|journal| {
+                journal.recording_id == recording_id
+                    && journal.request_group_id == latest.request_group_id
+            })
+            .collect::<Vec<_>>();
+        // One ambiguous chunk makes the entire final group ambiguous. Never let a later Prepared sibling
+        // hide an earlier paid dispatch and trigger a blind group retry after a crash.
+        let selected = [
+            FinalJournalState::Dispatched,
+            FinalJournalState::Applied,
+            FinalJournalState::ResultCached,
+            FinalJournalState::Prepared,
+            FinalJournalState::Abandoned,
+            FinalJournalState::Checkpointed,
+        ]
+        .into_iter()
+        .find_map(|state| {
+            group
+                .iter()
+                .find(|journal| journal.state == state)
+                .map(|journal| FinalRecoveryRecord {
+                    call_id: journal.call_id.clone(),
+                    state,
+                })
+        });
+        Ok(selected)
     }
 
     fn record_terminal(&mut self, telemetry: &TerminalTelemetryDto) -> Result<(), ErrorCode> {
@@ -1190,6 +1950,10 @@ fn default_outbox_path() -> Result<PathBuf> {
     Ok(corti_queue::data_dir()?.join("postprocess-outbox.json"))
 }
 
+fn default_store_path() -> Result<PathBuf> {
+    Ok(corti_queue::data_dir()?.join("postprocess-store.enc"))
+}
+
 fn import_outbox(queue: &Queue, outbox: &TelemetryOutbox) -> Result<usize> {
     let mut imported = HashSet::new();
     for telemetry in outbox.pending() {
@@ -1200,16 +1964,8 @@ fn import_outbox(queue: &Queue, outbox: &TelemetryOutbox) -> Result<usize> {
         }
         let record = telemetry_to_record(&telemetry)?;
         queue.upsert_postprocess_call(&record)?;
-        if telemetry.lane == Lane::Final {
-            let projection = match telemetry.outcome {
-                TerminalOutcomeDto::Completed => Some(corti_queue::PostprocessState::Complete),
-                TerminalOutcomeDto::Failed
-                | TerminalOutcomeDto::Canceled
-                | TerminalOutcomeDto::Superseded
-                | TerminalOutcomeDto::Timeout => Some(corti_queue::PostprocessState::Fallback),
-            };
-            queue.set_postprocess_state(&telemetry.recording_id, projection)?;
-        }
+        // A terminal row is one chunk, not the publication boundary for its final group. The pipeline/live
+        // owner projects Complete/Fallback only after the whole group and its checkpoint commit atomically.
         imported.insert(telemetry.call_id);
     }
     let count = imported.len();
@@ -1331,6 +2087,7 @@ enum ServiceCommand {
     },
     EndSession {
         recording_id: String,
+        reply: Sender<Result<(), ErrorCode>>,
     },
     Patch {
         request: HostedPatchRequest,
@@ -1365,9 +2122,11 @@ enum ServiceCommand {
     },
     AbandonFinal {
         call_ids: Vec<CallId>,
+        reply: Sender<Result<(), ErrorCode>>,
     },
     MarkFinalCheckpointed {
         call_ids: Vec<CallId>,
+        reply: Sender<Result<(), ErrorCode>>,
     },
     SubmitAdHoc {
         question: String,
@@ -1378,8 +2137,8 @@ enum ServiceCommand {
         reply: Sender<bool>,
     },
     SetPinnedTemplate {
-        template: String,
-        reply: Sender<Result<(), ErrorCode>>,
+        request: PinnedQuestionUpdateRequest,
+        reply: Sender<Result<HostedMutationResult, ErrorCode>>,
     },
     AssistantSnapshot {
         reply: Sender<AssistantSnapshotDto>,
@@ -1446,31 +2205,77 @@ struct Service {
 }
 
 impl Service {
-    fn run(mut self, command_rx: Receiver<ServiceCommand>, ingress_rx: Receiver<HotPathCommand>) {
+    fn run(
+        mut self,
+        command_rx: Receiver<ServiceCommand>,
+        priority_rx: Receiver<ServiceCommand>,
+        ingress_rx: Receiver<HotPathCommand>,
+    ) {
+        let mut command_connected = true;
+        let mut priority_connected = true;
+        let mut next_tick = Instant::now();
         loop {
-            match command_rx.recv_timeout(SERVICE_TICK) {
-                Ok(command) => self.handle_command(command),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.cancel_pending_finals(ErrorCode::Canceled);
-                    return;
+            let mut did_work = false;
+            for _ in 0..MAX_PRIORITY_DRAIN {
+                match priority_rx.try_recv() {
+                    Ok(command) => {
+                        did_work = true;
+                        self.handle_command(command);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        priority_connected = false;
+                        break;
+                    }
                 }
             }
-            while let Ok(command) = command_rx.try_recv() {
-                self.handle_command(command);
+            for _ in 0..MAX_COMMAND_DRAIN {
+                match command_rx.try_recv() {
+                    Ok(command) => {
+                        did_work = true;
+                        self.handle_command(command);
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        command_connected = false;
+                        break;
+                    }
+                }
             }
-            self.drain_ingress(&ingress_rx);
-            self.drain_provider_events();
-            self.drain_workers();
-            self.drain_vertex();
-            self.coordinator.tick();
-            self.expire_pending_finals();
-            self.sync_pinned_revision();
-            if let Some(attempt) = self.coordinator.drive_vertex() {
-                self.spawn_vertex_resolution(attempt);
+            if !did_work && command_connected {
+                let until_tick = next_tick.saturating_duration_since(Instant::now());
+                let timeout = SERVICE_IDLE_POLL.min(until_tick.max(Duration::from_micros(1)));
+                match command_rx.recv_timeout(timeout) {
+                    Ok(command) => self.handle_command(command),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => command_connected = false,
+                }
+            } else if !did_work && !command_connected {
+                std::thread::sleep(SERVICE_IDLE_POLL);
             }
-            self.drive_dispatch();
+
+            self.drain_ingress(&ingress_rx, MAX_INGRESS_DRAIN);
+            self.drain_provider_events(MAX_PROVIDER_EVENT_DRAIN);
+            self.drain_workers(MAX_WORKER_DRAIN);
+            self.drain_vertex(MAX_VERTEX_DRAIN);
+
+            let now = Instant::now();
+            if now >= next_tick {
+                self.coordinator.tick();
+                self.expire_pending_finals();
+                self.sync_pinned_revision();
+                if let Some(attempt) = self.coordinator.drive_vertex() {
+                    self.spawn_vertex_resolution(attempt);
+                }
+                next_tick = now + SERVICE_TICK;
+            }
+            self.drive_dispatch(MAX_DISPATCH_DRAIN);
             self.publish_events(false);
+
+            if !command_connected && !priority_connected {
+                self.cancel_pending_finals(ErrorCode::Canceled);
+                return;
+            }
         }
     }
 
@@ -1483,7 +2288,10 @@ impl Service {
                 let result = self.begin_session(recording_id);
                 let _ = reply.send(result);
             }
-            ServiceCommand::EndSession { recording_id } => {
+            ServiceCommand::EndSession {
+                recording_id,
+                reply,
+            } => {
                 if self.current_recording.as_deref() == Some(&recording_id) {
                     self.cancel_pending_finals(ErrorCode::Canceled);
                     let _ = self.coordinator.begin_session();
@@ -1495,6 +2303,7 @@ impl Service {
                     self.ingress_incomplete.store(false, Ordering::Release);
                     self.bump_state();
                 }
+                let _ = reply.send(Ok(()));
             }
             ServiceCommand::Patch { request, reply } => {
                 let result = self.patch(request);
@@ -1533,16 +2342,19 @@ impl Service {
                     .map_err(coordinator_error_code);
                 let _ = reply.send(result);
             }
-            ServiceCommand::AbandonFinal { call_ids } => {
+            ServiceCommand::AbandonFinal { call_ids, reply } => {
                 for call_id in call_ids {
                     self.coordinator
                         .cancel_call(&call_id, CancellationReason::Superseded);
                 }
+                let _ = reply.send(Ok(()));
             }
-            ServiceCommand::MarkFinalCheckpointed { call_ids } => {
-                for call_id in call_ids {
-                    let _ = self.coordinator.mark_final_checkpointed(&call_id);
-                }
+            ServiceCommand::MarkFinalCheckpointed { call_ids, reply } => {
+                let result = self
+                    .coordinator
+                    .mark_final_group_checkpointed(&call_ids)
+                    .map_err(coordinator_error_code);
+                let _ = reply.send(result);
             }
             ServiceCommand::SubmitAdHoc { question, reply } => {
                 let result = self.submit_ad_hoc(question);
@@ -1554,15 +2366,14 @@ impl Service {
                     .cancel_call(&call_id, CancellationReason::Explicit);
                 let _ = reply.send(canceled);
             }
-            ServiceCommand::SetPinnedTemplate { template, reply } => {
-                let result = self.set_pinned_template(template);
+            ServiceCommand::SetPinnedTemplate { request, reply } => {
+                let result = self.set_pinned_template(request);
                 let _ = reply.send(result);
             }
             ServiceCommand::AssistantSnapshot { reply } => {
                 let _ = reply.send(self.assistant_snapshot());
             }
         }
-        self.drive_dispatch();
         self.publish_events(true);
     }
 
@@ -1755,35 +2566,38 @@ impl Service {
         let quota_project = bounded_optional(request.quota_project)?;
         let configured =
             alias.is_some() || project.is_some() || region.is_some() || quota_project.is_some();
-        let existing_id = {
+        let existing = {
             let preferences = self.preferences.lock().unwrap();
             let values = preferences.values();
             match (provider.as_str(), transport.as_str()) {
-                ("google", "vertex_api") => values.providers.vertex.connection_scope_id.clone(),
-                ("openai", "openai_api") => {
-                    values.providers.openai.scope.connection_scope_id.clone()
-                }
-                ("anthropic", "anthropic_api") => {
-                    values.providers.anthropic.scope.connection_scope_id.clone()
-                }
+                ("google", "vertex_api") => values.providers.vertex.clone(),
+                ("openai", "openai_api") => values.providers.openai.scope.clone(),
+                ("anthropic", "anthropic_api") => values.providers.anthropic.scope.clone(),
                 _ => return Err(ErrorCode::PolicyBlocked),
             }
         };
-        let generated_id = if configured && existing_id.is_none() {
-            let id = self.next_id;
-            self.next_id = self.next_id.checked_add(1).ok_or(ErrorCode::Internal)?;
-            Some(
-                ConnectionScopeId::new(format!(
-                    "scope-{}-{id}",
-                    self.coordinator.control_snapshot().process_epoch.0
-                ))
-                .map_err(|_| ErrorCode::Internal)?,
-            )
-        } else if configured {
-            existing_id
-        } else {
-            None
-        };
+        if existing.alias == alias
+            && existing.project == project
+            && existing.region == region
+            && existing.quota_project == quota_project
+        {
+            return Ok(HostedMutationResult::Unchanged {
+                settings: self.current_settings(),
+            });
+        }
+        let generated_id = configured
+            .then(|| {
+                derive_connection_scope_id(
+                    &self.digest_key,
+                    &provider,
+                    &transport,
+                    alias.as_deref(),
+                    project.as_deref(),
+                    region.as_deref(),
+                    quota_project.as_deref(),
+                )
+            })
+            .transpose()?;
         self.revise_preferences(|values| {
             let scope = match (provider.as_str(), transport.as_str()) {
                 ("google", "vertex_api") => &mut values.providers.vertex,
@@ -1886,14 +2700,35 @@ impl Service {
         Ok(state)
     }
 
-    fn set_pinned_template(&mut self, template: String) -> Result<(), ErrorCode> {
+    fn set_pinned_template(
+        &mut self,
+        request: PinnedQuestionUpdateRequest,
+    ) -> Result<HostedMutationResult, ErrorCode> {
+        if request.observed_state_revision != self.state_revision {
+            return Ok(HostedMutationResult::Conflict {
+                settings: self.current_settings(),
+            });
+        }
+        let template = request.template;
         if template.len() > crate::postprocess::MAX_QUESTION_TEXT_BYTES
             || template.chars().any(char::is_control)
         {
             return Err(ErrorCode::PolicyBlocked);
         }
-        // Persist content first, like steering/word-bank updates. A failed private-file write must not
-        // cancel the active pinned call or arm a session-only template that the command reported as failed.
+        if self
+            .preferences
+            .lock()
+            .unwrap()
+            .values()
+            .pinned_question_template
+            == template
+        {
+            return Ok(HostedMutationResult::Unchanged {
+                settings: self.current_settings(),
+            });
+        }
+        // The frontend is the single debounce owner. Persist and fence one accepted revision atomically on
+        // this serial service thread so an older response/edit can never win after a newer revision.
         self.revise_preferences(|values| values.pinned_question_template = template.clone())?;
         self.coordinator
             .edit_pinned_template(template)
@@ -1901,7 +2736,9 @@ impl Service {
         self.pinned_exchange = None;
         self.bump_state();
         self.refresh_snapshot();
-        Ok(())
+        Ok(HostedMutationResult::Applied {
+            settings: self.current_settings(),
+        })
     }
 
     fn revise_preferences(
@@ -1919,8 +2756,8 @@ impl Service {
         Ok(())
     }
 
-    fn drain_ingress(&mut self, ingress_rx: &Receiver<HotPathCommand>) {
-        loop {
+    fn drain_ingress(&mut self, ingress_rx: &Receiver<HotPathCommand>, limit: usize) {
+        for _ in 0..limit {
             match ingress_rx.try_recv() {
                 Ok(HotPathCommand::FinalizedRows { recording_id, rows }) => {
                     self.observe_rows(&recording_id, rows)
@@ -1977,27 +2814,48 @@ impl Service {
         if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
             return None;
         }
+        let input_token_budget = self.input_token_budget(LaneFamily::Live);
         let mut bytes = 0usize;
+        let mut tokens = 0u64;
         let mut targets = Vec::new();
-        for row in &self.ledger[old_len..] {
-            let next = bytes.saturating_add(row.text.len());
-            if targets.len() >= MAX_LIVE_TARGET_ROWS || next > MAX_LIVE_TARGET_BYTES {
+        let incoming = &self.ledger[old_len..];
+        for row in incoming {
+            let row_tokens = estimated_row_tokens(row);
+            let next_bytes = bytes.saturating_add(row.text.len());
+            let next_tokens = tokens.saturating_add(row_tokens);
+            if row_tokens > input_token_budget
+                || next_tokens > input_token_budget
+                || (!targets.is_empty()
+                    && (targets.len() >= MAX_LIVE_TARGET_ROWS
+                        || next_bytes > MAX_LIVE_TARGET_BYTES))
+            {
                 break;
             }
-            bytes = next;
+            bytes = next_bytes;
+            tokens = next_tokens;
             targets.push(row.clone());
+        }
+        if targets.len() != incoming.len() {
+            // Never imply complete hosted coverage when a latency/model token budget omitted finalized rows.
+            // The raw UI remains complete and the stronger live final safely falls back to raw.
+            self.ingress_incomplete.store(true, Ordering::Release);
         }
         if targets.is_empty() {
             return None;
         }
         let context_start = old_len.saturating_sub(MAX_CONTEXT_ROWS);
-        let context = self.ledger[context_start..old_len].to_vec();
+        let context = bounded_rows_from_end(
+            &self.ledger[context_start..old_len],
+            input_token_budget.saturating_sub(tokens),
+        )
+        .0;
         self.build_submission(
             recording_id,
             Lane::Live,
             targets,
             context,
             None,
+            false,
             watermark,
             None,
             self.clock
@@ -2070,13 +2928,15 @@ impl Service {
         {
             return None;
         }
-        let context = bounded_question_context(&self.ledger);
+        let (context, context_truncated) =
+            bounded_question_context(&self.ledger, self.input_token_budget(LaneFamily::Question));
         self.build_submission(
             recording_id,
             Lane::PinnedQuestion,
             Vec::new(),
             context,
             Some(&template),
+            context_truncated,
             watermark,
             None,
             self.clock
@@ -2092,13 +2952,15 @@ impl Service {
             .clone()
             .ok_or(ErrorCode::PolicyBlocked)?;
         let watermark = self.coordinator.watermark();
-        let context = bounded_question_context(&self.ledger);
+        let (context, context_truncated) =
+            bounded_question_context(&self.ledger, self.input_token_budget(LaneFamily::Question));
         let submission = self.build_submission(
             &recording_id,
             Lane::AdHocQuestion,
             Vec::new(),
             context,
             Some(&question),
+            context_truncated,
             watermark,
             None,
             self.clock
@@ -2193,6 +3055,29 @@ impl Service {
             ));
             return;
         }
+        match self.coordinator.recover_final(&recording_id) {
+            Ok(
+                FinalRecoveryDirective::None
+                | FinalRecoveryDirective::ResumePrepared { .. }
+                | FinalRecoveryDirective::ResumeEncryptedResult { .. }
+                | FinalRecoveryDirective::ResumeCheckpoint { .. },
+            ) => {}
+            Ok(FinalRecoveryDirective::Fallback { call_id, code, .. }) => {
+                self.release_batch_session(live_session);
+                let _ = reply.send(fallback_final(transcript, code, vec![call_id], None));
+                return;
+            }
+            Err(_) => {
+                self.release_batch_session(live_session);
+                let _ = reply.send(fallback_final(
+                    transcript,
+                    ErrorCode::Cache,
+                    Vec::new(),
+                    None,
+                ));
+                return;
+            }
+        }
         let indexed_rows = transcript_rows(&transcript);
         let rows: Vec<TranscriptRow> = indexed_rows.iter().map(|(_, row)| row.clone()).collect();
         if rows.is_empty() {
@@ -2222,7 +3107,11 @@ impl Service {
         } else {
             self.coordinator.watermark()
         };
-        let chunks = match final_chunks(&rows) {
+        let chunks = match final_chunks(
+            &rows,
+            self.input_token_budget(LaneFamily::Final)
+                .min(MAX_FINAL_INPUT_TOKENS),
+        ) {
             Ok(chunks) => chunks,
             Err(code) => {
                 self.release_batch_session(live_session);
@@ -2257,6 +3146,7 @@ impl Service {
                 targets,
                 context,
                 None,
+                false,
                 watermark,
                 Some((group_id.clone(), target_id)),
                 deadline,
@@ -2329,6 +3219,7 @@ impl Service {
         targets: Vec<TranscriptRow>,
         context: Vec<TranscriptRow>,
         question: Option<&str>,
+        context_truncated: bool,
         watermark: TranscriptWatermark,
         identity: Option<(RequestGroupId, Option<TargetId>)>,
         deadline: u64,
@@ -2363,7 +3254,7 @@ impl Service {
                 &steering,
                 &context,
                 question.ok_or(ErrorCode::PolicyBlocked)?,
-                false,
+                context_truncated,
             )
         } else {
             CanonicalPrompt::rewrite(&self.word_bank, &steering, &context, &targets)
@@ -2430,7 +3321,7 @@ impl Service {
             adapter_version,
             2 * 1024 * 1024,
             2 * 1024 * 1024,
-            false,
+            context_truncated,
         )
         .map_err(submit_error_code)
     }
@@ -2479,6 +3370,36 @@ impl Service {
             steering_fingerprint: ProvenanceFingerprint::new(steering_fingerprint.as_str())
                 .map_err(|_| ErrorCode::Internal)?,
         })
+    }
+
+    fn input_token_budget(&self, family: LaneFamily) -> u64 {
+        let lane = match family {
+            LaneFamily::Live => &self.coordinator.control_snapshot().live,
+            LaneFamily::Final => &self.coordinator.control_snapshot().final_lane,
+            LaneFamily::Question => &self.coordinator.control_snapshot().questions,
+        };
+        let (Some(provider), Some(transport), Some(model_id)) = (
+            lane.selection.provider.as_ref(),
+            lane.selection.transport.as_ref(),
+            lane.selection.model.as_ref(),
+        ) else {
+            return DEFAULT_INPUT_TOKEN_BUDGET;
+        };
+        self.coordinator
+            .provider_states()
+            .filter(|state| {
+                &state.descriptor.provider == provider && &state.descriptor.transport == transport
+            })
+            .flat_map(|state| state.models.iter())
+            .find(|model| &model.exact_model_id == model_id)
+            .map(|model| {
+                model
+                    .max_context_tokens
+                    .saturating_sub(model.max_output_tokens)
+                    .saturating_sub(PROMPT_TOKEN_RESERVE)
+            })
+            .filter(|budget| *budget > 0)
+            .unwrap_or(DEFAULT_INPUT_TOKEN_BUDGET)
     }
 
     fn effective_steering(&self) -> String {
@@ -2534,8 +3455,8 @@ impl Service {
         .map_err(|_| ErrorCode::Internal)
     }
 
-    fn drive_dispatch(&mut self) {
-        loop {
+    fn drive_dispatch(&mut self, limit: usize) {
+        for _ in 0..limit {
             match self.coordinator.dispatch_next() {
                 DispatchOutcome::Ticket(ticket) => self.spawn_ticket(ticket),
                 DispatchOutcome::CacheApply(apply) => {
@@ -2573,8 +3494,11 @@ impl Service {
         }
     }
 
-    fn drain_vertex(&mut self) {
-        while let Ok((attempt, outcome)) = self.vertex_rx.try_recv() {
+    fn drain_vertex(&mut self, limit: usize) {
+        for _ in 0..limit {
+            let Ok((attempt, outcome)) = self.vertex_rx.try_recv() else {
+                break;
+            };
             let _ = self.coordinator.complete_vertex(attempt, outcome);
         }
     }
@@ -2619,15 +3543,20 @@ impl Service {
         }
     }
 
-    fn drain_provider_events(&mut self) {
-        let _ = crate::postprocess::drain_provider_events(
-            &self.provider_event_rx,
-            &mut self.coordinator,
-        );
+    fn drain_provider_events(&mut self, limit: usize) {
+        for _ in 0..limit {
+            let Ok(event) = self.provider_event_rx.try_recv() else {
+                break;
+            };
+            let _ = self.coordinator.on_provider_event(event);
+        }
     }
 
-    fn drain_workers(&mut self) {
-        while let Ok(completion) = self.worker_rx.try_recv() {
+    fn drain_workers(&mut self, limit: usize) {
+        for _ in 0..limit {
+            let Ok(completion) = self.worker_rx.try_recv() else {
+                break;
+            };
             let call_id = completion.ticket.request().call_id.clone();
             self.call_cache.insert(call_id.clone(), completion.cache);
             match self
@@ -3021,6 +3950,29 @@ fn adapter_version(transport: &TransportId) -> u32 {
     }
 }
 
+fn derive_connection_scope_id(
+    key: &DigestKey,
+    provider: &ProviderId,
+    transport: &TransportId,
+    alias: Option<&str>,
+    project: Option<&str>,
+    region: Option<&str>,
+    quota_project: Option<&str>,
+) -> Result<ConnectionScopeId, ErrorCode> {
+    let canonical = serde_json::to_vec(&(
+        provider.as_str(),
+        transport.as_str(),
+        alias,
+        project,
+        region,
+        quota_project,
+    ))
+    .map_err(|_| ErrorCode::Internal)?;
+    let fingerprint = key.fingerprint(b"corti-provider-scope-v2\0", &canonical);
+    ConnectionScopeId::new(format!("scope-v2-{}", fingerprint.as_str()))
+        .map_err(|_| ErrorCode::Internal)
+}
+
 fn bounded_optional(value: Option<String>) -> Result<Option<String>, ErrorCode> {
     let value = value.map(|value| value.trim().to_owned());
     let value = value.filter(|value| !value.is_empty());
@@ -3077,23 +4029,32 @@ fn seconds_to_millis(value: f64) -> u64 {
 
 type FinalChunk = (Vec<TranscriptRow>, Vec<TranscriptRow>);
 
-fn final_chunks(rows: &[TranscriptRow]) -> Result<Vec<FinalChunk>, ErrorCode> {
+fn final_chunks(
+    rows: &[TranscriptRow],
+    input_token_budget: u64,
+) -> Result<Vec<FinalChunk>, ErrorCode> {
     if rows.is_empty() {
         return Ok(vec![(Vec::new(), Vec::new())]);
+    }
+    if input_token_budget == 0 {
+        return Err(ErrorCode::PolicyBlocked);
     }
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < rows.len() {
         let mut end = start;
-        let mut bytes = 0usize;
+        let mut tokens = 0u64;
         while end < rows.len() {
-            let row_bytes = rows[end].text.len().saturating_add(rows[end].speaker.len());
-            if end > start && bytes.saturating_add(row_bytes) > REQUEST_CHUNK_BYTES {
+            let row_tokens = estimated_row_tokens(&rows[end]);
+            if row_tokens > input_token_budget
+                || (end > start && tokens.saturating_add(row_tokens) > input_token_budget)
+            {
                 break;
             }
-            bytes = bytes.saturating_add(row_bytes);
+            tokens = tokens.saturating_add(row_tokens);
             end += 1;
         }
+        // A row is an indivisible identity. Never truncate its text or silently discard a remainder.
         if end == start {
             return Err(ErrorCode::PolicyBlocked);
         }
@@ -3106,30 +4067,51 @@ fn final_chunks(rows: &[TranscriptRow]) -> Result<Vec<FinalChunk>, ErrorCode> {
     Ok(ranges
         .into_iter()
         .map(|(start, end)| {
-            let mut context = Vec::new();
-            context.extend_from_slice(&rows[start.saturating_sub(2)..start]);
-            context.extend_from_slice(&rows[end..rows.len().min(end.saturating_add(2))]);
+            let remaining = input_token_budget.saturating_sub(
+                rows[start..end]
+                    .iter()
+                    .map(estimated_row_tokens)
+                    .fold(0u64, u64::saturating_add),
+            );
+            let mut neighbors = Vec::new();
+            neighbors.extend_from_slice(&rows[start.saturating_sub(2)..start]);
+            neighbors.extend_from_slice(&rows[end..rows.len().min(end.saturating_add(2))]);
+            let context = bounded_rows_from_end(&neighbors, remaining).0;
             (rows[start..end].to_vec(), context)
         })
         .collect())
 }
 
-fn bounded_question_context(rows: &[TranscriptRow]) -> Vec<TranscriptRow> {
-    const MAX_BYTES: usize = 256 * 1024;
-    let mut bytes = 0usize;
+fn estimated_row_tokens(row: &TranscriptRow) -> u64 {
+    // Conservative provider-neutral upper bound: at most one token per UTF-8 byte plus fixed JSON/identity
+    // overhead. Exact tokenizers remain adapter-owned; this boundary never claims omitted context was sent.
+    let bytes = row
+        .text
+        .len()
+        .saturating_add(row.speaker.len())
+        .saturating_add(row.row_id.as_str().len());
+    u64::try_from(bytes).unwrap_or(u64::MAX).saturating_add(24)
+}
+
+fn bounded_rows_from_end(rows: &[TranscriptRow], token_budget: u64) -> (Vec<TranscriptRow>, bool) {
+    let mut tokens = 0u64;
     let mut start = rows.len();
     while start > 0 {
-        let next = rows[start - 1]
-            .text
-            .len()
-            .saturating_add(rows[start - 1].speaker.len());
-        if bytes.saturating_add(next) > MAX_BYTES {
+        let next = estimated_row_tokens(&rows[start - 1]);
+        if next > token_budget || tokens.saturating_add(next) > token_budget {
             break;
         }
-        bytes = bytes.saturating_add(next);
+        tokens = tokens.saturating_add(next);
         start -= 1;
     }
-    rows[start..].to_vec()
+    (rows[start..].to_vec(), start > 0)
+}
+
+fn bounded_question_context(
+    rows: &[TranscriptRow],
+    input_token_budget: u64,
+) -> (Vec<TranscriptRow>, bool) {
+    bounded_rows_from_end(rows, input_token_budget)
 }
 
 fn transcript_fingerprint(
@@ -3225,14 +4207,19 @@ fn coordinator_error_code(error: crate::postprocess::CoordinatorError) -> ErrorC
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Condvar;
     use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 
     use corti_core::{OwningApp, RecordingMeta, Speaker, TranscriptSegment};
     use corti_postprocess::{
         AdapterCapabilities, CredentialSourceKind, EventContext, LatencyFields, ModelDescriptor,
-        NormalizedUsage, ProviderEvent, ProviderEventKind, ProviderOutput, QuestionOutput,
-        QuestionTerminal, Replacement, RewriteOutput,
+        NormalizedUsage, PromptTask, ProviderCacheKey, ProviderCacheKeyMaterial, ProviderEvent,
+        ProviderEventKind, ProviderOutput, QuestionOutput, QuestionTerminal, Replacement,
+        RewriteOutput,
+    };
+    use corti_postprocess_providers::{
+        HttpRequest, HttpResponse, HttpResponseBody, TransportError,
     };
 
     use super::*;
@@ -3324,6 +4311,76 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct InjectedTransportFactory {
+        openai: Arc<Mutex<VecDeque<HttpResponse>>>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl DirectTransportFactory for InjectedTransportFactory {
+        fn openai(&self) -> Box<dyn HttpTransport> {
+            Box::new(InjectedTransport {
+                responses: self.openai.clone(),
+                sends: self.sends.clone(),
+            })
+        }
+
+        fn anthropic(&self) -> Box<dyn HttpTransport> {
+            Box::new(InjectedTransport {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                sends: self.sends.clone(),
+            })
+        }
+    }
+
+    struct InjectedTransport {
+        responses: Arc<Mutex<VecDeque<HttpResponse>>>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl HttpTransport for InjectedTransport {
+        fn send(
+            &mut self,
+            _request: &HttpRequest,
+            _cancel: &corti_postprocess::CancellationToken,
+        ) -> Result<HttpResponse, TransportError> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected approved-factory HTTP request"))
+        }
+    }
+
+    struct FixtureBody(VecDeque<Vec<u8>>);
+
+    impl HttpResponseBody for FixtureBody {
+        fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+            Ok(self.0.pop_front())
+        }
+    }
+
+    struct InjectedSecrets;
+
+    impl DirectSecretStore for InjectedSecrets {
+        fn read(&self, _account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
+            Ok(Some(b"synthetic-injected-api-key".to_vec()))
+        }
+    }
+
+    fn fixture_http_response(
+        content_type: &str,
+        chunks: impl IntoIterator<Item = Vec<u8>>,
+    ) -> HttpResponse {
+        HttpResponse::new(
+            200,
+            [("content-type".to_string(), content_type.to_string())],
+            Box::new(FixtureBody(chunks.into_iter().collect())),
+        )
+    }
+
     struct RewriteExecutor;
 
     impl TicketExecutor for RewriteExecutor {
@@ -3337,17 +4394,29 @@ mod tests {
                 kind: ProviderEventKind::DispatchStarted,
             });
             let output = if ticket.request().lane.is_question() {
+                let citation = ticket
+                    .request()
+                    .context
+                    .first()
+                    .map(|row| row.row_id.clone());
                 ProviderOutput::Question(QuestionTerminal {
                     output: QuestionOutput {
                         schema: 1,
-                        answer: "fixture grounded answer".to_string(),
-                        cited_row_ids: ticket
+                        answer: citation.as_ref().map_or_else(
+                            || corti_postprocess::EXPLICIT_NO_ANSWER.to_string(),
+                            |_| "fixture grounded answer".to_string(),
+                        ),
+                        cited_row_ids: citation.into_iter().collect(),
+                        context_truncated: ticket
                             .request()
-                            .context
-                            .first()
-                            .map(|row| vec![row.row_id.clone()])
-                            .unwrap_or_default(),
-                        context_truncated: false,
+                            .prompt
+                            .messages()
+                            .last()
+                            .and_then(|message| {
+                                serde_json::from_str::<serde_json::Value>(message.content()).ok()
+                            })
+                            .and_then(|value| value["context_truncated"].as_bool())
+                            .unwrap_or(false),
                     },
                 })
             } else {
@@ -3577,9 +4646,69 @@ mod tests {
             ProcessEpoch(77),
             false,
             None,
+            None,
         )
         .unwrap();
         (handle, pipeline_rx, path)
+    }
+
+    fn fixture_request_key() -> RequestKey {
+        let provider = ProviderId::new("openai").unwrap();
+        let transport = TransportId::new("openai_api").unwrap();
+        let scope = ConnectionScopeId::new("fixture-scope").unwrap();
+        let model = ModelId::new("fixture-model").unwrap();
+        let targets = [TranscriptRow {
+            row_id: RowId::new("fixture-boundary-row").unwrap(),
+            speaker: "Fixture".into(),
+            start_ms: 0,
+            end_ms: 1,
+            text: "fixture sensitive row".into(),
+        }];
+        RequestKey::derive(
+            &DigestKey::new([91; 32]),
+            &RequestKeyMaterial {
+                provider: &provider,
+                transport: &transport,
+                support_tier: SupportTier::Documented,
+                connection_scope_id: &scope,
+                region: None,
+                exact_model_id: &model,
+                adapter_version: 1,
+                prompt_template_version: PROMPT_TEMPLATE_VERSION,
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
+                chunker_version: 1,
+                lane: Lane::Final,
+                billing_basis: BillingBasis::MeteredEstimate,
+                cache_policy: CachePolicy {
+                    local: LocalCacheMode::Reusable,
+                    provider: ProviderCacheMode::Off,
+                },
+                word_bank_canonical_digest: "fixture-bank",
+                effective_steering: "",
+                targets: &targets,
+                context: &[],
+                question: None,
+            },
+        )
+    }
+
+    fn fixture_boundary(call: &str, group: &str) -> FinalJournalBoundary {
+        FinalJournalBoundary {
+            recording_id: "fixture-sensitive-recording".into(),
+            request_group_id: RequestGroupId::new(group).unwrap(),
+            call_id: CallId::new(call).unwrap(),
+            request_key: fixture_request_key(),
+            fence: RequestFence {
+                process_epoch: ProcessEpoch(1),
+                session_generation: 1,
+                transcript_revision: 1,
+                control_revision: 1,
+                lane_revision: 1,
+                steering_revision: 1,
+                bank_revision: 1,
+                question_revision: None,
+            },
+        }
     }
 
     fn raw_transcript() -> DiarizedTranscript {
@@ -3598,6 +4727,185 @@ mod tests {
             owning_app: OwningApp::from_bundle_id("fixture.app"),
             audio_path: audio,
         }
+    }
+
+    #[test]
+    fn hosted_command_surfaces_deny_cross_window_content_and_controls() {
+        assert!(hosted_window_allowed("live", &["live", "settings"]));
+        assert!(hosted_window_allowed("settings", &["live", "settings"]));
+        assert!(hosted_window_allowed("settings", &["settings"]));
+        for denied in ["queue", "console", "how", "ethics"] {
+            assert!(!hosted_window_allowed(denied, &["live", "settings"]));
+            assert!(!hosted_window_allowed(denied, &["live"]));
+        }
+        assert!(!hosted_window_allowed("live", &["settings"]));
+        assert!(!hosted_window_allowed("settings", &["live"]));
+    }
+
+    #[test]
+    fn explicitly_approved_factory_starts_and_dispatches_only_through_injected_transport() {
+        let path = dir("approved-factory-startup");
+        let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
+        let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
+        let model = corti_postprocess_providers::OPENAI_LUNA_MODEL_ID;
+        let preferences = configured_preferences()
+            .revise(|values| {
+                values.final_lane.model = Some(ModelId::new(model).unwrap());
+                values.questions.model = Some(ModelId::new(model).unwrap());
+            })
+            .unwrap();
+        let catalog = format!(
+            r#"{{"object":"list","data":[{{"id":"{model}","object":"model","shutdown_date":null}}]}}"#
+        );
+        let output = r#"{"schema":1,"replacements":[{"row_id":"final-row-00000000","text":"factory corrected text"}]}"#;
+        let stream = format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":{delta}}}\n\n\
+             event: response.output_text.done\ndata: {{\"type\":\"response.output_text.done\",\"text\":{delta}}}\n\n\
+             event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"model\":\"{model}\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}}}\n\n",
+            delta = serde_json::to_string(output).unwrap(),
+        );
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            fixture_http_response("application/json", [catalog.into_bytes()]),
+            fixture_http_response("text/event-stream", [stream.into_bytes()]),
+        ])));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let transports = Arc::new(InjectedTransportFactory {
+            openai: responses,
+            sends: sends.clone(),
+        });
+        let (executor, providers) = approved_direct_components(
+            ProductionApproval::for_test(),
+            transports,
+            Arc::new(InjectedSecrets),
+        );
+        let (_, handle) = start_with_components(
+            preferences,
+            WordBankDocument::empty(),
+            LiveTranscriptStore::detached(),
+            pipeline_tx,
+            outbox,
+            executor,
+            providers,
+            Arc::new(NoPricing),
+            Arc::new(UnarmedVertex),
+            Arc::new(|_| {}),
+            DigestKey::new([41; 32]),
+            ProcessEpoch(123),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let settled = handle.finalize("recording", raw_transcript(), false);
+        assert!(settled.hosted_text_applied);
+        assert_eq!(
+            settled.transcript.segments[0].text,
+            "factory corrected text"
+        );
+        assert_eq!(
+            sends.load(Ordering::SeqCst),
+            2,
+            "catalog + one injected POST"
+        );
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn project_and_quota_changes_rotate_both_local_and_provider_cache_scopes() {
+        let key = DigestKey::new([23; 32]);
+        let provider = ProviderId::new("google").unwrap();
+        let transport = TransportId::new("vertex_api").unwrap();
+        let model = ModelId::new("fixture-model").unwrap();
+        let first_scope = derive_connection_scope_id(
+            &key,
+            &provider,
+            &transport,
+            Some("fixture"),
+            Some("project-a"),
+            Some("global"),
+            Some("quota-a"),
+        )
+        .unwrap();
+        let project_scope = derive_connection_scope_id(
+            &key,
+            &provider,
+            &transport,
+            Some("fixture"),
+            Some("project-b"),
+            Some("global"),
+            Some("quota-a"),
+        )
+        .unwrap();
+        let quota_scope = derive_connection_scope_id(
+            &key,
+            &provider,
+            &transport,
+            Some("fixture"),
+            Some("project-a"),
+            Some("global"),
+            Some("quota-b"),
+        )
+        .unwrap();
+        assert_ne!(first_scope, project_scope);
+        assert_ne!(first_scope, quota_scope);
+
+        let targets = vec![TranscriptRow {
+            row_id: RowId::new("scope-row").unwrap(),
+            speaker: "Fixture".into(),
+            start_ms: 0,
+            end_ms: 1,
+            text: "synthetic".into(),
+        }];
+        let request_key = |scope: &ConnectionScopeId| {
+            RequestKey::derive(
+                &key,
+                &RequestKeyMaterial {
+                    provider: &provider,
+                    transport: &transport,
+                    support_tier: SupportTier::Documented,
+                    connection_scope_id: scope,
+                    region: Some("global"),
+                    exact_model_id: &model,
+                    adapter_version: 1,
+                    prompt_template_version: PROMPT_TEMPLATE_VERSION,
+                    output_schema_version: OUTPUT_SCHEMA_VERSION,
+                    chunker_version: 1,
+                    lane: Lane::Final,
+                    billing_basis: BillingBasis::MeteredEstimate,
+                    cache_policy: CachePolicy {
+                        local: LocalCacheMode::Reusable,
+                        provider: ProviderCacheMode::ExplicitStablePrefix,
+                    },
+                    word_bank_canonical_digest: "bank",
+                    effective_steering: "",
+                    targets: &targets,
+                    context: &[],
+                    question: None,
+                },
+            )
+        };
+        let provider_key = |scope: &ConnectionScopeId| {
+            ProviderCacheKey::derive(
+                &key,
+                &ProviderCacheKeyMaterial {
+                    provider: &provider,
+                    transport: &transport,
+                    support_tier: SupportTier::Documented,
+                    connection_scope_id: scope,
+                    region: Some("global"),
+                    exact_model_id: &model,
+                    adapter_version: 1,
+                    prompt_template_version: PROMPT_TEMPLATE_VERSION,
+                    output_schema_version: OUTPUT_SCHEMA_VERSION,
+                    prompt_task: PromptTask::Rewrite,
+                    provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
+                    word_bank_canonical_digest: "bank",
+                },
+            )
+        };
+        assert_ne!(request_key(&first_scope), request_key(&project_scope));
+        assert_ne!(provider_key(&first_scope), provider_key(&quota_scope));
     }
 
     #[test]
@@ -3691,7 +4999,7 @@ mod tests {
             .set_final_attempt_call_ids(settled.call_ids.clone())
             .unwrap();
         checkpoint.store(&audio).unwrap();
-        handle.mark_final_checkpointed(&settled.call_ids);
+        handle.mark_final_checkpointed(&settled.call_ids).unwrap();
         assert_eq!(
             crate::checkpoint::FilingCheckpoint::load(&audio)
                 .unwrap()
@@ -3699,12 +5007,236 @@ mod tests {
             settled.transcript
         );
 
+        queue
+            .set_postprocess_state(&id, Some(corti_queue::PostprocessState::Finalizing))
+            .unwrap();
         assert_eq!(handle.import_outbox(&queue).unwrap(), 1);
+        assert_eq!(
+            queue.get(&id).unwrap().unwrap().postprocess_state,
+            Some(corti_queue::PostprocessState::Finalizing),
+            "one terminal chunk must not publish completion for its whole final group"
+        );
         assert_eq!(handle.import_outbox(&queue).unwrap(), 0);
         let history = queue.postprocess_history(&id).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].call_id, settled.call_ids[0]);
         assert!(!history[0].provider_request_sent || history[0].error_code.is_none());
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn encrypted_store_restart_reuses_durable_final_output_without_paid_egress() {
+        let path = dir("encrypted-restart");
+        let store_path = path.join("postprocess-store.enc");
+        let encryption_key = [61; 32];
+        let first_outbox =
+            Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
+        let (first_pipeline_tx, _first_pipeline_rx) = std::sync::mpsc::channel();
+        let first_store = Box::new(
+            RuntimeStore::open_encrypted(
+                store_path.clone(),
+                encryption_key,
+                first_outbox.clone(),
+                first_pipeline_tx.clone(),
+            )
+            .unwrap(),
+        );
+        let first_executor = Arc::new(RecordingExecutor::new());
+        let (_, first_handle) = start_with_components(
+            configured_preferences(),
+            WordBankDocument::empty(),
+            LiveTranscriptStore::detached(),
+            first_pipeline_tx,
+            first_outbox,
+            first_executor.clone(),
+            Box::new(FixtureProviders::openai()),
+            Arc::new(NoPricing),
+            Arc::new(UnarmedVertex),
+            Arc::new(|_| {}),
+            DigestKey::new([71; 32]),
+            ProcessEpoch(701),
+            false,
+            Some(first_store),
+            None,
+        )
+        .unwrap();
+        let first = first_handle.finalize("restart-recording", raw_transcript(), false);
+        assert!(first.hosted_text_applied);
+        assert_eq!(first_executor.target_texts.lock().unwrap().len(), 1);
+        drop(first_handle);
+        std::thread::sleep(Duration::from_millis(30));
+
+        let encrypted = std::fs::read(&store_path).unwrap();
+        assert!(
+            !encrypted
+                .windows("fixture raw text".len())
+                .any(|window| window == b"fixture raw text")
+        );
+        assert!(
+            !encrypted
+                .windows("fixture corrected text".len())
+                .any(|window| window == b"fixture corrected text")
+        );
+        assert!(
+            RuntimeStore::open_encrypted(
+                store_path.clone(),
+                [62; 32],
+                Arc::new(TelemetryOutbox::open(path.join("wrong-key-outbox.json")).unwrap()),
+                std::sync::mpsc::channel().0,
+            )
+            .is_err()
+        );
+
+        let second_outbox =
+            Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
+        let (second_pipeline_tx, _second_pipeline_rx) = std::sync::mpsc::channel();
+        let second_store = Box::new(
+            RuntimeStore::open_encrypted(
+                store_path,
+                encryption_key,
+                second_outbox.clone(),
+                second_pipeline_tx.clone(),
+            )
+            .unwrap(),
+        );
+        let second_executor = Arc::new(RecordingExecutor::new());
+        let (_, second_handle) = start_with_components(
+            configured_preferences(),
+            WordBankDocument::empty(),
+            LiveTranscriptStore::detached(),
+            second_pipeline_tx,
+            second_outbox,
+            second_executor.clone(),
+            Box::new(FixtureProviders::openai()),
+            Arc::new(NoPricing),
+            Arc::new(UnarmedVertex),
+            Arc::new(|_| {}),
+            DigestKey::new([71; 32]),
+            ProcessEpoch(702),
+            false,
+            Some(second_store),
+            None,
+        )
+        .unwrap();
+        let recovered = second_handle.finalize("restart-recording", raw_transcript(), false);
+        assert!(recovered.hosted_text_applied);
+        assert_eq!(
+            recovered.transcript.segments[0].text,
+            "fixture corrected text"
+        );
+        assert!(
+            second_executor.target_texts.lock().unwrap().is_empty(),
+            "restart recovery must be an exact encrypted hit, not another provider request"
+        );
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn encrypted_intent_and_group_transitions_have_crash_atomicity() {
+        let path = dir("encrypted-intent");
+        let outbox = Arc::new(TelemetryOutbox::open(path.join("outbox.json")).unwrap());
+        let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
+        let store_path = path.join("store.enc");
+        let mut store = RuntimeStore::open_encrypted(
+            store_path.clone(),
+            [81; 32],
+            outbox.clone(),
+            pipeline_tx.clone(),
+        )
+        .unwrap();
+        let first = fixture_boundary("fixture-call-a", "fixture-group");
+        let mut second = fixture_boundary("fixture-call-b", "fixture-group");
+        second.request_key = RequestKey::derive(
+            &DigestKey::new([92; 32]),
+            &RequestKeyMaterial {
+                provider: &ProviderId::new("openai").unwrap(),
+                transport: &TransportId::new("openai_api").unwrap(),
+                support_tier: SupportTier::Documented,
+                connection_scope_id: &ConnectionScopeId::new("fixture-scope").unwrap(),
+                region: None,
+                exact_model_id: &ModelId::new("fixture-model").unwrap(),
+                adapter_version: 1,
+                prompt_template_version: PROMPT_TEMPLATE_VERSION,
+                output_schema_version: OUTPUT_SCHEMA_VERSION,
+                chunker_version: 2,
+                lane: Lane::Final,
+                billing_basis: BillingBasis::MeteredEstimate,
+                cache_policy: CachePolicy {
+                    local: LocalCacheMode::RecoveryOnly,
+                    provider: ProviderCacheMode::Off,
+                },
+                word_bank_canonical_digest: "fixture-bank",
+                effective_steering: "",
+                targets: &[],
+                context: &[],
+                question: None,
+            },
+        );
+        store.prepare_final(&first).unwrap();
+        store.prepare_final(&second).unwrap();
+        store.mark_final_dispatched(&first).unwrap();
+        drop(store);
+
+        let encrypted = std::fs::read(&store_path).unwrap();
+        assert!(
+            !encrypted
+                .windows("fixture-sensitive-recording".len())
+                .any(|window| window == b"fixture-sensitive-recording")
+        );
+        let mut recovered =
+            RuntimeStore::open_encrypted(store_path, [81; 32], outbox, pipeline_tx).unwrap();
+        assert_eq!(
+            recovered
+                .recover_final("fixture-sensitive-recording")
+                .unwrap()
+                .unwrap()
+                .state,
+            FinalJournalState::Dispatched,
+            "one dispatched chunk makes the complete final group ambiguous"
+        );
+        assert_eq!(
+            recovered
+                .state
+                .journals
+                .iter()
+                .find(|journal| journal.call_id == first.call_id)
+                .unwrap()
+                .state,
+            FinalJournalState::Dispatched
+        );
+
+        for journal in &mut recovered.state.journals {
+            journal.state = FinalJournalState::ResultCached;
+        }
+        recovered.persistence = RuntimeStorePersistence::Memory;
+        let blocker = path.join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        recovered.persistence = RuntimeStorePersistence::Encrypted {
+            path: blocker.join("store.enc"),
+            cipher: StoreCipher::new([81; 32]).unwrap(),
+        };
+        assert_eq!(
+            recovered.mark_final_group_applied(&[first.clone(), second.clone()]),
+            Err(ErrorCode::Cache)
+        );
+        assert!(
+            recovered
+                .state
+                .journals
+                .iter()
+                .all(|journal| journal.state == FinalJournalState::ResultCached)
+        );
+        recovered.persistence = RuntimeStorePersistence::Memory;
+        recovered
+            .mark_final_group_applied(&[first, second])
+            .unwrap();
+        assert!(
+            recovered
+                .state
+                .journals
+                .iter()
+                .all(|journal| journal.state == FinalJournalState::Applied)
+        );
         std::fs::remove_dir_all(path).ok();
     }
 
@@ -3739,6 +5271,105 @@ mod tests {
         );
         assert_eq!(executor.target_texts.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn live_oversized_first_row_is_not_silently_dropped_or_byte_truncated() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(RecordingExecutor::new());
+        let (handle, _pipeline_rx, path) =
+            start_fixture("live-oversized-row", executor.clone(), events);
+        let descriptor = corti_postprocess::KnownTransport::OpenAiDirect.descriptor();
+        let (reply, receive) = std::sync::mpsc::channel();
+        handle
+            .send(ServiceCommand::RefreshProvider {
+                provider: descriptor.provider.clone(),
+                transport: descriptor.transport.clone(),
+                reply,
+            })
+            .unwrap();
+        receive.recv().unwrap().unwrap();
+        let settings = handle.snapshot();
+        handle
+            .patch_for_test(HostedPatchRequest {
+                observed_state_revision: settings.state_revision,
+                patch: HostedPatchInput::SetLaneSelection {
+                    lane: HostedLaneDto::Live,
+                    selection: HostedSelectionInput {
+                        provider: Some(descriptor.provider.as_str().into()),
+                        transport: Some(descriptor.transport.as_str().into()),
+                        model: Some("fixture-model".into()),
+                        local_cache: LocalCacheMode::Reusable,
+                        provider_cache: ProviderCacheMode::Off,
+                    },
+                },
+            })
+            .unwrap();
+        let settings = handle.snapshot();
+        handle
+            .patch_for_test(HostedPatchRequest {
+                observed_state_revision: settings.state_revision,
+                patch: HostedPatchInput::SetLaneEnabled {
+                    lane: HostedLaneDto::Live,
+                    enabled: true,
+                },
+            })
+            .unwrap();
+        handle.begin_live_session("recording").unwrap();
+        let text = "x".repeat(MAX_LIVE_TARGET_BYTES + 512);
+        handle
+            .try_observe_finalized_rows(
+                "recording",
+                vec![TranscriptRow {
+                    row_id: RowId::new("oversized-live-row").unwrap(),
+                    speaker: "Me".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: text.clone(),
+                }],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !executor.target_texts.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "oversized live row was dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(executor.target_texts.lock().unwrap()[0], vec![text]);
+        let _ = handle.end_live_session("recording");
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn question_context_reports_token_budget_truncation_and_final_rows_are_indivisible() {
+        let rows = vec![
+            TranscriptRow {
+                row_id: RowId::new("context-old").unwrap(),
+                speaker: "Me".into(),
+                start_ms: 0,
+                end_ms: 1,
+                text: "old context".into(),
+            },
+            TranscriptRow {
+                row_id: RowId::new("context-new").unwrap(),
+                speaker: "Me".into(),
+                start_ms: 1,
+                end_ms: 2,
+                text: "new context".into(),
+            },
+        ];
+        let newest_budget = estimated_row_tokens(&rows[1]);
+        let (bounded, truncated) = bounded_question_context(&rows, newest_budget);
+        assert!(truncated);
+        assert_eq!(bounded, vec![rows[1].clone()]);
+
+        let too_small = estimated_row_tokens(&rows[0]).saturating_sub(1);
+        assert_eq!(
+            final_chunks(&rows, too_small),
+            Err(ErrorCode::PolicyBlocked)
+        );
     }
 
     #[test]
@@ -3891,14 +5522,20 @@ mod tests {
         }
 
         let (reply, receive) = std::sync::mpsc::channel();
+        let before_pinned = handle.snapshot();
         handle
             .send(ServiceCommand::SetPinnedTemplate {
-                template: "fixture pinned question".into(),
+                request: PinnedQuestionUpdateRequest {
+                    observed_state_revision: before_pinned.state_revision,
+                    template: "fixture pinned question".into(),
+                },
                 reply,
             })
             .unwrap();
-        receive.recv().unwrap().unwrap();
-        std::thread::sleep(Duration::from_millis(550));
+        assert!(matches!(
+            receive.recv().unwrap().unwrap(),
+            HostedMutationResult::Applied { .. }
+        ));
         let settings = handle.snapshot();
         handle
             .patch_for_test(HostedPatchRequest {
@@ -3938,7 +5575,7 @@ mod tests {
             assert!(Instant::now() < deadline, "pinned answer did not settle");
             std::thread::sleep(Duration::from_millis(10));
         }
-        handle.end_live_session("recording");
+        handle.end_live_session("recording").unwrap();
         std::fs::remove_dir_all(path).ok();
     }
 
@@ -3983,6 +5620,56 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_and_checkpoint_acknowledgements_bypass_saturated_normal_commands() {
+        let path = dir("priority-saturation");
+        let (command_tx, _command_rx) = sync_channel(1);
+        let (dummy_reply, _dummy_receive) = std::sync::mpsc::channel();
+        command_tx
+            .send(ServiceCommand::AssistantSnapshot { reply: dummy_reply })
+            .unwrap();
+        let (priority_tx, priority_rx) = std::sync::mpsc::channel();
+        let (ingress, _ingress_rx) = CoordinatorIngress::bounded(1);
+        let preferences = configured_preferences();
+        let word_bank = WordBankDocument::empty();
+        let control =
+            control_from_preferences(ProcessEpoch(501), &preferences, word_bank.revision());
+        let snapshot = Arc::new(Mutex::new(settings_snapshot(
+            1,
+            &preferences,
+            &word_bank,
+            &control,
+            &initial_provider_states(),
+        )));
+        let handle = HostedHandle {
+            command_tx,
+            priority_tx,
+            ingress,
+            snapshot,
+            ingress_incomplete: Arc::new(AtomicBool::new(false)),
+            outbox: Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap()),
+        };
+
+        let ending = handle.clone();
+        let end_thread = std::thread::spawn(move || ending.end_live_session("recording"));
+        match priority_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ServiceCommand::EndSession { reply, .. } => reply.send(Ok(())).unwrap(),
+            _ => panic!("lifecycle command did not use the priority channel"),
+        }
+        assert_eq!(end_thread.join().unwrap(), Ok(()));
+
+        let checkpointing = handle.clone();
+        let checkpoint_thread = std::thread::spawn(move || {
+            checkpointing.mark_final_checkpointed(&[CallId::new("priority-call").unwrap()])
+        });
+        match priority_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            ServiceCommand::MarkFinalCheckpointed { reply, .. } => reply.send(Ok(())).unwrap(),
+            _ => panic!("checkpoint acknowledgement did not use the priority channel"),
+        }
+        assert_eq!(checkpoint_thread.join().unwrap(), Ok(()));
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
     fn queued_unarmed_auth_expires_to_raw_with_call_provenance() {
         let path = dir("auth-timeout");
         let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
@@ -4004,6 +5691,7 @@ mod tests {
             DigestKey::new([9; 32]),
             ProcessEpoch(88),
             false,
+            None,
             None,
         )
         .unwrap();
@@ -4067,6 +5755,7 @@ mod tests {
             DigestKey::new([5; 32]),
             ProcessEpoch(99),
             false,
+            None,
             Some(clock.clone()),
         )
         .unwrap();
@@ -4124,7 +5813,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].role, "alert");
         assert_eq!(notices[0].visible_message, "gcloud token isn't armed");
-        handle.end_live_session("recording");
+        handle.end_live_session("recording").unwrap();
         std::fs::remove_dir_all(path).ok();
     }
 

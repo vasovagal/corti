@@ -10,6 +10,8 @@ use crate::{RowId, TranscriptRow};
 
 pub const REWRITE_SCHEMA_VERSION: u32 = 1;
 pub const QUESTION_SCHEMA_VERSION: u32 = 1;
+/// The only citation-free terminal answer accepted by the grounding validator.
+pub const EXPLICIT_NO_ANSWER: &str = "No answer in supplied transcript.";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,6 +109,10 @@ pub enum ValidationError {
     SizeOverflow,
     #[error("question answer is empty")]
     EmptyAnswer,
+    #[error("a grounded answer must cite at least one supplied row")]
+    MissingCitation,
+    #[error("the explicit no-answer form must have no citations")]
+    InvalidNoAnswer,
     #[error("question truncation marker does not match supplied context")]
     TruncationMismatch,
     #[error("final chunk target sets are not exact and disjoint")]
@@ -301,6 +307,13 @@ pub fn parse_and_validate_question(
         if row.end_ms < row.start_ms || !context_ids.insert(&row.row_id) {
             return Err(ValidationError::InvalidTargets);
         }
+    }
+    let explicit_no_answer = output.answer == EXPLICIT_NO_ANSWER;
+    if output.cited_row_ids.is_empty() && !explicit_no_answer {
+        return Err(ValidationError::MissingCitation);
+    }
+    if explicit_no_answer && !output.cited_row_ids.is_empty() {
+        return Err(ValidationError::InvalidNoAnswer);
     }
     let mut citations = HashSet::with_capacity(output.cited_row_ids.len());
     for citation in &output.cited_row_ids {
@@ -529,6 +542,19 @@ mod tests {
         assert_eq!(
             parse_and_validate_question(valid, &context, false, 1_024),
             Err(ValidationError::TruncationMismatch)
+        );
+
+        let uncited = br#"{"schema":1,"answer":"Unsupported claim.","cited_row_ids":[],"context_truncated":true}"#;
+        assert_eq!(
+            parse_and_validate_question(uncited, &context, true, 1_024),
+            Err(ValidationError::MissingCitation)
+        );
+        let no_answer = br#"{"schema":1,"answer":"No answer in supplied transcript.","cited_row_ids":[],"context_truncated":true}"#;
+        assert_eq!(
+            parse_and_validate_question(no_answer, &context, true, 1_024)
+                .unwrap()
+                .answer(),
+            EXPLICIT_NO_ANSWER
         );
     }
 

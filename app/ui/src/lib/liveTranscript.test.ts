@@ -10,6 +10,9 @@ import {
 
 function snapshot(over: Partial<LiveTranscriptSnapshot> = {}): LiveTranscriptSnapshot {
   return {
+    protocol_version: 2,
+    process_epoch: 10,
+    session_generation: 1,
     revision: 1,
     session_id: "call-a",
     mode: "call",
@@ -25,8 +28,13 @@ function snapshot(over: Partial<LiveTranscriptSnapshot> = {}): LiveTranscriptSna
 }
 
 function event(over: Partial<LiveTranscriptEvent> = {}): LiveTranscriptEvent {
+  const revision = over.revision ?? 2;
   return {
-    revision: 2,
+    protocol_version: 2,
+    process_epoch: 10,
+    session_generation: 1,
+    from_revision: over.from_revision ?? revision - 1,
+    revision,
     session_id: "call-a",
     mode: "call",
     status: "listening",
@@ -94,6 +102,7 @@ describe("live transcript race/retention reducer", () => {
       event({
         revision: 7,
         session_id: "test-b",
+        session_generation: 2,
         mode: "test",
         reset: true,
         line: null,
@@ -129,9 +138,18 @@ describe("live transcript race/retention reducer", () => {
     expect(gap.snapshot).toBe(current);
     expect(gap.snapshot?.lines[0].text).toBe("raw retained");
 
-    const process = reduceLiveEvent(current, event({ revision: 1, process_epoch: 11 }));
+    const process = reduceLiveEvent(
+      current,
+      event({ from_revision: 0, revision: 1, process_epoch: 11 }),
+    );
     expect(process.outcome).toBe("process_change");
     expect(process.snapshot).toBe(current);
+  });
+
+  it("rejects stale snapshots from an earlier session generation", () => {
+    const current = snapshot({ session_generation: 4, revision: 20, session_id: "new" });
+    const stale = snapshot({ session_generation: 3, revision: 99, session_id: "old" });
+    expect(applyLiveSnapshot(current, stale)).toBe(current);
   });
 
   it("uses from_revision when supplied and never lets a clean upsert mutate immutable raw text", () => {

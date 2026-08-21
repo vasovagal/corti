@@ -4,12 +4,15 @@ import type {
   HostedAssistantExchange,
   HostedCostEstimate,
   HostedNormalizedUsage,
+  HostedSettingsDto,
   HostedTerminalEvent,
 } from "./api";
 import {
   MAX_VISIBLE_CALL_DETAILS,
   applyHostedCallEvent,
   boundAssistantExchanges,
+  hostedUiFenceMatches,
+  shouldInstallHostedSettings,
   formatHostedCost,
   formatLatencyMicros,
   latencyEntries,
@@ -37,7 +40,18 @@ function accounting(over: Partial<HostedAccountingEvent> = {}): HostedAccounting
   return {
     event: "accounting",
     call_id: "call-live-1",
+    recording_id: "session-a",
     lane: "live",
+    fence: {
+      process_epoch: 7,
+      session_generation: 3,
+      transcript_revision: 9,
+      control_revision: 2,
+      lane_revision: 2,
+      steering_revision: 1,
+      bank_revision: 1,
+      question_revision: null,
+    },
     finality: "provisional",
     usage,
     cost: unknownCost,
@@ -118,7 +132,7 @@ function exchange(index: number, bytes = 8): HostedAssistantExchange {
 
 describe("live hosted call state", () => {
   it("upgrades provisional accounting to final telemetry and ignores late provisional regressions", () => {
-    const context = { sessionId: "session-a", sessionGeneration: 3 };
+    const context = { processEpoch: 7, sessionId: "session-a", sessionGeneration: 3 };
     const provisional = applyHostedCallEvent([], accounting(), context);
     expect(provisional[0].finality).toBe("provisional");
     const final = applyHostedCallEvent(provisional, terminal(), context);
@@ -132,7 +146,7 @@ describe("live hosted call state", () => {
   });
 
   it("drops stale session/generation terminals and bounds visible calls", () => {
-    const context = { sessionId: "session-a", sessionGeneration: 3 };
+    const context = { processEpoch: 7, sessionId: "session-a", sessionGeneration: 3 };
     const first = applyHostedCallEvent([], terminal(), context);
     expect(
       applyHostedCallEvent(first, terminal({ recording_id: "old-session", call_id: "late" }), context),
@@ -141,6 +155,13 @@ describe("live hosted call state", () => {
       applyHostedCallEvent(
         first,
         terminal({ call_id: "late-generation", fence: { ...terminal().fence, session_generation: 2 } }),
+        context,
+      ),
+    ).toBe(first);
+    expect(
+      applyHostedCallEvent(
+        first,
+        accounting({ call_id: "stale-accounting", recording_id: "old-session" }),
         context,
       ),
     ).toBe(first);
@@ -166,6 +187,43 @@ describe("live hosted call state", () => {
     expect(formatHostedCost({ ...unknownCost, billing_basis: "no_provider_request" })).toBe(
       "Local cache · no provider request",
     );
+  });
+});
+
+function hostedSettings(revision: number, processEpoch = 7): HostedSettingsDto {
+  return {
+    state_revision: revision,
+    control: {
+      process_epoch: processEpoch,
+      session_generation: 3,
+      control_revision: 2,
+      live: { revision: 2 },
+      final_lane: { revision: 4 },
+      questions: { revision: 6 },
+    },
+  } as HostedSettingsDto;
+}
+
+describe("hosted UI revision fences", () => {
+  it("rejects stale settings responses while accepting a new process", () => {
+    const current = hostedSettings(8);
+    expect(shouldInstallHostedSettings(current, hostedSettings(7))).toBe(false);
+    expect(shouldInstallHostedSettings(current, hostedSettings(8))).toBe(true);
+    expect(shouldInstallHostedSettings(current, hostedSettings(1, 9))).toBe(true);
+  });
+
+  it("requires the exact process/session/control/lane fence", () => {
+    const settings = hostedSettings(8);
+    const fence = {
+      process_epoch: 7,
+      session_generation: 3,
+      control_revision: 2,
+      lane_revision: 2,
+    };
+    expect(hostedUiFenceMatches(settings, "live", fence)).toBe(true);
+    expect(hostedUiFenceMatches(settings, "live", { ...fence, lane_revision: 1 })).toBe(false);
+    expect(hostedUiFenceMatches(settings, "final", { ...fence, lane_revision: 4 })).toBe(true);
+    expect(hostedUiFenceMatches(settings, "final", { ...fence, session_generation: 2 })).toBe(false);
   });
 });
 

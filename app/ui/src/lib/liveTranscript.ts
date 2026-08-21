@@ -16,15 +16,15 @@ export function applyLiveSnapshot(
   current: LiveTranscriptSnapshot | null,
   incoming: LiveTranscriptSnapshot,
 ): LiveTranscriptSnapshot {
-  const processChanged =
-    current?.process_epoch !== undefined &&
-    incoming.process_epoch !== undefined &&
-    current.process_epoch !== incoming.process_epoch;
-  if (processChanged) return normalizeSnapshot(incoming);
-
-  if (current && incoming.revision < current.revision) {
-    // Subscribe-before-snapshot race: the invoke may have cloned revision N just before event N+1 arrived.
-    // Merge that older baseline with the newer delta instead of either losing history or regressing metadata.
+  if (!current || current.process_epoch !== incoming.process_epoch) {
+    return normalizeSnapshot(incoming);
+  }
+  if (incoming.session_generation < current.session_generation) return current;
+  if (
+    incoming.session_generation === current.session_generation &&
+    incoming.revision < current.revision
+  ) {
+    // Subscribe-before-snapshot race: merge only within the exact process/session fence.
     if (current.session_id !== incoming.session_id) return current;
     return {
       ...current,
@@ -44,11 +44,7 @@ export function reduceLiveEvent(
 ): LiveEventReduction {
   if (!current) return { snapshot: snapshotFromEvent(null, event), outcome: "applied" };
 
-  if (
-    current.process_epoch !== undefined &&
-    event.process_epoch !== undefined &&
-    current.process_epoch !== event.process_epoch
-  ) {
+  if (current.process_epoch !== event.process_epoch) {
     return { snapshot: current, outcome: "process_change" };
   }
 
@@ -57,12 +53,8 @@ export function reduceLiveEvent(
   }
 
   const sameSession = current.session_id === event.session_id;
-  const sameGeneration =
-    current.session_generation === undefined ||
-    event.session_generation === undefined ||
-    current.session_generation === event.session_generation;
-  const expectedFrom = event.from_revision ?? event.revision - 1;
-  const contiguous = expectedFrom === current.revision;
+  const sameGeneration = current.session_generation === event.session_generation;
+  const contiguous = event.from_revision === current.revision;
 
   if (!sameSession || !sameGeneration) {
     if (!event.reset || !contiguous) return { snapshot: current, outcome: "gap" };
@@ -94,15 +86,13 @@ function snapshotFromEvent(
 ): LiveTranscriptSnapshot {
   const sameSession =
     current?.session_id === event.session_id &&
-    (current.session_generation === undefined ||
-      event.session_generation === undefined ||
-      current.session_generation === event.session_generation);
+    current?.session_generation === event.session_generation;
   const prior = event.reset || !sameSession ? [] : (current?.lines ?? []);
   const lines = event.line === null ? prior : [...prior, event.line];
   return {
-    protocol_version: event.protocol_version ?? current?.protocol_version,
-    process_epoch: event.process_epoch ?? current?.process_epoch,
-    session_generation: event.session_generation ?? current?.session_generation,
+    protocol_version: event.protocol_version,
+    process_epoch: event.process_epoch,
+    session_generation: event.session_generation,
     revision: event.revision,
     session_id: event.session_id,
     mode: event.mode,

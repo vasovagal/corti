@@ -220,9 +220,6 @@ impl OpenAiResponsesAdapter {
         timing.exchange = Some(exchange.times);
         if exchange.response.status() != 200 {
             let code = http_status_code(exchange.response.status());
-            if code == ErrorCode::AuthRejected {
-                self.credentials.mark_rejected();
-            }
             return Err(ExecFailure::new(code, true));
         }
         validate_event_stream_response(&exchange.response)
@@ -369,6 +366,11 @@ impl ProviderAdapter for OpenAiResponsesAdapter {
                 Ok(terminal)
             }
             Err(failure) => {
+                // One terminal edge owns rejection for both HTTP and in-stream authentication failures.
+                // This also avoids double-marking a 401 handled earlier in the exchange.
+                if failure.code == ErrorCode::AuthRejected {
+                    self.credentials.mark_rejected();
+                }
                 if let Some(reason) = cancel.reason() {
                     emit(
                         sink,

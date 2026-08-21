@@ -1310,7 +1310,7 @@ pub(crate) fn transcribe_and_file(
     let mut settled = ctx.hosted.finalize(id, raw_transcript.clone(), false);
     let mut final_applied = settled.hosted_text_applied;
     if final_applied && ctx.hosted.mark_final_applied(&settled.call_ids).is_err() {
-        ctx.hosted.abandon_final_result(&settled.call_ids);
+        let _ = ctx.hosted.abandon_final_result(&settled.call_ids);
         settled.transcript = raw_transcript;
         settled.hosted_text_applied = false;
         settled.fallback_code = Some(corti_postprocess::ErrorCode::Superseded);
@@ -1361,12 +1361,12 @@ pub(crate) fn transcribe_and_file(
         .context("persisting transcript checkpoint")
     {
         if final_applied {
-            ctx.hosted.abandon_final_result(&settled.call_ids);
+            let _ = ctx.hosted.abandon_final_result(&settled.call_ids);
         }
         return Err(error);
     }
     if final_applied {
-        ctx.hosted.mark_final_checkpointed(&settled.call_ids);
+        let _ = ctx.hosted.mark_final_checkpointed(&settled.call_ids);
     }
     if hosted_snapshot.control.master_enabled && hosted_snapshot.control.final_lane.enabled {
         ctx.queue

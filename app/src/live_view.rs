@@ -6,7 +6,9 @@
 //! the store mutex is held.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use corti_core::{Speaker, TranscriptSegment};
 use corti_postprocess::{RowId, TranscriptRow};
@@ -16,6 +18,8 @@ use tauri::{Emitter, State};
 
 /// Event listened to by the Live Transcript webview.
 pub(crate) const LIVE_TRANSCRIPT_EVENT: &str = "live-transcript-changed";
+const LIVE_TRANSCRIPT_PROTOCOL_VERSION: u32 = 2;
+static PROCESS_EPOCH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// UI history is independent of call length. Text plus conservative per-row overhead stays under ~1 MiB.
 const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 /// A second independent bound protects against pathological streams of tiny rows.
@@ -69,6 +73,9 @@ pub(crate) struct LiveTranscriptLine {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LiveTranscriptSnapshot {
+    pub protocol_version: u32,
+    pub process_epoch: u64,
+    pub session_generation: u64,
     pub revision: u64,
     pub session_id: Option<String>,
     pub mode: LiveTranscriptMode,
@@ -85,6 +92,10 @@ pub(crate) struct LiveTranscriptSnapshot {
 /// `reset` clears rows for a new session; `retained_from_seq` trims rows evicted by either hard cap.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LiveTranscriptEvent {
+    pub protocol_version: u32,
+    pub process_epoch: u64,
+    pub session_generation: u64,
+    pub from_revision: u64,
     pub revision: u64,
     pub session_id: Option<String>,
     pub mode: LiveTranscriptMode,
@@ -111,6 +122,8 @@ pub(crate) struct LiveTranscriptStore {
 }
 
 struct Inner {
+    process_epoch: u64,
+    session_generation: u64,
     revision: u64,
     next_seq: u64,
     session_id: Option<String>,
@@ -127,6 +140,8 @@ struct Inner {
 impl Default for Inner {
     fn default() -> Self {
         Self {
+            process_epoch: new_process_epoch(),
+            session_generation: 0,
             revision: 0,
             next_seq: 1,
             session_id: None,
@@ -149,6 +164,9 @@ impl Inner {
 
     fn snapshot(&self) -> LiveTranscriptSnapshot {
         LiveTranscriptSnapshot {
+            protocol_version: LIVE_TRANSCRIPT_PROTOCOL_VERSION,
+            process_epoch: self.process_epoch,
+            session_generation: self.session_generation,
             revision: self.revision,
             session_id: self.session_id.clone(),
             mode: self.mode,
@@ -162,8 +180,17 @@ impl Inner {
         }
     }
 
-    fn event(&self, reset: bool, line: Option<LiveTranscriptLine>) -> LiveTranscriptEvent {
+    fn event(
+        &self,
+        from_revision: u64,
+        reset: bool,
+        line: Option<LiveTranscriptLine>,
+    ) -> LiveTranscriptEvent {
         LiveTranscriptEvent {
+            protocol_version: LIVE_TRANSCRIPT_PROTOCOL_VERSION,
+            process_epoch: self.process_epoch,
+            session_generation: self.session_generation,
+            from_revision,
             revision: self.revision,
             session_id: self.session_id.clone(),
             mode: self.mode,
@@ -182,7 +209,7 @@ impl Inner {
 impl LiveTranscriptStore {
     pub(crate) fn for_app(app: tauri::AppHandle) -> Self {
         Self::with_notifier(Arc::new(move |event| {
-            let _ = app.emit(LIVE_TRANSCRIPT_EVENT, event);
+            let _ = app.emit_to("live", LIVE_TRANSCRIPT_EVENT, event);
         }))
     }
 
@@ -201,6 +228,10 @@ impl LiveTranscriptStore {
 
     pub(crate) fn snapshot(&self) -> LiveTranscriptSnapshot {
         self.inner.lock().unwrap().snapshot()
+    }
+
+    pub(crate) fn process_epoch(&self) -> corti_postprocess::ProcessEpoch {
+        corti_postprocess::ProcessEpoch(self.inner.lock().unwrap().process_epoch)
     }
 
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
@@ -263,7 +294,9 @@ impl LiveTranscriptStore {
         let _publish = self.publish.lock().unwrap();
         let event = {
             let mut inner = self.inner.lock().unwrap();
+            let from_revision = inner.revision;
             inner.revision = inner.revision.saturating_add(1);
+            inner.session_generation = inner.session_generation.saturating_add(1).max(1);
             inner.session_id = Some(id.to_string());
             inner.mode = mode;
             inner.status = status;
@@ -276,7 +309,7 @@ impl LiveTranscriptStore {
             inner.lines.clear();
             inner.retained_bytes = 0;
             inner.evicted_lines = 0;
-            inner.event(true, None)
+            inner.event(from_revision, true, None)
         };
         (self.notify)(event);
     }
@@ -326,11 +359,12 @@ impl LiveTranscriptStore {
             if inner.session_id.as_deref() != Some(id) {
                 return;
             }
+            let from_revision = inner.revision;
             inner.revision = inner.revision.saturating_add(1);
             inner.status = status;
             inner.active = active;
             inner.detail = detail;
-            inner.event(false, None)
+            inner.event(from_revision, false, None)
         };
         (self.notify)(event);
     }
@@ -404,8 +438,9 @@ impl LiveTranscriptStore {
                     inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
                     inner.evicted_lines = inner.evicted_lines.saturating_add(1);
                 }
+                let from_revision = inner.revision;
                 inner.revision = inner.revision.saturating_add(1);
-                events.push(inner.event(false, Some(line)));
+                events.push(inner.event(from_revision, false, Some(line)));
             }
             (events, hosted_rows)
         };
@@ -461,8 +496,9 @@ impl LiveTranscriptStore {
                     inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
                     inner.evicted_lines = inner.evicted_lines.saturating_add(1);
                 }
+                let from_revision = inner.revision;
                 inner.revision = inner.revision.saturating_add(1);
-                events.push(inner.event(false, Some(line)));
+                events.push(inner.event(from_revision, false, Some(line)));
             }
             events
         };
@@ -470,6 +506,16 @@ impl LiveTranscriptStore {
             (self.notify)(event);
         }
     }
+}
+
+fn new_process_epoch() -> u64 {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let sequence = PROCESS_EPOCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    (time.rotate_left(17) ^ u64::from(std::process::id()).rotate_left(41) ^ sequence).max(1)
 }
 
 fn finite_nonnegative(value: f64) -> f64 {
@@ -507,8 +553,18 @@ fn cap_utf8(value: &str, max_bytes: usize) -> String {
 }
 
 #[tauri::command]
-pub(crate) fn get_live_transcript(store: State<'_, LiveTranscriptStore>) -> LiveTranscriptSnapshot {
-    store.snapshot()
+pub(crate) fn get_live_transcript(
+    store: State<'_, LiveTranscriptStore>,
+    window: tauri::WebviewWindow,
+) -> Result<LiveTranscriptSnapshot, String> {
+    if !window_may_read_live(window.label()) {
+        return Err("live transcript content is available only in the live window".to_string());
+    }
+    Ok(store.snapshot())
+}
+
+fn window_may_read_live(label: &str) -> bool {
+    label == "live"
 }
 
 #[cfg(test)]
@@ -520,6 +576,17 @@ mod tests {
             start,
             end,
             text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn content_commands_are_allowlisted_to_the_live_window() {
+        assert!(window_may_read_live("live"));
+        for denied in ["queue", "settings", "console", "how"] {
+            assert!(
+                !window_may_read_live(denied),
+                "{denied} unexpectedly gained transcript access"
+            );
         }
     }
 
@@ -544,18 +611,25 @@ mod tests {
         );
 
         let snapshot = store.snapshot();
+        assert_eq!(snapshot.protocol_version, LIVE_TRANSCRIPT_PROTOCOL_VERSION);
+        assert_eq!(snapshot.process_epoch, store.process_epoch().0);
+        assert_eq!(snapshot.session_generation, 1);
         assert_eq!(snapshot.lines.len(), 2);
         assert_eq!(snapshot.lines[0].speaker, "Me");
         assert_eq!(snapshot.lines[0].start_sec, 12.25);
         assert_eq!(snapshot.lines[0].end_sec, 13.0);
         assert_eq!(snapshot.lines[0].text, "Hello there");
         assert_eq!(snapshot.lines[1].speaker, "Them 1");
+        let events = events.lock().unwrap();
         assert!(
             events
-                .lock()
-                .unwrap()
                 .windows(2)
                 .all(|pair| pair[0].revision < pair[1].revision)
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.from_revision + 1 == event.revision)
         );
     }
 

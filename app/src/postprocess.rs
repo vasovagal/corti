@@ -56,7 +56,6 @@ pub(crate) const LIVE_FIRST_TEXT_DEADLINE_MICROS: u64 = 2_000_000;
 pub(crate) const LIVE_TERMINAL_DEADLINE_MICROS: u64 = 5_000_000;
 pub(crate) const QUESTION_DEADLINE_MICROS: u64 = 30_000_000;
 pub(crate) const FINAL_PROMOTION_MICROS: u64 = 2_000_000;
-pub(crate) const PINNED_EDIT_DEBOUNCE_MICROS: u64 = 500_000;
 pub(crate) const PINNED_QUIET_DEBOUNCE_MICROS: u64 = 750_000;
 pub(crate) const PINNED_WORD_THRESHOLD: u64 = 40;
 pub(crate) const PINNED_SPEECH_THRESHOLD_MS: u64 = 30_000;
@@ -582,7 +581,7 @@ impl fmt::Debug for ExactLookup {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FinalJournalState {
     Prepared,
@@ -596,6 +595,7 @@ pub(crate) enum FinalJournalState {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct FinalJournalBoundary {
     pub(crate) recording_id: String,
+    pub(crate) request_group_id: corti_postprocess::RequestGroupId,
     pub(crate) call_id: CallId,
     pub(crate) request_key: RequestKey,
     pub(crate) fence: RequestFence,
@@ -605,6 +605,7 @@ impl fmt::Debug for FinalJournalBoundary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FinalJournalBoundary")
             .field("recording_id", &self.recording_id)
+            .field("request_group_id", &self.request_group_id)
             .field("call_id", &self.call_id)
             .field("request_key", &self.request_key)
             .field("fence", &self.fence)
@@ -734,6 +735,8 @@ pub(crate) struct StoreCommit<'a> {
     pub(crate) request_key: RequestKey,
     pub(crate) lane: Lane,
     pub(crate) local_cache_mode: LocalCacheMode,
+    /// Raw typed provider output is persisted only inside the encrypted store and revalidated on every hit.
+    pub(crate) cache_output: &'a ProviderOutput,
     pub(crate) output: &'a ValidatedOutput,
     pub(crate) final_boundary: Option<&'a FinalJournalBoundary>,
     pub(crate) telemetry: &'a TerminalTelemetryDto,
@@ -745,13 +748,20 @@ pub(crate) trait EncryptedPostprocessStore: Send {
     fn lookup_exact(&mut self, key: RequestKey) -> Result<ExactLookup, ErrorCode>;
     fn evict_corrupt(&mut self, key: RequestKey) -> Result<(), ErrorCode>;
     fn prepare_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
+    /// Persist the conservative ambiguous-dispatch state before a ticket may reach any egress transport.
     fn mark_final_dispatched(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
     /// For final calls this must atomically persist encrypted output and move the journal to ResultCached.
     fn commit_validated(&mut self, commit: StoreCommit<'_>) -> Result<(), ErrorCode>;
     fn abandon_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
-    fn mark_final_applied(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
-    fn mark_final_checkpointed(&mut self, boundary: &FinalJournalBoundary)
-    -> Result<(), ErrorCode>;
+    /// Move an entire final chunk group in one durable transaction; partial group publication is forbidden.
+    fn mark_final_group_applied(
+        &mut self,
+        boundaries: &[FinalJournalBoundary],
+    ) -> Result<(), ErrorCode>;
+    fn mark_final_group_checkpointed(
+        &mut self,
+        boundaries: &[FinalJournalBoundary],
+    ) -> Result<(), ErrorCode>;
     fn recover_final(
         &mut self,
         recording_id: &str,
@@ -819,10 +829,19 @@ pub(crate) enum LaneStateDto {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct UiFenceDto {
+    pub(crate) process_epoch: ProcessEpoch,
+    pub(crate) session_generation: u64,
+    pub(crate) control_revision: u64,
+    pub(crate) lane_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct LaneStateEventDto {
     pub(crate) lane: Lane,
     pub(crate) state: LaneStateDto,
     pub(crate) code: Option<ErrorCode>,
+    pub(crate) fence: UiFenceDto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -842,7 +861,9 @@ pub(crate) enum AccountingFinalityDto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AccountingEventDto {
     pub(crate) call_id: CallId,
+    pub(crate) recording_id: String,
     pub(crate) lane: Lane,
+    pub(crate) fence: RequestFence,
     pub(crate) finality: AccountingFinalityDto,
     pub(crate) usage: NormalizedUsage,
     pub(crate) cost: CostEstimate,
@@ -978,12 +999,6 @@ struct PinnedCandidate {
 }
 
 #[derive(Debug)]
-struct PendingPinnedEdit {
-    text: SensitiveText,
-    due_at_micros: u64,
-}
-
-#[derive(Debug)]
 struct PinnedProgress {
     request_watermark: TranscriptWatermark,
     candidate: Option<PinnedCandidate>,
@@ -1007,6 +1022,7 @@ impl PinnedProgress {
 #[derive(Debug)]
 struct ActiveCall {
     sequence: u64,
+    recording_id: String,
     context: EventContext,
     cancel: CancellationToken,
     descriptor: ProviderDescriptor,
@@ -1147,7 +1163,6 @@ pub(crate) struct PostprocessCoordinator {
     watermark: TranscriptWatermark,
     last_progress_at_micros: u64,
     pinned: PinnedProgress,
-    pending_pinned_edit: Option<PendingPinnedEdit>,
     pinned_template: Option<SensitiveText>,
     ad_hoc: VecDeque<AdHocEntry>,
     awaiting_final_apply: HashMap<CallId, FinalJournalBoundary>,
@@ -1248,7 +1263,6 @@ impl PostprocessCoordinator {
             watermark: TranscriptWatermark::initial(session_generation),
             last_progress_at_micros: 0,
             pinned: PinnedProgress::new(session_generation),
-            pending_pinned_edit: None,
             pinned_template: pinned_template
                 .filter(|text| !text.trim().is_empty())
                 .map(SensitiveText::new),
@@ -1426,7 +1440,6 @@ impl PostprocessCoordinator {
         self.vertex.clear_pending();
         self.watermark = TranscriptWatermark::initial(snapshot.session_generation);
         self.pinned = PinnedProgress::new(snapshot.session_generation);
-        self.pending_pinned_edit = None;
         self.last_progress_at_micros = self.clock.monotonic_micros();
         self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
             snapshot.clone(),
@@ -1487,19 +1500,22 @@ impl PostprocessCoordinator {
     }
 
     pub(crate) fn edit_pinned_template(&mut self, text: String) -> Result<(), SubmitError> {
-        if text.len() > MAX_QUESTION_TEXT_BYTES {
+        if text.len() > MAX_QUESTION_TEXT_BYTES || text.chars().any(char::is_control) {
             return Err(SubmitError::InvalidQuestion);
         }
         self.cancel_scope(CancellationScope::Pinned(CancellationReason::Superseded));
         self.remove_queued_lane(Lane::PinnedQuestion, CancellationReason::Superseded);
         self.pinned.candidate = None;
-        self.pending_pinned_edit = Some(PendingPinnedEdit {
-            text: SensitiveText::new(text),
-            due_at_micros: self
-                .clock
-                .monotonic_micros()
-                .saturating_add(PINNED_EDIT_DEBOUNCE_MICROS),
-        });
+        self.pinned_template = (!text.trim().is_empty()).then(|| SensitiveText::new(text));
+        self.control
+            .commit_pinned_question_revision()
+            .map_err(|_| SubmitError::GenerationOverflow)?;
+        self.pinned.request_watermark = self.watermark;
+        self.pinned.quiet_due_at_micros = None;
+        self.pinned.dirty_while_running = false;
+        self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
+            self.control.snapshot().clone(),
+        )));
         Ok(())
     }
 
@@ -1692,6 +1708,7 @@ impl PostprocessCoordinator {
             );
         }
         let sequence = self.next_sequence()?;
+        let event_fence = ui_fence(&submission.request.fence);
         self.queue.push_back(QueuedCall {
             sequence,
             queued_at_micros: now,
@@ -1711,6 +1728,7 @@ impl PostprocessCoordinator {
                 LaneStateDto::Queued
             },
             code: None,
+            fence: event_fence,
         }));
         Ok(())
     }
@@ -1775,38 +1793,9 @@ impl PostprocessCoordinator {
     /// hand the opaque attempt to an injected ADC worker.
     pub(crate) fn tick(&mut self) {
         let now = self.clock.monotonic_micros();
-        self.apply_due_pinned_edit(now);
         self.maybe_queue_pinned(now);
         self.expire_queued(now);
         self.expire_active(now);
-    }
-
-    fn apply_due_pinned_edit(&mut self, now: u64) {
-        let due = self
-            .pending_pinned_edit
-            .as_ref()
-            .is_some_and(|edit| now >= edit.due_at_micros);
-        if !due {
-            return;
-        }
-        let edit = self
-            .pending_pinned_edit
-            .take()
-            .expect("due edit was present");
-        self.pinned_template = (!edit.text.as_str().trim().is_empty()).then_some(edit.text);
-        if self.control.commit_pinned_question_revision().is_err() {
-            self.pinned_template = None;
-            self.push_event(CoordinatorEventDto::PersistenceWarning {
-                code: ErrorCode::Internal,
-            });
-            return;
-        }
-        self.pinned.request_watermark = self.watermark;
-        self.pinned.quiet_due_at_micros = None;
-        self.pinned.dirty_while_running = false;
-        self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
-            self.control.snapshot().clone(),
-        )));
     }
 
     fn meaningful_pinned_progress(&self, watermark: TranscriptWatermark) -> bool {
@@ -1876,11 +1865,6 @@ impl PostprocessCoordinator {
         let update = self.vertex.complete(attempt, outcome)?;
         self.publish_vertex_state();
         if matches!(update.state, VertexCredentialState::Ready { .. }) {
-            let sequences: Vec<u64> = update
-                .catch_up
-                .iter()
-                .map(VertexAutoPending::sequence)
-                .collect();
             let now = self.clock.monotonic_micros();
             let mut expired_calls = Vec::new();
             let mut catching_up = Vec::new();
@@ -1892,20 +1876,31 @@ impl PostprocessCoordinator {
                     queued.stage = QueueStage::ReadyForCatalog;
                     continue;
                 }
-                if sequences.contains(&queued.sequence)
-                    && !queued.submission.request.deadline.is_expired_at(now)
-                {
+                let retained = update.catch_up.iter().any(|pending| {
+                    pending.sequence() == queued.sequence
+                        || (queued.submission.request.lane == Lane::Final
+                            && pending.lane() == Lane::Final
+                            && pending.fence() == &queued.submission.request.fence)
+                });
+                if retained && !queued.submission.request.deadline.is_expired_at(now) {
+                    // The Vertex resolver intentionally keeps one newest slot per automatic lane. Every
+                    // chunk in one final group shares the exact fence, so retain the complete group rather
+                    // than dispatching only the last sequence and dropping otherwise valid chunks.
                     queued.stage = QueueStage::ReadyForCatalog;
-                    catching_up.push(queued.submission.request.lane);
+                    catching_up.push((
+                        queued.submission.request.lane,
+                        ui_fence(&queued.submission.request.fence),
+                    ));
                 } else {
                     expired_calls.push(queued.submission.request.call_id.clone());
                 }
             }
-            for lane in catching_up {
+            for (lane, fence) in catching_up {
                 self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
                     lane,
                     state: LaneStateDto::CatchingUp,
                     code: None,
+                    fence,
                 }));
             }
             for call_id in expired_calls {
@@ -1981,6 +1976,15 @@ impl PostprocessCoordinator {
         provider: &ProviderId,
         transport: &TransportId,
     ) {
+        if let Some(state) = self
+            .provider_states
+            .get_mut(&(provider.clone(), transport.clone()))
+        {
+            state.credential = CredentialState::Resolving;
+            state.service_error = None;
+            let state = state.clone();
+            self.push_event(CoordinatorEventDto::ProviderState(Box::new(state)));
+        }
         let mut ad_hoc_calls = Vec::new();
         for queued in &mut self.queue {
             if queued.stage == QueueStage::WaitingCredential
@@ -2107,6 +2111,7 @@ impl PostprocessCoordinator {
                                 lane,
                                 state: LaneStateDto::Arming,
                                 code: None,
+                                fence: ui_fence(&queued.submission.request.fence),
                             }));
                             self.queue.push_back(queued);
                             return DispatchOutcome::Waiting;
@@ -2154,10 +2159,22 @@ impl PostprocessCoordinator {
                     }
                 }
             } else {
-                let credential = self.providers.credential_state(
-                    &queued.submission.request.provider,
-                    &queued.submission.request.transport,
+                let provider_key = (
+                    queued.submission.request.provider.clone(),
+                    queued.submission.request.transport.clone(),
                 );
+                let credential = if self
+                    .provider_states
+                    .get(&provider_key)
+                    .is_some_and(|state| state.credential == CredentialState::Rejected)
+                {
+                    CredentialState::Rejected
+                } else {
+                    self.providers.credential_state(
+                        &queued.submission.request.provider,
+                        &queued.submission.request.transport,
+                    )
+                };
                 self.publish_provider_credential(&queued, credential.clone());
                 match credential {
                     CredentialState::Ready { .. } => queued.stage = QueueStage::ReadyForCatalog,
@@ -2178,6 +2195,7 @@ impl PostprocessCoordinator {
                             lane,
                             state: LaneStateDto::Arming,
                             code: None,
+                            fence: ui_fence(&queued.submission.request.fence),
                         }));
                         self.queue.push_back(queued);
                         return DispatchOutcome::Waiting;
@@ -2231,6 +2249,19 @@ impl PostprocessCoordinator {
             queued.submission.request.deadline =
                 MonotonicDeadline(now.saturating_add(LIVE_TERMINAL_DEADLINE_MICROS));
         }
+        if lane == Lane::Final {
+            // Persist the ambiguous-dispatch boundary before handing any ticket to a transport thread. A
+            // crash after this point may require explicit retry even if the OS never scheduled the worker,
+            // but it can never silently repeat a paid request whose body may have left the process.
+            let boundary = final_boundary(&queued.submission);
+            if self.store.mark_final_dispatched(&boundary).is_err() {
+                self.finish_queued_failure(&queued, ErrorCode::Cache);
+                return DispatchOutcome::Failed {
+                    call_id,
+                    code: ErrorCode::Cache,
+                };
+            }
+        }
         let cancel = CancellationToken::new();
         let submission = Arc::new(queued.submission);
         let context = request_context(&submission.request);
@@ -2239,6 +2270,7 @@ impl PostprocessCoordinator {
             call_id.clone(),
             ActiveCall {
                 sequence: queued.sequence,
+                recording_id: submission.recording_id.clone(),
                 context,
                 cancel: cancel.clone(),
                 descriptor: queued.descriptor.clone(),
@@ -2268,6 +2300,7 @@ impl PostprocessCoordinator {
                 _ => LaneStateDto::Rewriting,
             },
             code: None,
+            fence: ui_fence(&submission.request.fence),
         }));
         DispatchOutcome::Ticket(DispatchTicket {
             sequence: queued.sequence,
@@ -2368,6 +2401,7 @@ impl PostprocessCoordinator {
 
     fn finish_cache_hit(&mut self, queued: QueuedCall, output: ProviderOutput) -> DispatchOutcome {
         let call_id = queued.submission.request.call_id.clone();
+        let cache_output = output.clone();
         let validated = match validate_output(&queued.submission, output) {
             Ok(output) => output,
             Err(code) => {
@@ -2395,6 +2429,7 @@ impl PostprocessCoordinator {
                 request_key: queued.submission.request_key,
                 lane: queued.submission.request.lane,
                 local_cache_mode: queued.submission.request.cache_policy.local,
+                cache_output: &cache_output,
                 output: &validated,
                 final_boundary: Some(boundary),
                 telemetry: &telemetry,
@@ -2418,6 +2453,7 @@ impl PostprocessCoordinator {
             lane: queued.submission.request.lane,
             state: LaneStateDto::Clean,
             code: None,
+            fence: ui_fence(&queued.submission.request.fence),
         }));
         DispatchOutcome::CacheApply(ApplyReady {
             call_id,
@@ -2444,11 +2480,6 @@ impl PostprocessCoordinator {
                 active.provider_request_sent = true;
                 active.dispatch_started_at_micros = Some(self.clock.monotonic_micros());
                 active.dispatched_at_unix_ms = Some(self.clock.unix_millis());
-                if let Some(boundary) = active.final_boundary.as_ref() {
-                    self.store
-                        .mark_final_dispatched(boundary)
-                        .map_err(|_| CoordinatorError::Store)?;
-                }
             }
             ProviderEventKind::FirstText | ProviderEventKind::TextDelta(_) => {
                 if !active.cancel.is_cancelled() {
@@ -2464,11 +2495,16 @@ impl PostprocessCoordinator {
                         active.region.as_deref(),
                         active.dispatched_at_unix_ms,
                         active.provider_request_sent,
+                        CacheObservation::None,
                         &usage,
                     );
+                    let recording_id = active.recording_id.clone();
+                    let fence = event.context.fence.clone();
                     self.push_event(CoordinatorEventDto::Accounting(AccountingEventDto {
                         call_id,
+                        recording_id,
                         lane: event.context.lane,
+                        fence,
                         finality: AccountingFinalityDto::Provisional,
                         usage,
                         cost,
@@ -2566,6 +2602,7 @@ impl PostprocessCoordinator {
             ticket.call.scope.region.as_deref(),
             dispatched_at,
             provider_sent,
+            cache,
             &usage,
         );
 
@@ -2594,6 +2631,9 @@ impl PostprocessCoordinator {
         }
 
         if let Some(code) = provider_error {
+            if code == ErrorCode::AuthRejected {
+                self.reject_provider_credential(&ticket);
+            }
             let telemetry = self.telemetry_for_ticket(
                 &ticket,
                 TerminalOutcomeDto::Failed,
@@ -2616,12 +2656,14 @@ impl PostprocessCoordinator {
                 lane,
                 state: LaneStateDto::Failed,
                 code: Some(code),
+                fence: ui_fence(&ticket.call.request.fence),
             }));
             self.after_lane_completion(lane);
             return CompletionOutcome::Failed { call_id, code };
         }
 
         let output = output.expect("successful terminal has output");
+        let cache_output = output.clone();
         let validated = match validate_output(&ticket.call, output) {
             Ok(output) => output,
             Err(code) => {
@@ -2663,6 +2705,7 @@ impl PostprocessCoordinator {
             request_key: ticket.call.request_key,
             lane,
             local_cache_mode: ticket.call.request.cache_policy.local,
+            cache_output: &cache_output,
             output: &validated,
             final_boundary: final_boundary.as_ref(),
             telemetry: &telemetry,
@@ -2687,6 +2730,7 @@ impl PostprocessCoordinator {
             lane,
             state: LaneStateDto::Clean,
             code: None,
+            fence: ui_fence(&ticket.call.request.fence),
         }));
         self.after_lane_completion(lane);
         CompletionOutcome::Apply(ApplyReady {
@@ -2752,39 +2796,55 @@ impl PostprocessCoordinator {
     ) -> Result<(), CoordinatorError> {
         let mut boundaries = Vec::with_capacity(call_ids.len());
         for call_id in call_ids {
-            let Some(boundary) = self.awaiting_final_apply.get(call_id) else {
-                return Err(CoordinatorError::UnknownCall);
-            };
-            if !self
+            boundaries.push(
+                self.awaiting_final_apply
+                    .get(call_id)
+                    .cloned()
+                    .ok_or(CoordinatorError::UnknownCall)?,
+            );
+        }
+        if boundaries.iter().any(|boundary| {
+            !self
                 .control
                 .fence_controls_are_current(Lane::Final, &boundary.fence)
-            {
-                for boundary in &boundaries {
-                    let _ = self.store.abandon_final(boundary);
-                }
+        }) {
+            for boundary in &boundaries {
                 let _ = self.store.abandon_final(boundary);
-                return Err(CoordinatorError::StaleApplication);
             }
-            boundaries.push(boundary.clone());
+            return Err(CoordinatorError::StaleApplication);
         }
-        for boundary in &boundaries {
-            self.store
-                .mark_final_applied(boundary)
-                .map_err(|_| CoordinatorError::Store)?;
-        }
-        Ok(())
+        self.store
+            .mark_final_group_applied(&boundaries)
+            .map_err(|_| CoordinatorError::Store)
     }
 
     pub(crate) fn mark_final_checkpointed(
         &mut self,
         call_id: &CallId,
     ) -> Result<(), CoordinatorError> {
-        let Some(boundary) = self.awaiting_final_apply.remove(call_id) else {
-            return Err(CoordinatorError::UnknownCall);
-        };
+        self.mark_final_group_checkpointed(std::slice::from_ref(call_id))
+    }
+
+    pub(crate) fn mark_final_group_checkpointed(
+        &mut self,
+        call_ids: &[CallId],
+    ) -> Result<(), CoordinatorError> {
+        let mut boundaries = Vec::with_capacity(call_ids.len());
+        for call_id in call_ids {
+            boundaries.push(
+                self.awaiting_final_apply
+                    .get(call_id)
+                    .cloned()
+                    .ok_or(CoordinatorError::UnknownCall)?,
+            );
+        }
         self.store
-            .mark_final_checkpointed(&boundary)
-            .map_err(|_| CoordinatorError::Store)
+            .mark_final_group_checkpointed(&boundaries)
+            .map_err(|_| CoordinatorError::Store)?;
+        for call_id in call_ids {
+            self.awaiting_final_apply.remove(call_id);
+        }
+        Ok(())
     }
 
     pub(crate) fn recover_final(
@@ -2830,6 +2890,34 @@ impl PostprocessCoordinator {
                 explicit_retry_required: false,
             },
         })
+    }
+
+    fn reject_provider_credential(&mut self, ticket: &DispatchTicket) {
+        let key = (
+            ticket.descriptor.provider.clone(),
+            ticket.descriptor.transport.clone(),
+        );
+        let state = ProviderStateDto {
+            descriptor: ticket.descriptor.clone(),
+            credential: CredentialState::Rejected,
+            models: Vec::new(),
+            service_error: Some(ErrorCode::AuthRejected),
+        };
+        self.provider_states.insert(key, state.clone());
+        self.push_event(CoordinatorEventDto::ProviderState(Box::new(state)));
+
+        let queued_peers = self
+            .queue
+            .iter()
+            .filter(|queued| {
+                queued.descriptor.provider == ticket.descriptor.provider
+                    && queued.descriptor.transport == ticket.descriptor.transport
+            })
+            .map(|queued| queued.submission.request.call_id.clone())
+            .collect::<Vec<_>>();
+        for call_id in queued_peers {
+            self.fail_queued_call(&call_id, ErrorCode::AuthRejected);
+        }
     }
 
     fn publish_provider_credential(&mut self, queued: &QueuedCall, credential: CredentialState) {
@@ -3014,7 +3102,7 @@ impl PostprocessCoordinator {
             false,
             CacheObservation::None,
             NormalizedUsage::unknown(),
-            CostEstimate::no_provider_request(),
+            CostEstimate::unavailable(),
             LatencyFields::default(),
             None,
         );
@@ -3044,7 +3132,7 @@ impl PostprocessCoordinator {
             false,
             CacheObservation::None,
             NormalizedUsage::unknown(),
-            CostEstimate::no_provider_request(),
+            CostEstimate::unavailable(),
             LatencyFields::default(),
             None,
         );
@@ -3055,6 +3143,7 @@ impl PostprocessCoordinator {
             lane: queued.submission.request.lane,
             state: LaneStateDto::Failed,
             code: Some(code),
+            fence: ui_fence(&queued.submission.request.fence),
         }));
     }
 
@@ -3230,7 +3319,9 @@ impl PostprocessCoordinator {
     ) {
         self.push_event(CoordinatorEventDto::Accounting(AccountingEventDto {
             call_id: telemetry.call_id.clone(),
+            recording_id: telemetry.recording_id.clone(),
             lane: telemetry.lane,
+            fence: telemetry.fence.clone(),
             finality,
             usage: telemetry.usage,
             cost: telemetry.cost.clone(),
@@ -3252,9 +3343,19 @@ impl PostprocessCoordinator {
 fn final_boundary(submission: &RequestSubmission) -> FinalJournalBoundary {
     FinalJournalBoundary {
         recording_id: submission.recording_id.clone(),
+        request_group_id: submission.request.group_id.clone(),
         call_id: submission.request.call_id.clone(),
         request_key: submission.request_key,
         fence: submission.request.fence.clone(),
+    }
+}
+
+fn ui_fence(fence: &RequestFence) -> UiFenceDto {
+    UiFenceDto {
+        process_epoch: fence.process_epoch,
+        session_generation: fence.session_generation,
+        control_revision: fence.control_revision,
+        lane_revision: fence.lane_revision,
     }
 }
 
@@ -3360,10 +3461,15 @@ fn estimate_cost(
     region: Option<&str>,
     dispatched_at_unix_ms: Option<i64>,
     provider_request_sent: bool,
+    cache: CacheObservation,
     usage: &NormalizedUsage,
 ) -> CostEstimate {
     if !provider_request_sent {
-        return CostEstimate::no_provider_request();
+        return if cache == CacheObservation::Local {
+            CostEstimate::no_provider_request()
+        } else {
+            CostEstimate::unavailable()
+        };
     }
     let Some(dispatch_unix_ms) = dispatched_at_unix_ms else {
         return CostEstimate::unavailable();
@@ -3515,10 +3621,10 @@ mod tests {
     use corti_postprocess::{
         AdapterCapabilities, BillingBasis, CachePolicy, CanonicalPrompt, ConnectionScopeId,
         CredentialSourceKind, CurrencyCode, DigestKey, InputTokenAccounting, KnownTransport,
-        ModelId, NormalizedUsage, OUTPUT_SCHEMA_VERSION, PROMPT_TEMPLATE_VERSION, PricingError,
-        QuestionOutput, QuestionTerminal, RawUsage, Replacement, RequestGroupId,
-        RequestKeyMaterial, RewriteOutput, RowId, TargetId, Tariff, TariffCatalog, TariffRates,
-        WordBankDocument,
+        ModelId, NormalizedUsage, OUTPUT_SCHEMA_VERSION, OutputTokenAccounting,
+        PROMPT_TEMPLATE_VERSION, PricingError, QuestionOutput, QuestionTerminal, RawUsage,
+        Replacement, RequestGroupId, RequestKeyMaterial, RewriteOutput, RowId, TargetId, Tariff,
+        TariffCatalog, TariffRates, WordBankDocument,
     };
 
     use super::*;
@@ -3652,24 +3758,31 @@ mod tests {
             Ok(())
         }
 
-        fn mark_final_applied(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
-            self.0
-                .lock()
-                .unwrap()
-                .journal
-                .push((boundary.call_id.clone(), FinalJournalState::Applied));
+        fn mark_final_group_applied(
+            &mut self,
+            boundaries: &[FinalJournalBoundary],
+        ) -> Result<(), ErrorCode> {
+            let mut state = self.0.lock().unwrap();
+            state.trace.push("group_applied");
+            state.journal.extend(
+                boundaries
+                    .iter()
+                    .map(|boundary| (boundary.call_id.clone(), FinalJournalState::Applied)),
+            );
             Ok(())
         }
 
-        fn mark_final_checkpointed(
+        fn mark_final_group_checkpointed(
             &mut self,
-            boundary: &FinalJournalBoundary,
+            boundaries: &[FinalJournalBoundary],
         ) -> Result<(), ErrorCode> {
-            self.0
-                .lock()
-                .unwrap()
-                .journal
-                .push((boundary.call_id.clone(), FinalJournalState::Checkpointed));
+            let mut state = self.0.lock().unwrap();
+            state.trace.push("group_checkpointed");
+            state.journal.extend(
+                boundaries
+                    .iter()
+                    .map(|boundary| (boundary.call_id.clone(), FinalJournalState::Checkpointed)),
+            );
             Ok(())
         }
 
@@ -3876,6 +3989,7 @@ mod tests {
             effective_until_unix_ms: None,
             currency: CurrencyCode::usd(),
             input_accounting: InputTokenAccounting::ClassesDisjoint,
+            output_accounting: OutputTokenAccounting::IncludesReasoning,
             rates: TariffRates {
                 input_micros_per_million: Some(1_000_000),
                 output_micros_per_million: Some(2_000_000),
@@ -4306,7 +4420,74 @@ mod tests {
     }
 
     #[test]
-    fn pinned_policy_hits_exact_thresholds_debounces_and_coalesces_one_dirty_rerun() {
+    fn terminal_auth_rejection_updates_coordinator_and_cancels_queued_peers() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Question, KnownTransport::OpenAiDirect);
+        harness.enable_master();
+        let context = row(1, "fixture context", 0, 1_000);
+        let watermark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&context))
+            .unwrap();
+        for index in 0..3 {
+            harness
+                .coordinator
+                .submit_ad_hoc(
+                    submission(
+                        &format!("auth-question-{index}"),
+                        Lane::AdHocQuestion,
+                        KnownTransport::OpenAiDirect,
+                        harness.clock.now(),
+                        Vec::new(),
+                        vec![context.clone()],
+                    ),
+                    watermark,
+                    format!("fixture question {index}"),
+                )
+                .unwrap();
+        }
+        let first = ticket(harness.coordinator.dispatch_next());
+        let outcome = harness
+            .coordinator
+            .complete(first, Err(ErrorCode::AuthRejected.into()));
+        assert!(matches!(
+            outcome,
+            CompletionOutcome::Failed {
+                code: ErrorCode::AuthRejected,
+                ..
+            }
+        ));
+        assert!(harness.coordinator.queue.is_empty());
+        assert!(
+            harness
+                .coordinator
+                .question_summaries()
+                .iter()
+                .all(|summary| summary.status == QuestionStatusDto::Failed
+                    && summary.error == Some(ErrorCode::AuthRejected))
+        );
+        let descriptor = KnownTransport::OpenAiDirect.descriptor();
+        let state = harness
+            .coordinator
+            .provider_states()
+            .find(|state| state.descriptor == descriptor)
+            .unwrap();
+        assert_eq!(state.credential, CredentialState::Rejected);
+        assert!(state.models.is_empty());
+        assert!(
+            harness
+                .store
+                .lock()
+                .unwrap()
+                .telemetry
+                .iter()
+                .all(|telemetry| telemetry.cost.render() == "Cost unavailable"),
+            "pre-egress auth failures must never be mislabeled as local cache hits"
+        );
+    }
+
+    #[test]
+    fn pinned_policy_hits_exact_thresholds_and_coalesces_one_dirty_rerun() {
         let mut harness = Harness::new();
         harness.configure(LaneFamily::Question, KnownTransport::OpenAiDirect);
         harness.enable_master();
@@ -4318,23 +4499,13 @@ mod tests {
             .coordinator
             .edit_pinned_template("fixture pinned template".into())
             .unwrap();
-        harness.clock.advance(PINNED_EDIT_DEBOUNCE_MICROS - 1);
-        harness.coordinator.tick();
         assert_eq!(
             harness
                 .coordinator
                 .control_snapshot()
                 .pinned_question_revision,
-            1
-        );
-        harness.clock.advance(1);
-        harness.coordinator.tick();
-        assert_eq!(
-            harness
-                .coordinator
-                .control_snapshot()
-                .pinned_question_revision,
-            2
+            2,
+            "the frontend owns edit debounce; the backend commits one accepted edit atomically"
         );
 
         let words_39 = (0..39)
@@ -4851,6 +5022,72 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn vertex_ready_catches_up_every_final_chunk_sharing_the_atomic_fence() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Final, KnownTransport::VertexDirect);
+        harness.enable_master();
+        let first_row = row(1, "first final chunk", 0, 1_000);
+        let second_row = row(2, "second final chunk", 1_000, 2_000);
+        let watermark = harness
+            .coordinator
+            .observe_finalized_rows(&[first_row.clone(), second_row.clone()])
+            .unwrap();
+        harness
+            .coordinator
+            .submit_final(
+                submission(
+                    "vertex-final-a",
+                    Lane::Final,
+                    KnownTransport::VertexDirect,
+                    harness.clock.now(),
+                    vec![first_row],
+                    Vec::new(),
+                ),
+                watermark,
+            )
+            .unwrap();
+        harness
+            .coordinator
+            .submit_final(
+                submission(
+                    "vertex-final-b",
+                    Lane::Final,
+                    KnownTransport::VertexDirect,
+                    harness.clock.now(),
+                    vec![second_row],
+                    Vec::new(),
+                ),
+                watermark,
+            )
+            .unwrap();
+        assert!(matches!(
+            harness.coordinator.dispatch_next(),
+            DispatchOutcome::Waiting
+        ));
+        assert!(matches!(
+            harness.coordinator.dispatch_next(),
+            DispatchOutcome::Waiting
+        ));
+        let attempt = harness.coordinator.drive_vertex().unwrap();
+        harness
+            .coordinator
+            .complete_vertex(
+                attempt,
+                VertexResolutionOutcome::Ready {
+                    expires_at_unix_ms: None,
+                },
+            )
+            .unwrap();
+        let first = ticket(harness.coordinator.dispatch_next());
+        let second = ticket(harness.coordinator.dispatch_next());
+        let calls = [
+            first.request().call_id.as_str(),
+            second.request().call_id.as_str(),
+        ];
+        assert_eq!(calls, ["vertex-final-a", "vertex-final-b"]);
     }
 
     #[test]

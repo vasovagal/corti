@@ -798,7 +798,7 @@ fn session_thread(
         )),
     }
     if let Some(hosted) = publisher.hosted.as_ref() {
-        hosted.end_live_session(&publisher.id);
+        let _ = hosted.end_live_session(&publisher.id);
     }
     outcome
 }
@@ -1207,12 +1207,12 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 if settled.hosted_text_applied {
                     if hosted.mark_final_applied(&settled.call_ids).is_ok() {
                         if let Err(error) = writer.rewrite_settled_final(&settled) {
-                            hosted.abandon_final_result(&settled.call_ids);
+                            let _ = hosted.abandon_final_result(&settled.call_ids);
                             return Err(error);
                         }
                         applied_call_ids = settled.call_ids;
                     } else {
-                        hosted.abandon_final_result(&settled.call_ids);
+                        let _ = hosted.abandon_final_result(&settled.call_ids);
                     }
                 } else if !settled.call_ids.is_empty() {
                     writer.rewrite_settled_final(&settled)?;
@@ -1220,7 +1220,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             }
             corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
             if let Some(hosted) = publisher.hosted() {
-                hosted.mark_final_checkpointed(&applied_call_ids);
+                let _ = hosted.mark_final_checkpointed(&applied_call_ids);
             }
             info!(
                 target: "corti::live",

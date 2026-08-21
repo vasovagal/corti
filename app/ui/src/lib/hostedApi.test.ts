@@ -78,9 +78,12 @@ describe("hosted Tauri command bindings", () => {
       request: { provider: "google", transport: "vertex_api" },
     });
 
-    await setHostedPinnedQuestion("Synthetic pinned question");
+    await setHostedPinnedQuestion(9, "Synthetic pinned question");
     expect(bridge.invoke).toHaveBeenLastCalledWith("set_hosted_pinned_question", {
-      template: "Synthetic pinned question",
+      request: {
+        observed_state_revision: 9,
+        template: "Synthetic pinned question",
+      },
     });
   });
 

@@ -33,17 +33,18 @@ pub use ids::{
     RowId, TargetId, TransportId,
 };
 pub use pricing::{
-    CostEstimate, CurrencyCode, InputTokenAccounting, NormalizedUsage, PricingCatalog,
-    PricingError, PricingQuery, RawUsage, Tariff, TariffCatalog, TariffRates,
+    CostEstimate, CurrencyCode, InputTokenAccounting, NormalizedUsage, OutputTokenAccounting,
+    PricingCatalog, PricingError, PricingQuery, RawUsage, Tariff, TariffCatalog, TariffRates,
 };
 pub use prompt::{
     CanonicalPrompt, OUTPUT_SCHEMA_VERSION, PROMPT_TEMPLATE_VERSION, PromptMessage, PromptRole,
     PromptSection, PromptTask,
 };
 pub use validation::{
-    QUESTION_SCHEMA_VERSION, QuestionOutput, REWRITE_SCHEMA_VERSION, Replacement, RewriteOutput,
-    RewriteValidationLimits, ValidatedQuestion, ValidatedRewrite, ValidationError,
-    parse_and_validate_question, parse_and_validate_rewrite, validate_disjoint_target_chunks,
+    EXPLICIT_NO_ANSWER, QUESTION_SCHEMA_VERSION, QuestionOutput, REWRITE_SCHEMA_VERSION,
+    Replacement, RewriteOutput, RewriteValidationLimits, ValidatedQuestion, ValidatedRewrite,
+    ValidationError, parse_and_validate_question, parse_and_validate_rewrite,
+    validate_disjoint_target_chunks,
 };
 pub use word_bank::{
     MAX_WORD_BANK_BYTES, MAX_WORD_BANK_ENTRIES, MAX_WORD_BANK_ENTRY_SCALARS, WORD_BANK_SCHEMA,

@@ -7,7 +7,7 @@
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,14 +17,38 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn read_private(path: &Path, label: &str, max_bytes: usize) -> Result<Option<Vec<u8>>> {
-    let mut file = match File::open(path) {
+    read_private_inner(path, label, max_bytes, false)
+}
+
+/// Read a legacy app-owned document and atomically tighten an old read-only-for-others mode (for example
+/// 0644) to 0600 through the already-open descriptor. Symlinks, foreign owners, executable files, and any
+/// group/other-writable mode fail closed and are never migrated.
+pub(crate) fn read_private_migrating_mode(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    read_private_inner(path, label, max_bytes, true)
+}
+
+fn read_private_inner(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+    migrate_legacy_mode: bool,
+) -> Result<Option<Vec<u8>>> {
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("opening {label} {}", path.display()));
         }
     };
-    let metadata = file
+    let mut metadata = file
         .metadata()
         .with_context(|| format!("inspecting {label} {}", path.display()))?;
     ensure!(
@@ -32,12 +56,33 @@ pub(crate) fn read_private(path: &Path, label: &str, max_bytes: usize) -> Result
         "refusing non-file {label} {}",
         path.display()
     );
-    ensure!(
-        metadata.permissions().mode() & 0o777 == PRIVATE_FILE_MODE,
-        "refusing {label} {} with permissions {:04o}; expected 0600",
-        path.display(),
-        metadata.permissions().mode() & 0o777
-    );
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != PRIVATE_FILE_MODE {
+        let owner = metadata.uid();
+        // SAFETY: geteuid has no preconditions and does not expose mutable process state.
+        let current_user = unsafe { libc::geteuid() };
+        ensure!(
+            migrate_legacy_mode
+                && owner == current_user
+                && mode & 0o022 == 0
+                && mode & 0o111 == 0
+                && mode & 0o600 == 0o600,
+            "refusing {label} {} with permissions {mode:04o}; expected 0600",
+            path.display()
+        );
+        file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
+            .with_context(|| format!("migrating private mode for {label} {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing migrated {label} {}", path.display()))?;
+        metadata = file
+            .metadata()
+            .with_context(|| format!("re-inspecting {label} {}", path.display()))?;
+        ensure!(
+            metadata.permissions().mode() & 0o777 == PRIVATE_FILE_MODE,
+            "failed to secure {label} {}",
+            path.display()
+        );
+    }
     ensure!(
         metadata.len() <= max_bytes as u64,
         "refusing oversized {label} {}",
@@ -186,6 +231,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("expected 0600"), "{error}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn legacy_mode_migration_is_descriptor_scoped_and_symlinks_fail_closed() {
+        let path = test_path("migration");
+        std::fs::write(&path, b"legacy private bytes").unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_migrating_mode(&path, "legacy document", 1024)
+                .unwrap()
+                .unwrap(),
+            b"legacy private bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            PRIVATE_FILE_MODE
+        );
+
+        let link = path.with_file_name("document-link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_private_migrating_mode(&link, "legacy document", 1024).is_err());
+        assert!(read_private(&link, "legacy document", 1024).is_err());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }
