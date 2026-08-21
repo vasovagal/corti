@@ -778,6 +778,7 @@ pub(crate) fn provider_support_catalog() -> Vec<ProviderDescriptor> {
         corti_postprocess::KnownTransport::CodexAppServer,
         corti_postprocess::KnownTransport::AnthropicDirect,
         corti_postprocess::KnownTransport::ClaudeSubscription,
+        corti_postprocess::KnownTransport::BedrockRuntime,
     ]
     .into_iter()
     .map(corti_postprocess::KnownTransport::descriptor)
@@ -3864,6 +3865,7 @@ mod tests {
             KnownTransport::AnthropicDirect,
             KnownTransport::CodexAppServer,
             KnownTransport::ClaudeSubscription,
+            KnownTransport::BedrockRuntime,
         ]
         .into_iter()
         .map(KnownTransport::descriptor)
@@ -5235,7 +5237,11 @@ mod tests {
             KnownTransport::CodexAppServer.descriptor().support_tier,
             SupportTier::Experimental
         );
-        assert_eq!(provider_support_catalog().len(), 5);
+        assert_eq!(
+            KnownTransport::BedrockRuntime.descriptor().support_tier,
+            SupportTier::Documented
+        );
+        assert_eq!(provider_support_catalog().len(), 6);
         let claude_state = harness
             .coordinator
             .provider_states()

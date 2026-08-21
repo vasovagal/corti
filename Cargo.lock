@@ -1386,6 +1386,7 @@ version = "0.13.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-sts",
  "chrono",
  "corti-aec",
@@ -1405,6 +1406,7 @@ dependencies = [
  "libc",
  "objc2",
  "objc2-app-kit",
+ "objc2-foundation",
  "rfd",
  "ring",
  "security-framework",

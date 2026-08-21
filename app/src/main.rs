@@ -17,6 +17,8 @@
 #[cfg(target_os = "macos")]
 mod activity;
 #[cfg(target_os = "macos")]
+mod bedrock_creds;
+#[cfg(target_os = "macos")]
 mod checkpoint;
 #[cfg(target_os = "macos")]
 mod cli;
@@ -26,6 +28,8 @@ mod config;
 mod console;
 #[cfg(target_os = "macos")]
 mod jobs;
+#[cfg(target_os = "macos")]
+mod keychain;
 #[cfg(target_os = "macos")]
 mod live;
 #[cfg(target_os = "macos")]
@@ -48,6 +52,8 @@ mod private_file;
 mod provenance;
 #[cfg(target_os = "macos")]
 mod queue_ui;
+#[cfg(target_os = "macos")]
+mod secure_entry;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
@@ -305,6 +311,10 @@ pub(crate) mod imp {
                 crate::postprocess_app::cancel_hosted_question,
                 crate::postprocess_app::set_hosted_pinned_question,
                 crate::postprocess_app::get_hosted_assistant,
+                crate::postprocess_app::list_aws_credential_options,
+                crate::postprocess_app::set_bedrock_credential_mode,
+                crate::postprocess_app::prompt_for_provider_secret,
+                crate::postprocess_app::clear_provider_secret,
                 crate::live_test::start_live_test,
                 crate::live_test::stop_live_test,
                 crate::queue_ui::list_recordings,

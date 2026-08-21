@@ -733,7 +733,7 @@ fn aws_file(env_override: &str, default_leaf: &str) -> Option<PathBuf> {
 /// Profile names across ~/.aws/credentials + ~/.aws/config, unioned, deduped, and sorted. Missing files are
 /// skipped. Includes SSO-only profiles (they appear as `[profile x]` in config).
 #[cfg(feature = "aws")]
-fn list_aws_profiles() -> Vec<String> {
+pub(crate) fn list_aws_profiles() -> Vec<String> {
     let mut names = std::collections::BTreeSet::new();
     if let Some(p) = aws_file("AWS_SHARED_CREDENTIALS_FILE", "credentials")
         && let Ok(body) = std::fs::read_to_string(&p)

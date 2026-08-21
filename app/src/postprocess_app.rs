@@ -28,9 +28,9 @@ use corti_postprocess::{
 };
 use corti_postprocess_providers::{
     ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
-    CredentialError, HttpTransport, OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter,
-    SystemClock as ProviderSystemClock, UreqTransport, VERTEX_REST_ADAPTER_VERSION,
-    VertexResolutionAttempt, VertexResolutionOutcome,
+    BEDROCK_CONVERSE_ADAPTER_VERSION, BedrockConverseAdapter, CredentialError, HttpTransport,
+    OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter, SystemClock as ProviderSystemClock,
+    UreqTransport, VERTEX_REST_ADAPTER_VERSION, VertexResolutionAttempt, VertexResolutionOutcome,
 };
 use corti_queue::{
     PostprocessCacheSource, PostprocessCallRecord, PostprocessCost, PostprocessOutcome, Queue,
@@ -43,6 +43,9 @@ use corti_vagus::provenance::{
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::bedrock_creds::{
+    BedrockAdapterCredentials, BedrockCredentialConfig, BedrockCredentialResolver,
+};
 use crate::live_view::LiveTranscriptStore;
 use crate::pipeline::PipelineMsg;
 use crate::postprocess::{
@@ -56,7 +59,7 @@ use crate::postprocess::{
 };
 use crate::postprocess_config::{
     EGRESS_DISCLOSURE_VERSION, HostedPreferences, PINNED_AUTO_DISCLOSURE_VERSION,
-    ProviderScopePreferences,
+    ProviderScopePreferences, SecretPurpose,
 };
 use crate::private_file::{atomic_write_private, read_private};
 
@@ -90,8 +93,8 @@ const MAX_STORE_JOURNALS: usize = 1_024;
 const MAX_STORE_CACHE_ENTRIES: usize = 1_024;
 const HOSTED_KEYCHAIN_SERVICE: &str = "com.vasovagal.corti.hosted";
 const HOSTED_MASTER_KEY_ACCOUNT: &str = "encrypted-store-master-v1";
-const OPENAI_API_KEY_ACCOUNT: &str = "openai-api-key-v1";
-const ANTHROPIC_API_KEY_ACCOUNT: &str = "anthropic-api-key-v1";
+const OPENAI_API_KEY_ACCOUNT: &str = SecretPurpose::OpenAiApiKey.keychain_account();
+const ANTHROPIC_API_KEY_ACCOUNT: &str = SecretPurpose::AnthropicApiKey.keychain_account();
 const PRODUCTION_ARM_ENV: &str = "CORTI_HOSTED_PRODUCTION_ARMED";
 const FINGERPRINT_DOMAIN: &[u8] = b"corti-app-provenance-v1\0";
 
@@ -317,6 +320,18 @@ pub(crate) struct HostedProviderScopeDto {
     pub(crate) quota_project: Option<String>,
 }
 
+/// Bedrock's credential configuration as the pane sees it: the mode plus its non-secret companions, and
+/// booleans for the Keychain slots. No key, token, or account id is representable.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BedrockCredentialDto {
+    pub(crate) mode: crate::postprocess_config::AwsCredentialMode,
+    pub(crate) profile: Option<String>,
+    pub(crate) role_arn: Option<String>,
+    pub(crate) has_access_key_id: bool,
+    pub(crate) has_secret_access_key: bool,
+    pub(crate) has_session_token: bool,
+}
+
 /// Complete secret-free Settings projection. It cannot represent a key, token, credential path, transcript,
 /// question, answer, or provider body.
 #[derive(Debug, Clone, Serialize)]
@@ -326,6 +341,7 @@ pub(crate) struct HostedSettingsDto {
     pub(crate) control: ControlSnapshotDto,
     pub(crate) providers: Vec<ProviderStateDto>,
     pub(crate) scopes: Vec<HostedProviderScopeDto>,
+    pub(crate) bedrock: BedrockCredentialDto,
     pub(crate) default_steering: String,
     pub(crate) word_bank: HostedWordBankDto,
     pub(crate) final_deadline_seconds: u32,
@@ -682,6 +698,167 @@ pub(crate) fn get_hosted_assistant(
         .map_err(|_| "hosted coordinator stopped".to_string())
 }
 
+/// Non-secret AWS setup facts the Bedrock pane needs: which `~/.aws` profiles exist, and which Keychain
+/// slots hold a value. Presence is a boolean; no key material is ever projected.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AwsCredentialOptionsDto {
+    pub(crate) profiles: Vec<String>,
+    pub(crate) has_access_key_id: bool,
+    pub(crate) has_secret_access_key: bool,
+    pub(crate) has_session_token: bool,
+}
+
+/// Which stored AWS secret a command refers to. The webview can name a slot but never read or write one.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AwsKeySlotDto {
+    AccessKeyId,
+    SecretAccessKey,
+    SessionToken,
+}
+
+impl AwsKeySlotDto {
+    const fn purpose(self) -> SecretPurpose {
+        match self {
+            Self::AccessKeyId => SecretPurpose::AwsAccessKeyId,
+            Self::SecretAccessKey => SecretPurpose::AwsSecretAccessKey,
+            Self::SessionToken => SecretPurpose::AwsSessionToken,
+        }
+    }
+
+    const fn prompt(self) -> (&'static str, &'static str) {
+        match self {
+            Self::AccessKeyId => (
+                "AWS access key ID",
+                "Stored in the macOS Keychain and never shown to the Corti window.",
+            ),
+            Self::SecretAccessKey => (
+                "AWS secret access key",
+                "Stored in the macOS Keychain and never shown to the Corti window.",
+            ),
+            Self::SessionToken => (
+                "AWS session token",
+                "Optional. Only temporary credentials need a session token.",
+            ),
+        }
+    }
+}
+
+/// Which secret a key-entry command targets. Direct providers hold one API key each; Bedrock's static
+/// mode holds an AWS keypair.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub(crate) enum SecretSlotRequest {
+    OpenAi,
+    Anthropic,
+    Aws { slot: AwsKeySlotDto },
+}
+
+impl SecretSlotRequest {
+    const fn purpose(self) -> SecretPurpose {
+        match self {
+            Self::OpenAi => SecretPurpose::OpenAiApiKey,
+            Self::Anthropic => SecretPurpose::AnthropicApiKey,
+            Self::Aws { slot } => slot.purpose(),
+        }
+    }
+
+    const fn prompt(self) -> (&'static str, &'static str) {
+        match self {
+            Self::OpenAi => (
+                "OpenAI API key",
+                "Stored in the macOS Keychain and never shown to the Corti window.",
+            ),
+            Self::Anthropic => (
+                "Anthropic API key",
+                "Stored in the macOS Keychain and never shown to the Corti window.",
+            ),
+            Self::Aws { slot } => slot.prompt(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SecretEntryResultDto {
+    Stored,
+    Cancelled,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct BedrockCredentialModeRequest {
+    pub(crate) observed_state_revision: u64,
+    pub(crate) mode: crate::postprocess_config::AwsCredentialMode,
+    pub(crate) profile: Option<String>,
+    pub(crate) role_arn: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) fn list_aws_credential_options(
+    window: tauri::WebviewWindow,
+) -> Result<AwsCredentialOptionsDto, String> {
+    require_hosted_window(&window, &["settings"])?;
+    Ok(AwsCredentialOptionsDto {
+        profiles: crate::settings::list_aws_profiles(),
+        has_access_key_id: crate::keychain::is_present(SecretPurpose::AwsAccessKeyId),
+        has_secret_access_key: crate::keychain::is_present(SecretPurpose::AwsSecretAccessKey),
+        has_session_token: crate::keychain::is_present(SecretPurpose::AwsSessionToken),
+    })
+}
+
+#[tauri::command]
+pub(crate) fn set_bedrock_credential_mode(
+    request: BedrockCredentialModeRequest,
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    state
+        .handle
+        .send(ServiceCommand::SetBedrockCredentialMode {
+            request,
+            reply: reply_tx,
+        })
+        .map_err(sanitized_error)?;
+    reply_rx
+        .recv()
+        .map_err(|_| "hosted coordinator stopped".to_string())?
+        .map_err(sanitized_error)
+}
+
+/// Open the native secure-entry sheet and store the typed value. The secret never crosses IPC in either
+/// direction; the reply says only what happened.
+#[tauri::command]
+pub(crate) fn prompt_for_provider_secret(
+    request: SecretSlotRequest,
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<SecretEntryResultDto, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let (title, detail) = request.prompt();
+    match crate::secure_entry::prompt_and_store(&app, request.purpose(), title, detail) {
+        Ok(crate::secure_entry::SecureEntryOutcome::Stored) => Ok(SecretEntryResultDto::Stored),
+        Ok(crate::secure_entry::SecureEntryOutcome::Cancelled) => {
+            Ok(SecretEntryResultDto::Cancelled)
+        }
+        Ok(crate::secure_entry::SecureEntryOutcome::Rejected) => Ok(SecretEntryResultDto::Rejected),
+        // The anyhow chain can name a Keychain failure but never the value.
+        Err(_) => Err("the secure-entry sheet could not store the value".to_string()),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn clear_provider_secret(
+    request: SecretSlotRequest,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    require_hosted_window(&window, &["settings"])?;
+    crate::keychain::delete(request.purpose())
+        .map_err(|_| "the stored value could not be removed".to_string())
+}
+
 fn require_live_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     require_hosted_window(window, &["live"])
 }
@@ -722,6 +899,7 @@ pub(crate) fn start(
         );
         HostedPreferences::default()
     });
+    let preferences = Arc::new(Mutex::new(preferences));
     let word_bank = crate::word_bank::load().unwrap_or_else(|error| {
         tracing::warn!(
             target: "corti::hosted",
@@ -781,6 +959,7 @@ pub(crate) fn start(
                 approval,
                 Arc::new(ProductionTransportFactory),
                 Arc::new(KeychainDirectSecretStore),
+                BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
             )
         },
     );
@@ -808,7 +987,7 @@ type EventNotifier = Arc<dyn Fn(&CoordinatorEventDto) + Send + Sync>;
 
 #[allow(clippy::too_many_arguments)]
 fn start_with_components(
-    preferences: HostedPreferences,
+    preferences: Arc<Mutex<HostedPreferences>>,
     word_bank: WordBankDocument,
     live_view: LiveTranscriptStore,
     pipeline_tx: Sender<PipelineMsg>,
@@ -824,7 +1003,6 @@ fn start_with_components(
     store_override: Option<Box<dyn EncryptedPostprocessStore>>,
     clock_override: Option<Arc<dyn CoordinatorClock>>,
 ) -> Result<(HostedState, HostedHandle)> {
-    let preferences = Arc::new(Mutex::new(preferences));
     let initial_control = control_from_preferences(
         process_epoch,
         &preferences.lock().unwrap(),
@@ -1088,6 +1266,23 @@ impl ControlPersistence for HostedControlPersistence {
     }
 }
 
+/// A live view of Bedrock's non-secret connection facts, so a mode or profile change in Settings takes
+/// effect on the next resolution without restarting the app.
+fn bedrock_config_source(
+    preferences: Arc<Mutex<HostedPreferences>>,
+) -> crate::bedrock_creds::ConfigSource {
+    Arc::new(move || {
+        let preferences = preferences.lock().unwrap();
+        let bedrock = &preferences.values().providers.bedrock;
+        BedrockCredentialConfig {
+            mode: bedrock.credential_mode,
+            profile: bedrock.profile.clone(),
+            region: bedrock.scope.region.clone(),
+            role_arn: bedrock.role_arn.clone(),
+        }
+    })
+}
+
 fn copy_lane(source: &LaneControlDto, target: &mut crate::postprocess_config::LanePreferences) {
     target.enabled = source.enabled;
     target.provider = source.selection.provider.clone();
@@ -1163,6 +1358,7 @@ impl ProductionApproval {
 trait DirectTransportFactory: Send + Sync {
     fn openai(&self) -> Box<dyn HttpTransport>;
     fn anthropic(&self) -> Box<dyn HttpTransport>;
+    fn bedrock(&self) -> Box<dyn HttpTransport>;
 }
 
 struct ProductionTransportFactory;
@@ -1175,6 +1371,10 @@ impl DirectTransportFactory for ProductionTransportFactory {
     fn anthropic(&self) -> Box<dyn HttpTransport> {
         Box::new(UreqTransport::new())
     }
+
+    fn bedrock(&self) -> Box<dyn HttpTransport> {
+        Box::new(UreqTransport::new())
+    }
 }
 
 trait DirectSecretStore: Send + Sync {
@@ -1185,16 +1385,12 @@ struct KeychainDirectSecretStore;
 
 impl DirectSecretStore for KeychainDirectSecretStore {
     fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
-        use security_framework::passwords::{PasswordOptions, generic_password};
-        use security_framework_sys::base::errSecItemNotFound;
-
-        let mut options = PasswordOptions::new_generic_password(HOSTED_KEYCHAIN_SERVICE, account);
-        options.set_access_synchronized(Some(false));
-        match generic_password(options) {
-            Ok(value) => Ok(Some(value)),
-            Err(error) if error.code() == errSecItemNotFound => Ok(None),
-            Err(_) => Err(CredentialError::Unavailable),
-        }
+        let purpose = match account {
+            OPENAI_API_KEY_ACCOUNT => SecretPurpose::OpenAiApiKey,
+            ANTHROPIC_API_KEY_ACCOUNT => SecretPurpose::AnthropicApiKey,
+            _ => return Err(CredentialError::Unavailable),
+        };
+        crate::keychain::read(purpose).map_err(|_| CredentialError::Unavailable)
     }
 }
 
@@ -1275,6 +1471,9 @@ type SharedAdapter = Arc<Mutex<Box<dyn ProviderAdapter>>>;
 struct ApprovedProviderDirectory {
     adapters: HashMap<(ProviderId, TransportId), SharedAdapter>,
     credentials: HashMap<(ProviderId, TransportId), Arc<DirectCredential>>,
+    /// Bedrock resolves through the AWS chain rather than a single Keychain item, so its readiness —
+    /// including assumed-role and SSO expiry — comes from its own resolver.
+    bedrock: Arc<BedrockCredentialResolver>,
 }
 
 struct ApprovedProviderAccess(Arc<ApprovedProviderDirectory>);
@@ -1296,6 +1495,9 @@ impl ProviderAccess for ApprovedProviderAccess {
         let key = (provider.clone(), transport.clone());
         if let Some(credential) = self.0.credentials.get(&key) {
             return credential.state();
+        }
+        if (provider.as_str(), transport.as_str()) == ("amazon", "bedrock_runtime") {
+            return self.0.bedrock.state();
         }
         match known_descriptor(provider, transport).map(|descriptor| descriptor.support_tier) {
             Some(SupportTier::Blocked | SupportTier::Experimental) | None => {
@@ -1353,6 +1555,7 @@ fn approved_direct_components(
     _approval: ProductionApproval,
     transports: Arc<dyn DirectTransportFactory>,
     secrets: Arc<dyn DirectSecretStore>,
+    bedrock: Arc<BedrockCredentialResolver>,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
     let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
     let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
@@ -1366,6 +1569,12 @@ fn approved_direct_components(
         Box::new(ProviderSystemClock::new()),
         Box::new(DirectApiKeySource(anthropic_credential.clone())),
     ));
+    let bedrock_adapter: Box<dyn ProviderAdapter> = Box::new(BedrockConverseAdapter::new(
+        transports.bedrock(),
+        Box::new(ProviderSystemClock::new()),
+        Box::new(ProviderSystemClock::new()),
+        Box::new(BedrockAdapterCredentials::new(bedrock.clone())),
+    ));
     let mut adapters = HashMap::new();
     let mut credentials = HashMap::new();
     for (adapter, credential) in [
@@ -1377,9 +1586,15 @@ fn approved_direct_components(
         adapters.insert(key.clone(), Arc::new(Mutex::new(adapter)));
         credentials.insert(key, credential);
     }
+    let bedrock_descriptor = bedrock_adapter.descriptor();
+    adapters.insert(
+        (bedrock_descriptor.provider, bedrock_descriptor.transport),
+        Arc::new(Mutex::new(bedrock_adapter)),
+    );
     let directory = Arc::new(ApprovedProviderDirectory {
         adapters,
         credentials,
+        bedrock,
     });
     (
         Arc::new(ApprovedTicketExecutor(directory.clone())),
@@ -2108,6 +2323,10 @@ enum ServiceCommand {
         request: ProviderScopeUpdateRequest,
         reply: Sender<Result<HostedMutationResult, ErrorCode>>,
     },
+    SetBedrockCredentialMode {
+        request: BedrockCredentialModeRequest,
+        reply: Sender<Result<HostedMutationResult, ErrorCode>>,
+    },
     RefreshProvider {
         provider: ProviderId,
         transport: TransportId,
@@ -2322,6 +2541,10 @@ impl Service {
             }
             ServiceCommand::UpdateProviderScope { request, reply } => {
                 let result = self.update_provider_scope(request);
+                let _ = reply.send(result);
+            }
+            ServiceCommand::SetBedrockCredentialMode { request, reply } => {
+                let result = self.set_bedrock_credential_mode(request);
                 let _ = reply.send(result);
             }
             ServiceCommand::RefreshProvider {
@@ -2576,6 +2799,7 @@ impl Service {
                 ("google", "vertex_api") => values.providers.vertex.clone(),
                 ("openai", "openai_api") => values.providers.openai.scope.clone(),
                 ("anthropic", "anthropic_api") => values.providers.anthropic.scope.clone(),
+                ("amazon", "bedrock_runtime") => values.providers.bedrock.scope.clone(),
                 _ => return Err(ErrorCode::PolicyBlocked),
             }
         };
@@ -2606,6 +2830,7 @@ impl Service {
                 ("google", "vertex_api") => &mut values.providers.vertex,
                 ("openai", "openai_api") => &mut values.providers.openai.scope,
                 ("anthropic", "anthropic_api") => &mut values.providers.anthropic.scope,
+                ("amazon", "bedrock_runtime") => &mut values.providers.bedrock.scope,
                 _ => unreachable!("validated provider transport"),
             };
             scope.connection_scope_id = generated_id;
@@ -2617,6 +2842,50 @@ impl Service {
         self.coordinator
             .apply_patch(ControlPatch::ProviderScopeChanged)
             .map_err(control_error_code)?;
+        self.coordinator
+            .invalidate_provider_scope(&provider, &transport);
+        self.bump_state();
+        self.refresh_snapshot();
+        Ok(HostedMutationResult::Applied {
+            settings: self.current_settings(),
+        })
+    }
+
+    fn set_bedrock_credential_mode(
+        &mut self,
+        request: BedrockCredentialModeRequest,
+    ) -> Result<HostedMutationResult, ErrorCode> {
+        if request.observed_state_revision != self.state_revision {
+            return Ok(HostedMutationResult::Conflict {
+                settings: self.current_settings(),
+            });
+        }
+        let profile = bounded_optional(request.profile)?;
+        let role_arn = bounded_optional(request.role_arn)?;
+        {
+            let preferences = self.preferences.lock().unwrap();
+            let bedrock = &preferences.values().providers.bedrock;
+            if bedrock.credential_mode == request.mode
+                && bedrock.profile == profile
+                && bedrock.role_arn == role_arn
+            {
+                drop(preferences);
+                return Ok(HostedMutationResult::Unchanged {
+                    settings: self.current_settings(),
+                });
+            }
+        }
+        // `revise` runs `validate`, so a mode missing its companion field is rejected before persisting.
+        self.revise_preferences(|values| {
+            let bedrock = &mut values.providers.bedrock;
+            bedrock.credential_mode = request.mode;
+            bedrock.profile = profile;
+            bedrock.role_arn = role_arn;
+        })
+        .map_err(|_| ErrorCode::PolicyBlocked)?;
+        // A credential change invalidates the authenticated catalog, exactly like a scope change.
+        let provider = ProviderId::new("amazon").map_err(|_| ErrorCode::Internal)?;
+        let transport = TransportId::new("bedrock_runtime").map_err(|_| ErrorCode::Internal)?;
         self.coordinator
             .invalidate_provider_scope(&provider, &transport);
         self.bump_state();
@@ -3883,7 +4152,16 @@ fn settings_snapshot(
                 "anthropic_api",
                 &values.providers.anthropic.scope,
             ),
+            scope_dto("amazon", "bedrock_runtime", &values.providers.bedrock.scope),
         ],
+        bedrock: BedrockCredentialDto {
+            mode: values.providers.bedrock.credential_mode,
+            profile: values.providers.bedrock.profile.clone(),
+            role_arn: values.providers.bedrock.role_arn.clone(),
+            has_access_key_id: crate::keychain::is_present(SecretPurpose::AwsAccessKeyId),
+            has_secret_access_key: crate::keychain::is_present(SecretPurpose::AwsSecretAccessKey),
+            has_session_token: crate::keychain::is_present(SecretPurpose::AwsSessionToken),
+        },
         default_steering: values.default_steering.clone(),
         word_bank: HostedWordBankDto {
             revision: word_bank.revision(),
@@ -3949,6 +4227,7 @@ fn adapter_version(transport: &TransportId) -> u32 {
         "vertex_api" => VERTEX_REST_ADAPTER_VERSION,
         "openai_api" => OPENAI_RESPONSES_ADAPTER_VERSION,
         "anthropic_api" => ANTHROPIC_MESSAGES_ADAPTER_VERSION,
+        "bedrock_runtime" => BEDROCK_CONVERSE_ADAPTER_VERSION,
         _ => 1,
     }
 }
@@ -4334,6 +4613,13 @@ mod tests {
                 sends: self.sends.clone(),
             })
         }
+
+        fn bedrock(&self) -> Box<dyn HttpTransport> {
+            Box::new(InjectedTransport {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                sends: self.sends.clone(),
+            })
+        }
     }
 
     struct InjectedTransport {
@@ -4575,6 +4861,10 @@ mod tests {
         }
     }
 
+    fn shared(preferences: HostedPreferences) -> Arc<Mutex<HostedPreferences>> {
+        Arc::new(Mutex::new(preferences))
+    }
+
     fn configured_preferences() -> HostedPreferences {
         HostedPreferences::default()
             .revise(|values| {
@@ -4635,7 +4925,7 @@ mod tests {
             sink.lock().unwrap().push(event.clone());
         });
         let (_, handle) = start_with_components(
-            configured_preferences(),
+            shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
             pipeline_tx,
@@ -4776,10 +5066,12 @@ mod tests {
             openai: responses,
             sends: sends.clone(),
         });
+        let preferences = shared(preferences);
         let (executor, providers) = approved_direct_components(
             ProductionApproval::for_test(),
             transports,
             Arc::new(InjectedSecrets),
+            BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
         );
         let (_, handle) = start_with_components(
             preferences,
@@ -5046,7 +5338,7 @@ mod tests {
         );
         let first_executor = Arc::new(RecordingExecutor::new());
         let (_, first_handle) = start_with_components(
-            configured_preferences(),
+            shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
             first_pipeline_tx,
@@ -5104,7 +5396,7 @@ mod tests {
         );
         let second_executor = Arc::new(RecordingExecutor::new());
         let (_, second_handle) = start_with_components(
-            configured_preferences(),
+            shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
             second_pipeline_tx,
@@ -5681,7 +5973,7 @@ mod tests {
             .revise(|values| values.final_deadline_seconds = 1)
             .unwrap();
         let (_, handle) = start_with_components(
-            preferences,
+            shared(preferences),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
             pipeline_tx,
@@ -5745,7 +6037,7 @@ mod tests {
         let executor = Arc::new(RecordingExecutor::new());
         let resolver = Arc::new(ArmsOnSecondResolution(AtomicUsize::new(0)));
         let (_, handle) = start_with_components(
-            vertex_preferences(),
+            shared(vertex_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
             pipeline_tx,

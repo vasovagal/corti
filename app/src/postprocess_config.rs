@@ -43,6 +43,47 @@ pub(crate) enum SecretPurpose {
     OpenAiApiKey,
     AnthropicApiKey,
     PostprocessCacheMasterKey,
+    AwsAccessKeyId,
+    AwsSecretAccessKey,
+    AwsSessionToken,
+}
+
+impl SecretPurpose {
+    /// Fixed Keychain account name for this slot. Values are versioned so a format change can never
+    /// silently reinterpret an existing item.
+    pub(crate) const fn keychain_account(self) -> &'static str {
+        match self {
+            Self::OpenAiApiKey => "openai-api-key-v1",
+            Self::AnthropicApiKey => "anthropic-api-key-v1",
+            Self::PostprocessCacheMasterKey => "encrypted-store-master-v1",
+            Self::AwsAccessKeyId => "aws-access-key-id-v1",
+            Self::AwsSecretAccessKey => "aws-secret-access-key-v1",
+            Self::AwsSessionToken => "aws-session-token-v1",
+        }
+    }
+}
+
+/// How AWS credentials are resolved for Bedrock. This is a non-secret preference; the values it selects
+/// live in `~/.aws` or the Keychain, never in this document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AwsCredentialMode {
+    #[default]
+    DefaultChain,
+    Profile,
+    StaticKeychain,
+    AssumeRole,
+    Sso,
+}
+
+impl AwsCredentialMode {
+    pub(crate) const fn requires_profile(self) -> bool {
+        matches!(self, Self::Profile | Self::Sso)
+    }
+
+    pub(crate) const fn requires_role_arn(self) -> bool {
+        matches!(self, Self::AssumeRole)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +104,18 @@ impl SecretReference {
 
     pub(crate) const fn cache_master_key() -> Self {
         Self::keychain(SecretPurpose::PostprocessCacheMasterKey)
+    }
+
+    pub(crate) const fn aws_access_key_id() -> Self {
+        Self::keychain(SecretPurpose::AwsAccessKeyId)
+    }
+
+    pub(crate) const fn aws_secret_access_key() -> Self {
+        Self::keychain(SecretPurpose::AwsSecretAccessKey)
+    }
+
+    pub(crate) const fn aws_session_token() -> Self {
+        Self::keychain(SecretPurpose::AwsSessionToken)
     }
 
     const fn keychain(purpose: SecretPurpose) -> Self {
@@ -117,6 +170,32 @@ impl DirectProviderPreferences {
     }
 }
 
+/// Bedrock's non-secret connection facts. The credential *mode*, the `~/.aws` profile name, the region,
+/// and the role ARN are all configuration; no key material is representable here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct BedrockProviderPreferences {
+    pub(crate) scope: ProviderScopePreferences,
+    pub(crate) credential_mode: AwsCredentialMode,
+    /// A `~/.aws/config` or `~/.aws/credentials` profile name. Used by the profile and SSO modes.
+    pub(crate) profile: Option<String>,
+    /// The role assumed after the base chain resolves, for the assume-role mode.
+    pub(crate) role_arn: Option<String>,
+    pub(crate) provider_cache_acknowledgement_version: Option<u32>,
+}
+
+impl Default for BedrockProviderPreferences {
+    fn default() -> Self {
+        Self {
+            scope: ProviderScopePreferences::default(),
+            credential_mode: AwsCredentialMode::DefaultChain,
+            profile: None,
+            role_arn: None,
+            provider_cache_acknowledgement_version: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ProviderPreferences {
@@ -124,6 +203,7 @@ pub(crate) struct ProviderPreferences {
     pub(crate) vertex_provider_cache_acknowledgement_version: Option<u32>,
     pub(crate) openai: DirectProviderPreferences,
     pub(crate) anthropic: DirectProviderPreferences,
+    pub(crate) bedrock: BedrockProviderPreferences,
     /// Product/legal approval is distinct from build capability. This persisted gate starts false.
     pub(crate) codex_experimental_approved: bool,
 }
@@ -135,6 +215,7 @@ impl Default for ProviderPreferences {
             vertex_provider_cache_acknowledgement_version: None,
             openai: DirectProviderPreferences::openai(),
             anthropic: DirectProviderPreferences::anthropic(),
+            bedrock: BedrockProviderPreferences::default(),
             codex_experimental_approved: false,
         }
     }
@@ -315,6 +396,7 @@ impl HostedPreferences {
             &self.preferences.providers.anthropic,
             SecretPurpose::AnthropicApiKey,
         )?;
+        validate_bedrock_provider(&self.preferences.providers.bedrock)?;
         for lane in [
             &self.preferences.live,
             &self.preferences.final_lane,
@@ -342,6 +424,12 @@ impl HostedPreferences {
                             .providers
                             .vertex_provider_cache_acknowledgement_version
                     }
+                    Some("amazon") => {
+                        self.preferences
+                            .providers
+                            .bedrock
+                            .provider_cache_acknowledgement_version
+                    }
                     // Experimental transports have no controllable provider-cache policy.
                     _ => None,
                 };
@@ -362,6 +450,53 @@ fn validate_direct_provider(
     if provider.credential.purpose() != expected {
         bail!("hosted credential reference does not match its provider slot");
     }
+    Ok(())
+}
+
+/// A Bedrock mode is only savable once its own non-secret companion field is present, so the pane can
+/// never persist a connection that is guaranteed to fail at resolve time.
+fn validate_bedrock_provider(provider: &BedrockProviderPreferences) -> Result<()> {
+    let profile = provider
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let role_arn = provider
+        .role_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    ensure!(
+        !provider.credential_mode.requires_profile() || profile.is_some(),
+        "the {:?} AWS credential mode requires a profile name",
+        provider.credential_mode
+    );
+    ensure!(
+        !provider.credential_mode.requires_role_arn() || role_arn.is_some(),
+        "assuming a role requires its ARN"
+    );
+    ensure!(
+        role_arn.is_none_or(|arn| arn.starts_with("arn:") && arn.contains(":role/")),
+        "the AWS role ARN is not an IAM role ARN"
+    );
+    ensure!(
+        profile.is_none_or(|profile| profile.len() <= 256 && !profile.contains(['[', ']', '\n'])),
+        "the AWS profile name is not a valid profile name"
+    );
+    // The connection is regional, and Bedrock model availability differs per region.
+    ensure!(
+        provider.scope.connection_scope_id.is_none()
+            || provider
+                .scope
+                .region
+                .as_deref()
+                .is_some_and(|region| !region.trim().is_empty()),
+        "a configured Bedrock connection requires a region"
+    );
+    ensure!(
+        provider.scope.project.is_none() && provider.scope.quota_project.is_none(),
+        "Bedrock has no project or quota-project scope"
+    );
     Ok(())
 }
 
@@ -461,6 +596,121 @@ mod tests {
             assert!(!text.to_ascii_lowercase().contains(forbidden));
         }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn bedrock_round_trip_persists_mode_profile_region_and_role_but_no_key_material() {
+        let path = test_path("bedrock-round-trip");
+        let preferences = HostedPreferences::default()
+            .revise(|values| {
+                let bedrock = &mut values.providers.bedrock;
+                bedrock.credential_mode = AwsCredentialMode::AssumeRole;
+                bedrock.profile = Some("synthetic-profile".into());
+                bedrock.role_arn = Some("arn:aws:iam::123456789012:role/synthetic-role".into());
+                bedrock.scope.connection_scope_id =
+                    Some(ConnectionScopeId::new("bedrock-scope-fixture").unwrap());
+                bedrock.scope.alias = Some("Fixture Bedrock".into());
+                bedrock.scope.region = Some("us-east-1".into());
+            })
+            .unwrap();
+        preferences.save_at(&path).unwrap();
+        assert_eq!(HostedPreferences::load_at(&path).unwrap(), preferences);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("assume_role"));
+        assert!(text.contains("synthetic-profile"));
+        assert!(text.contains("us-east-1"));
+        assert!(text.contains("role/synthetic-role"));
+        let lowered = text.to_ascii_lowercase();
+        for forbidden in [
+            "akia",
+            "asia",
+            "aws_secret_access_key =",
+            "session_token =",
+            "aws_access_key_id =",
+        ] {
+            assert!(!lowered.contains(forbidden), "{forbidden} leaked");
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn bedrock_modes_require_their_own_non_secret_companion_field() {
+        let base = HostedPreferences::default();
+        let error = base
+            .revise(|values| values.providers.bedrock.credential_mode = AwsCredentialMode::Profile)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a profile name"), "{error}");
+
+        let error = base
+            .revise(|values| {
+                values.providers.bedrock.credential_mode = AwsCredentialMode::AssumeRole;
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires its ARN"), "{error}");
+
+        let error = base
+            .revise(|values| {
+                values.providers.bedrock.credential_mode = AwsCredentialMode::AssumeRole;
+                values.providers.bedrock.role_arn = Some("not-an-arn".into());
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not an IAM role ARN"), "{error}");
+
+        // The default chain needs nothing beyond a region once the connection is configured.
+        let ok = base
+            .revise(|values| {
+                values.providers.bedrock.scope.connection_scope_id =
+                    Some(ConnectionScopeId::new("bedrock-scope-fixture").unwrap());
+                values.providers.bedrock.scope.region = Some("eu-central-1".into());
+            })
+            .unwrap();
+        assert_eq!(
+            ok.values().providers.bedrock.credential_mode,
+            AwsCredentialMode::DefaultChain
+        );
+
+        let error = base
+            .revise(|values| {
+                values.providers.bedrock.scope.connection_scope_id =
+                    Some(ConnectionScopeId::new("bedrock-scope-fixture").unwrap());
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a region"), "{error}");
+    }
+
+    #[test]
+    fn aws_keychain_slots_are_fixed_and_distinct() {
+        let slots = [
+            SecretPurpose::AwsAccessKeyId,
+            SecretPurpose::AwsSecretAccessKey,
+            SecretPurpose::AwsSessionToken,
+            SecretPurpose::OpenAiApiKey,
+            SecretPurpose::AnthropicApiKey,
+            SecretPurpose::PostprocessCacheMasterKey,
+        ];
+        let accounts = slots
+            .iter()
+            .map(|slot| slot.keychain_account())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(accounts.len(), slots.len());
+        assert_eq!(
+            SecretReference::aws_secret_access_key().purpose(),
+            SecretPurpose::AwsSecretAccessKey
+        );
+        // The pre-existing accounts must not move, or a running install loses its stored keys.
+        assert_eq!(
+            SecretPurpose::OpenAiApiKey.keychain_account(),
+            "openai-api-key-v1"
+        );
+        assert_eq!(
+            SecretPurpose::PostprocessCacheMasterKey.keychain_account(),
+            "encrypted-store-master-v1"
+        );
     }
 
     #[test]
