@@ -1390,7 +1390,9 @@ struct PendingFinal {
     live_session: bool,
     deadline_micros: u64,
     original: DiarizedTranscript,
-    row_ids: Vec<RowId>,
+    /// Original transcript segment index for every non-empty hosted row. Keeping the index alongside the
+    /// row id prevents filtered blank segments from shifting a validated replacement onto another segment.
+    row_positions: Vec<(usize, RowId)>,
     call_ids: Vec<CallId>,
     remaining: HashSet<CallId>,
     rewritten: HashMap<RowId, String>,
@@ -1890,11 +1892,13 @@ impl Service {
         {
             return Err(ErrorCode::PolicyBlocked);
         }
+        // Persist content first, like steering/word-bank updates. A failed private-file write must not
+        // cancel the active pinned call or arm a session-only template that the command reported as failed.
+        self.revise_preferences(|values| values.pinned_question_template = template.clone())?;
         self.coordinator
-            .edit_pinned_template(template.clone())
+            .edit_pinned_template(template)
             .map_err(submit_error_code)?;
         self.pinned_exchange = None;
-        self.revise_preferences(|values| values.pinned_question_template = template)?;
         self.bump_state();
         self.refresh_snapshot();
         Ok(())
@@ -2189,11 +2193,23 @@ impl Service {
             ));
             return;
         }
-        let rows = transcript_rows(&transcript);
+        let indexed_rows = transcript_rows(&transcript);
+        let rows: Vec<TranscriptRow> = indexed_rows.iter().map(|(_, row)| row.clone()).collect();
+        if rows.is_empty() {
+            self.release_batch_session(live_session);
+            let _ = reply.send(fallback_final(
+                transcript,
+                ErrorCode::PolicyBlocked,
+                Vec::new(),
+                None,
+            ));
+            return;
+        }
         let watermark = if self.coordinator.watermark().transcript_revision == 0 {
             match self.coordinator.observe_finalized_rows(&rows) {
                 Ok(value) => value,
                 Err(_) => {
+                    self.release_batch_session(live_session);
                     let _ = reply.send(fallback_final(
                         transcript,
                         ErrorCode::Internal,
@@ -2209,6 +2225,7 @@ impl Service {
         let chunks = match final_chunks(&rows) {
             Ok(chunks) => chunks,
             Err(code) => {
+                self.release_batch_session(live_session);
                 let _ = reply.send(fallback_final(transcript, code, Vec::new(), None));
                 return;
             }
@@ -2216,6 +2233,7 @@ impl Service {
         let group_id = match self.next_group_id("final") {
             Ok(value) => value,
             Err(code) => {
+                self.release_batch_session(live_session);
                 let _ = reply.send(fallback_final(transcript, code, Vec::new(), None));
                 return;
             }
@@ -2245,6 +2263,7 @@ impl Service {
             ) {
                 Ok(value) => submissions.push(value),
                 Err(code) => {
+                    self.release_batch_session(live_session);
                     let _ = reply.send(fallback_final(transcript, code, Vec::new(), None));
                     return;
                 }
@@ -2253,6 +2272,7 @@ impl Service {
         let metadata = match self.applied_metadata(LaneFamily::Final) {
             Ok(value) => value,
             Err(code) => {
+                self.release_batch_session(live_session);
                 let _ = reply.send(fallback_final(transcript, code, Vec::new(), None));
                 return;
             }
@@ -2268,6 +2288,7 @@ impl Service {
                     self.coordinator
                         .cancel_call(call_id, CancellationReason::Superseded);
                 }
+                self.release_batch_session(live_session);
                 let _ = reply.send(fallback_final(
                     transcript,
                     submit_error_code(error),
@@ -2286,7 +2307,10 @@ impl Service {
                 live_session,
                 deadline_micros: deadline,
                 original: transcript,
-                row_ids: rows.iter().map(|row| row.row_id.clone()).collect(),
+                row_positions: indexed_rows
+                    .into_iter()
+                    .map(|(segment_index, row)| (segment_index, row.row_id))
+                    .collect(),
                 remaining: call_ids.iter().cloned().collect(),
                 call_ids,
                 rewritten: HashMap::new(),
@@ -2674,9 +2698,9 @@ impl Service {
             self.final_by_call.remove(call_id);
         }
         let mut transcript = group.original.clone();
-        for (segment, row_id) in transcript.segments.iter_mut().zip(&group.row_ids) {
+        for (segment_index, row_id) in &group.row_positions {
             if let Some(text) = group.rewritten.get(row_id) {
-                segment.text.clone_from(text);
+                transcript.segments[*segment_index].text.clone_from(text);
             }
         }
         let cache = combined_cache(group.call_ids.iter().map(|call_id| {
@@ -2706,11 +2730,7 @@ impl Service {
             },
         )
         .unwrap_or_else(|_| AppliedPostprocessProvenance::none());
-        if !group.live_session {
-            self.current_recording = None;
-            self.ledger.clear();
-            self.ledger_bytes = 0;
-        }
+        self.release_batch_session(group.live_session);
         let _ = group.reply.send(SettledFinalTranscript {
             transcript,
             applied_postprocess: applied,
@@ -2736,17 +2756,21 @@ impl Service {
             }
             self.call_cache.remove(peer);
         }
-        if !group.live_session {
-            self.current_recording = None;
-            self.ledger.clear();
-            self.ledger_bytes = 0;
-        }
+        self.release_batch_session(group.live_session);
         let _ = group.reply.send(fallback_final(
             group.original,
             code,
             group.call_ids,
             group.source_fingerprint,
         ));
+    }
+
+    fn release_batch_session(&mut self, live_session: bool) {
+        if !live_session {
+            self.current_recording = None;
+            self.ledger.clear();
+            self.ledger_bytes = 0;
+        }
     }
 
     fn expire_pending_finals(&mut self) {
@@ -3018,7 +3042,7 @@ fn validate_recording_id(value: &str) -> Result<(), ErrorCode> {
     }
 }
 
-fn transcript_rows(transcript: &DiarizedTranscript) -> Vec<TranscriptRow> {
+fn transcript_rows(transcript: &DiarizedTranscript) -> Vec<(usize, TranscriptRow)> {
     transcript
         .segments
         .iter()
@@ -3028,13 +3052,17 @@ fn transcript_rows(transcript: &DiarizedTranscript) -> Vec<TranscriptRow> {
             if text.is_empty() {
                 return None;
             }
-            Some(TranscriptRow {
-                row_id: RowId::new(format!("final-row-{index:08}")).ok()?,
-                speaker: segment.speaker.display().to_owned(),
-                start_ms: seconds_to_millis(segment.start),
-                end_ms: seconds_to_millis(segment.end).max(seconds_to_millis(segment.start)),
-                text: text.to_owned(),
-            })
+            Some((
+                index,
+                TranscriptRow {
+                    row_id: RowId::new(format!("final-row-{index:08}"))
+                        .expect("segment-index final row id is valid"),
+                    speaker: segment.speaker.display().to_owned(),
+                    start_ms: seconds_to_millis(segment.start),
+                    end_ms: seconds_to_millis(segment.end).max(seconds_to_millis(segment.start)),
+                    text: text.to_owned(),
+                },
+            ))
         })
         .collect()
 }
@@ -3677,6 +3705,87 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].call_id, settled.call_ids[0]);
         assert!(!history[0].provider_request_sent || history[0].error_code.is_none());
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn empty_final_transcript_never_dispatches_a_provider_call() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let executor = Arc::new(RecordingExecutor::new());
+        let (handle, _pipeline_rx, path) = start_fixture("empty-final", executor.clone(), events);
+        let transcript = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 0.0,
+            end: 0.0,
+            text: "   ".into(),
+        }]);
+
+        let settled = handle.finalize("recording", transcript.clone(), false);
+
+        assert_eq!(settled.transcript, transcript);
+        assert!(!settled.hosted_text_applied);
+        assert_eq!(
+            settled.applied_postprocess.final_outcome(),
+            Some(FinalPostprocessOutcome::Disabled)
+        );
+        assert!(settled.call_ids.is_empty());
+        assert_eq!(settled.fallback_code, Some(ErrorCode::PolicyBlocked));
+        assert!(executor.target_texts.lock().unwrap().is_empty());
+
+        let next = handle.finalize("next-recording", raw_transcript(), false);
+        assert!(
+            next.hosted_text_applied,
+            "empty final must release its session"
+        );
+        assert_eq!(executor.target_texts.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn final_replacements_keep_their_original_segment_indices() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (handle, _pipeline_rx, path) =
+            start_fixture("final-segment-indices", Arc::new(RewriteExecutor), events);
+        let transcript = DiarizedTranscript::new(vec![
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 0.0,
+                end: 0.0,
+                text: String::new(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 1.0,
+                end: 2.0,
+                text: "fixture first raw row".into(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: 2.0,
+                end: 2.0,
+                text: "   ".into(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: 3.0,
+                end: 4.0,
+                text: "fixture second raw row".into(),
+            },
+        ]);
+
+        let settled = handle.finalize("recording", transcript, false);
+
+        assert!(settled.hosted_text_applied);
+        assert_eq!(settled.transcript.segments[0].text, "");
+        assert_eq!(
+            settled.transcript.segments[1].text,
+            "fixture corrected text"
+        );
+        assert_eq!(settled.transcript.segments[2].text, "   ");
+        assert_eq!(
+            settled.transcript.segments[3].text,
+            "fixture corrected text"
+        );
         std::fs::remove_dir_all(path).ok();
     }
 
