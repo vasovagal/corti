@@ -65,14 +65,16 @@ pub enum KnownTransport {
     CodexAppServer,
     AnthropicDirect,
     ClaudeSubscription,
+    BedrockRuntime,
 }
 
 impl KnownTransport {
     pub const fn support_tier(self) -> SupportTier {
         match self {
-            Self::VertexDirect | Self::OpenAiDirect | Self::AnthropicDirect => {
-                SupportTier::Documented
-            }
+            Self::VertexDirect
+            | Self::OpenAiDirect
+            | Self::AnthropicDirect
+            | Self::BedrockRuntime => SupportTier::Documented,
             Self::CodexAppServer => SupportTier::Experimental,
             Self::ClaudeSubscription => SupportTier::Blocked,
         }
@@ -80,9 +82,10 @@ impl KnownTransport {
 
     pub const fn billing_basis(self) -> BillingBasis {
         match self {
-            Self::VertexDirect | Self::OpenAiDirect | Self::AnthropicDirect => {
-                BillingBasis::MeteredEstimate
-            }
+            Self::VertexDirect
+            | Self::OpenAiDirect
+            | Self::AnthropicDirect
+            | Self::BedrockRuntime => BillingBasis::MeteredEstimate,
             Self::CodexAppServer => BillingBasis::IncludedSubscription,
             Self::ClaudeSubscription => BillingBasis::Unknown,
         }
@@ -92,7 +95,7 @@ impl KnownTransport {
     pub const fn production_adapter_allowed(self) -> bool {
         matches!(
             self,
-            Self::VertexDirect | Self::OpenAiDirect | Self::AnthropicDirect
+            Self::VertexDirect | Self::OpenAiDirect | Self::AnthropicDirect | Self::BedrockRuntime
         )
     }
 
@@ -103,6 +106,7 @@ impl KnownTransport {
             Self::CodexAppServer => ("openai", "codex_app_server"),
             Self::AnthropicDirect => ("anthropic", "anthropic_api"),
             Self::ClaudeSubscription => ("anthropic", "claude_subscription"),
+            Self::BedrockRuntime => ("amazon", "bedrock_runtime"),
         };
         ProviderDescriptor {
             provider: ProviderId::new(provider).expect("known provider id is valid"),
@@ -293,6 +297,10 @@ impl ModelCatalog {
 }
 
 /// Secret-free credential source labels suitable for UI projection.
+///
+/// The AWS variants name only the *flavor* of resolution. Account ids, role ARNs, profile names, and
+/// credential-file paths are deliberately unrepresentable here; the app projects those separately as
+/// non-secret preferences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSourceKind {
@@ -300,6 +308,11 @@ pub enum CredentialSourceKind {
     WorkloadIdentity,
     ApplicationDefaultCredentials,
     BrokerKeyring,
+    AwsDefaultChain,
+    AwsProfile,
+    AwsStaticKeychain,
+    AwsAssumedRole,
+    AwsSso,
 }
 
 /// Secret-free credential state. Tokens, keys, provider bodies, and credential paths cannot be represented.
@@ -718,6 +731,34 @@ mod tests {
         );
         assert!(!KnownTransport::ClaudeSubscription.production_adapter_allowed());
         assert_eq!(VERTEX_UNARMED_WARNING, "gcloud token isn't armed");
+
+        let bedrock = KnownTransport::BedrockRuntime.descriptor();
+        assert_eq!(bedrock.provider.as_str(), "amazon");
+        assert_eq!(bedrock.transport.as_str(), "bedrock_runtime");
+        assert_eq!(bedrock.support_tier, SupportTier::Documented);
+        assert_eq!(bedrock.billing_basis, BillingBasis::MeteredEstimate);
+        assert!(bedrock.adapter_available);
+    }
+
+    #[test]
+    fn aws_credential_source_labels_carry_no_account_detail() {
+        for source in [
+            CredentialSourceKind::AwsDefaultChain,
+            CredentialSourceKind::AwsProfile,
+            CredentialSourceKind::AwsStaticKeychain,
+            CredentialSourceKind::AwsAssumedRole,
+            CredentialSourceKind::AwsSso,
+        ] {
+            let state = CredentialState::Ready {
+                expires_at_unix_ms: Some(1_787_000_000_000),
+                source,
+            };
+            let rendered = serde_json::to_string(&state).unwrap();
+            assert!(rendered.starts_with(r#"{"state":"ready""#));
+            for forbidden in ["arn:", "/", "\\", "@"] {
+                assert!(!rendered.contains(forbidden), "{rendered}");
+            }
+        }
     }
 
     #[test]
