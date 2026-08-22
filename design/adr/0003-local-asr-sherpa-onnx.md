@@ -44,7 +44,7 @@ A mid-2026 research sweep (and direct verification) settled the engine choice:
   `SHERPA_ONNX_LIB_DIR` to a pre-extracted archive.
 - **Make Apple Silicon explicit in the build and tune for the author's M1 Pro.** A repo `.cargo/config.toml`
   pins `target = "aarch64-apple-darwin"` with `-C target-cpu=apple-m1`, and `[profile.release]` uses
-  `lto = "thin"` + `codegen-units = 1`. `apple-m1` is the forward-compatible baseline (M2/M3/M4 are
+  `lto = "fat"` + `codegen-units = 1`. `apple-m1` is the forward-compatible baseline (M2/M3/M4 are
   supersets), so binaries still run on any Apple Silicon while getting native codegen.
 
 ## Consequences
@@ -146,3 +146,18 @@ A persisted `config.toml` carrying `local_provider` still loads: `AppConfig` is 
 
 Re-evaluating CoreML now means reverting this addendum on top of the 2026-06-08 recipe, not flipping a knob.
 The prerequisite is unchanged and unmet: a CoreML-capable sherpa-onnx lib.
+
+## Addendum (2026-08-22): full LTO tightens the combined release app
+
+**Supersedes** the Decision's `lto = "thin"` release-profile setting, but not its Apple-M1 target,
+single-codegen-unit, static-linking, or performance decisions. The default app now links AWS, sherpa/ONNX,
+transcribe.cpp/GGML, Tauri, and hosted providers together. On one `ba0884f` tree and toolchain, changing only
+ThinLTO to FullLTO reduced the stripped executable from 45,263,200 to 42,803,088 bytes (−5.44%) and its
+`gzip -9` representation from 18,125,066 to 17,481,325 bytes (−3.55%). Dynamic linkage was identical.
+
+The deterministic 60-second AEC workload remained within measurement noise: 0.373 s median under ThinLTO
+and 0.369 s under FullLTO. By contrast, `opt-level = "z"` produced a much smaller 33,428,784-byte app but
+nearly halved AEC throughput (0.730 s median), so release optimization stays speed-oriented. FullLTO adds
+release-link time; `.github/workflows/warm-cache.yml` already builds the exact release profile on qualifying
+`main` pushes before a tag build. Full measurements and reproduction commands are in
+[`design/release-binary-size.md`](../release-binary-size.md) and tracked by [#120](https://github.com/vasovagal/corti/issues/120).
