@@ -75,6 +75,9 @@ tokio = { version = "1", default-features = false }
 futures-core = "0.3"
 
 [profile.release]
-lto = "thin"
+# The default-feature app statically links two ASR runtimes and a broad Rust graph. On the ba0884f
+# release tree, full LTO removed 2,460,112 bytes (5.44%) versus thin LTO without slowing the AEC hot path;
+# see design/release-binary-size.md and #120. The extra release-link work is paid by warm-cache.yml.
+lto = "fat"
 codegen-units = 1 # single-unit codegen: best raw speed for the M1 Pro daily driver (ADR 0002/0003)
 strip = true
