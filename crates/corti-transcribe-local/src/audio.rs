@@ -14,6 +14,8 @@ pub struct TwoTrack {
     pub them: Vec<f32>,
     /// Source sample rate (typically 48 kHz); the engine resamples to 16 kHz as needed.
     pub sample_rate: i32,
+    /// Source WAV channel count, retained even when the file contains zero frames.
+    pub channel_count: u16,
 }
 
 /// Read a 16-bit-int or 32-bit-float WAV and deinterleave it. A 1-channel WAV (tap-only / webinar) is treated
@@ -47,6 +49,7 @@ pub fn read_two_track(path: &Path) -> Result<TwoTrack> {
             mic: Vec::new(),
             them: samples,
             sample_rate,
+            channel_count: spec.channels,
         }),
         2 => {
             let mut mic = Vec::with_capacity(samples.len() / 2);
@@ -59,6 +62,7 @@ pub fn read_two_track(path: &Path) -> Result<TwoTrack> {
                 mic,
                 them,
                 sample_rate,
+                channel_count: spec.channels,
             })
         }
         n => bail!("unsupported channel count {n} (expected 1 or 2)"),
@@ -95,6 +99,7 @@ mod tests {
 
         let t = read_two_track(&path).unwrap();
         assert_eq!(t.sample_rate, 48_000);
+        assert_eq!(t.channel_count, 2);
         assert_eq!(t.mic.len(), 2);
         assert_eq!(t.them.len(), 2);
         assert!(close(t.mic[0], 0.5) && close(t.mic[1], 1.0), "mic = ch0");
@@ -126,11 +131,34 @@ mod tests {
         }
 
         let t = read_two_track(&path).unwrap();
+        assert_eq!(t.channel_count, 1);
         assert!(t.mic.is_empty(), "tap-only has no mic track");
         assert_eq!(t.them.len(), 3);
         assert!(close(t.them[0], 0.5) && close(t.them[1], -0.5) && close(t.them[2], 1.0));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retains_channel_count_for_a_zero_frame_wav() {
+        let path = std::env::temp_dir().join("corti-local-read-empty-2ch.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        hound::WavWriter::create(&path, spec)
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        let track = read_two_track(&path).unwrap();
+        assert_eq!(track.channel_count, 2);
+        assert!(track.mic.is_empty());
+        assert!(track.them.is_empty());
+
+        let _ = std::fs::remove_file(path);
     }
 
     /// No regression for the AEC-cleaned format: a 2-channel **float32** WAV still decodes.

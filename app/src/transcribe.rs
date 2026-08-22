@@ -75,7 +75,9 @@ impl Backend {
             #[cfg(feature = "aws")]
             BackendKind::Aws(_) => "system",
             #[cfg(feature = "local")]
-            BackendKind::Local if self.cfg.local_asr_engine == "sherpa" => "onnx",
+            BackendKind::Local if matches!(self.cfg.local_asr_engine.as_str(), "" | "sherpa") => {
+                "onnx"
+            }
             #[cfg(feature = "local")]
             BackendKind::Local => "other",
             BackendKind::Unavailable(_) => "other",
@@ -484,6 +486,17 @@ mod tests {
                 lookahead_seconds: 7.0,
             },
         }
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn empty_local_engine_token_traces_as_the_onnx_default() {
+        let backend = Backend::init(AppConfig {
+            transcribe_backend: BackendChoice::Local,
+            local_asr_engine: String::new(),
+            ..AppConfig::default()
+        });
+        assert_eq!(backend.trace_engine(), "onnx");
     }
 
     #[test]

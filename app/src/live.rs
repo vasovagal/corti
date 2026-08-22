@@ -336,6 +336,7 @@ impl LiveManager {
                 hosted: self.hosted.clone(),
             };
             let trace = crate::offline_trace::live_session("mixed", "local");
+            let worker_trace = trace.clone();
             let dispatch = crate::offline_trace::Dispatch::capture();
             let thread = std::thread::Builder::new().name("corti-live".into()).spawn(
                 move || -> LiveOutcome {
@@ -348,12 +349,12 @@ impl LiveManager {
                             cfg,
                             pipe_tx,
                             publisher,
-                            &trace,
+                            &worker_trace,
                         );
                         match &outcome {
-                            LiveOutcome::Filed { .. } => trace.ok(),
-                            LiveOutcome::NoNote => trace.skipped(),
-                            LiveOutcome::Fallback { .. } => trace.fallback(),
+                            LiveOutcome::Filed { .. } => worker_trace.ok(),
+                            LiveOutcome::NoNote => worker_trace.skipped(),
+                            LiveOutcome::Fallback { .. } => worker_trace.fallback(),
                         }
                         outcome
                     })
@@ -391,6 +392,7 @@ impl LiveManager {
                     }
                 }
                 Err(e) => {
+                    trace.error(crate::offline_trace::ErrorCode::ResourceExhausted);
                     self.transcript.set_error(
                         &id,
                         "Could not start the live transcript; Corti will transcribe after the call.",
@@ -932,6 +934,9 @@ fn run_session(
             .transcription
             .in_scope(|| spans.backend.in_scope(|| build_parts(sample_rate, cfg)))
     });
+    if parts.is_err() {
+        spans.consume.skipped();
+    }
     let consumed = match parts.as_mut() {
         Ok(p) => {
             publisher.listening();

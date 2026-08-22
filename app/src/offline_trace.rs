@@ -197,6 +197,8 @@ pub enum ErrorCode {
     Storage,
     #[cfg(feature = "local")]
     DecodeFailed,
+    #[cfg(feature = "local")]
+    ResourceExhausted,
     BackendUnavailable,
     Other,
 }
@@ -208,6 +210,8 @@ impl ErrorCode {
             Self::Storage => "storage",
             #[cfg(feature = "local")]
             Self::DecodeFailed => "decode_failed",
+            #[cfg(feature = "local")]
+            Self::ResourceExhausted => "resource_exhausted",
             Self::BackendUnavailable => "backend_unavailable",
             Self::Other => "other",
         }

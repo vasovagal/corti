@@ -307,10 +307,7 @@ impl LocalTranscriber {
             record_result(&decode_span, &decoded, "decode_failed");
             if let Ok(track) = &decoded {
                 decode_span.record("sample_rate", u64::try_from(track.sample_rate).unwrap_or(0));
-                decode_span.record(
-                    "channel_count",
-                    u64::from(!track.mic.is_empty()) + u64::from(!track.them.is_empty()),
-                );
+                decode_span.record("channel_count", u64::from(track.channel_count));
                 decode_span.record(
                     "sample_count",
                     u64::try_from(track.mic.len().saturating_add(track.them.len()))
