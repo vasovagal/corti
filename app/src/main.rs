@@ -110,6 +110,7 @@ pub(crate) mod imp {
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
 
     use anyhow::{Context, Result};
     use chrono::{DateTime, Local};
@@ -251,6 +252,50 @@ pub(crate) mod imp {
         tx: Sender<PipelineMsg>,
     }
 
+    /// Handles that must settle before the offline writer emits its graceful session summary. Keeping them
+    /// outside Tauri managed state makes shutdown order explicit after `App::run` has dropped capture/UI
+    /// owners, and an explicit pipeline message breaks sender cycles.
+    #[derive(Default)]
+    struct RuntimeWorkers {
+        pipeline_tx: Option<Sender<PipelineMsg>>,
+        pipeline: Option<JoinHandle<()>>,
+        live: Option<Arc<crate::live::LiveManager>>,
+        hosted: Option<crate::postprocess_app::HostedWorker>,
+    }
+
+    type SharedRuntimeWorkers = Arc<Mutex<RuntimeWorkers>>;
+
+    impl RuntimeWorkers {
+        fn shutdown_shared(shared: &SharedRuntimeWorkers) {
+            let workers = std::mem::take(&mut *shared.lock().unwrap_or_else(|e| e.into_inner()));
+            workers.shutdown();
+        }
+
+        fn shutdown(mut self) {
+            // Capture-owned senders have already been dropped by `App::run`. Cancel and settle active live
+            // work while the pipeline can still persist discard cleanup, then let queued Process messages
+            // finish before the explicit shutdown marker is received.
+            if let Some(live) = self.live.as_ref() {
+                live.begin_shutdown();
+            }
+            if let Some(tx) = self.pipeline_tx.take() {
+                let _ = tx.send(PipelineMsg::Shutdown);
+                drop(tx);
+            }
+            if let Some(handle) = self.pipeline.take()
+                && handle.join().is_err()
+            {
+                tracing::error!(target: "corti::pipeline", "pipeline worker panicked during shutdown");
+            }
+            if let Some(live) = self.live.take() {
+                live.finish_shutdown();
+            }
+            if let Some(hosted) = self.hosted.take() {
+                hosted.shutdown();
+            }
+        }
+    }
+
     impl Webinar {
         fn new(tx: Sender<PipelineMsg>) -> Self {
             Self(Mutex::new(WebinarState {
@@ -275,8 +320,10 @@ pub(crate) mod imp {
         // Install the composed subscriber FIRST so every later diagnostics line is preserved. The returned
         // diagnostics/offline guards remain local across `app.run`, then drain in a defined order.
         let (console_buffer, tracing_guards) = console::init_tracing();
+        let runtime_workers = Arc::new(Mutex::new(RuntimeWorkers::default()));
 
         let cfg = AppConfig::load();
+        let setup_workers = runtime_workers.clone();
 
         let app = tauri::Builder::default()
             // Global menu handler: catches events from the dynamically-rebuilt tray menu.
@@ -324,12 +371,20 @@ pub(crate) mod imp {
                 crate::queue_ui::reveal_audio,
             ])
             .setup(move |app| {
-                setup(app, &cfg, console_buffer.clone()).map_err(|e| {
+                setup(app, &cfg, console_buffer.clone(), &setup_workers).map_err(|e| {
                     Box::new(SetupError(format!("{e:#}"))) as Box<dyn std::error::Error>
                 })
             })
             .build(tauri::generate_context!())
-            .context("building the tauri app")?;
+            .context("building the tauri app");
+        let app = match app {
+            Ok(app) => app,
+            Err(error) => {
+                RuntimeWorkers::shutdown_shared(&runtime_workers);
+                tracing_guards.shutdown();
+                return Err(error);
+            }
+        };
 
         // Tray-agent policy: closing the final utility window (and other user-driven/Cmd-Q requests) emits
         // `ExitRequested { code: None }`; veto it so Corti returns to menu-bar-only mode. The tray's explicit
@@ -341,8 +396,9 @@ pub(crate) mod imp {
                 api.prevent_exit();
             }
         });
-        // `App::run` consumes and drops managed state before returning; now stop trace admission and drain
-        // both writer guards.
+        // `App::run` consumes and drops managed capture/UI state before returning. Settle every worker that
+        // can still own an offline span, then stop trace admission and emit the graceful summary.
+        RuntimeWorkers::shutdown_shared(&runtime_workers);
         tracing_guards.shutdown();
         Ok(())
     }
@@ -357,6 +413,7 @@ pub(crate) mod imp {
         app: &mut tauri::App,
         cfg: &AppConfig,
         console_buffer: console::ConsoleBuffer,
+        runtime_workers: &SharedRuntimeWorkers,
     ) -> Result<()> {
         // Menu-bar agent: no Dock icon, no app menu.
         app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -391,12 +448,16 @@ pub(crate) mod imp {
 
         // Hosted coordinator state is separate from AppConfig and starts fail-closed. It owns its bounded
         // control thread before any live/pipeline producer receives a handle.
-        let (hosted_state, hosted) = crate::postprocess_app::start(
+        let (hosted_state, hosted, hosted_worker) = crate::postprocess_app::start(
             app.handle().clone(),
             live_transcript.clone(),
             pipe_tx.clone(),
         )
         .context("starting hosted post-processing coordinator")?;
+        runtime_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hosted = Some(hosted_worker);
         app.manage(hosted_state);
 
         // Tray + blink (icons swap on the main thread).
@@ -409,6 +470,10 @@ pub(crate) mod imp {
             live_transcript.clone(),
             hosted.clone(),
         ));
+        runtime_workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live = Some(live_manager.clone());
         app.manage(crate::live_test::LiveTestManager::new(
             live_manager.clone(),
             shared_cfg.clone(),
@@ -424,7 +489,7 @@ pub(crate) mod imp {
             let live = live_manager.clone();
             let hosted = hosted.clone();
             let dispatch = crate::offline_trace::Dispatch::capture();
-            std::thread::Builder::new()
+            let pipeline_worker = std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
                 .spawn(move || {
                     dispatch.with_default(|| {
@@ -432,6 +497,9 @@ pub(crate) mod imp {
                     })
                 })
                 .context("spawning pipeline worker")?;
+            let mut workers = runtime_workers.lock().unwrap_or_else(|e| e.into_inner());
+            workers.pipeline_tx = Some(pipe_tx.clone());
+            workers.pipeline = Some(pipeline_worker);
         }
 
         // 1 Hz stats sampler on its OWN `corti-stats` thread — never on the pipeline thread (guardrail 9).
@@ -782,6 +850,8 @@ pub(crate) mod imp {
 
     #[cfg(test)]
     mod lifecycle_tests {
+        #[cfg(feature = "offline-tracing")]
+        use super::RuntimeWorkers;
         use super::should_prevent_implicit_exit;
 
         #[test]
@@ -789,6 +859,129 @@ pub(crate) mod imp {
             assert!(should_prevent_implicit_exit(None));
             assert!(!should_prevent_implicit_exit(Some(0)));
             assert!(!should_prevent_implicit_exit(Some(1)));
+        }
+
+        /// Subprocess isolation is required because the tray subscriber is global. The child uses the real
+        /// tray composition and retained-worker shutdown order, while a lightweight pipeline stand-in owns
+        /// spans until it receives the production `Shutdown` message.
+        #[cfg(feature = "offline-tracing")]
+        #[test]
+        fn tray_shutdown_joins_span_owners_before_summary_and_preserves_diagnostics() {
+            const CHILD: &str = "CORTI_TRAY_TRACE_LIFECYCLE_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                run_tray_trace_lifecycle_child();
+                return;
+            }
+
+            // Darwin exposes `/var` as a symlink; use the canonical `/private/var` spelling because secure
+            // trace storage intentionally rejects every symlinked path component.
+            let base = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "corti-tray-trace-lifecycle-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            std::fs::create_dir_all(&base).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("tray_shutdown_joins_span_owners_before_summary_and_preserves_diagnostics")
+                .env(CHILD, "1")
+                .env("VASOVAGAL_TRACE", "true")
+                .env("XDG_STATE_HOME", base.join("state"))
+                .env("XDG_CONFIG_HOME", base.join("config"))
+                .env("CORTI_DATA_DIR", base.join("data"))
+                .env("HOME", base.join("home"))
+                .env("RUST_LOG", "trace")
+                .env("CORTI_TRACE_LIFECYCLE_BASE", &base)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+
+        #[cfg(feature = "offline-tracing")]
+        fn run_tray_trace_lifecycle_child() {
+            use std::io::BufReader;
+
+            let base =
+                std::path::PathBuf::from(std::env::var_os("CORTI_TRACE_LIFECYCLE_BASE").unwrap());
+            let (_buffer, guards) = crate::console::init_tracing();
+            tracing::info!(target: "corti::lifecycle_test", "diagnostic before tray shutdown");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let dispatch = crate::offline_trace::Dispatch::capture();
+            let pipeline = std::thread::Builder::new()
+                .name("corti-pipeline-lifecycle-test".into())
+                .spawn(move || {
+                    dispatch.with_default(|| {
+                        let root = crate::offline_trace::pipeline_recording(None, "mixed", "local");
+                        let queue = crate::offline_trace::pipeline_queue(&root, "mixed", "local");
+                        assert!(matches!(
+                            rx.recv(),
+                            Ok(crate::pipeline::PipelineMsg::Shutdown)
+                        ));
+                        queue.ok();
+                        root.ok();
+                    });
+                })
+                .unwrap();
+            RuntimeWorkers {
+                pipeline_tx: Some(tx),
+                pipeline: Some(pipeline),
+                live: None,
+                hosted: None,
+            }
+            .shutdown();
+            guards.shutdown();
+
+            let trace_dir = base.join("state/vasovagal/traces/corti");
+            let trace_file = std::fs::read_dir(trace_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .unwrap();
+            let report = vasovagal_tracing::validate_jsonl(
+                BufReader::new(std::fs::File::open(&trace_file).unwrap()),
+                vasovagal_tracing::TailPolicy::Strict,
+            );
+            assert!(report.is_valid(), "trace validation: {:?}", report.errors);
+            let records = std::fs::read_to_string(trace_file)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let span_end = records
+                .iter()
+                .position(|record| {
+                    record["record_type"] == "span_end"
+                        && record["operation"] == "corti.pipeline.recording"
+                })
+                .unwrap();
+            let summary = records
+                .iter()
+                .position(|record| record["record_type"] == "session_summary")
+                .unwrap();
+            assert!(
+                span_end < summary,
+                "summary must follow every joined worker span"
+            );
+            assert_eq!(records[span_end]["outcome"], "ok");
+
+            let diagnostics = std::fs::read_dir(base.join("data/logs"))
+                .unwrap()
+                .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<String>();
+            assert!(diagnostics.contains("diagnostic before tray shutdown"));
+            assert!(!diagnostics.contains(crate::offline_trace::TARGET));
+            assert!(!diagnostics.contains("corti.pipeline.recording"));
         }
     }
 }

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -118,6 +119,24 @@ pub(crate) struct HostedHandle {
     snapshot: Arc<Mutex<HostedSettingsDto>>,
     ingress_incomplete: Arc<AtomicBool>,
     outbox: Arc<TelemetryOutbox>,
+}
+
+/// Retained coordinator lifecycle. Production joins this worker before the offline trace guard shuts down;
+/// tests may drop it to retain their historical channel-owned detached-service posture.
+pub(crate) struct HostedWorker {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl HostedWorker {
+    pub(crate) fn shutdown(mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!(target: "corti::hosted", "hosted coordinator panicked during shutdown");
+        }
+    }
 }
 
 impl fmt::Debug for HostedHandle {
@@ -888,7 +907,7 @@ pub(crate) fn start(
     app: AppHandle,
     live_view: LiveTranscriptStore,
     pipeline_tx: Sender<PipelineMsg>,
-) -> Result<(HostedState, HostedHandle)> {
+) -> Result<(HostedState, HostedHandle, HostedWorker)> {
     let preferences = HostedPreferences::load().unwrap_or_else(|error| {
         tracing::warn!(
             target: "corti::hosted",
@@ -1000,7 +1019,7 @@ fn start_with_components(
     persist_to_disk: bool,
     store_override: Option<Box<dyn EncryptedPostprocessStore>>,
     clock_override: Option<Arc<dyn CoordinatorClock>>,
-) -> Result<(HostedState, HostedHandle)> {
+) -> Result<(HostedState, HostedHandle, HostedWorker)> {
     let initial_control = control_from_preferences(
         process_epoch,
         &preferences.lock().unwrap(),
@@ -1047,6 +1066,7 @@ fn start_with_components(
     let (vertex_tx, vertex_rx) = std::sync::mpsc::channel();
     let (event_sink, provider_event_rx) = crate::postprocess::BoundedProviderEventSink::channel();
     let ingress_incomplete = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let handle = HostedHandle {
         command_tx,
         priority_tx,
@@ -1085,8 +1105,9 @@ fn start_with_components(
         observed_pinned_revision,
         pinned_exchange: None,
         persist_to_disk,
+        shutdown: shutdown.clone(),
     };
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("corti-hosted-control".into())
         .spawn(move || service.run(command_rx, priority_rx, ingress_rx))
         .context("spawning hosted coordinator")?;
@@ -1095,6 +1116,10 @@ fn start_with_components(
             handle: handle.clone(),
         },
         handle,
+        HostedWorker {
+            shutdown,
+            thread: Some(thread),
+        },
     ))
 }
 
@@ -2422,6 +2447,7 @@ struct Service {
     observed_pinned_revision: u64,
     pinned_exchange: Option<AssistantExchangeDto>,
     persist_to_disk: bool,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Service {
@@ -2435,6 +2461,10 @@ impl Service {
         let mut priority_connected = true;
         let mut next_tick = Instant::now();
         loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                self.cancel_pending_finals(ErrorCode::Canceled);
+                return;
+            }
             let mut did_work = false;
             for _ in 0..MAX_PRIORITY_DRAIN {
                 match priority_rx.try_recv() {
@@ -2492,7 +2522,8 @@ impl Service {
             self.drive_dispatch(MAX_DISPATCH_DRAIN);
             self.publish_events(false);
 
-            if !command_connected && !priority_connected {
+            if self.shutdown.load(Ordering::Acquire) || (!command_connected && !priority_connected)
+            {
                 self.cancel_pending_finals(ErrorCode::Canceled);
                 return;
             }
@@ -4922,7 +4953,7 @@ mod tests {
         let notifier: EventNotifier = Arc::new(move |event| {
             sink.lock().unwrap().push(event.clone());
         });
-        let (_, handle) = start_with_components(
+        let (_, handle, _worker) = start_with_components(
             shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
@@ -5071,7 +5102,7 @@ mod tests {
             Arc::new(InjectedSecrets),
             BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
         );
-        let (_, handle) = start_with_components(
+        let (_, handle, _worker) = start_with_components(
             preferences,
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
@@ -5335,7 +5366,7 @@ mod tests {
             .unwrap(),
         );
         let first_executor = Arc::new(RecordingExecutor::new());
-        let (_, first_handle) = start_with_components(
+        let (_, first_handle, _first_worker) = start_with_components(
             shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
@@ -5393,7 +5424,7 @@ mod tests {
             .unwrap(),
         );
         let second_executor = Arc::new(RecordingExecutor::new());
-        let (_, second_handle) = start_with_components(
+        let (_, second_handle, _second_worker) = start_with_components(
             shared(configured_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
@@ -5970,7 +6001,7 @@ mod tests {
         let preferences = configured_preferences()
             .revise(|values| values.final_deadline_seconds = 1)
             .unwrap();
-        let (_, handle) = start_with_components(
+        let (_, handle, _worker) = start_with_components(
             shared(preferences),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),
@@ -6034,7 +6065,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let executor = Arc::new(RecordingExecutor::new());
         let resolver = Arc::new(ArmsOnSecondResolution(AtomicUsize::new(0)));
-        let (_, handle) = start_with_components(
+        let (_, handle, _worker) = start_with_components(
             shared(vertex_preferences()),
             WordBankDocument::empty(),
             LiveTranscriptStore::detached(),

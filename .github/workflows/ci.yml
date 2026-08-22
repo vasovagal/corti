@@ -106,6 +106,9 @@ jobs:
       - name: test (official default features)
         run: cargo test --locked -p corti-app
 
+      - name: test (offline tracing only, no backend/default features)
+        run: cargo test --locked -p corti-app --no-default-features --features offline-tracing
+
       - name: check (offline tracing compiled out)
         run: cargo check --locked -p corti-app --no-default-features
 

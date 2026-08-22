@@ -248,7 +248,8 @@ commands read; a parallel **daily-rolling** file layer writes `<data_dir>/logs/c
 entries. Tray and headless startup also compose the optional shared offline layer using `try_init`. Each
 console/file/stderr diagnostics layer owns its own historical `RUST_LOG`/`CORTI_LOG` `EnvFilter` and excludes
 the exact `vasovagal::trace` target, so diagnostics filtering cannot alter schema traces or render them as log
-messages. Both guards live across `app.run`; headless dispatch drains them before `process::exit` (ADR 0016).
+messages. Both guards live across `app.run`; tray shutdown joins live/pipeline/hosted span owners before
+emitting its summary, and headless dispatch drains the guards before `process::exit` (ADR 0016).
 
 **Stats** (`stats.rs`): `spawn_sampler` (`stats.rs:302`) runs the 1 Hz `corti-stats` thread — off the
 pipeline thread (guardrail 9) — sampling process RSS/CPU (libc self-introspection) plus the recording

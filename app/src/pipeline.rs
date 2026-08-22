@@ -127,6 +127,9 @@ pub enum PipelineMsg {
     /// Wake the sole queue writer to import and acknowledge content-free hosted telemetry. The durable
     /// outbox remains authoritative when this best-effort wake races recording-row creation.
     ImportPostprocessOutbox,
+    /// Explicit tray shutdown. This breaks sender cycles and lets the retained worker handle be joined
+    /// before the offline trace guard emits its session summary.
+    Shutdown,
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -323,9 +326,14 @@ pub fn run(
                         // note first so the post-ASR checkpoint owns the same rewrite target.
                         match resolve_live(ctx.live.collect(&id)) {
                             LiveResolution::Filed(note_path) => {
-                                if let Err(e) =
-                                    live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
-                                {
+                                if let Err(e) = live_filed(
+                                    &mut ctx,
+                                    &id,
+                                    &meta,
+                                    &audio_path,
+                                    &note_path,
+                                    &pipeline_trace,
+                                ) {
                                     pipeline_trace.error(crate::offline_trace::ErrorCode::Storage);
                                     let note = OwnedNote::canonical(note_path);
                                     schedule_retry(&ctx, &id, &meta, e, Some(&note));
@@ -440,6 +448,7 @@ pub fn run(
                 error,
             }) => live_discard_cleanup(&ctx, &meta, &note_path, &error),
             Ok(PipelineMsg::ImportPostprocessOutbox) => import_hosted_outbox(&ctx),
+            Ok(PipelineMsg::Shutdown) => break,
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
@@ -548,7 +557,11 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
             {
                 // `Jobs::fail` persists the claimed payload in the same SQL settlement, so a path returned
                 // by vagus survives even when both checkpoint and recording completion writes failed.
-                settled_job.payload = crate::jobs::retry_payload(id, Some(&note));
+                settled_job.payload = crate::jobs::retry_payload(
+                    id,
+                    Some(&note),
+                    crate::jobs::retry_attempt_kind(&job.payload),
+                );
             }
 
             let exhausts_recording = settled_job.kind == crate::jobs::RETRY_TRANSCRIPTION
@@ -681,15 +694,24 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     } else {
         JobStatus::PendingTranscription
     };
+    let payload = crate::jobs::id_payload(id, crate::jobs::AttemptKind::ManualRetry);
+    // Remove the exact current-shape row and the pre-provenance legacy row. Note-owning failures are
+    // intentionally retained as recovery evidence and do not conflict with the fresh active payload.
+    let _ = ctx
+        .queue
+        .jobs()
+        .delete_failed(crate::jobs::RETRY_TRANSCRIPTION, &payload);
     let _ = ctx.queue.jobs().delete_failed(
         crate::jobs::RETRY_TRANSCRIPTION,
-        &crate::jobs::id_payload(id),
+        &serde_json::json!({ "id": id }),
     );
     // Enqueue first: a crash/failure before the reset leaves the row terminal, whereas resetting first can
     // create nonterminal work with no active job.
-    if let Err(e) = ctx.queue.jobs().enqueue(
-        crate::jobs::RETRY_TRANSCRIPTION,
-        &crate::jobs::id_payload(id),
+    if let Err(e) = crate::jobs::enqueue_retry(
+        &ctx.queue,
+        id,
+        None,
+        crate::jobs::AttemptKind::ManualRetry,
         crate::jobs::RETRY_MAX_ATTEMPTS,
         Utc::now(),
     ) {
@@ -749,10 +771,11 @@ fn schedule_retry(
                 JobStatus::PendingTranscription
             }
         });
-    let payload = crate::jobs::retry_payload(id, preferred_note.as_ref());
-    if let Err(e) = ctx.queue.jobs().enqueue(
-        crate::jobs::RETRY_TRANSCRIPTION,
-        &payload,
+    if let Err(e) = crate::jobs::enqueue_retry(
+        &ctx.queue,
+        id,
+        preferred_note.as_ref(),
+        crate::jobs::AttemptKind::AutomaticRetry,
         crate::jobs::RETRY_MAX_ATTEMPTS,
         Utc::now() + chrono::Duration::from_std(JOB_BACKOFF.base).unwrap_or_default(),
     ) {
@@ -796,6 +819,7 @@ fn live_filed(
     meta: &RecordingMeta,
     audio: &Path,
     note: &Path,
+    parent: &crate::offline_trace::Span,
 ) -> Result<()> {
     info!(
         target: "corti::pipeline",
@@ -806,28 +830,37 @@ fn live_filed(
     );
     // One atomic SQL write owns path + Done. If it fails, the caller's canonical retry payload performs
     // completion only; it never reruns ASR or tests path existence as permission to file again.
-    complete_canonical_note(ctx, id, meta, audio, note)
+    complete_canonical_note(ctx, id, meta, audio, note, Some(parent))
 }
 
 /// Complete a note whose canonical body already exists. The stored path remains authoritative when vagus
-/// moves it; disappearance means "Filed in brain", not permission for another `add-note`.
+/// moves it; disappearance means "Filed in brain", not permission for another `add-note`. A live-filed
+/// recording borrows its existing pipeline root; a standalone durable retry owns a fresh root.
 pub(crate) fn complete_canonical_note(
     ctx: &Ctx,
     id: &str,
     meta: &RecordingMeta,
     audio: &Path,
     note: &Path,
+    parent: Option<&crate::offline_trace::Span>,
 ) -> Result<()> {
     let capture_mode = trace_capture_mode(meta);
     let backend = crate::offline_trace::backend(ctx.backend_label);
-    let trace = crate::offline_trace::pipeline_recording(None, capture_mode, backend);
+    let owned_trace = parent
+        .is_none()
+        .then(|| crate::offline_trace::pipeline_recording(None, capture_mode, backend));
+    let trace = parent
+        .or(owned_trace.as_ref())
+        .expect("completion trace is borrowed or locally owned");
     let result = trace.in_scope(|| {
-        complete_canonical_note_inner(ctx, id, meta, audio, note, &trace, capture_mode, backend)
+        complete_canonical_note_inner(ctx, id, meta, audio, note, trace, capture_mode, backend)
     });
-    if result.is_ok() {
-        trace.ok();
-    } else {
-        trace.error(crate::offline_trace::ErrorCode::Storage);
+    if let Some(owned) = owned_trace.as_ref() {
+        if result.is_ok() {
+            owned.ok();
+        } else {
+            owned.error(crate::offline_trace::ErrorCode::Storage);
+        }
     }
     result
 }
@@ -1084,9 +1117,11 @@ fn recover_filing_checkpoints(queue: &Queue) -> Vec<Job> {
     }) {
         // Enqueue first. If the following status repair fails, the handler still recognizes the checkpoint
         // from any nonterminal transcription state and promotes it itself.
-        let enqueued = queue.jobs().enqueue(
-            crate::jobs::RETRY_TRANSCRIPTION,
-            &crate::jobs::id_payload(&row.id),
+        let enqueued = crate::jobs::enqueue_retry(
+            queue,
+            &row.id,
+            None,
+            crate::jobs::AttemptKind::Recovery,
             crate::jobs::RETRY_MAX_ATTEMPTS,
             Utc::now(),
         );
@@ -1140,9 +1175,11 @@ fn reap_recording_rows(queue: &Queue) -> Vec<(Job, Reaped)> {
         let outcome = if row.audio_path.exists() {
             // Enqueue first. If the status repair fails/crashes, startup sees `Recording` again and the
             // active-job dedupe makes another pass harmless; the inverse order can strand Pending work.
-            let retry = queue.jobs().enqueue(
-                crate::jobs::RETRY_TRANSCRIPTION,
-                &crate::jobs::id_payload(&row.id),
+            let retry = crate::jobs::enqueue_retry(
+                queue,
+                &row.id,
+                None,
+                crate::jobs::AttemptKind::Recovery,
                 crate::jobs::RETRY_MAX_ATTEMPTS,
                 Utc::now(),
             );

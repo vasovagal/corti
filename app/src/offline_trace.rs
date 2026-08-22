@@ -446,7 +446,9 @@ macro_rules! live_phase {
 
 #[cfg(feature = "local")]
 live_phase!(live_consume, "corti.live.consume");
+#[cfg(feature = "local")]
 live_phase!(live_window_flush, "corti.live.window_flush");
+#[cfg(feature = "local")]
 live_phase!(live_note_sync, "corti.live.note_sync");
 live_phase!(live_finish, "corti.live.finish");
 
@@ -530,15 +532,36 @@ mod tests {
     }
 
     #[test]
-    fn worker_phase_uses_its_explicit_parent_without_an_entered_guard() {
+    fn worker_phases_keep_explicit_pipeline_and_live_parents_across_threads() {
         let captured = ParentCapture::default();
         let records = captured.0.clone();
         let subscriber = Registry::default().with(captured);
         tracing::subscriber::with_default(subscriber, || {
-            let root = pipeline_recording(None, "mixed", "local");
-            let child = transcription(&root, "local", "onnx");
-            child.ok();
-            root.ok();
+            let pipeline = pipeline_recording(None, "mixed", "local");
+            let worker_pipeline = pipeline.clone();
+            #[cfg(feature = "local")]
+            let live = live_session("mixed", "local");
+            #[cfg(feature = "local")]
+            let worker_live = live.clone();
+            let dispatch = Dispatch::capture();
+            std::thread::spawn(move || {
+                dispatch.with_default(|| {
+                    let transcription = transcription(&worker_pipeline, "local", "onnx");
+                    transcription.ok();
+                    #[cfg(feature = "local")]
+                    {
+                        let window = live_window_flush(&worker_live, "mixed", "local");
+                        let sync = live_note_sync(&worker_live, "mixed", "local");
+                        window.ok();
+                        sync.ok();
+                    }
+                });
+            })
+            .join()
+            .unwrap();
+            pipeline.ok();
+            #[cfg(feature = "local")]
+            live.ok();
         });
 
         let records = records.lock().unwrap();
@@ -547,5 +570,17 @@ mod tests {
             "corti.transcription".into(),
             Some("corti.pipeline.recording".into())
         )));
+        #[cfg(feature = "local")]
+        for phase in ["corti.live.window_flush", "corti.live.note_sync"] {
+            assert!(records.contains(&(phase.into(), Some("corti.live.session".into()))));
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|(operation, _)| operation == phase)
+                    .count(),
+                1,
+                "aggregate phase {phase} must be constructed once"
+            );
+        }
     }
 }

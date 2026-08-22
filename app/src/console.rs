@@ -411,4 +411,46 @@ mod tests {
         assert_eq!(entries[0].target, "corti::test");
         assert_eq!(entries[0].message, "unchanged diagnostic count=3");
     }
+
+    #[cfg(feature = "offline-tracing")]
+    #[test]
+    fn subscriber_conflict_fails_closed_without_creating_a_trace_path() {
+        const CHILD: &str = "CORTI_TRACE_CONFLICT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+            let guards = init_cli_tracing();
+            guards.shutdown();
+            let state = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+            assert!(
+                !state.exists(),
+                "subscriber conflict must finish(false) before resolving trace storage"
+            );
+            return;
+        }
+
+        let state = std::env::temp_dir().join(format!(
+            "corti-trace-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("subscriber_conflict_fails_closed_without_creating_a_trace_path")
+            .env(CHILD, "1")
+            .env("VASOVAGAL_TRACE", "true")
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_CONFIG_HOME", state.join("config"))
+            .env("HOME", state.join("home"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!state.exists());
+    }
 }

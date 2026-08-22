@@ -128,7 +128,7 @@ permissions, bounded rotation, and retention. They contain operation/timing/outc
 counts only—never transcript/audio/title/app identity, recording/job IDs, paths, cloud configuration,
 credentials, arguments/results, or raw errors. There is no endpoint, collector, daemon, or upload mechanism.
 Invalid config/storage silently disables tracing. See [ADR 0016](./design/adr/0016-local-offline-tracing.md)
-and the shared [offline analysis guide](https://github.com/vasovagal/vasovagal-tracing/blob/eebe5bbbba597b64dabd2d1981d18ba71bab9869/docs/offline-analysis.md).
+and the shared [offline analysis guide](https://github.com/vasovagal/vasovagal-tracing/blob/7afe13e46df63a3767d518ede7b733349dc09b14/docs/offline-analysis.md).
 
 ## AEC tuning
 

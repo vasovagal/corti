@@ -1,7 +1,7 @@
 # ADR 0016 — Privacy-conscious local offline tracing
 
 - **Status:** Proposed (2026-08-22; #122)
-- **References:** [`vasovagal-tracing` architecture v1](https://github.com/vasovagal/vasovagal-tracing/blob/eebe5bbbba597b64dabd2d1981d18ba71bab9869/docs/architecture-v1.md), guardrails 3/5/9, ADRs 0007/0009/0012/0013
+- **References:** [`vasovagal-tracing` architecture v1](https://github.com/vasovagal/vasovagal-tracing/blob/7afe13e46df63a3767d518ede7b733349dc09b14/docs/architecture-v1.md), guardrails 3/5/9, ADRs 0007/0009/0012/0013
 
 ## Context
 
@@ -20,10 +20,10 @@ attributes, or raw log export.
 1. **Compile-time boundary.** The app feature is `offline-tracing` and is included in official defaults. It
    enables the optional shared crate and fans out to empty `offline-tracing` instrumentation features in the
    selected AWS/local backend crates. `--no-default-features` omits the shared crate and every new callsite;
-   Corti's existing diagnostics `tracing` dependencies remain independent. The integration branch pins the
-   exact reviewed pushed revision `eebe5bbbba597b64dabd2d1981d18ba71bab9869`; no Git/path dependency may
-   merge. Replace it with reviewed registry `vasovagal-tracing = "0.1.1"` and lockfile changes after the
-   protected tokenless release exists.
+   Corti's existing diagnostics `tracing` dependencies remain independent. The integration branch pins exact
+   independently reviewed main commit `7afe13e46df63a3767d518ede7b733349dc09b14` (the squash merge of core
+   PR #2); no Git/path dependency may merge. Replace it with reviewed registry
+   `vasovagal-tracing = "0.1.1"` and lockfile changes after the protected tokenless release exists.
 2. **Runtime off by default and outside Settings.** Corti adds no Settings field, DTO member, command, or UI.
    The shared crate resolves only:
 
@@ -54,9 +54,12 @@ attributes, or raw log export.
    `vasovagal::trace` exclusion. Those filters cannot enable/disable offline output or format schema events as
    logs. Subscriber conflict disables the offline session without panic or trace-file creation.
 5. **Explicit lifetimes.** One guard owner keeps both the diagnostics `WorkerGuard` and shared `TraceGuard`
-   alive across `app.run`. Headless dispatch closes `corti.cli`, drains the trace for up to two seconds, drops
-   diagnostics, and only then calls `process::exit`. A crash/SIGKILL may omit the summary; complete JSONL lines
-   remain independently valid. The crate installs no signal handler.
+   alive across `app.run`. After Tauri drops capture/UI state, tray shutdown discards and joins active live
+   work, sends an explicit shutdown marker to break pipeline sender cycles, joins the serial pipeline, settles
+   all remaining live/reaper handles, and stops the hosted coordinator before emitting the trace summary.
+   Headless dispatch closes `corti.cli`, drains the trace for up to two seconds, drops diagnostics, and only
+   then calls `process::exit`. A crash/SIGKILL may omit the summary; complete JSONL lines remain independently
+   valid. The crate installs no signal handler.
 6. **Bounded, reviewed instrumentation.** Static catalogue operations cover CLI dispatch; recording queue;
    transcription AEC/audio decode/model load/channel/backend/diarization; checkpoint/cloud cleanup/Vagus
    filing/completion; live consume/window flush/note sync/finish; and durable retry/cleanup/retention. Worker
@@ -78,5 +81,6 @@ attributes, or raw log export.
 - Schema v1 cannot accept new operation names or attributes. Future instrumentation requires schema v2 rather
   than forwarding arbitrary fields.
 - Long-run CPU/RSS/trace-volume and real audio-deadline qualification still require a signed-bundle soak on
-  representative calls; CI covers schema-valid headless output, diagnostics isolation, parentage, Settings
-  shape, and default/tracing-only/compiled-out feature lanes on Rust 1.96 and latest stable.
+  representative calls; CI covers schema-valid headless output, subscriber-conflict and diagnostics
+  isolation, tray/headless lifecycle ordering, cross-thread parentage, aggregate live spans, Settings shape,
+  and default/tracing-only/compiled-out feature lanes on Rust 1.96 and latest stable.

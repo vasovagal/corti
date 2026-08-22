@@ -34,6 +34,7 @@
 //! Each window is merged by timestamp before its one append. Far-end `Them N` identities are window-local
 //! and may be renumbered at a boundary; stable cross-window embeddings are deliberately outside ADR 0012.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,6 +529,91 @@ impl LiveManager {
         debug_assert!(matches!(removed, Some(Discarding::Collecting)));
     }
 
+    /// Begin orderly tray shutdown after Tauri has dropped capture-owned state. Pending tees are released,
+    /// an active recording receives a discard verdict, and discard cleanup is joined while the pipeline is
+    /// still available to persist a rare unlink failure. Finished sessions remain available for already
+    /// queued `Process` messages.
+    pub(crate) fn begin_shutdown(&self) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.pending.take();
+            inner.test_reservation = None;
+            inner.reap_completed();
+            if let Some(active) = inner.active.take() {
+                Self::park_discard(&mut inner, active);
+            }
+        }
+        self.settle_discarding();
+    }
+
+    /// Join every remaining live/reaper handle after the serial pipeline has stopped. This guarantees no
+    /// application-owned live span can outlive the offline trace guard's graceful summary.
+    pub(crate) fn finish_shutdown(&self) {
+        self.begin_shutdown();
+        loop {
+            let mut collecting = false;
+            let awaiting = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.reap_completed();
+                std::mem::take(&mut inner.awaiting)
+            };
+            for (id, session) in awaiting {
+                match session {
+                    AwaitingFinish::Running(handle) => {
+                        drop(join_live_thread(handle));
+                    }
+                    AwaitingFinish::Ready(outcome) => drop(outcome),
+                    AwaitingFinish::Collecting => {
+                        collecting = true;
+                        self.inner
+                            .lock()
+                            .unwrap()
+                            .awaiting
+                            .insert(id, AwaitingFinish::Collecting);
+                    }
+                }
+            }
+            if !collecting {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        self.settle_discarding();
+    }
+
+    fn settle_discarding(&self) {
+        loop {
+            let mut collecting = false;
+            let discarding = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.reap_completed();
+                std::mem::take(&mut inner.discarding)
+            };
+            for (id, session) in discarding {
+                match session {
+                    Discarding::Reaper(handle) => {
+                        if handle.join().is_err() {
+                            warn!(target: "corti::live", job_id = %id, "discard reaper panicked during shutdown");
+                        }
+                    }
+                    Discarding::Inline(work) => reap_discard_work(work),
+                    Discarding::Collecting => {
+                        collecting = true;
+                        self.inner
+                            .lock()
+                            .unwrap()
+                            .discarding
+                            .insert(id, Discarding::Collecting);
+                    }
+                }
+            }
+            if !collecting {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     /// Whether a live note for `id` still belongs to a session that will be collected. Includes a
     /// finish-delivered session (not just the currently active capture), because its final flush may create
     /// the first note while `Process` is waiting behind another pipeline job. Discarded sessions are false.
@@ -893,10 +979,16 @@ struct SessionTrace {
     decode: crate::offline_trace::Span,
     aec: crate::offline_trace::Span,
     consume: crate::offline_trace::Span,
+    window_flush: crate::offline_trace::Span,
+    note_sync: crate::offline_trace::Span,
+    window_count: Cell<usize>,
+    item_count: Cell<usize>,
+    window_failed: Cell<bool>,
+    sync_failed: Cell<bool>,
 }
 
-#[cfg(feature = "local")]
 impl SessionTrace {
+    #[cfg(feature = "local")]
     fn new(session: &crate::offline_trace::Span, cfg: &AppConfig) -> Self {
         let engine = crate::offline_trace::engine(&cfg.local_asr_engine);
         let transcription = crate::offline_trace::transcription(session, "local", engine);
@@ -906,7 +998,49 @@ impl SessionTrace {
             decode: crate::offline_trace::transcription_decode(&transcription, "local", engine),
             aec: crate::offline_trace::transcription_aec(&transcription, "local", engine),
             consume: crate::offline_trace::live_consume(session, "mixed", "local"),
+            // Both are explicit siblings under the session. They are repeatedly entered around work but
+            // produce exactly one lifecycle record each for the entire live session.
+            window_flush: crate::offline_trace::live_window_flush(session, "mixed", "local"),
+            note_sync: crate::offline_trace::live_note_sync(session, "mixed", "local"),
             transcription,
+            window_count: Cell::new(0),
+            item_count: Cell::new(0),
+            window_failed: Cell::new(false),
+            sync_failed: Cell::new(false),
+        }
+    }
+
+    fn record_window(&self) {
+        let count = self.window_count.get().saturating_add(1);
+        self.window_count.set(count);
+        self.window_flush.record_window_count(count);
+        self.session.record_window_count(count);
+    }
+
+    fn record_items(&self, value: usize) {
+        let count = self.item_count.get().saturating_add(value);
+        self.item_count.set(count);
+        self.note_sync.record_item_count(count);
+        self.session.record_item_count(count);
+    }
+
+    fn finish_rollups(&self) {
+        if self.window_count.get() == 0 {
+            self.window_flush.skipped();
+        } else if self.window_failed.get() {
+            self.window_flush
+                .error(crate::offline_trace::ErrorCode::Other);
+        } else {
+            self.window_flush.ok();
+        }
+
+        if self.item_count.get() == 0 {
+            self.note_sync.skipped();
+        } else if self.sync_failed.get() {
+            self.note_sync
+                .error(crate::offline_trace::ErrorCode::Storage);
+        } else {
+            self.note_sync.ok();
         }
     }
 }
@@ -994,6 +1128,7 @@ fn run_session(
             Err(_) => anyhow::bail!("live session received no finish/discard verdict"),
         }
     })();
+    spans.finish_rollups();
     match &result {
         Ok(LiveOutcome::NoNote) => {
             spans.backend.skipped();
@@ -1296,45 +1431,26 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     writer: &mut NoteWriter<F>,
     trace: Option<&SessionTrace>,
 ) -> Result<()> {
-    let window_trace = trace
-        .map(|trace| crate::offline_trace::live_window_flush(&trace.session, "mixed", "local"));
-    let result = match window_trace.as_ref() {
-        Some(span) => span.in_scope(|| flush_window_inner(diarizer, window, writer, span)),
-        None => flush_window_inner_without_trace(diarizer, window, writer),
-    };
-    if let Some(span) = window_trace.as_ref() {
-        span.record_window_count(1);
-        if result.is_ok() {
-            span.ok();
-        } else {
-            span.error(crate::offline_trace::ErrorCode::Other);
+    match trace {
+        Some(trace) => {
+            trace.record_window();
+            let result = trace
+                .window_flush
+                .in_scope(|| flush_window_work(diarizer, window, writer, Some(trace)));
+            if result.is_err() {
+                trace.window_failed.set(true);
+            }
+            result
         }
+        None => flush_window_work(diarizer, window, writer, None),
     }
-    result
-}
-
-fn flush_window_inner<D: LiveDiarizer, F: NoteFiler>(
-    diarizer: &D,
-    window: &mut TranscriptWindow,
-    writer: &mut NoteWriter<F>,
-    trace: &crate::offline_trace::Span,
-) -> Result<()> {
-    flush_window_work(diarizer, window, writer, Some(trace))
-}
-
-fn flush_window_inner_without_trace<D: LiveDiarizer, F: NoteFiler>(
-    diarizer: &D,
-    window: &mut TranscriptWindow,
-    writer: &mut NoteWriter<F>,
-) -> Result<()> {
-    flush_window_work(diarizer, window, writer, None)
 }
 
 fn flush_window_work<D: LiveDiarizer, F: NoteFiler>(
     diarizer: &D,
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
-    trace: Option<&crate::offline_trace::Span>,
+    trace: Option<&SessionTrace>,
 ) -> Result<()> {
     let mut segments = words_to_segments(&window.mic_words, Speaker::Me, SEGMENT_GAP);
     if !window.them_words.is_empty() {
@@ -1363,14 +1479,13 @@ fn flush_window_work<D: LiveDiarizer, F: NoteFiler>(
     let segments = merge_by_time(segments);
     if !segments.is_empty() {
         let synced = match trace {
-            Some(parent) => {
-                let sync = crate::offline_trace::live_note_sync(parent, "mixed", "local");
-                let result = sync.in_scope(|| writer.append_segments(&segments));
-                sync.record_item_count(segments.len());
-                if result.is_ok() {
-                    sync.ok();
-                } else {
-                    sync.error(crate::offline_trace::ErrorCode::Storage);
+            Some(trace) => {
+                trace.record_items(segments.len());
+                let result = trace
+                    .note_sync
+                    .in_scope(|| writer.append_segments(&segments));
+                if result.is_err() {
+                    trace.sync_failed.set(true);
                 }
                 result
             }
@@ -2090,6 +2205,69 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "offline-tracing", feature = "local"))]
+    #[test]
+    fn rolling_flushes_reenter_one_pair_of_sibling_aggregate_spans() {
+        use std::sync::{Arc, Mutex};
+        use tracing::{Subscriber, span};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::{Layer, Registry};
+
+        type Records = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        #[derive(Clone, Default)]
+        struct Capture(Records);
+        impl<S> Layer<S> for Capture
+        where
+            S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &span::Attributes<'_>,
+                id: &span::Id,
+                context: Context<'_, S>,
+            ) {
+                let parent = context
+                    .span(id)
+                    .and_then(|span| span.parent())
+                    .map(|span| span.metadata().name().to_string());
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((attrs.metadata().name().to_string(), parent));
+            }
+        }
+
+        let capture = Capture::default();
+        let records = capture.0.clone();
+        let subscriber = Registry::default().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let session = crate::offline_trace::live_session("mixed", "local");
+            let trace = SessionTrace::new(&session, &AppConfig::default());
+            let filer = TempFiler::new("aggregate-spans");
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            for text in ["first", "second"] {
+                let mut window = TranscriptWindow::new(10, 1, false).unwrap();
+                window.push_mic_words(vec![word(0.0, 0.5, text)]);
+                flush_window(&NoDiarizer, &mut window, &mut writer, Some(&trace)).unwrap();
+            }
+            trace.finish_rollups();
+            assert_eq!(trace.window_count.get(), 2);
+            assert_eq!(trace.item_count.get(), 2);
+            session.ok();
+        });
+
+        let records = records.lock().unwrap();
+        for phase in ["corti.live.window_flush", "corti.live.note_sync"] {
+            let matches = records
+                .iter()
+                .filter(|(operation, _)| operation == phase)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{phase} must be aggregate");
+            assert_eq!(matches[0].1.as_deref(), Some("corti.live.session"));
+        }
+    }
+
     #[test]
     fn far_end_is_diarized_before_the_durable_chunk_is_written() {
         let filer = TempFiler::new("diarized-window");
@@ -2392,6 +2570,42 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn orderly_shutdown_discards_active_work_and_joins_all_live_handles() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let manager = LiveManager::new();
+        let active_done = Arc::new(AtomicBool::new(false));
+        let active_flag = active_done.clone();
+        install_active(&manager, "active", 0, move |verdicts| {
+            assert!(matches!(verdicts.recv().unwrap(), Verdict::Discard));
+            active_flag.store(true, Ordering::Release);
+            LiveOutcome::NoNote
+        });
+        let awaiting_done = Arc::new(AtomicBool::new(false));
+        let awaiting_flag = awaiting_done.clone();
+        let awaiting = std::thread::spawn(move || {
+            awaiting_flag.store(true, Ordering::Release);
+            LiveOutcome::NoNote
+        });
+        manager
+            .inner
+            .lock()
+            .unwrap()
+            .awaiting
+            .insert("awaiting".to_string(), AwaitingFinish::Running(awaiting));
+
+        manager.begin_shutdown();
+        manager.finish_shutdown();
+
+        assert!(active_done.load(Ordering::Acquire));
+        assert!(awaiting_done.load(Ordering::Acquire));
+        let inner = manager.inner.lock().unwrap();
+        assert!(inner.active.is_none());
+        assert!(inner.awaiting.is_empty());
+        assert!(inner.discarding.is_empty());
     }
 
     #[test]
