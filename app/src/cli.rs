@@ -292,24 +292,29 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         .ok();
 
     let resolved = resolve_recording(&args.input, queue.as_ref())?;
+    let aec_cfg = cfg.aec_config();
+    let already_clean = resolved
+        .audio
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with("-clean.wav"));
+    let offline_aec = crate::transcribe::recording_aec_plan(
+        resolved.capture_processing.as_ref(),
+        cfg.aec_enabled,
+        &aec_cfg,
+        already_clean,
+    );
     eprintln!(
-        "[corti] re-transcribing {} (id {}) with {backend_label}",
+        "[corti] re-transcribing {} (id {}) with {backend_label}; offline AEC {}",
         resolved.audio.display(),
         resolved.id,
+        if offline_aec.is_some() { "on" } else { "off" },
     );
 
-    // No AEC pass: a cached recording was echo-cancelled by the capture writer when it was made (#74), so
-    // cleaning it again would cancel twice. Use `--input` on a raw 2-track to run the file-to-file pass.
-    let mut provenance_cfg = cfg.clone();
-    provenance_cfg.aec_enabled = false;
-    let provenance = crate::provenance::from_config(
-        &provenance_cfg,
-        corti_vagus::provenance::GenerationMode::Batch,
-    );
+    let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used) = crate::transcribe::transcribe_recording(
+    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
         &backend,
-        None,
+        offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&resolved.id),
         &resolved.meta,
         &resolved.audio,
@@ -327,6 +332,17 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         return Ok(());
     }
 
+    let aec_execution = redo_aec_execution(
+        resolved.capture_processing.as_ref(),
+        offline_aec.as_ref(),
+        aec_outcome,
+        already_clean,
+    );
+    let provenance = crate::provenance::from_config_with_aec(
+        &provenance_cfg,
+        corti_vagus::provenance::GenerationMode::Batch,
+        aec_execution,
+    );
     let vagus = Vagus::discover()
         .context("vagus not available (needed to file the note; pass --print to skip filing)")?;
     let note = vagus
@@ -362,6 +378,46 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn redo_aec_execution<'a>(
+    processing: Option<&'a corti_capture::CaptureProcessing>,
+    offline: Option<&'a crate::transcribe::OfflineAec>,
+    outcome: crate::transcribe::OfflineAecOutcome,
+    already_clean: bool,
+) -> crate::provenance::AecExecution<'a> {
+    let capture_fallback = processing.is_some_and(|processing| {
+        matches!(
+            &processing.aec,
+            corti_capture::CaptureAecState::RawFallback { .. }
+        )
+    });
+    if let Some(aec) = offline {
+        return crate::provenance::AecExecution::Offline {
+            config: &aec.config,
+            lookahead_seconds: aec.lookahead_seconds,
+            outcome,
+            capture_fallback,
+        };
+    }
+    if already_clean {
+        return match processing.map(|processing| &processing.aec) {
+            Some(corti_capture::CaptureAecState::RawFallback {
+                config,
+                lookahead_seconds,
+            }) => crate::provenance::AecExecution::Offline {
+                config,
+                lookahead_seconds: *lookahead_seconds,
+                outcome: crate::transcribe::OfflineAecOutcome::Applied,
+                capture_fallback: true,
+            },
+            _ => crate::provenance::AecExecution::PreprocessedUnknown,
+        };
+    }
+    processing.map_or(
+        crate::provenance::AecExecution::Disabled,
+        crate::provenance::AecExecution::Capture,
+    )
 }
 
 /// `--input`: the low-level primitive. Transcribe an explicit WAV and render a note to `--output` (or
@@ -405,16 +461,12 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         if aec_enabled { "on" } else { "off" },
     );
     let aec_cfg = cfg.aec_config();
-    let mut provenance_cfg = cfg.clone();
-    provenance_cfg.aec_enabled = aec_enabled;
-    let provenance = crate::provenance::from_config(
-        &provenance_cfg,
-        corti_vagus::provenance::GenerationMode::Batch,
-    );
+    let offline_aec = aec_enabled.then(|| crate::transcribe::OfflineAec::current(aec_cfg));
+    let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used) = crate::transcribe::transcribe_recording(
+    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
         &backend,
-        aec_enabled.then_some(&aec_cfg),
+        offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&job_id),
         &meta,
         input,
@@ -426,6 +478,23 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         used.display(),
     );
 
+    let aec_execution = if let Some(aec) = offline_aec.as_ref() {
+        crate::provenance::AecExecution::Offline {
+            config: &aec.config,
+            lookahead_seconds: aec.lookahead_seconds,
+            outcome: aec_outcome,
+            capture_fallback: false,
+        }
+    } else if name.ends_with("-clean.wav") {
+        crate::provenance::AecExecution::PreprocessedUnknown
+    } else {
+        crate::provenance::AecExecution::Disabled
+    };
+    let provenance = crate::provenance::from_config_with_aec(
+        &provenance_cfg,
+        corti_vagus::provenance::GenerationMode::Batch,
+        aec_execution,
+    );
     let title = args.title.unwrap_or_else(|| meta.note_title());
     let source = args.source.unwrap_or_else(|| meta.source());
     let body = corti_vagus::recording_body(&meta, &transcript);
@@ -472,6 +541,8 @@ struct Resolved {
     meta: RecordingMeta,
     /// The note filed by the previous run, if any (reported so the user can delete the stale one).
     old_note: Option<PathBuf>,
+    /// Capture-time processing identity; absent for pre-v3/foreign recordings.
+    capture_processing: Option<corti_capture::CaptureProcessing>,
     /// Whether a queue row exists (⇒ safe to write the new note path back).
     had_row: bool,
 }
@@ -507,11 +578,18 @@ fn resolve_recording(input: &str, queue: Option<&Queue>) -> Result<Resolved> {
         resolve_audio_in_cache(&stem, &name, row.as_ref())?
     };
 
-    let (id, meta, old_note, had_row) = match &row {
-        Some(job) => (job.id.clone(), job.meta(), job.note_path.clone(), true),
+    let (id, meta, old_note, capture_processing, had_row) = match &row {
+        Some(job) => (
+            job.id.clone(),
+            job.meta(),
+            job.note_path.clone(),
+            crate::transcribe::decode_capture_processing(job.capture_processing.as_deref())?,
+            true,
+        ),
         None => (
             stem.clone(),
             derive_meta_from_stem(&stem, &audio),
+            None,
             None,
             false,
         ),
@@ -522,13 +600,14 @@ fn resolve_recording(input: &str, queue: Option<&Queue>) -> Result<Resolved> {
         audio,
         meta,
         old_note,
+        capture_processing,
         had_row,
     })
 }
 
 /// Resolve a bare filename/stem to an audio file in the recordings cache. Prefers the WAV the row was
-/// recorded to; with no row, looks up the literal name, then `<stem>.wav`. The `-clean.wav` fallbacks are
-/// vestigial — nothing writes that sibling since #74 — but still resolve a pre-#74 cache.
+/// recorded to; with no row, looks up the literal name, then `<stem>.wav`. The `-clean.wav` fallback covers
+/// legacy/raw recovery and explicit-input derivatives; marker-positive ordinary capture creates no sibling.
 fn resolve_audio_in_cache(stem: &str, name: &str, row: Option<&Job>) -> Result<PathBuf> {
     if let Some(job) = row {
         if job.audio_path.exists() {
@@ -708,6 +787,40 @@ mod tests {
         assert!(p(&["--redo", "r.wav", "--backend"]).is_err()); // --backend needs a value
         assert!(p(&["--redo", "r.wav", "--backend", "xx"]).is_err()); // bad backend value
         assert!(p(&["--redo", "r.wav", "--nope"]).is_err()); // unknown option
+    }
+
+    #[test]
+    fn clean_redo_of_raw_capture_fallback_reports_the_offline_derivative() {
+        let config = corti_aec::AecConfig {
+            filter_len: 4_096,
+            ..Default::default()
+        };
+        let processing = corti_capture::CaptureProcessing {
+            schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            aec: corti_capture::CaptureAecState::RawFallback {
+                config,
+                lookahead_seconds: 7.0,
+            },
+        };
+        match redo_aec_execution(
+            Some(&processing),
+            None,
+            crate::transcribe::OfflineAecOutcome::NotRequested,
+            true,
+        ) {
+            crate::provenance::AecExecution::Offline {
+                config,
+                lookahead_seconds,
+                outcome,
+                capture_fallback,
+            } => {
+                assert_eq!(config.filter_len, 4_096);
+                assert_eq!(lookahead_seconds, 7.0);
+                assert_eq!(outcome, crate::transcribe::OfflineAecOutcome::Applied);
+                assert!(capture_fallback);
+            }
+            _ => panic!("clean raw-fallback derivative must retain its exact offline provenance"),
+        }
     }
 
     #[test]

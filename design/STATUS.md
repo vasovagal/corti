@@ -1,8 +1,10 @@
 # corti — status
 
-Shipped through **v0.13.0**: the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
-capture (2-track WAV) → offline streaming AEC (`StreamingAec`, ADR 0007) → transcription (AWS batch or
-local offline Parakeet-TDT via sherpa/CPU or transcribe.cpp/Metal, runtime-selectable) → filed vagus note. Plus the Tauri UI
+Current tree (latest tag **v0.13.0**): the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
+capture + in-flight writer-thread AEC (`StreamingAec`, ADR 0007/#74) → cleaned 2-track WAV →
+transcription (AWS batch or local offline Parakeet-TDT via sherpa/CPU or transcribe.cpp/Metal,
+runtime-selectable) → filed vagus note. Capture disposition/config is durable in `queue.db`, so legacy
+rows and raw setup fallback still take the safe file pass. Plus the Tauri UI
 surface (Settings, diagnostics Console, live stats, Ethics/Voiceprint guide, Recording Queue), the `corti`
 CLI (`corti --list`), `corti-tap`, and the `corti-bench` audio-quality harness. Durability landed in #85
 via `corti-jobs`: durable transcribe/file retry with backoff, startup recovery of orphaned jobs, and an

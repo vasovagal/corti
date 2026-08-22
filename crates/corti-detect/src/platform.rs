@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Local;
-use corti_capture::{Recorder, RecordingOptions};
+use corti_capture::{FinishedRecording, Recorder, RecordingOptions};
 use corti_core::RecordingMeta;
 use corti_coreaudio::{DefaultInputDeviceMonitor, MicMonitor, mic_owner, other_app_holds_input};
 
@@ -173,13 +173,17 @@ impl Drop for Detector {
 fn deliver_finished(
     live: Option<&dyn LiveHook>,
     meta: RecordingMeta,
-    audio_path: std::path::PathBuf,
+    finished: FinishedRecording,
     emit: impl FnOnce(DetectorEvent),
 ) {
     if let Some(hook) = live {
         hook.finished(&meta);
     }
-    emit(DetectorEvent::RecordingFinished { meta, audio_path });
+    emit(DetectorEvent::RecordingFinished {
+        meta,
+        audio_path: finished.path,
+        capture_processing: finished.processing,
+    });
 }
 
 /// Deliver the live discard verdict before exposing the corresponding terminal event.
@@ -405,8 +409,8 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                     deliver_discarded(self.live.as_deref(), meta, |event| self.emit(event));
                     return;
                 }
-                match recorder.finish() {
-                    Ok(audio_path) => {
+                match recorder.finish_with_processing() {
+                    Ok(finished) => {
                         // ended_at = start + the mic-open span (a monotonic delta mapped onto the wall
                         // clock). This is the span up to the last mic-off, excluding the coalesce tail, so
                         // it agrees with the `keep` decision; the written WAV may be a hair longer.
@@ -417,12 +421,12 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             app = %meta.owning_app.name,
                             duration_secs = duration.as_secs_f64(),
                             kept = true,
-                            path = %audio_path.display(),
+                            path = %finished.path.display(),
                             "call ended — recording kept"
                         );
                         // Deliver the recording-specific live verdict before the event callback can queue
                         // `Process` behind unrelated serial pipeline work.
-                        deliver_finished(self.live.as_deref(), meta, audio_path, |event| {
+                        deliver_finished(self.live.as_deref(), meta, finished, |event| {
                             self.emit(event);
                         });
                     }
@@ -500,7 +504,10 @@ mod tests {
         deliver_finished(
             Some(&hook),
             meta(),
-            PathBuf::from("/tmp/corti-ordering.wav"),
+            FinishedRecording {
+                path: PathBuf::from("/tmp/corti-ordering.wav"),
+                processing: corti_capture::CaptureProcessing::disabled(),
+            },
             move |event| {
                 assert!(matches!(event, DetectorEvent::RecordingFinished { .. }));
                 finish_order.lock().unwrap().push("finished event");

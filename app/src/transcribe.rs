@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
@@ -53,13 +53,13 @@ impl Backend {
         Self { cfg, kind }
     }
 
-    /// Provenance from the same immutable config snapshot this backend owns. Filing retries persist this
-    /// beside the transcript rather than re-reading possibly newer Settings.
-    pub fn provenance(
+    /// Provenance with the recording's durable AEC execution record rather than current Settings.
+    pub fn provenance_with_aec(
         &self,
         mode: corti_vagus::provenance::GenerationMode,
+        aec: crate::provenance::AecExecution<'_>,
     ) -> corti_vagus::provenance::TranscriptProvenance {
-        crate::provenance::from_config(&self.cfg, mode)
+        crate::provenance::from_config_with_aec(&self.cfg, mode, aec)
     }
 
     /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
@@ -216,29 +216,101 @@ impl<'a> TranscriptionAttempt<'a> {
     }
 }
 
+/// One immutable whole-file fallback request. The lookahead is captured with the recording/config rather
+/// than re-read when a durable retry eventually runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfflineAec {
+    pub config: corti_aec::AecConfig,
+    pub lookahead_seconds: f32,
+}
+
+impl OfflineAec {
+    pub fn current(config: corti_aec::AecConfig) -> Self {
+        Self {
+            config,
+            lookahead_seconds: corti_aec::configured_lookahead_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineAecOutcome {
+    NotRequested,
+    Applied,
+    NotApplicable,
+    Failed,
+}
+
+/// Parse and validate a queue row's versioned capture-processing record. `None` is a legacy pre-marker row.
+pub fn decode_capture_processing(
+    raw: Option<&str>,
+) -> Result<Option<corti_capture::CaptureProcessing>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let processing: corti_capture::CaptureProcessing =
+        serde_json::from_str(raw).context("parsing capture-processing record")?;
+    processing.validate()?;
+    Ok(Some(processing))
+}
+
+/// Decide whether a retained recording needs a safe whole-file pass. Marker-less rows preserve the old
+/// behavior for upgrades; a factory failure is wholly raw and uses its original settings; fully applied,
+/// intentionally disabled, tap-only, and mixed/degraded files must not be processed twice.
+pub fn recording_aec_plan(
+    processing: Option<&corti_capture::CaptureProcessing>,
+    legacy_enabled: bool,
+    legacy_config: &corti_aec::AecConfig,
+    already_clean: bool,
+) -> Option<OfflineAec> {
+    if already_clean {
+        return None;
+    }
+    match processing.map(|p| &p.aec) {
+        Some(corti_capture::CaptureAecState::RawFallback {
+            config,
+            lookahead_seconds,
+        }) => Some(OfflineAec {
+            config: config.clone(),
+            lookahead_seconds: *lookahead_seconds,
+        }),
+        Some(
+            corti_capture::CaptureAecState::Disabled
+            | corti_capture::CaptureAecState::NotApplicable
+            | corti_capture::CaptureAecState::Applied { .. }
+            | corti_capture::CaptureAecState::Degraded { .. },
+        ) => None,
+        None if legacy_enabled => Some(OfflineAec::current(legacy_config.clone())),
+        None => None,
+    }
+}
+
 /// Optionally run the file-to-file AEC pass, then transcribe with the runtime-selected `backend`. This is
 /// the tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
 /// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
 /// input) for logging. Persisting any transcript sidecar is a caller's concern, not this primitive's.
 ///
-/// `aec` is `Some` only for **foreign** audio — `corti --input <wav>` over a 2-track corti did not record.
-/// Corti's own recordings are echo-cancelled in the capture writer thread (#74), so cleaning them again
-/// here would cancel a second time; the pipeline and `--redo` pass `None`. A tap-only (mono) input is
-/// handled inside `write_clean_wav` (`Ok(None)`). Only a genuine backend transcription failure is returned
-/// as `Err`; an AEC failure falls back to the raw recording so it never stalls the caller.
+/// `aec` is `Some` for foreign audio, marker-less legacy rows, or a positively identified wholly-raw
+/// writer fallback. Applied/degraded/disabled captures pass `None` to avoid changing their retained audio.
+/// A tap-only input is handled as `NotApplicable`; an AEC error becomes `Failed` and falls back to raw,
+/// while only a genuine backend transcription failure is returned as `Err`.
 pub fn transcribe_recording(
     backend: &Backend,
-    aec: Option<&corti_aec::AecConfig>,
+    aec: Option<&OfflineAec>,
     attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
-) -> Result<(DiarizedTranscript, PathBuf)> {
+) -> Result<(DiarizedTranscript, PathBuf, OfflineAecOutcome)> {
     // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
-    let input: PathBuf = if let Some(aec_cfg) = aec {
-        match corti_capture::write_clean_wav(raw_audio, aec_cfg) {
+    let (input, aec_outcome): (PathBuf, OfflineAecOutcome) = if let Some(aec) = aec {
+        match corti_capture::write_clean_wav_with_lookahead(
+            raw_audio,
+            &aec.config,
+            aec.lookahead_seconds,
+        ) {
             Ok(Some(clean)) => {
                 info!(
                     target: "corti::transcribe",
@@ -248,7 +320,7 @@ pub fn transcribe_recording(
                     output = %clean.display(),
                     "AEC ran — cleaned recording"
                 );
-                clean
+                (clean, OfflineAecOutcome::Applied)
             }
             Ok(None) => {
                 // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
@@ -259,7 +331,7 @@ pub fn transcribe_recording(
                     input = %raw_audio.display(),
                     "tap-only recording — no mic track to clean; skipping AEC"
                 );
-                raw_audio.to_path_buf()
+                (raw_audio.to_path_buf(), OfflineAecOutcome::NotApplicable)
             }
             Err(e) => {
                 warn!(
@@ -270,15 +342,15 @@ pub fn transcribe_recording(
                     error = %format!("{e:#}"),
                     "AEC failed; using the raw recording"
                 );
-                raw_audio.to_path_buf()
+                (raw_audio.to_path_buf(), OfflineAecOutcome::Failed)
             }
         }
     } else {
-        raw_audio.to_path_buf()
+        (raw_audio.to_path_buf(), OfflineAecOutcome::NotRequested)
     };
 
     let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
-    Ok((transcript, input))
+    Ok((transcript, input, aec_outcome))
 }
 
 /// Whether an env var is set and non-empty (after trim) — the conventional "this is configured" test, and
@@ -344,4 +416,71 @@ fn build_sdk_config_for_region(
         loader = loader.region(aws_config::Region::new(region.to_string()));
     }
     Some(rt.block_on(loader.load()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn applied(config: corti_aec::AecConfig) -> corti_capture::CaptureProcessing {
+        corti_capture::CaptureProcessing {
+            schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            aec: corti_capture::CaptureAecState::Applied {
+                config,
+                lookahead_seconds: 7.0,
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_rows_keep_the_offline_upgrade_path_but_marked_clean_rows_do_not() {
+        let cfg = corti_aec::AecConfig::default();
+        let legacy = recording_aec_plan(None, true, &cfg, false).unwrap();
+        assert_eq!(legacy.config, cfg);
+        assert!(recording_aec_plan(None, true, &cfg, true).is_none());
+        assert!(recording_aec_plan(Some(&applied(cfg.clone())), true, &cfg, false).is_none());
+        for aec in [
+            corti_capture::CaptureAecState::Disabled,
+            corti_capture::CaptureAecState::NotApplicable,
+            corti_capture::CaptureAecState::Degraded {
+                config: cfg.clone(),
+                lookahead_seconds: 5.0,
+            },
+        ] {
+            let processing = corti_capture::CaptureProcessing {
+                schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+                aec,
+            };
+            assert!(recording_aec_plan(Some(&processing), true, &cfg, false).is_none());
+        }
+    }
+
+    #[test]
+    fn raw_factory_fallback_reuses_capture_time_settings() {
+        let current = corti_aec::AecConfig::default();
+        let mut captured = current.clone();
+        captured.filter_len = 4_096;
+        let processing = corti_capture::CaptureProcessing {
+            schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            aec: corti_capture::CaptureAecState::RawFallback {
+                config: captured.clone(),
+                lookahead_seconds: 9.0,
+            },
+        };
+        let plan = recording_aec_plan(Some(&processing), false, &current, false).unwrap();
+        assert_eq!(plan.config, captured);
+        assert_eq!(plan.lookahead_seconds, 9.0);
+    }
+
+    #[test]
+    fn capture_processing_json_round_trips_and_rejects_unknown_versions() {
+        let processing = applied(corti_aec::AecConfig::default());
+        let json = serde_json::to_string(&processing).unwrap();
+        assert_eq!(
+            decode_capture_processing(Some(&json)).unwrap(),
+            Some(processing.clone())
+        );
+        let newer = json.replace("\"schema_version\":1", "\"schema_version\":999");
+        assert!(decode_capture_processing(Some(&newer)).is_err());
+    }
 }

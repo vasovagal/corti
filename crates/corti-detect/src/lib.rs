@@ -49,6 +49,8 @@ pub enum DetectorEvent {
     RecordingFinished {
         meta: RecordingMeta,
         audio_path: PathBuf,
+        /// Immutable writer disposition/config to persist before any retryable work.
+        capture_processing: corti_capture::CaptureProcessing,
     },
     /// A started recording was discarded below the keep threshold (too short): no WAV was kept. Lets a
     /// consumer that reacted to `RecordingStarted` unwind its in-flight state instead of sitting on it.

@@ -72,7 +72,7 @@ To transcribe **during** capture you need the downmixed PCM the writer thread al
   `capture.rs:190`; live-readable via `CaptureTee::dropped_counter()`).
 - **The tee carries the raw downmix**, taken before the writer's in-flight AEC (#74) — the live consumer runs
   its own `StreamingAec` over it. Two independent cancellers, each bounded; the tee stays strictly additive,
-  and with no tee attached the writer path is unchanged.
+  and removing it does not change the selected on-disk filter policy.
 
 Contract: *the recording is the source of truth; the live stream is throwaway.* A blocking tee could stall the
 writer and corrupt the recording, so dropping a live chunk is the correct trade — the dropped-chunk counter

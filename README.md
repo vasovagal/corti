@@ -64,7 +64,7 @@ signals. Exactly what this app does: audio → notes.
      process tap ─┐
      mic ─────────┼─▶ ring ─▶ AEC ─▶ 2-track WAV   (ch0 Me, cleaned · ch1 Them)
        │             writer thread runs the FDAF adaptive filter + residual suppressor in flight,
-       │             so no raw mic ever hits disk and RAM stays flat on a multi-hour call
+       │             so automatic app recordings keep no raw mic on disk and RAM stays flat
        │      └─ bounded tee ─▶ live: streaming AEC ─▶ Parakeet (CPU or Metal) ─▶ rolling checkpoint
        │                              └─ optional diarize ─▶ append + sync_all (local backend)
        │  Action::Stop                   └─ sync tail, then flip `State:` durably

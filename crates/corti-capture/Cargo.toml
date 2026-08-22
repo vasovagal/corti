@@ -17,6 +17,7 @@ dirs = "6"
 hound = "3.5"
 # Structured logging for capture milestones (issue #76): clean-WAV write path/size, dropped samples.
 tracing = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 corti-coreaudio = { workspace = true }

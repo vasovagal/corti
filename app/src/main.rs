@@ -487,14 +487,22 @@ pub(crate) mod imp {
                 tray::push_history_recording(app, &meta);
                 tray::set_status(app, format!("● Recording — {}", meta.owning_app.name));
             }
-            DetectorEvent::RecordingFinished { meta, audio_path } => {
+            DetectorEvent::RecordingFinished {
+                meta,
+                audio_path,
+                capture_processing,
+            } => {
                 set_detector_recording(app, false);
                 // Bridge to the pipeline's own Transcribing set so the diagram doesn't sit on Recording
                 // while the finished job waits in the channel.
                 set_stage(app, Stage::Transcribing);
                 tray::set_status(app, format!("Transcribing — {}…", meta.owning_app.name));
                 if pipe_tx
-                    .send(PipelineMsg::Process { meta, audio_path })
+                    .send(PipelineMsg::Process {
+                        meta,
+                        audio_path,
+                        capture_processing,
+                    })
                     .is_err()
                 {
                     tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished recording");
@@ -721,8 +729,8 @@ pub(crate) mod imp {
         tx: Sender<PipelineMsg>,
     ) {
         // `webinar_recording` was already cleared by the toggle's Stopping branch before this thread spawned.
-        let audio_path = match recorder.finish_tap_only() {
-            Ok(p) => p,
+        let finished = match recorder.finish_tap_only_with_processing() {
+            Ok(finished) => finished,
             Err(e) => {
                 tracing::error!(target: "corti::detector", error = %format!("{e:#}"), "webinar capture produced no audio");
                 // The toggle already bridged the stage to Transcribing; nothing will transcribe now.
@@ -738,9 +746,16 @@ pub(crate) mod imp {
                 bundle_id: None,
                 name: WEBINAR_NAME.to_string(),
             },
-            audio_path: audio_path.clone(),
+            audio_path: finished.path.clone(),
         };
-        if tx.send(PipelineMsg::Process { meta, audio_path }).is_err() {
+        if tx
+            .send(PipelineMsg::Process {
+                meta,
+                audio_path: finished.path,
+                capture_processing: finished.processing,
+            })
+            .is_err()
+        {
             tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished webinar recording");
             set_stage(app, Stage::Idle);
         }

@@ -64,8 +64,9 @@ path is deferred.
   `push()`-per-block call **into the capture writer thread** (so the raw 2-track never lands on disk and RAM
   is bounded end-to-end) is the tracked follow-up that actually closes #67/#68/#32; until then those stay
   open and the on-disk raw still exists.
-  **Reached (#74):** the writer drives the canceller in 4096-frame blocks and writes only cleaned audio; the
-  file-to-file pass survives for `corti --input` and `corti-bench` only.
+  **Reached (#74):** the writer drives the canceller in 4096-frame blocks and writes cleaned audio. A
+  versioned queue marker preserves capture disposition/config for retries and provenance; NULL legacy rows
+  retain the old file pass, which also survives for `corti --input`, `corti-bench`, and raw setup fallback.
 - **Lost (intentionally, revisit-able):** re-tunability/calibration; crash recovery; the README "raw tracks are
   always preserved" invariant (update that copy); the retention/queue UI work.
 - **Opening-seconds quality** now depends on the lookahead length, not a 2-pass re-filter — hence the

@@ -40,10 +40,11 @@ and reuse these to shape the final transcript.
 (`AppConfig::transcribe_backend`, env `CORTI_TRANSCRIBE_BACKEND`). `Backend::init` (`:37`) resolves
 `BackendChoice::{Aws,Local}` behind cfg-gated features; unavailable backends degrade to a stringly
 error rather than failing the build. `Backend::transcribe` (`:60`) dispatches to the AWS or local
-arm; `transcribe_recording` (`:132`) is the pipeline entry point. Its `AecConfig` argument is `Some`
-only for **foreign** audio (`corti --input <wav>`), cleaned via `corti_capture::write_clean_wav`;
-recordings arrive already echo-cancelled by the capture writer (#74), so the pipeline passes `None`
-and hands the path straight to the backend.
+arm; `transcribe_recording` is the pipeline entry point. Its optional `OfflineAec` request is used
+for foreign audio (`corti --input`), marker-less pre-upgrade rows, and a writer filter that failed
+before emitting any clean frame. Ordinary recordings carry a versioned `CaptureProcessing` record
+in `queue.db`, so retries skip the file pass only when capture positively identifies the WAV as
+processed/disabled. The request includes the original lookahead rather than re-reading environment.
 
 ## Local backend — Parakeet via sherpa or transcribe.cpp
 
@@ -119,9 +120,10 @@ From the pipeline thread's view this remains an ordinary blocking call.
 `crates/corti-queue`: one SQLite DB in **WAL** at `~/.local/share/corti/queue.db` (override
 `$CORTI_DATA_DIR`; outside any vault, guardrail 5). One `recordings` row per recording mirrors `Job`;
 `job_id` is the recording filename stem, making everything idempotent on it. #85 added a
-`transcribe_secs` column (`src/lib.rs:56`) for the Recording Queue window's "transcribed 55 min in 30 s"
-line, and a v0→v1 migration (`:409`) that rewrites every stored timestamp to the fixed-width UTC `…Z`
-form so string ordering is chronological.
+`transcribe_secs` for the Recording Queue window's "transcribed 55 min in 30 s" line. Schema v3 adds
+`capture_processing`, a bounded versioned JSON record containing only AEC disposition/config/lookahead;
+existing NULL rows are deliberately raw/unknown and retain compatibility cleaning. Earlier migration also
+rewrites stored timestamps to fixed-width UTC `…Z` so string ordering is chronological.
 
 `JobStatus` (`corti-core recording.rs:119`) is the state machine:
 
@@ -162,8 +164,8 @@ due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) c
 job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
 
 Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` → publish any exact pre-ASR AWS
-owner → `transcribe::transcribe_recording` (`Backend::transcribe`, a **blocking** call on this thread —
-the recording is already echo-cancelled, #74) → atomically write the filing checkpoint →
+owner → choose capture identity / legacy-safe offline fallback → `transcribe::transcribe_recording`
+(`Backend::transcribe`, a **blocking** call on this thread) → atomically write the filing checkpoint →
 `queue.update(PendingNote, transcribe_secs)` → clean AWS staging (when applicable) → file. Cloud cleanup
 errors propagate and retry from the checkpoint. Completion is one `Queue::complete_with_note` SQL update
 for `note_path + Done`; errors propagate before any success UI. On durable success the checkpoint is

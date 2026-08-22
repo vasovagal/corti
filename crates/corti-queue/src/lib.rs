@@ -9,7 +9,8 @@
 //! Idempotency (so crash recovery is free and safe): the job id is the recording's filename stem, so
 //! [`enqueue`](Queue::enqueue) is a no-op if the recording is already tracked, and the AWS backend's
 //! `transcribe_job` name is stored so a re-poll re-attaches to the existing job instead of paying to start
-//! a new one. `note_path` is stored so a re-file doesn't duplicate the note.
+//! a new one. `note_path` is stored so a re-file doesn't duplicate the note. Since schema v3, the row also
+//! carries versioned, content-free capture-processing JSON so retries never confuse raw and cleaned audio.
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,9 @@ pub struct Job {
     /// Wall-clock seconds the (successful) transcription took, for the Queue UI's
     /// "transcribed 55 min in 30 s" line.
     pub transcribe_secs: Option<f64>,
+    /// Versioned JSON from `corti-capture` describing whether this WAV is raw, fully streaming-cleaned, or
+    /// degraded. `None` identifies a pre-v3/legacy row whose WAV must be treated as raw/unknown.
+    pub capture_processing: Option<String>,
     /// Additive hosted projection; the existing `status` remains the downgrade authority.
     pub postprocess_state: Option<PostprocessState>,
     pub postprocess_updated_at: Option<DateTime<Local>>,
@@ -358,6 +362,16 @@ impl Queue {
     /// recording (same id) is already tracked, the existing row is left untouched (its progress is
     /// preserved) and its id is returned.
     pub fn enqueue(&self, meta: &RecordingMeta) -> Result<String> {
+        self.enqueue_with_capture_processing(meta, None)
+    }
+
+    /// Enqueue while durably identifying the retained audio. Existing rows created mid-call by live filing
+    /// are updated only when their marker is still NULL; a duplicate delivery cannot rewrite history.
+    pub fn enqueue_with_capture_processing(
+        &self,
+        meta: &RecordingMeta,
+        capture_processing: Option<&str>,
+    ) -> Result<String> {
         let id = job_id(meta);
         let started = fmt_dt(meta.started_at);
         let ended = meta.ended_at.map(fmt_dt);
@@ -370,9 +384,20 @@ impl Queue {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO recordings
-                   (id, started_at, ended_at, owning_app, bundle_id, audio_path, status, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, started, ended, name, bundle, audio, status, now],
+                   (id, started_at, ended_at, owning_app, bundle_id, audio_path, status, updated_at,
+                    capture_processing)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    id,
+                    started,
+                    ended,
+                    name,
+                    bundle,
+                    audio,
+                    status,
+                    now,
+                    capture_processing
+                ],
             )
             .context("inserting recording row")?;
         // `INSERT OR IGNORE` is a no-op when the recording is already tracked; say so rather than implying a
@@ -380,6 +405,16 @@ impl Queue {
         if inserted > 0 {
             tracing::debug!(target: "corti::queue", job_id = %id, status = %status, "enqueue");
         } else {
+            if capture_processing.is_some() {
+                self.conn
+                    .execute(
+                        "UPDATE recordings
+                         SET capture_processing = COALESCE(capture_processing, ?2)
+                         WHERE id = ?1",
+                        params![id, capture_processing],
+                    )
+                    .context("attaching capture processing to existing recording row")?;
+            }
             tracing::debug!(target: "corti::queue", job_id = %id, "enqueue (already tracked)");
         }
         Ok(id)
@@ -753,10 +788,10 @@ impl Queue {
 /// Columns in a fixed order shared by every `SELECT` so [`read_row`] indices stay aligned.
 const COLS: &str = "id, started_at, ended_at, owning_app, bundle_id, audio_path, \
                     status, s3_uri, transcribe_job, note_path, error, updated_at, \
-                    transcribe_secs, postprocess_state, postprocess_updated_at";
+                    transcribe_secs, postprocess_state, postprocess_updated_at, capture_processing";
 
 /// Bumped whenever [`migrate`] gains a step; stamped into `PRAGMA user_version` on every open.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS recordings(
@@ -774,7 +809,8 @@ CREATE TABLE IF NOT EXISTS recordings(
   updated_at              TEXT NOT NULL,
   transcribe_secs         REAL,
   postprocess_state       TEXT,
-  postprocess_updated_at  TEXT
+  postprocess_updated_at  TEXT,
+  capture_processing      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
 
@@ -859,6 +895,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     }
     if version < 2 && has_table {
         migrate_v1_to_v2(conn).context("migrating queue schema v1 → v2")?;
+    }
+    if version < 3 && has_table {
+        migrate_v2_to_v3(conn).context("migrating queue schema v2 → v3")?;
     }
     Ok(())
 }
@@ -952,6 +991,33 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<()> {
     tx.commit().context("committing v1 → v2 migration")
 }
 
+/// v2 → v3 adds immutable capture-processing identity. Existing rows intentionally stay NULL: they predate
+/// writer-thread AEC and are therefore handled as raw/unknown by the app's compatibility path.
+fn migrate_v2_to_v3(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction()
+        .context("starting v2 → v3 migration tx")?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM pragma_table_info('recordings') WHERE name = 'capture_processing'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .context("probing for recordings.capture_processing")?;
+    if !exists {
+        tx.execute(
+            "ALTER TABLE recordings ADD COLUMN capture_processing TEXT",
+            [],
+        )
+        .context("adding recordings.capture_processing")?;
+    }
+    tx.pragma_update(None, "user_version", 3)
+        .context("stamping queue schema v3")?;
+    tx.commit().context("committing v2 → v3 migration")
+}
+
 /// v0 → v1: add `transcribe_secs`, and rewrite every stored timestamp to the fixed-width UTC `…Z` form
 /// [`fmt_dt`] now writes. v0 stored `DateTime<Local>::to_rfc3339()` — local-*offset* strings whose lexical
 /// order diverges from chronological order the moment two rows carry different offsets (DST transition,
@@ -1029,6 +1095,7 @@ struct RawRow {
     transcribe_secs: Option<f64>,
     postprocess_state: Option<String>,
     postprocess_updated_at: Option<String>,
+    capture_processing: Option<String>,
 }
 
 fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
@@ -1048,6 +1115,7 @@ fn read_row(row: &rusqlite::Row) -> rusqlite::Result<RawRow> {
         transcribe_secs: row.get(12)?,
         postprocess_state: row.get(13)?,
         postprocess_updated_at: row.get(14)?,
+        capture_processing: row.get(15)?,
     })
 }
 
@@ -1065,6 +1133,7 @@ fn raw_to_job(r: RawRow) -> Result<Job> {
         note_path: r.note_path.map(PathBuf::from),
         error: r.error,
         transcribe_secs: r.transcribe_secs,
+        capture_processing: r.capture_processing,
         postprocess_state: r
             .postprocess_state
             .as_deref()
@@ -1536,6 +1605,29 @@ mod tests {
     }
 
     #[test]
+    fn capture_processing_is_durable_and_fills_a_live_created_row_once() {
+        let q = Queue::memory();
+        let m = meta("/cache/a.wav", "us.zoom.xos");
+        let id = q.enqueue(&m).unwrap();
+        assert_eq!(q.get(&id).unwrap().unwrap().capture_processing, None);
+
+        q.enqueue_with_capture_processing(&m, Some(r#"{"schema_version":1}"#))
+            .unwrap();
+        assert_eq!(
+            q.get(&id).unwrap().unwrap().capture_processing.as_deref(),
+            Some(r#"{"schema_version":1}"#)
+        );
+
+        // Duplicate delivery cannot rewrite the immutable capture identity.
+        q.enqueue_with_capture_processing(&m, Some("different"))
+            .unwrap();
+        assert_eq!(
+            q.get(&id).unwrap().unwrap().capture_processing.as_deref(),
+            Some(r#"{"schema_version":1}"#)
+        );
+    }
+
+    #[test]
     fn set_status_updates_and_missing_id_errors() {
         let q = Queue::memory();
         let id = q.enqueue(&meta("/cache/a.wav", "us.zoom.xos")).unwrap();
@@ -1880,8 +1972,67 @@ mod tests {
         assert!(queue.postprocess_history(&recording_id).unwrap().is_empty());
     }
 
-    /// The v1 schema verbatim (schema version 1, before hosted projection/history). Keep frozen so the
-    /// migration test does not accidentally begin from the current schema.
+    const V2_RECORDINGS_SCHEMA: &str = "
+CREATE TABLE recordings(
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  owning_app TEXT NOT NULL,
+  bundle_id TEXT,
+  audio_path TEXT NOT NULL,
+  status TEXT NOT NULL,
+  s3_uri TEXT,
+  transcribe_job TEXT,
+  note_path TEXT,
+  error TEXT,
+  updated_at TEXT NOT NULL,
+  transcribe_secs REAL,
+  postprocess_state TEXT,
+  postprocess_updated_at TEXT
+);
+PRAGMA user_version = 2;
+";
+
+    #[test]
+    fn v2_rows_migrate_as_raw_unknown_capture_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "corti-queue-test-migrate-v2-v3-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.db");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(V2_RECORDINGS_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO recordings(
+                   id, started_at, owning_app, audio_path, status, updated_at
+                 ) VALUES(
+                   'legacy-raw', '2026-08-21T12:00:00.000Z', 'Zoom', '/cache/legacy.wav',
+                   'pending_transcription', '2026-08-21T12:00:01.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let queue = Queue::open_at(&path).unwrap();
+        let row = queue.get("legacy-raw").unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::PendingTranscription);
+        assert_eq!(row.capture_processing, None);
+        assert_eq!(
+            queue
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The v1 schema verbatim (schema version 1, before hosted projection/history and capture identity).
+    /// Keep frozen so the migration test does not accidentally begin from the current schema.
     const V1_SCHEMA: &str = "
 CREATE TABLE recordings(
   id              TEXT PRIMARY KEY,
@@ -1903,9 +2054,9 @@ PRAGMA user_version = 1;
 ";
 
     #[test]
-    fn migrates_v1_to_v2_transactionally_and_is_reopen_safe() {
+    fn migrates_v1_to_current_transactionally_and_is_reopen_safe() {
         let dir = std::env::temp_dir().join(format!(
-            "corti-queue-test-migrate-v1-v2-{}",
+            "corti-queue-test-migrate-v1-current-{}",
             std::process::id()
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1943,6 +2094,10 @@ PRAGMA user_version = 1;
         let migrated = queue.get("v1-fixture").unwrap().unwrap();
         assert_eq!(migrated.postprocess_state, None);
         assert_eq!(migrated.postprocess_updated_at, None);
+        assert_eq!(
+            migrated.capture_processing, None,
+            "pre-writer-AEC rows remain raw/unknown for compatibility cleaning"
+        );
         let call_table: bool = queue
             .conn
             .query_row(
@@ -2040,6 +2195,7 @@ CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
         );
         for job in &jobs {
             assert_eq!(job.transcribe_secs, None);
+            assert_eq!(job.capture_processing, None);
             let raw: String = q
                 .conn
                 .query_row(

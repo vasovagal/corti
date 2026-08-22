@@ -104,29 +104,24 @@ the WAV file — which is why the app transcribes batch (see [architecture.md](a
 The AEC kernel is streaming (a frequency-domain block adaptive filter, ADR 0007) and is now driven
 **as audio arrives**, on the writer thread, before anything is encoded.
 
-`CaptureOptions::with_filter` (`capture.rs:147`) hands `start_recording_with_options` a
-`CaptureFilterFactory` — a `FnOnce(sample_rate) -> Box<dyn CaptureFilter>` (`:132`), deferred so the
-FFT plan is built on the writer thread once the aggregate's rate is known. The trait is the whole
-seam between the HAL crate and the DSP: `push(&mic,&far) -> Vec<f32>` / `finish() -> Vec<f32>`.
-`corti-capture` supplies the implementation, `StreamingAecFilter` (`corti-capture/src/lib.rs:29`),
-wired in by `RecordingOptions::with_aec` (`:196`); the config comes from `LiveHook::aec_config()`
-each time a recording starts, so a Settings change applies to the next call.
+`CaptureOptions::with_filter` hands `start_recording_with_options` a `CaptureFilterFactory` — a
+`FnOnce(sample_rate) -> Box<dyn CaptureFilter>`, deferred so the FFT plan is built on the writer
+thread once the aggregate's rate is known. The trait is the whole seam between the HAL crate and the
+DSP: declared maximum output lag plus `push(&mic,&far) -> Vec<f32>` / `finish() -> Vec<f32>`.
+`corti-capture` supplies `StreamingAecFilter`, wired by `RecordingOptions::with_aec`; the config and
+effective lookahead are captured once from `LiveHook::aec_config()` when a recording starts.
 
-`FilterStage` (`capture.rs:945`) is the writer-side buffer: it stages downmixed mic/far into two
-`FILTER_FRAMES_PER_CHUNK`-sized (4096) Vecs, pushes them through the filter when full, and pairs each
-cleaned mic sample with its tap sample from a small `tap_pending` queue. Because `push` output lags
-input by up to the lookahead, `tap_pending` holds that lag — bounded by lookahead + one block, never
-by call length. A `mic_pending` mirror of the raw mic is queued in lockstep (≈2 MB for the pair at
-5 s/48 kHz). `finish` drains the filter's backlog and, defensively, pads any unmatched tap with
-silence so the frame count stays truthful. The filter is only installed for `TwoTrack` with a mic
-channel: without a near end there is nothing to cancel.
+`FilterStage` is the writer-side buffer: it stages downmixed mic/far into 4096-frame blocks, pushes
+them through the filter, and pairs each cleaned mic sample with its FIFO tap partner. `tap_pending`
+holds the filter's declared lag and `mic_pending` mirrors it for fail-open recovery (≈2 MB for the
+pair at the default 5 s / 48 kHz). The writer checks that declaration after every block and imposes
+a 35-second hard ceiling, so an under-emitting implementation cannot grow with call length.
 
-The mirror exists for one reason: **a DSP bug must not cost the recording.** Both `push` and `finish`
-run under `catch_unwind`; on a panic the filter is dropped, the backlog it was withholding is written
-raw from `mic_pending`, and the rest of the call passes through uncancelled. Degraded with a line on
-stderr, never lost — a panic escaping the writer thread would fail `stop()` and take the whole call.
-A filter emitting more than it was fed is a contract violation: the surplus is dropped and counted,
-and the total reported at end of recording.
+The mirror exists for one reason: **a DSP bug must not cost the recording.** Factory construction,
+`push`, and `finish` all run under `catch_unwind`; panic, over-emission, under-emission at finish, or
+excess backlog drops the filter and writes pending/later audio raw. `RecordingHandle` distinguishes a
+wholly raw fallback from a cleaned-prefix/raw-remainder degradation. No silence is substituted and
+frame/tap ordering remains exact. The filter is only installed for `TwoTrack` with a mic channel.
 
 `StreamingAec` (`crates/corti-aec/src/streaming.rs`) is overlap-save FDAF: block hop = `filter_len`
 (default 8192 ≈ 170 ms @ 48 kHz), FFT size `2·hop`. A tunable lookahead window
@@ -135,23 +130,28 @@ Total-emitted == total-pushed across all calls (not per-call), which is what let
 exact frame accounting. `cancel(mic,far,sr,cfg)` remains the intentional full-input-lookahead
 scoring shim.
 
-**The file-to-file pass survives, but off the recording path.**
-`corti_capture::write_clean_wav(raw_2track_wav, &AecConfig)` (`corti-capture/src/lib.rs:103`) reads a
-2-track WAV, deinterleaves into `mic`/`tap` Vecs, and writes a `-clean.wav` sibling. It is now only
-for **foreign** audio — `corti --input <wav>` — and `corti-bench` scoring. A 1-channel
-(tap-only/webinar) input has no far end to cancel → `Ok(None)`, no sibling written. Its RAM is
-bounded by the input file, which is why it is not the recording path. Both drives produce
-sample-identical output (`in_flight_filter_matches_post_capture_pass`).
+**The file-to-file pass survives, but off the ordinary recording path.**
+`corti_capture::write_clean_wav` reads a 2-track WAV and writes a `-clean.wav` sibling. It serves
+foreign audio (`corti --input`), `corti-bench`, marker-less pre-upgrade queue rows, and a wholly-raw
+writer-construction fallback. A 1-channel webinar has no mic → `Ok(None)`. Its RAM is bounded by the
+input file, which is why normal app capture never uses it. Both drives produce sample-identical
+output (`in_flight_filter_matches_post_capture_pass`).
+
+On successful finish, `CaptureProcessing` records `disabled | not_applicable | applied |
+raw_fallback | degraded` plus the exact AEC config/lookahead. The pipeline serializes that versioned
+record into `queue.db` before retryable work. Existing rows migrate with NULL identity and retain the
+old offline pass; retries skip AEC only for positively identified processed/disabled files. Filed
+provenance comes from this immutable record and reports degraded capture instead of reconstructing
+AEC from later Settings.
 
 **The live tee is unrelated to this.** `run_writer` still tees the **raw** downmix to `corti-live`,
 which runs its own `StreamingAec` for the in-call transcript (#78/#87). Leaving it alone was a
 deliberate scope choice: the two cancellers are independent and each bounded.
 
-## corti-tap shares the same path
+## corti-tap shares the engine, not the app's filter policy
 
-`crates/corti-tap/src/main.rs` is a thin CLI over the exact app capture path: it constructs
-`corti_capture::Recorder` directly — `Recorder::start` (mic+tap) or `start_tap_only` under
-`--no-mic` — the same `Recorder` the detector uses. It differs only in trigger (Ctrl-C vs the mic
-state machine) and owner (a synthetic global-tap `OwningApp`, no PID attribution). Its optional
-`--inbox` feature spins a current-thread tokio runtime purely to load AWS config and file to vagus
-— the only tokio in the front end, and not in the capture path.
+`crates/corti-tap/src/main.rs` constructs the same `Recorder`, but ordinary Ctrl-C/`--inbox` mode
+intentionally uses `RecordingOptions::default()` and writes raw mic+tap (its note provenance says
+AEC disabled). `--no-mic` remains tap-only. `--live` attaches the raw bounded tee and runs its own
+streaming AEC for terminal output. Only the detector-driven app passes `with_aec`, so “no raw mic on
+disk” refers to automatic app recordings with AEC enabled, not this diagnostic/manual CLI.
