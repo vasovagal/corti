@@ -22,7 +22,8 @@ pub mod process;
 pub mod tap;
 
 pub use capture::{
-    CaptureChunk, CaptureSession, CaptureTee, CapturedAudio, MicrophoneCapture,
+    CaptureChunk, CaptureFilter, CaptureFilterDisposition, CaptureFilterFactory, CaptureOptions,
+    CaptureSession, CaptureTee, CapturedAudio, FILTER_FRAMES_PER_CHUNK, MicrophoneCapture,
     MicrophoneCaptureHandle, OutputLayout, RecordingHandle, TapTarget,
 };
 pub use listener::{DefaultInputDeviceMonitor, MicMonitor, default_input_device, is_running};

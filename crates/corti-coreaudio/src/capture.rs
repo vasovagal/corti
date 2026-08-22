@@ -13,9 +13,15 @@
 //! guardrail 9 requires), and a dedicated writer thread drains the ring and encodes the WAV **incrementally**
 //! to disk. Peak RAM is `O(ring capacity)`, independent of call length, so an all-day recording no longer
 //! grows without bound. The captured stream is interleaved with the **mic channel(s) first, then the tap
-//! channel(s)** — the "me" / "them" split that downstream code (and offline echo cancellation) relies on.
+//! channel(s)** — the "me" / "them" split that downstream code (and echo cancellation) relies on.
+//!
+//! **In-flight mic filtering (#74).** The writer thread can run an optional [`CaptureFilter`] over the
+//! downmixed mic/tap blocks before they are encoded, so normal output is already echo-cancelled. A filter
+//! failure is explicitly marked and fails open to raw rather than losing the call. The filter lives in `corti-capture` (over
+//! `corti_aec::StreamingAec`); this crate only owns the trait and the writer-thread plumbing.
 
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::path::PathBuf;
@@ -106,6 +112,64 @@ impl CaptureTee {
     }
 }
 
+/// Frames staged before each [`CaptureFilter::push`] (~85 ms at 48 kHz). Public so a caller can drive the
+/// same filter with the same block sizes the writer thread uses (the batch/in-flight parity test does).
+pub const FILTER_FRAMES_PER_CHUNK: usize = 4096;
+
+/// A streaming filter applied to the **mic** ("me") track on the writer thread, before encoding (#74).
+///
+/// The writer hands it downmixed mono mic + mono tap blocks as they come off the ring and writes the
+/// cleaned samples it returns paired with the untouched tap, so normal output is clean and peak RAM stays
+/// `O(block + filter state + lookahead)` end-to-end. Contract failure is marked and fails open to raw. The implementation lives in `corti-capture`
+/// (over `corti_aec::StreamingAec`) — declared as a trait here so the HAL crate carries no DSP dependency
+/// and the writer can be tested with a trivial stand-in.
+///
+/// **Contract.** `push` may return a different number of samples than it was handed (an adaptive filter
+/// with a warm-up window emits nothing, then a burst, then ~input-length); only the total over every
+/// `push` plus `finish` must equal the total pushed. Both run on the writer thread and must never block:
+/// a stall shows up as ring overflow (`RecordingHandle::dropped_samples`), never as backpressure on the
+/// real-time IO proc.
+pub trait CaptureFilter: Send {
+    /// Maximum number of pushed samples the filter may legitimately withhold. The writer enforces this
+    /// declaration (and a 35-second hard ceiling) so a buggy implementation cannot turn capture back into
+    /// an `O(call length)` buffer.
+    fn max_output_lag_samples(&self) -> usize;
+    /// Filter one block of mono mic against the mono far-end reference. `mic.len() == far.len()`.
+    fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32>;
+    /// Flush trailing state at end of stream. Consumes the filter (boxed, so `Self: Sized` isn't needed).
+    fn finish(self: Box<Self>) -> Vec<f32>;
+}
+
+/// Builds a [`CaptureFilter`] once the capture sample rate is known. Invoked **on the writer thread**
+/// after the first callback publishes the channel layout, so filter setup (FFT planning, buffers) never
+/// delays `AudioDeviceStart`.
+pub type CaptureFilterFactory = Box<dyn FnOnce(u32) -> Box<dyn CaptureFilter> + Send>;
+
+/// Optional extras for a capture session: a bounded live tee and/or an in-flight mic filter. Neither
+/// changes the channel layout; `CaptureOptions::default()` is exactly the plain streaming writer.
+#[derive(Default)]
+pub struct CaptureOptions {
+    /// Bounded, lossy tee of the **raw** downmix for live consumers (ADR 0009). Unaffected by `filter`.
+    pub tee: Option<CaptureTee>,
+    /// In-flight mic filter (#74). Only honored for [`OutputLayout::TwoTrack`] captures that actually
+    /// carry a mic channel; ignored (with a warning) otherwise.
+    pub filter: Option<CaptureFilterFactory>,
+}
+
+impl CaptureOptions {
+    /// Attach a bounded, lossy live tee.
+    pub fn with_tee(mut self, tee: CaptureTee) -> Self {
+        self.tee = Some(tee);
+        self
+    }
+
+    /// Filter the mic in-flight on the writer thread.
+    pub fn with_filter(mut self, filter: CaptureFilterFactory) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+}
+
 /// Pure parse+clamp of a raw `CORTI_CAPTURE_RING_SECS` value, factored out so the policy is testable
 /// without mutating the process-global environment. Unset / empty / unparseable → default; in-range →
 /// as given; out-of-range (including 0) → clamped to `[RING_SECONDS_MIN, RING_SECONDS_MAX]`.
@@ -167,6 +231,28 @@ impl OutputLayout {
     }
 }
 
+/// What the optional writer-thread filter did to the retained recording. Higher layers persist this beside
+/// the queue row so retries can distinguish legacy/raw input from already-clean audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFilterDisposition {
+    /// No filter applied (not requested or not meaningful for the selected layout).
+    NotRequested,
+    /// Every retained mic frame came from the filter.
+    Applied,
+    /// The filter failed before it emitted anything; the retained mic is wholly raw and may be cleaned by a
+    /// post-capture fallback without double-processing.
+    RawFallback,
+    /// The filter violated its contract or failed after emitting; the retained mic may contain a cleaned
+    /// prefix and raw remainder, so a second whole-file pass would be unsafe.
+    Degraded,
+}
+
+#[derive(Debug)]
+struct WriterOutcome {
+    frames: u64,
+    filter: CaptureFilterDisposition,
+}
+
 /// Metadata about a finished, streamed recording — the samples are already on disk. Replaces the old
 /// in-memory `CapturedAudio` as the return of [`CaptureSession::stop`].
 #[derive(Debug, Clone)]
@@ -188,6 +274,9 @@ pub struct RecordingHandle {
     /// Live-tee chunks dropped because the consumer fell behind (bounded, lossy by design — never affects the
     /// on-disk WAV). 0 when no [`CaptureTee`] was attached.
     pub tee_dropped_chunks: u64,
+    /// Whether the writer filter fully applied or fell back. [`CaptureFilterDisposition::RawFallback`] is
+    /// safe to recover with a whole-file pass; [`CaptureFilterDisposition::Degraded`] is not.
+    pub filter_disposition: CaptureFilterDisposition,
 }
 
 impl RecordingHandle {
@@ -271,7 +360,7 @@ pub struct CaptureSession {
     state: *mut Cap,
     sample_rate: u32,
     /// The streaming writer thread; joined on `stop`/`Drop` so the file is flushed and finalized.
-    writer: Option<JoinHandle<Result<u64>>>,
+    writer: Option<JoinHandle<Result<WriterOutcome>>>,
     out: PathBuf,
     /// The live-tee dropped-chunk counter, shared with the writer thread; read into [`RecordingHandle`] at
     /// `stop`. `None` when no tee was attached.
@@ -285,7 +374,20 @@ unsafe impl Send for CaptureSession {}
 impl CaptureSession {
     /// Begin capturing `target` + the default mic, streaming `layout` to `out`. Returns once IO has started.
     pub fn start_recording(target: TapTarget, out: PathBuf, layout: OutputLayout) -> Result<Self> {
-        Self::start_inner(target, true, out, layout, None)
+        Self::start_inner(target, true, out, layout, CaptureOptions::default())
+    }
+
+    /// Like [`start_recording`], with an optional live tee and/or in-flight mic filter (see
+    /// [`CaptureOptions`]).
+    ///
+    /// [`start_recording`]: CaptureSession::start_recording
+    pub fn start_recording_with_options(
+        target: TapTarget,
+        out: PathBuf,
+        layout: OutputLayout,
+        options: CaptureOptions,
+    ) -> Result<Self> {
+        Self::start_inner(target, true, out, layout, options)
     }
 
     /// Like [`start_recording`], additionally teeing downmixed chunks to a live consumer. The tee is
@@ -298,7 +400,13 @@ impl CaptureSession {
         layout: OutputLayout,
         tee: CaptureTee,
     ) -> Result<Self> {
-        Self::start_inner(target, true, out, layout, Some(tee))
+        Self::start_inner(
+            target,
+            true,
+            out,
+            layout,
+            CaptureOptions::default().with_tee(tee),
+        )
     }
 
     /// Like [`start_recording`], but **tap-only**: the microphone is never opened (no orange "mic in use"
@@ -312,7 +420,20 @@ impl CaptureSession {
         out: PathBuf,
         layout: OutputLayout,
     ) -> Result<Self> {
-        Self::start_inner(target, false, out, layout, None)
+        Self::start_inner(target, false, out, layout, CaptureOptions::default())
+    }
+
+    /// Like [`start_tap_only_recording`], with an optional live tee (a tap-only capture has no mic, so an
+    /// in-flight mic filter in `options` is ignored).
+    ///
+    /// [`start_tap_only_recording`]: CaptureSession::start_tap_only_recording
+    pub fn start_tap_only_recording_with_options(
+        target: TapTarget,
+        out: PathBuf,
+        layout: OutputLayout,
+        options: CaptureOptions,
+    ) -> Result<Self> {
+        Self::start_inner(target, false, out, layout, options)
     }
 
     /// Like [`start_tap_only_recording`], additionally teeing downmixed chunks (the `mic` side is empty) to a
@@ -325,7 +446,13 @@ impl CaptureSession {
         layout: OutputLayout,
         tee: CaptureTee,
     ) -> Result<Self> {
-        Self::start_inner(target, false, out, layout, Some(tee))
+        Self::start_inner(
+            target,
+            false,
+            out,
+            layout,
+            CaptureOptions::default().with_tee(tee),
+        )
     }
 
     /// Shared start path. The aggregate's clock-leading main sub-device is the default **input** device when
@@ -338,8 +465,9 @@ impl CaptureSession {
         capture_mic: bool,
         out: PathBuf,
         layout: OutputLayout,
-        tee: Option<CaptureTee>,
+        options: CaptureOptions,
     ) -> Result<Self> {
+        let CaptureOptions { tee, filter } = options;
         // 1. Tap.
         let description = unsafe { make_tap_description(&target)? };
         let mut tap_id: ca::AudioObjectID = 0;
@@ -414,7 +542,7 @@ impl CaptureSession {
             let out = out.clone();
             std::thread::Builder::new()
                 .name("corti-capture-writer".into())
-                .spawn(move || run_writer(consumer, shared, out, layout, sample_rate, tee))
+                .spawn(move || run_writer(consumer, shared, out, layout, sample_rate, tee, filter))
                 .context("spawning capture writer thread")?
         };
 
@@ -456,7 +584,10 @@ impl CaptureSession {
         self.state = std::ptr::null_mut();
         let writer_result = match self.writer.take() {
             Some(h) => h.join(),
-            None => Ok(Ok(0)),
+            None => Ok(Ok(WriterOutcome {
+                frames: 0,
+                filter: CaptureFilterDisposition::NotRequested,
+            })),
         };
         // Tear down the CoreAudio objects regardless of the writer's fate.
         unsafe {
@@ -475,18 +606,19 @@ impl CaptureSession {
         let sample_rate = self.sample_rate;
         std::mem::forget(self);
 
-        let frames = writer_result
+        let writer = writer_result
             .map_err(|_| anyhow!("capture writer thread panicked"))?
             .context("streaming recording to disk")?;
         Ok(RecordingHandle {
             path: out,
-            frames,
+            frames: writer.frames,
             sample_rate,
             mic_channels: mic,
             tap_channels: total - mic,
             callbacks,
             dropped_samples: dropped,
             tee_dropped_chunks,
+            filter_disposition: writer.filter,
         })
     }
 }
@@ -836,11 +968,214 @@ fn send_microphone_chunk(tee: &CaptureTee, mic: &mut Vec<f32>) {
     }
 }
 
+/// Writer-thread state for the in-flight mic filter (#74): the block being staged for the next
+/// [`CaptureFilter::push`], and the far-end ("them") samples waiting for their cleaned mic partner.
+///
+/// A filter's output lags its input by the warm-up/lookahead window, so each frame has to be queued until
+/// its cleaned mic partner arrives. **Those queues are the entire memory cost of running the canceller
+/// here**: neither exceeds the filter's lookahead plus one staged block (≈2 MB for the pair at the 5 s
+/// default, 48 kHz) and both are independent of call length.
+const MAX_FILTER_BACKLOG_SECONDS: usize = 35;
+
+struct FilterStage {
+    /// `None` once [`FilterStage::finish`] has consumed it — or once it failed and was dropped.
+    filter: Option<Box<dyn CaptureFilter>>,
+    mic: Vec<f32>,
+    far: Vec<f32>,
+    tap_pending: VecDeque<f32>,
+    /// Raw mic, queued in lockstep with `tap_pending`. Read only after degradation: the filter's withheld
+    /// state dies with it, so this mirror lets those frames be written raw instead of lost.
+    mic_pending: VecDeque<f32>,
+    /// Declared filter lag, clamped to a hard 35-second ceiling. Checked after every bounded push.
+    max_pending: usize,
+    degraded: bool,
+    clean_frames: u64,
+    /// Clean samples dropped because the filter emitted more than it was fed (a contract violation).
+    over_emitted: u64,
+}
+
+impl FilterStage {
+    fn new(filter: Box<dyn CaptureFilter>, sample_rate: u32) -> Self {
+        let declared = filter.max_output_lag_samples();
+        let bounded_rate = (sample_rate as usize).clamp(8_000, 192_000);
+        let hard = bounded_rate
+            .saturating_mul(MAX_FILTER_BACKLOG_SECONDS)
+            .max(FILTER_FRAMES_PER_CHUNK);
+        let max_pending = declared.min(hard).saturating_add(FILTER_FRAMES_PER_CHUNK);
+        if declared > hard {
+            eprintln!(
+                "corti-capture: capture filter declared {declared} samples of lag; clamped to {hard}"
+            );
+        }
+        Self {
+            filter: Some(filter),
+            mic: Vec::with_capacity(FILTER_FRAMES_PER_CHUNK),
+            far: Vec::with_capacity(FILTER_FRAMES_PER_CHUNK),
+            tap_pending: VecDeque::new(),
+            mic_pending: VecDeque::new(),
+            max_pending,
+            degraded: false,
+            clean_frames: 0,
+            over_emitted: 0,
+        }
+    }
+
+    /// Stage one downmixed frame. `them` is both the echo reference and the passthrough ch1 (ADR 0007
+    /// Decision 2: only `me` is cleaned).
+    fn stage(&mut self, me: f32, them: f32) {
+        self.mic.push(me);
+        self.far.push(them);
+        self.tap_pending.push_back(them);
+        self.mic_pending.push_back(me);
+    }
+
+    fn is_full(&self) -> bool {
+        self.mic.len() >= FILTER_FRAMES_PER_CHUNK
+    }
+
+    /// Cancellation quality is forfeit, the recording is not. Everything still pending and every later
+    /// frame is written raw; the final disposition records whether a cleaned prefix already escaped.
+    fn degrade(&mut self, reason: &str) {
+        self.filter = None;
+        if !self.degraded {
+            eprintln!(
+                "corti-capture: capture filter {reason} — recording pending and later audio uncancelled"
+            );
+        }
+        self.degraded = true;
+    }
+
+    /// Write `clean` paired with the queued tap. Stops early if the filter ran ahead of its input; the
+    /// surplus is dropped and marks the stream degraded rather than corrupting channel alignment.
+    fn emit<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        writer: &mut hound::WavWriter<W>,
+        clean: &[f32],
+    ) -> Result<u64, hound::Error> {
+        let mut frames = 0u64;
+        for &me in clean {
+            let Some(them) = self.tap_pending.pop_front() else {
+                let dropped = clean.len() as u64 - frames;
+                self.over_emitted += dropped;
+                break;
+            };
+            self.mic_pending.pop_front();
+            writer.write_sample(me)?; // ch0 = cleaned me
+            writer.write_sample(them)?; // ch1 = them, untouched
+            frames += 1;
+        }
+        self.clean_frames += frames;
+        Ok(frames)
+    }
+
+    /// Degraded mode: write the queued frames straight through, mic uncancelled.
+    fn drain_raw<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        writer: &mut hound::WavWriter<W>,
+    ) -> Result<u64, hound::Error> {
+        let mut frames = 0;
+        while let Some(them) = self.tap_pending.pop_front() {
+            writer.write_sample(self.mic_pending.pop_front().unwrap_or(0.0))?;
+            writer.write_sample(them)?;
+            frames += 1;
+        }
+        Ok(frames)
+    }
+
+    /// Push one bounded staged block. Panics, over-emission, or backlog beyond the declared/hard bound all
+    /// fail open to raw without escaping the writer thread or allowing call-length growth.
+    fn flush<W: std::io::Write + std::io::Seek>(
+        &mut self,
+        writer: &mut hound::WavWriter<W>,
+    ) -> Result<u64, hound::Error> {
+        if self.mic.is_empty() {
+            return Ok(0);
+        }
+        let clean = match self.filter.take() {
+            Some(mut filter) => {
+                let pushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    filter.push(&self.mic, &self.far)
+                }));
+                match pushed {
+                    Ok(clean) => {
+                        self.filter = Some(filter);
+                        clean
+                    }
+                    Err(_) => {
+                        self.degrade("panicked during push");
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        self.mic.clear();
+        self.far.clear();
+        let mut frames = if self.degraded {
+            self.drain_raw(writer)?
+        } else {
+            self.emit(writer, &clean)?
+        };
+        if !self.degraded && self.over_emitted > 0 {
+            self.degrade("emitted more samples than it was fed");
+        }
+        if !self.degraded && self.tap_pending.len() > self.max_pending {
+            self.degrade("exceeded its declared output-lag bound");
+        }
+        if self.degraded {
+            frames += self.drain_raw(writer)?;
+        }
+        Ok(frames)
+    }
+
+    /// Flush the partial block and filter tail. Any samples still withheld after `finish` violate the
+    /// contract and are restored from the raw mirror rather than padded with destructive silence.
+    fn finish<W: std::io::Write + std::io::Seek>(
+        mut self,
+        writer: &mut hound::WavWriter<W>,
+    ) -> Result<(u64, CaptureFilterDisposition), hound::Error> {
+        let mut frames = self.flush(writer)?;
+        if let Some(filter) = self.filter.take() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter.finish())) {
+                Ok(tail) => frames += self.emit(writer, &tail)?,
+                Err(_) => self.degrade("panicked during finish"),
+            }
+        }
+        if !self.degraded && self.over_emitted > 0 {
+            self.degrade("emitted more samples than it was fed");
+        }
+        if !self.degraded && !self.tap_pending.is_empty() {
+            self.degrade("withheld samples after finish");
+        }
+        if self.degraded {
+            frames += self.drain_raw(writer)?;
+        }
+        if self.over_emitted > 0 {
+            eprintln!(
+                "corti-capture: capture filter over-emitted {} samples in total",
+                self.over_emitted
+            );
+        }
+        let disposition = if !self.degraded {
+            CaptureFilterDisposition::Applied
+        } else if self.clean_frames == 0 {
+            CaptureFilterDisposition::RawFallback
+        } else {
+            CaptureFilterDisposition::Degraded
+        };
+        Ok((frames, disposition))
+    }
+}
+
 /// The streaming writer thread: drain the ring, downmix each interleaved frame per `layout`, and write it to
-/// `out` incrementally — lossless 32-bit float for the 2-track AEC input, 16-bit PCM for the tap-only /
+/// `out` incrementally — lossless 32-bit float for the 2-track recording, 16-bit PCM for the tap-only /
 /// diagnostic layouts. Returns the number of output frames written. Creates the file lazily — only
 /// once the first callback has revealed the channel layout — so a permission-denied run (no callbacks) leaves
 /// no file behind.
+///
+/// With a `filter` (#74) the mic is echo-cancelled here, block by block, and only the cleaned 2-track is
+/// encoded. Nothing on this thread is sized by recording length; a filter failure is dropped and pending/
+/// later audio is written uncancelled with a durable raw/degraded disposition — never silently lost.
 fn run_writer(
     mut consumer: rtrb::Consumer<f32>,
     shared: Arc<Shared>,
@@ -848,7 +1183,8 @@ fn run_writer(
     layout: OutputLayout,
     sample_rate: u32,
     tee: Option<CaptureTee>,
-) -> Result<u64> {
+    filter: Option<CaptureFilterFactory>,
+) -> Result<WriterOutcome> {
     // Wait for the first callback to publish the channel layout (Acquire pairs with the io proc's Release
     // store of `total_channels`), or for end-of-stream (producer dropped ⇒ no audio ⇒ no file).
     let total = loop {
@@ -857,7 +1193,10 @@ fn run_writer(
             break t;
         }
         if consumer.is_abandoned() {
-            return Ok(0); // no audio ever delivered — no file
+            return Ok(WriterOutcome {
+                frames: 0,
+                filter: CaptureFilterDisposition::NotRequested,
+            }); // no audio ever delivered — no file
         }
         std::thread::sleep(Duration::from_millis(5));
     };
@@ -865,10 +1204,35 @@ fn run_writer(
     let tap = total.saturating_sub(mic);
     let out_channels = layout.out_channels(mic as u32, tap as u32);
 
-    // The 2-track recording is the **AEC input** (ADR 0007 §1/§2: the streaming canceller runs over this
-    // lossless 2-track post-capture). Writing it as 32-bit float preserves the bit-exact mic + mono echo
-    // reference the adaptive filter needs — quantizing here would impose an ERLE ceiling (ADR 0007 Context).
-    // The tap-only / diagnostic layouts carry no mic, so they are never an AEC input and stay compact 16-bit.
+    // Only the 2-track layout has a mic to clean and a far end to clean it against (ADR 0007 §2). Factory
+    // construction is contained too: configuration/FFT setup must fail open just like push/finish.
+    let mut filter_disposition = CaptureFilterDisposition::NotRequested;
+    let mut filter_stage = match filter {
+        Some(make) if matches!(layout, OutputLayout::TwoTrack) && mic > 0 => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                FilterStage::new(make(sample_rate), sample_rate)
+            })) {
+                Ok(stage) => Some(stage),
+                Err(_) => {
+                    eprintln!(
+                        "corti-capture: capture filter panicked during construction — recording raw"
+                    );
+                    filter_disposition = CaptureFilterDisposition::RawFallback;
+                    None
+                }
+            }
+        }
+        Some(_) => {
+            eprintln!("corti-capture: ignoring capture filter — layout carries no mic");
+            None
+        }
+        None => None,
+    };
+
+    // The 2-track recording carries the mic (ADR 0007 §1/§2). Writing it as 32-bit float preserves the
+    // bit-exact mic + mono echo reference the adaptive filter needs — quantizing before the filter would
+    // impose an ERLE ceiling (ADR 0007 Context), and quantizing after would lose cleaned-signal headroom.
+    // The tap-only / diagnostic layouts carry no mic, so they are never filtered and stay compact 16-bit.
     let (bits_per_sample, sample_format) = match layout {
         OutputLayout::TwoTrack => (32, hound::SampleFormat::Float),
         OutputLayout::TapOnlyMono | OutputLayout::AllChannels => (16, hound::SampleFormat::Int),
@@ -905,9 +1269,22 @@ fn run_writer(
         for &s in a.iter().chain(b.iter()) {
             frame.push(s);
             if frame.len() == total {
-                write_frame(&mut writer, &frame, layout, mic, total)
-                    .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
-                frames_written += 1;
+                if let Some(stage) = &mut filter_stage {
+                    stage.stage(
+                        frame_mean(&frame, 0, mic),
+                        frame_mean(&frame, mic, total - mic),
+                    );
+                    if stage.is_full() {
+                        frames_written += stage
+                            .flush(&mut writer)
+                            .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
+                    }
+                } else {
+                    write_frame(&mut writer, &frame, layout, mic, total)
+                        .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
+                    frames_written += 1;
+                }
+                // The tee carries the **raw** downmix regardless: its consumer runs its own processing.
                 if let Some(t) = &tee {
                     if mic > 0 {
                         tee_mic.push(frame_mean(&frame, 0, mic));
@@ -926,11 +1303,22 @@ fn run_writer(
     if let Some(t) = &tee {
         send_tee_chunk(t, &mut tee_mic, &mut tee_tap);
     }
+    // Drain the filter's lookahead/tail so the file holds every captured frame.
+    if let Some(stage) = filter_stage.take() {
+        let (frames, disposition) = stage
+            .finish(&mut writer)
+            .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
+        frames_written += frames;
+        filter_disposition = disposition;
+    }
     // A trailing partial frame (incomplete) is discarded.
     writer
         .finalize()
         .map_err(|e| anyhow!("finalizing {}: {e}", out.display()))?;
-    Ok(frames_written)
+    Ok(WriterOutcome {
+        frames: frames_written,
+        filter: filter_disposition,
+    })
 }
 
 /// Hand the accumulated downmixed chunk to the tee consumer, non-blocking. On a full or hung-up channel the
@@ -1239,16 +1627,18 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("two-track.wav");
-        let n = run_writer(
+        let outcome = run_writer(
             consumer,
             shared,
             out.clone(),
             OutputLayout::TwoTrack,
             48_000,
             None,
+            None,
         )
         .unwrap();
-        assert_eq!(n, 3, "three output frames");
+        assert_eq!(outcome.frames, 3, "three output frames");
+        assert_eq!(outcome.filter, CaptureFilterDisposition::NotRequested);
 
         let mut r = hound::WavReader::open(&out).unwrap();
         let spec = r.spec();
@@ -1284,16 +1674,18 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-tap-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("tap.wav");
-        let n = run_writer(
+        let outcome = run_writer(
             consumer,
             shared,
             out.clone(),
             OutputLayout::TapOnlyMono,
             48_000,
             None,
+            None,
         )
         .unwrap();
-        assert_eq!(n, 2);
+        assert_eq!(outcome.frames, 2);
+        assert_eq!(outcome.filter, CaptureFilterDisposition::NotRequested);
 
         let mut r = hound::WavReader::open(&out).unwrap();
         assert_eq!(r.spec().channels, 1);
@@ -1319,17 +1711,384 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-writer-empty-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("none.wav");
-        let n = run_writer(
+        let outcome = run_writer(
             consumer,
             shared,
             out.clone(),
             OutputLayout::TwoTrack,
             48_000,
             None,
+            None,
         )
         .unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(outcome.frames, 0);
         assert!(!out.exists(), "no audio ⇒ no file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stand-in for `StreamingAec`: "cleans" the mic by subtracting the far end, and reproduces the one
+    /// property the writer has to cope with — output lags input by `lag` samples, with the backlog released
+    /// by `finish`. Total emitted equals total pushed.
+    struct LaggingFilter {
+        lag: usize,
+        pending: VecDeque<f32>,
+    }
+
+    impl CaptureFilter for LaggingFilter {
+        fn max_output_lag_samples(&self) -> usize {
+            self.lag
+        }
+
+        fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+            for (m, f) in mic.iter().zip(far) {
+                self.pending.push_back(m - f);
+            }
+            let ready = self.pending.len().saturating_sub(self.lag);
+            self.pending.drain(..ready).collect()
+        }
+
+        fn finish(self: Box<Self>) -> Vec<f32> {
+            self.pending.into_iter().collect()
+        }
+    }
+
+    /// #74: with a filter installed the writer emits *cleaned* mic on ch0 and the **untouched** tap on ch1,
+    /// frame-for-frame — across chunk boundaries and through the lookahead backlog that `finish` releases.
+    #[test]
+    fn writer_runs_filter_in_flight_over_two_track() {
+        // Two chunks' worth plus a remainder, so both the mid-stream flush and the final drain run.
+        let frames = 2 * FILTER_FRAMES_PER_CHUNK + 97;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(3 * frames + 16);
+        let mic = |i: usize| (i % 7) as f32 / 8.0;
+        let far = |i: usize| (i % 5) as f32 / 16.0;
+        for i in 0..frames {
+            producer.push(mic(i)).unwrap();
+            // Two tap channels that average to far(i).
+            producer.push(far(i) - 0.125).unwrap();
+            producer.push(far(i) + 0.125).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(3),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("clean.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| {
+                Box::new(LaggingFilter {
+                    lag: 1_000,
+                    pending: VecDeque::new(),
+                })
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.frames as usize, frames,
+            "filtering preserves the frame count"
+        );
+        assert_eq!(outcome.filter, CaptureFilterDisposition::Applied);
+
+        let mut r = hound::WavReader::open(&out).unwrap();
+        assert_eq!(r.spec().channels, 2);
+        let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got.len(), 2 * frames);
+        for i in 0..frames {
+            assert_eq!(got[2 * i], mic(i) - far(i), "ch0 frame {i} is cleaned");
+            assert_eq!(got[2 * i + 1], far(i), "ch1 frame {i} is the raw tap");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A filter that violates its finish contract falls back to the mirrored raw mic: no silence insertion,
+    /// no lost tap, and the disposition makes a safe post-capture retry possible.
+    #[test]
+    fn writer_restores_raw_when_filter_withholds_output() {
+        struct Silent;
+        impl CaptureFilter for Silent {
+            fn max_output_lag_samples(&self) -> usize {
+                FILTER_FRAMES_PER_CHUNK
+            }
+
+            fn push(&mut self, _mic: &[f32], _far: &[f32]) -> Vec<f32> {
+                Vec::new()
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                Vec::new()
+            }
+        }
+
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        for fr in &[[1.0f32, 0.25, 0.75], [-1.0, 0.5, 1.0]] {
+            for &s in fr {
+                producer.push(s).unwrap();
+            }
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(3),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-silent-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("silent.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| Box::new(Silent))),
+        )
+        .unwrap();
+        assert_eq!(outcome.frames, 2);
+        assert_eq!(outcome.filter, CaptureFilterDisposition::RawFallback);
+
+        let mut r = hound::WavReader::open(&out).unwrap();
+        let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got, vec![1.0, 0.5, -1.0, 0.75]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writer_falls_back_to_raw_when_filter_factory_panics() {
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        for &sample in &[0.75f32, 0.25, -0.5, 0.5] {
+            producer.push(sample).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-factory-panic-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("raw.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| panic!("factory boom"))),
+        )
+        .unwrap();
+        assert_eq!(outcome.frames, 2);
+        assert_eq!(outcome.filter, CaptureFilterDisposition::RawFallback);
+        let mut reader = hound::WavReader::open(&out).unwrap();
+        let got: Vec<f32> = reader.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got, vec![0.75, 0.25, -0.5, 0.5]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writer_enforces_declared_filter_backlog_bound() {
+        struct NeverEmits;
+        impl CaptureFilter for NeverEmits {
+            fn max_output_lag_samples(&self) -> usize {
+                0
+            }
+            fn push(&mut self, _mic: &[f32], _far: &[f32]) -> Vec<f32> {
+                Vec::new()
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                Vec::new()
+            }
+        }
+
+        let frames = 3 * FILTER_FRAMES_PER_CHUNK;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(2 * frames + 16);
+        for _ in 0..frames {
+            producer.push(0.75).unwrap();
+            producer.push(0.25).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-filter-bound-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("bounded.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| Box::new(NeverEmits))),
+        )
+        .unwrap();
+        assert_eq!(outcome.frames as usize, frames);
+        assert_eq!(outcome.filter, CaptureFilterDisposition::RawFallback);
+        assert_eq!(
+            hound::WavReader::open(&out).unwrap().duration() as usize,
+            frames
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A panicking filter must cost cancellation quality, never the recording: the frames it was still
+    /// withholding are written raw from the mirror queue, every later frame passes straight through, and the
+    /// frame count is unchanged.
+    #[test]
+    fn writer_falls_back_to_raw_when_filter_panics() {
+        /// Lags like the real canceller, then panics on its second block.
+        struct PanicOnSecondPush {
+            pushes: usize,
+            pending: VecDeque<f32>,
+        }
+        impl CaptureFilter for PanicOnSecondPush {
+            fn max_output_lag_samples(&self) -> usize {
+                1_000
+            }
+
+            fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+                self.pushes += 1;
+                assert!(self.pushes < 2, "boom");
+                for (m, f) in mic.iter().zip(far) {
+                    self.pending.push_back(m - f);
+                }
+                let ready = self.pending.len().saturating_sub(1_000);
+                self.pending.drain(..ready).collect()
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                unreachable!("dropped by the panic before finish")
+            }
+        }
+
+        let frames = FILTER_FRAMES_PER_CHUNK + 500;
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(2 * frames + 16);
+        let mic = |i: usize| (i % 11) as f32 / 16.0;
+        let far = |i: usize| (i % 3) as f32 / 4.0;
+        for i in 0..frames {
+            producer.push(mic(i)).unwrap();
+            producer.push(far(i)).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(1),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: true,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-panic-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("degraded.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TwoTrack,
+            48_000,
+            None,
+            Some(Box::new(|_rate| {
+                Box::new(PanicOnSecondPush {
+                    pushes: 0,
+                    pending: VecDeque::new(),
+                })
+            })),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.frames as usize, frames,
+            "a filter panic loses no frames"
+        );
+        assert_eq!(outcome.filter, CaptureFilterDisposition::Degraded);
+
+        // The first push emitted all but its 1000-sample backlog; everything after that is raw.
+        let cleaned = FILTER_FRAMES_PER_CHUNK - 1_000;
+        let mut r = hound::WavReader::open(&out).unwrap();
+        let got: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got.len(), 2 * frames);
+        for i in 0..frames {
+            let want = if i < cleaned { mic(i) - far(i) } else { mic(i) };
+            assert_eq!(got[2 * i], want, "ch0 frame {i}");
+            assert_eq!(got[2 * i + 1], far(i), "ch1 frame {i}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A layout with no mic channel carries no echo reference, so the filter is dropped rather than fed
+    /// garbage — the tap-only WAV is written exactly as it would be without one.
+    #[test]
+    fn writer_ignores_filter_without_mic() {
+        struct Boom;
+        impl CaptureFilter for Boom {
+            fn max_output_lag_samples(&self) -> usize {
+                0
+            }
+
+            fn push(&mut self, _mic: &[f32], _far: &[f32]) -> Vec<f32> {
+                unreachable!("filter must not run without a mic channel")
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                unreachable!("filter must not run without a mic channel")
+            }
+        }
+
+        let (mut producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        for &s in &[0.5f32, 1.0] {
+            producer.push(s).unwrap();
+        }
+        let shared = Arc::new(Shared {
+            total_channels: AtomicU32::new(2),
+            mic_channels: AtomicU32::new(0),
+            callbacks: AtomicU32::new(1),
+            dropped: AtomicU64::new(0),
+            has_mic: false,
+        });
+        drop(producer);
+
+        let dir = std::env::temp_dir().join("corti-writer-nomic-filter-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("tap.wav");
+        let outcome = run_writer(
+            consumer,
+            shared,
+            out.clone(),
+            OutputLayout::TapOnlyMono,
+            48_000,
+            None,
+            Some(Box::new(|_rate| Box::new(Boom))),
+        )
+        .unwrap();
+        assert_eq!(outcome.frames, 1);
+        assert_eq!(outcome.filter, CaptureFilterDisposition::NotRequested);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1401,16 +2160,17 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-tee-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("tee.wav");
-        let n = run_writer(
+        let outcome = run_writer(
             consumer,
             shared,
             out.clone(),
             OutputLayout::TwoTrack,
             48_000,
             Some(tee),
+            None,
         )
         .unwrap();
-        assert_eq!(n as usize, frames);
+        assert_eq!(outcome.frames as usize, frames);
 
         let mut got_mic = 0usize;
         let mut got_tap = 0usize;
@@ -1494,17 +2254,18 @@ mod tests {
         let dir = std::env::temp_dir().join("corti-tee-drop-test");
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("tee-drop.wav");
-        let n = run_writer(
+        let outcome = run_writer(
             consumer,
             shared,
             out.clone(),
             OutputLayout::TapOnlyMono,
             48_000,
             Some(tee),
+            None,
         )
         .unwrap();
         assert_eq!(
-            n as usize, frames,
+            outcome.frames as usize, frames,
             "writer wrote every frame despite tee drops"
         );
         // 5 chunks produced, channel holds 1 → at least 3 dropped (the undrained receiver still holds 1).

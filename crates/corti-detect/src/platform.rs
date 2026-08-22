@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Local;
-use corti_capture::Recorder;
+use corti_capture::{FinishedRecording, Recorder, RecordingOptions};
 use corti_core::RecordingMeta;
 use corti_coreaudio::{DefaultInputDeviceMonitor, MicMonitor, mic_owner, other_app_holds_input};
 
@@ -44,6 +44,12 @@ pub trait LiveHook: Send + 'static {
     /// best-effort owning-app attribution (the full [`RecordingMeta`] doesn't exist yet — the recorder
     /// chooses the output path).
     fn attach(&self, app: &corti_core::OwningApp) -> Option<corti_capture::CaptureTee>;
+    /// Echo-cancellation settings for this recording, or `None` to record unfiltered. Consulted at every
+    /// start (independently of [`attach`](Self::attach)) so a settings change applies to the next call.
+    /// With `Some`, the capture writer thread cleans the mic in-flight and no raw mic reaches disk (#74).
+    fn aec_config(&self) -> Option<corti_capture::AecConfig> {
+        None
+    }
     /// Capture started with the tee attached: the definitive meta (with `audio_path`) plus the capture
     /// sample rate (to size a resampler/AEC). Only called when [`attach`](Self::attach) returned `Some`.
     fn started(&self, meta: &RecordingMeta, sample_rate: u32);
@@ -167,13 +173,17 @@ impl Drop for Detector {
 fn deliver_finished(
     live: Option<&dyn LiveHook>,
     meta: RecordingMeta,
-    audio_path: std::path::PathBuf,
+    finished: FinishedRecording,
     emit: impl FnOnce(DetectorEvent),
 ) {
     if let Some(hook) = live {
         hook.finished(&meta);
     }
-    emit(DetectorEvent::RecordingFinished { meta, audio_path });
+    emit(DetectorEvent::RecordingFinished {
+        meta,
+        audio_path: finished.path,
+        capture_processing: finished.processing,
+    });
 }
 
 /// Deliver the live discard verdict before exposing the corresponding terminal event.
@@ -330,10 +340,16 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 // captures it at session creation), so `attach` runs on the incomplete attribution.
                 let tee = self.live.as_ref().and_then(|h| h.attach(&owner.app));
                 let live_attached = tee.is_some();
-                let started = match tee {
-                    Some(tee) => Recorder::start_with_tee(&owner.app, owner.pid, tee),
-                    None => Recorder::start(&owner.app, owner.pid),
-                };
+                let aec = self.live.as_ref().and_then(|h| h.aec_config());
+                let aec_enabled = aec.is_some();
+                let mut options = RecordingOptions::default();
+                if let Some(tee) = tee {
+                    options = options.with_tee(tee);
+                }
+                if let Some(cfg) = aec {
+                    options = options.with_aec(cfg);
+                }
+                let started = Recorder::start_with(&owner.app, owner.pid, options);
                 match started {
                     Ok(recorder) => {
                         let meta = RecordingMeta {
@@ -348,6 +364,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             pid = owner.pid,
                             started_at = %meta.started_at,
                             live = live_attached,
+                            aec = aec_enabled,
                             path = %meta.audio_path.display(),
                             "call started — recording"
                         );
@@ -392,8 +409,8 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                     deliver_discarded(self.live.as_deref(), meta, |event| self.emit(event));
                     return;
                 }
-                match recorder.finish() {
-                    Ok(audio_path) => {
+                match recorder.finish_with_processing() {
+                    Ok(finished) => {
                         // ended_at = start + the mic-open span (a monotonic delta mapped onto the wall
                         // clock). This is the span up to the last mic-off, excluding the coalesce tail, so
                         // it agrees with the `keep` decision; the written WAV may be a hair longer.
@@ -404,12 +421,12 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                             app = %meta.owning_app.name,
                             duration_secs = duration.as_secs_f64(),
                             kept = true,
-                            path = %audio_path.display(),
+                            path = %finished.path.display(),
                             "call ended — recording kept"
                         );
                         // Deliver the recording-specific live verdict before the event callback can queue
                         // `Process` behind unrelated serial pipeline work.
-                        deliver_finished(self.live.as_deref(), meta, audio_path, |event| {
+                        deliver_finished(self.live.as_deref(), meta, finished, |event| {
                             self.emit(event);
                         });
                     }
@@ -487,7 +504,10 @@ mod tests {
         deliver_finished(
             Some(&hook),
             meta(),
-            PathBuf::from("/tmp/corti-ordering.wav"),
+            FinishedRecording {
+                path: PathBuf::from("/tmp/corti-ordering.wav"),
+                processing: corti_capture::CaptureProcessing::disabled(),
+            },
             move |event| {
                 assert!(matches!(event, DetectorEvent::RecordingFinished { .. }));
                 finish_order.lock().unwrap().push("finished event");

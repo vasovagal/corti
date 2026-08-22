@@ -1459,6 +1459,7 @@ dependencies = [
  "corti-coreaudio",
  "dirs",
  "hound",
+ "serde",
  "tracing",
 ]
 

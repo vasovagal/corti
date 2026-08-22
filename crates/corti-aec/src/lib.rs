@@ -23,14 +23,16 @@
 pub mod score;
 pub mod streaming;
 
-pub use streaming::StreamingAec;
+pub use streaming::{StreamingAec, configured_lookahead_seconds, lookahead_samples_for};
 
 use rustfft::num_complex::Complex;
 
 type Cf = Complex<f32>;
 
-/// NLMS configuration.
-#[derive(Debug, Clone)]
+/// NLMS configuration. Serialized into the durable capture-processing record so retries and provenance use
+/// the exact settings that produced the retained audio rather than whatever Settings contains later.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct AecConfig {
     /// Adaptive-filter length in taps. Default `8192` (≈ 170 ms at 48 kHz), benchmark-tuned up from 4096:
     /// the real captured room IR has a ~400 ms reverb tail that a 4096-tap (≈ 85 ms) filter under-models, so

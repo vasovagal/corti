@@ -35,14 +35,13 @@ threads push events and PCM, which hop onto worker threads over an `rtrb` ring (
    mic+tap PCM ──push────►│   │   push f32 ──► rtrb ring ──────► │       │  │     — filing) │
    (aggregate device)     │   │              (SPSC, drop-full)   │       │  └─► Backend     │
                           │   │   corti-capture-writer thread ◄──┘       │      .transcribe │
-                          │   │   drains ring ──► hound ──► 2-track WAV   │      (blocking)  │
+                          │   │   drains ring ──► AEC ──► hound ──► WAV   │      (blocking)  │
                           │   └───────│──────────────────────────┘       │                 │
                           │           │ try_send (bounded lossy CaptureTee, #87)            │
                           │           ▼                                                     │
                           │   corti-live thread (one per recording, when live filing is on) │
                           │     StreamingAec → 2× LiveTranscriber (CPU or Metal) → checkpoint│
                           │     → optional bounded diarize → append + sync_all; final flip   │
-                          │                                    write_clean_wav (offline AEC)│
                           └──────────────────────────────────────────────────────────────┘
 ```
 

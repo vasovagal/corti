@@ -45,15 +45,26 @@ const LEAK: f32 = 1e-5;
 /// Spectral floor for residual suppression (−40 dB) — identical to the offline `suppression_pass` constant.
 const SUPPRESS_FLOOR: f32 = 0.01;
 
-/// Read + clamp + round the lookahead window to a whole number of blocks of size `b`.
-fn lookahead_samples_from_env(sample_rate: u32, b: usize) -> usize {
-    let secs = std::env::var("CORTI_AEC_LOOKAHEAD_SECS")
+/// Read and clamp the effective lookahead once. Capture stores this value beside its AEC settings so a
+/// retry or provenance record cannot drift when the process environment changes later.
+pub fn configured_lookahead_seconds() -> f32 {
+    std::env::var("CORTI_AEC_LOOKAHEAD_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|v| v.is_finite())
         .unwrap_or(DEFAULT_LOOKAHEAD_SECS)
-        .clamp(LOOKAHEAD_SECS_MIN, LOOKAHEAD_SECS_MAX);
-    let raw = (secs * sample_rate as f32).round() as usize;
+        .clamp(LOOKAHEAD_SECS_MIN, LOOKAHEAD_SECS_MAX)
+}
+
+/// Convert a clamped lookahead duration to the exact whole-block sample count used by the filter.
+pub fn lookahead_samples_for(sample_rate: u32, filter_len: usize, seconds: f32) -> usize {
+    let b = filter_len.max(1);
+    let seconds = if seconds.is_finite() {
+        seconds.clamp(LOOKAHEAD_SECS_MIN, LOOKAHEAD_SECS_MAX)
+    } else {
+        DEFAULT_LOOKAHEAD_SECS
+    };
+    let raw = (seconds * sample_rate as f32).round() as usize;
     round_up_to_block(raw, b)
 }
 
@@ -128,8 +139,14 @@ impl StreamingAec {
     /// Build a streaming canceller. The lookahead window defaults from `CORTI_AEC_LOOKAHEAD_SECS` (or
     /// `DEFAULT_LOOKAHEAD_SECS`), clamped and rounded up to a whole multiple of the block size.
     pub fn new(sample_rate: u32, cfg: AecConfig) -> Self {
-        let b = cfg.filter_len.max(1);
-        let lookahead = lookahead_samples_from_env(sample_rate, b);
+        let seconds = configured_lookahead_seconds();
+        Self::new_with_lookahead_seconds(sample_rate, cfg, seconds)
+    }
+
+    /// Build a streaming canceller with a lookahead duration captured by the caller. Unlike [`new`](Self::new),
+    /// this never re-reads the environment, which keeps the writer and its durable processing record exact.
+    pub fn new_with_lookahead_seconds(sample_rate: u32, cfg: AecConfig, seconds: f32) -> Self {
+        let lookahead = lookahead_samples_for(sample_rate, cfg.filter_len, seconds);
         Self::build(sample_rate, cfg, lookahead)
     }
 
@@ -139,6 +156,12 @@ impl StreamingAec {
         let b = cfg.filter_len.max(1);
         let lookahead = round_up_to_block(lookahead_samples, b);
         Self::build(sample_rate, cfg, lookahead)
+    }
+
+    /// Maximum number of pushed samples that may legitimately be awaiting output. Callers can use this to
+    /// enforce a hard bound around a generic streaming-filter seam.
+    pub fn max_output_lag_samples(&self) -> usize {
+        self.lookahead_samples.saturating_add(self.b)
     }
 
     fn build(sample_rate: u32, cfg: AecConfig, lookahead_samples: usize) -> Self {

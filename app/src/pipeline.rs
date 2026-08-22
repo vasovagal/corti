@@ -93,6 +93,7 @@ pub enum PipelineMsg {
     Process {
         meta: RecordingMeta,
         audio_path: PathBuf,
+        capture_processing: corti_capture::CaptureProcessing,
     },
     /// The Recording Queue window's Retry button: reset a `Failed` recording and re-run it with a
     /// fresh attempt budget (a deliberate user action earns one).
@@ -137,9 +138,6 @@ pub(crate) struct Ctx {
     /// pipeline at startup.
     vagus: Result<Vagus, String>,
     backend: Backend,
-    /// Whether to clean speaker bleed (offline AEC) before transcribing. Captured from config at startup.
-    aec_enabled: bool,
-    aec_config: corti_aec::AecConfig,
     pub(crate) app: AppHandle,
     /// Clone of the managed stats buffer; the worker records coarse stage wall-clock here.
     stats: crate::stats::StatsBuffer,
@@ -181,18 +179,13 @@ pub fn run(
         warn!(target: "corti::pipeline", error = %e, "vagus not available — notes can't be filed");
     }
 
-    // Snapshot the shared config to build the initial backend. Capture the AEC toggle before `Backend::init`
-    // consumes the snapshot.
+    // Snapshot the shared config to build the initial backend.
     let cfg = config.lock().unwrap().clone();
-    let aec_enabled = cfg.aec_enabled;
-    let aec_config = cfg.aec_config();
     let backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     let mut ctx = Ctx {
         queue,
         vagus,
         backend: Backend::init(cfg),
-        aec_enabled,
-        aec_config,
         app,
         stats,
         backend_label,
@@ -267,7 +260,11 @@ pub fn run(
     // thread — a job mid-run delays the next message exactly like a long transcription always has.
     loop {
         match rx.recv_timeout(next_wake(&ctx)) {
-            Ok(PipelineMsg::Process { meta, audio_path }) => match ctx.queue.enqueue(&meta) {
+            Ok(PipelineMsg::Process {
+                meta,
+                audio_path,
+                capture_processing,
+            }) => match enqueue_captured(&ctx.queue, &meta, &capture_processing) {
                 Ok(id) => {
                     info!(
                         target: "corti::pipeline",
@@ -425,6 +422,17 @@ pub fn run(
         import_hosted_outbox(&ctx);
         drain_due_jobs(&mut ctx);
     }
+}
+
+fn enqueue_captured(
+    queue: &Queue,
+    meta: &RecordingMeta,
+    processing: &corti_capture::CaptureProcessing,
+) -> Result<String> {
+    processing.validate()?;
+    let json =
+        serde_json::to_string(processing).context("serializing capture-processing record")?;
+    queue.enqueue_with_capture_processing(meta, Some(&json))
 }
 
 fn import_hosted_outbox(ctx: &Ctx) {
@@ -955,20 +963,18 @@ fn live_discard_cleanup(ctx: &Ctx, meta: &RecordingMeta, note_path: &Path, previ
     }
 }
 
-/// Apply a saved config change: re-read the shared runtime config and rebuild the backend + AEC toggle. A
-/// job already transcribing finishes on the old backend (the worker is serial), so this is exactly "takes
-/// effect on the next recording".
+/// Apply a saved config change: re-read the shared runtime config and rebuild the backend. A job already
+/// transcribing finishes on the old backend (the worker is serial), so this is exactly "takes effect on the
+/// next recording". The AEC toggle is not mirrored here — it is read from [`SharedConfig`] at capture start
+/// (#74), so it needs no pipeline-side copy.
 fn reload_config(ctx: &mut Ctx, config: &SharedConfig) {
     let cfg = config.lock().unwrap().clone();
     let backend_name = cfg.backend_name();
-    ctx.aec_enabled = cfg.aec_enabled;
-    ctx.aec_config = cfg.aec_config();
     ctx.backend_label = cfg.backend_label(); // read BEFORE Backend::init consumes cfg
     ctx.backend = Backend::init(cfg);
     info!(
         target: "corti::pipeline",
         backend = backend_name,
-        aec = if ctx.aec_enabled { "on" } else { "off" },
         "settings saved — backend reloaded"
     );
 }
@@ -1253,10 +1259,20 @@ pub(crate) fn transcribe_and_file(
 
     // Reuse the persisted stable Transcribe name across retries. Legacy PendingNote recovery writes a new
     // compatibility name first; ordinary recordings default to their id.
-    let transcribe_job = ctx
-        .queue
-        .get(id)
-        .context("reading transcription attempt")?
+    let row = ctx.queue.get(id).context("reading transcription attempt")?;
+    let capture_processing = crate::transcribe::decode_capture_processing(
+        row.as_ref()
+            .and_then(|row| row.capture_processing.as_deref()),
+    )?;
+    let current_cfg = ctx.config.lock().unwrap().clone();
+    let current_aec = current_cfg.aec_config();
+    let offline_aec = crate::transcribe::recording_aec_plan(
+        capture_processing.as_ref(),
+        current_cfg.aec_enabled,
+        &current_aec,
+        false,
+    );
+    let transcribe_job = row
         .and_then(|row| row.transcribe_job)
         .unwrap_or_else(|| id.to_string());
     ctx.queue
@@ -1281,14 +1297,13 @@ pub(crate) fn transcribe_and_file(
     );
     tray::update_history(&ctx.app, id, JobStatus::Transcribing, None, None, None);
 
-    // Run AEC + backend from the retained raw recording. Pipeline AWS attempts use the row's stable name;
-    // one-shot CLI calls deliberately pass no stable name.
+    // Marker-positive applied/degraded/disabled captures go straight to ASR. Legacy NULL rows and a
+    // wholly-raw writer setup failure take the safe file pass selected above. Pipeline AWS attempts use the
+    // row's stable name; one-shot CLI calls pass none.
     let t0 = std::time::Instant::now();
     let transcribed = crate::transcribe::transcribe_recording(
         &ctx.backend,
-        ctx.aec_enabled,
-        false,
-        &ctx.aec_config,
+        offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
         meta,
         audio,
@@ -1296,7 +1311,8 @@ pub(crate) fn transcribe_and_file(
     ctx.stats
         .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
     let transcribe_secs = t0.elapsed().as_secs_f64();
-    let (raw_transcript, _input) = transcribed.context("transcription failed")?;
+    let (raw_transcript, _transcribed_input, aec_outcome) =
+        transcribed.context("transcription failed")?;
 
     // Hosted final runs strictly after ASR and before the first post-ASR checkpoint. It owns no audio and
     // every disabled/auth/deadline/error/stale outcome returns this immutable raw transcript. Confirm the
@@ -1338,10 +1354,28 @@ pub(crate) fn transcribe_and_file(
         owned_note.as_ref().map(|note| note.path.clone()),
         aws_staging,
     );
-    checkpoint.set_provenance(
-        ctx.backend
-            .provenance(corti_vagus::provenance::GenerationMode::Batch),
-    );
+    let capture_fallback = capture_processing.as_ref().is_some_and(|processing| {
+        matches!(
+            &processing.aec,
+            corti_capture::CaptureAecState::RawFallback { .. }
+        )
+    });
+    let aec_execution = if let Some(aec) = offline_aec.as_ref() {
+        crate::provenance::AecExecution::Offline {
+            config: &aec.config,
+            lookahead_seconds: aec.lookahead_seconds,
+            outcome: aec_outcome,
+            capture_fallback,
+        }
+    } else if let Some(processing) = capture_processing.as_ref() {
+        crate::provenance::AecExecution::Capture(processing)
+    } else {
+        crate::provenance::AecExecution::Disabled
+    };
+    checkpoint.set_provenance(ctx.backend.provenance_with_aec(
+        corti_vagus::provenance::GenerationMode::Batch,
+        aec_execution,
+    ));
     checkpoint
         .set_applied_postprocess(settled.applied_postprocess)
         .context("attaching settled hosted provenance to checkpoint")?;
@@ -1540,8 +1574,9 @@ fn file_and_done(
     Ok(())
 }
 
-/// Completion cleanup has one authority: keep the raw recording for the configured sweep, but remove
+/// Completion cleanup has one authority: keep the recording for the configured sweep, but remove
 /// reproducible/transient derivatives. Failures are logged and the sweep retries all of these paths later.
+/// Ordinary marker-positive capture writes no sibling; legacy/raw fallback and explicit input still can.
 fn cleanup_completed_artifacts(raw: &Path) {
     for path in [corti_capture::clean_wav_path(raw), checkpoint_path(raw)] {
         if !path.exists() {

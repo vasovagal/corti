@@ -36,7 +36,9 @@ fn main() -> anyhow::Result<()> {
                     meta.audio_path.display()
                 );
             }
-            DetectorEvent::RecordingFinished { meta, audio_path } => {
+            DetectorEvent::RecordingFinished {
+                meta, audio_path, ..
+            } => {
                 let ended = meta
                     .ended_at
                     .map(|t| t.format("%H:%M:%S").to_string())

@@ -95,7 +95,8 @@ pub struct AppConfig {
     /// Whether to run offline echo cancellation on speaker recordings before transcription
     /// (`CORTI_AEC`, default on; set `0`/`false`/`off`/`no` to disable).
     pub aec_enabled: bool,
-    /// AEC adaptive-filter length in taps (`CORTI_AEC_FILTER_LEN`). `None` ⇒ crate default (8192).
+    /// AEC adaptive-filter length in taps (`CORTI_AEC_FILTER_LEN`). `None` ⇒ crate default (8192); effective
+    /// app values are clamped to `1..=32768` before constructing the capture filter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aec_filter_len: Option<usize>,
     /// AEC step size (`CORTI_AEC_MU`). `None` ⇒ crate default (0.3).
@@ -164,13 +165,25 @@ impl AppConfig {
     pub fn aec_config(&self) -> corti_aec::AecConfig {
         let d = corti_aec::AecConfig::default();
         corti_aec::AecConfig {
-            filter_len: self.aec_filter_len.unwrap_or(d.filter_len),
-            mu: self.aec_mu.unwrap_or(d.mu),
-            eps: self.aec_eps.unwrap_or(d.eps),
-            power_smoothing: self.aec_power_smoothing.unwrap_or(d.power_smoothing),
-            double_talk_ratio: self.aec_double_talk_ratio.unwrap_or(d.double_talk_ratio),
+            filter_len: self
+                .aec_filter_len
+                .unwrap_or(d.filter_len)
+                .clamp(1, corti_capture::MAX_CAPTURE_AEC_FILTER_LEN),
+            mu: self.aec_mu.filter(|v| v.is_finite()).unwrap_or(d.mu),
+            eps: self.aec_eps.filter(|v| v.is_finite()).unwrap_or(d.eps),
+            power_smoothing: self
+                .aec_power_smoothing
+                .filter(|v| v.is_finite())
+                .unwrap_or(d.power_smoothing),
+            double_talk_ratio: self
+                .aec_double_talk_ratio
+                .filter(|v| v.is_finite())
+                .unwrap_or(d.double_talk_ratio),
             passes: d.passes,
-            suppress_residual: self.aec_suppress_residual.unwrap_or(d.suppress_residual),
+            suppress_residual: self
+                .aec_suppress_residual
+                .filter(|v| v.is_finite())
+                .unwrap_or(d.suppress_residual),
             max_lag_ms: d.max_lag_ms,
         }
     }
@@ -512,6 +525,31 @@ mod tests {
         assert_eq!(cfg.backend_name(), "Parakeet / CPU");
         cfg.local_asr_engine = "ggml".into();
         assert_eq!(cfg.backend_name(), "Parakeet / Metal");
+    }
+
+    #[test]
+    fn production_aec_filter_len_is_bounded_before_fft_construction() {
+        let huge = AppConfig {
+            aec_filter_len: Some(usize::MAX),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            huge.aec_config().filter_len,
+            corti_capture::MAX_CAPTURE_AEC_FILTER_LEN
+        );
+        let zero = AppConfig {
+            aec_filter_len: Some(0),
+            ..AppConfig::default()
+        };
+        assert_eq!(zero.aec_config().filter_len, 1);
+        let nonfinite = AppConfig {
+            aec_mu: Some(f32::NAN),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            nonfinite.aec_config().mu,
+            corti_aec::AecConfig::default().mu
+        );
     }
 
     #[test]

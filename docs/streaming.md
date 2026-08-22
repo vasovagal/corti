@@ -70,8 +70,9 @@ To transcribe **during** capture you need the downmixed PCM the writer thread al
 - Delivery is `SyncSender::try_send` — **the writer never blocks** (`send_tee_chunk`, `capture.rs:728`). On a
   full or hung-up channel the chunk is **dropped and counted** (`RecordingHandle::tee_dropped_chunks`,
   `capture.rs:190`; live-readable via `CaptureTee::dropped_counter()`).
-- **The on-disk WAV is untouched.** The tee is strictly additive; with no tee attached the writer path is
-  byte-identical to before.
+- **The tee carries the raw downmix**, taken before the writer's in-flight AEC (#74) — the live consumer runs
+  its own `StreamingAec` over it. Two independent cancellers, each bounded; the tee stays strictly additive,
+  and removing it does not change the selected on-disk filter policy.
 
 Contract: *the recording is the source of truth; the live stream is throwaway.* A blocking tee could stall the
 writer and corrupt the recording, so dropping a live chunk is the correct trade — the dropped-chunk counter
@@ -83,8 +84,8 @@ resampler/AEC before `stop`); `CaptureChunk`/`CaptureTee` are re-exported (`lib.
 on `corti-capture`. Existing `start`/`start_tap_only` call sites are unchanged.
 
 ```
-IO proc ─push→ SPSC ring ─drain→ writer thread ─┬─ hound → WAV        (source of truth, unaffected)
-                                                └─ try_send → CaptureTee → live consumer  (lossy, counted)
+IO proc ─push→ SPSC ring ─drain→ writer thread ─┬─ StreamingAec → hound → WAV  (source of truth, #74)
+                                                └─ try_send → CaptureTee → live consumer  (raw, lossy, counted)
 ```
 
 ## The async edge — `stream` feature

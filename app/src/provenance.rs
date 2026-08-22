@@ -12,17 +12,57 @@ use serde_json::{Map, Number, Value};
 
 use crate::config::{AppConfig, BackendChoice};
 
+/// How the audio supplied to ASR was echo-processed. Capture/retry callers select this from the durable
+/// queue record, never mutable Settings.
+#[derive(Clone, Copy)]
+pub(crate) enum AecExecution<'a> {
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    Live,
+    Capture(&'a corti_capture::CaptureProcessing),
+    Offline {
+        config: &'a corti_aec::AecConfig,
+        lookahead_seconds: f32,
+        outcome: crate::transcribe::OfflineAecOutcome,
+        capture_fallback: bool,
+    },
+    /// The caller supplied an already-clean artifact but no capture record survives to identify settings.
+    PreprocessedUnknown,
+    Disabled,
+}
+
 /// Describe the final transcript generated under `cfg`. Callers must pass the same immutable snapshot the
 /// backend/live engine owns, never re-read shared Settings at filing time.
+#[cfg_attr(not(feature = "local"), allow(dead_code))]
 pub(crate) fn from_config(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
+    let effective = cfg.aec_config();
+    let aec = if mode == GenerationMode::Live {
+        AecExecution::Live
+    } else if cfg.aec_enabled {
+        AecExecution::Offline {
+            config: &effective,
+            lookahead_seconds: corti_aec::configured_lookahead_seconds(),
+            outcome: crate::transcribe::OfflineAecOutcome::Applied,
+            capture_fallback: false,
+        }
+    } else {
+        AecExecution::Disabled
+    };
+    from_config_with_aec(cfg, mode, aec)
+}
+
+pub(crate) fn from_config_with_aec(
+    cfg: &AppConfig,
+    mode: GenerationMode,
+    aec: AecExecution<'_>,
+) -> TranscriptProvenance {
     match cfg.transcribe_backend {
-        BackendChoice::Aws => aws(cfg, mode),
-        BackendChoice::Local => local(cfg, mode),
+        BackendChoice::Aws => aws(cfg, mode, aec),
+        BackendChoice::Local => local(cfg, mode, aec),
     }
 }
 
-fn aws(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
-    let mut configuration = base_configuration(cfg, mode);
+fn aws(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
+    let mut configuration = base_configuration(cfg, mode, aec);
     configuration.insert("language".into(), Value::String(cfg.language.clone()));
     configuration.insert(
         "speaker_attribution".into(),
@@ -43,7 +83,7 @@ fn aws(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
 }
 
 #[cfg(feature = "local")]
-fn local(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
+fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
     use corti_transcribe_local::{LocalConfig, models};
 
     let defaults = LocalConfig::default();
@@ -59,7 +99,7 @@ fn local(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
     };
     let selected_embedding = models::embedding_spec(&cfg.local_embedding_model);
 
-    let mut configuration = base_configuration(cfg, mode);
+    let mut configuration = base_configuration(cfg, mode, aec);
     configuration.insert(
         "asr_engine".into(),
         Value::String(cfg.local_asr_engine.clone()),
@@ -111,32 +151,120 @@ fn local(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
 }
 
 #[cfg(not(feature = "local"))]
-fn local(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
+fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
     // This can only be observed if a build without the local backend somehow files a successful local
     // transcript. Keep it truthful rather than borrowing AWS/current settings.
     let mut provenance = TranscriptProvenance::legacy_unknown(mode);
     provenance.backend = "local-unavailable".into();
-    provenance.configuration = base_configuration(cfg, mode);
+    provenance.configuration = base_configuration(cfg, mode, aec);
     provenance
 }
 
-fn base_configuration(cfg: &AppConfig, mode: GenerationMode) -> BTreeMap<String, Value> {
-    let effective = cfg.aec_config();
-    let mut aec = Map::new();
-    aec.insert("enabled".into(), Value::Bool(cfg.aec_enabled));
-    aec.insert(
-        "mode".into(),
-        Value::String(
-            if !cfg.aec_enabled {
-                "disabled"
-            } else if mode == GenerationMode::Live {
+fn base_configuration(
+    cfg: &AppConfig,
+    mode: GenerationMode,
+    execution: AecExecution<'_>,
+) -> BTreeMap<String, Value> {
+    let current = cfg.aec_config();
+    let (enabled, aec_mode, outcome, effective, lookahead_seconds) = match execution {
+        AecExecution::Live => (
+            cfg.aec_enabled,
+            if cfg.aec_enabled {
                 "streaming"
             } else {
-                "offline"
-            }
-            .into(),
+                "disabled"
+            },
+            if cfg.aec_enabled {
+                "applied"
+            } else {
+                "disabled"
+            },
+            &current,
+            cfg.aec_enabled
+                .then(corti_aec::configured_lookahead_seconds),
         ),
-    );
+        AecExecution::Capture(processing) => match &processing.aec {
+            corti_capture::CaptureAecState::Disabled => {
+                (false, "disabled", "disabled", &current, None)
+            }
+            corti_capture::CaptureAecState::NotApplicable => {
+                (false, "not_applicable", "not_applicable", &current, None)
+            }
+            corti_capture::CaptureAecState::Applied {
+                config,
+                lookahead_seconds,
+            } => (
+                true,
+                "capture_streaming",
+                "applied",
+                config,
+                Some(*lookahead_seconds),
+            ),
+            corti_capture::CaptureAecState::RawFallback {
+                config,
+                lookahead_seconds,
+            } => (
+                true,
+                "capture_streaming",
+                "raw_fallback",
+                config,
+                Some(*lookahead_seconds),
+            ),
+            corti_capture::CaptureAecState::Degraded {
+                config,
+                lookahead_seconds,
+            } => (
+                true,
+                "capture_streaming",
+                "degraded_mixed",
+                config,
+                Some(*lookahead_seconds),
+            ),
+        },
+        AecExecution::Offline {
+            config,
+            lookahead_seconds,
+            outcome,
+            capture_fallback,
+        } => match outcome {
+            crate::transcribe::OfflineAecOutcome::Applied => (
+                true,
+                if capture_fallback {
+                    "offline_capture_fallback"
+                } else {
+                    "offline"
+                },
+                "applied",
+                config,
+                Some(lookahead_seconds),
+            ),
+            crate::transcribe::OfflineAecOutcome::NotApplicable => {
+                (false, "not_applicable", "not_applicable", config, None)
+            }
+            crate::transcribe::OfflineAecOutcome::Failed => (
+                true,
+                if capture_fallback {
+                    "offline_capture_fallback"
+                } else {
+                    "offline"
+                },
+                "failed_raw_fallback",
+                config,
+                Some(lookahead_seconds),
+            ),
+            crate::transcribe::OfflineAecOutcome::NotRequested => {
+                (false, "disabled", "disabled", config, None)
+            }
+        },
+        AecExecution::PreprocessedUnknown => {
+            (true, "preprocessed_unknown", "unknown", &current, None)
+        }
+        AecExecution::Disabled => (false, "disabled", "disabled", &current, None),
+    };
+    let mut aec = Map::new();
+    aec.insert("enabled".into(), Value::Bool(enabled));
+    aec.insert("mode".into(), Value::String(aec_mode.into()));
+    aec.insert("outcome".into(), Value::String(outcome.into()));
     aec.insert(
         "filter_len".into(),
         Value::from(effective.filter_len as u64),
@@ -156,6 +284,9 @@ fn base_configuration(cfg: &AppConfig, mode: GenerationMode) -> BTreeMap<String,
         float_value(effective.suppress_residual),
     );
     aec.insert("max_lag_ms".into(), float_value(effective.max_lag_ms));
+    if let Some(seconds) = lookahead_seconds {
+        aec.insert("lookahead_seconds".into(), float_value(seconds));
+    }
 
     let mut configuration = BTreeMap::new();
     configuration.insert("aec".into(), Value::Object(aec));
@@ -252,13 +383,73 @@ mod tests {
     }
 
     #[test]
-    fn nonfinite_config_is_described_without_breaking_serialization() {
+    fn capture_provenance_uses_persisted_settings_and_reports_degradation() {
+        let cfg = AppConfig::default();
+        let mut captured = cfg.aec_config();
+        captured.filter_len = 4_096;
+        let processing = corti_capture::CaptureProcessing {
+            schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            aec: corti_capture::CaptureAecState::Degraded {
+                config: captured,
+                lookahead_seconds: 7.5,
+            },
+        };
+        let provenance = from_config_with_aec(
+            &cfg,
+            GenerationMode::Batch,
+            AecExecution::Capture(&processing),
+        );
+        assert_eq!(provenance.configuration["aec"]["mode"], "capture_streaming");
+        assert_eq!(provenance.configuration["aec"]["outcome"], "degraded_mixed");
+        assert_eq!(provenance.configuration["aec"]["filter_len"], 4_096);
+        assert_eq!(provenance.configuration["aec"]["lookahead_seconds"], 7.5);
+    }
+
+    #[test]
+    fn offline_provenance_distinguishes_applied_not_applicable_and_failed() {
+        let cfg = AppConfig::default();
+        let aec = cfg.aec_config();
+        for (outcome, expected_mode, expected_outcome) in [
+            (
+                crate::transcribe::OfflineAecOutcome::Applied,
+                "offline",
+                "applied",
+            ),
+            (
+                crate::transcribe::OfflineAecOutcome::NotApplicable,
+                "not_applicable",
+                "not_applicable",
+            ),
+            (
+                crate::transcribe::OfflineAecOutcome::Failed,
+                "offline",
+                "failed_raw_fallback",
+            ),
+        ] {
+            let provenance = from_config_with_aec(
+                &cfg,
+                GenerationMode::Batch,
+                AecExecution::Offline {
+                    config: &aec,
+                    lookahead_seconds: 5.0,
+                    outcome,
+                    capture_fallback: false,
+                },
+            );
+            assert_eq!(provenance.configuration["aec"]["mode"], expected_mode);
+            assert_eq!(provenance.configuration["aec"]["outcome"], expected_outcome);
+        }
+    }
+
+    #[test]
+    fn nonfinite_app_config_falls_back_before_provenance_serialization() {
         let cfg = AppConfig {
             aec_mu: Some(f32::NAN),
             ..AppConfig::default()
         };
         let provenance = from_config(&cfg, GenerationMode::Batch);
-        assert_eq!(provenance.configuration["aec"]["mu"], "NaN");
+        let mu = provenance.configuration["aec"]["mu"].as_f64().unwrap();
+        assert!((mu - 0.3).abs() < 1e-6);
         provenance.frontmatter_json().unwrap();
     }
 }
