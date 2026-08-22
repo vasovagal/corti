@@ -15,6 +15,7 @@ pub struct TwoTrack {
     /// Source sample rate (typically 48 kHz); the engine resamples to 16 kHz as needed.
     pub sample_rate: i32,
     /// Source WAV channel count, retained even when the file contains zero frames.
+    #[cfg(feature = "offline-tracing")]
     pub channel_count: u16,
 }
 
@@ -49,6 +50,7 @@ pub fn read_two_track(path: &Path) -> Result<TwoTrack> {
             mic: Vec::new(),
             them: samples,
             sample_rate,
+            #[cfg(feature = "offline-tracing")]
             channel_count: spec.channels,
         }),
         2 => {
@@ -62,6 +64,7 @@ pub fn read_two_track(path: &Path) -> Result<TwoTrack> {
                 mic,
                 them,
                 sample_rate,
+                #[cfg(feature = "offline-tracing")]
                 channel_count: spec.channels,
             })
         }
@@ -99,6 +102,7 @@ mod tests {
 
         let t = read_two_track(&path).unwrap();
         assert_eq!(t.sample_rate, 48_000);
+        #[cfg(feature = "offline-tracing")]
         assert_eq!(t.channel_count, 2);
         assert_eq!(t.mic.len(), 2);
         assert_eq!(t.them.len(), 2);
@@ -131,6 +135,7 @@ mod tests {
         }
 
         let t = read_two_track(&path).unwrap();
+        #[cfg(feature = "offline-tracing")]
         assert_eq!(t.channel_count, 1);
         assert!(t.mic.is_empty(), "tap-only has no mic track");
         assert_eq!(t.them.len(), 3);
@@ -139,6 +144,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(feature = "offline-tracing")]
     #[test]
     fn retains_channel_count_for_a_zero_frame_wav() {
         let path = std::env::temp_dir().join("corti-local-read-empty-2ch.wav");

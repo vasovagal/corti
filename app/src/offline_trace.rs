@@ -158,6 +158,12 @@ impl Span {
         self.outcome("fallback");
     }
 
+    /// Consume the last application-owned handle before the writer guard is shut down.
+    pub fn close(self) {
+        #[cfg(feature = "offline-tracing")]
+        drop(self.inner);
+    }
+
     pub fn error(&self, code: ErrorCode) {
         #[cfg(feature = "offline-tracing")]
         {

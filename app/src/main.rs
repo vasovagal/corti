@@ -90,7 +90,7 @@ fn main() {
             } else {
                 trace.error(offline_trace::ErrorCode::Other);
             }
-            drop(trace);
+            trace.close();
             guards.shutdown();
             std::process::exit(code)
         }
