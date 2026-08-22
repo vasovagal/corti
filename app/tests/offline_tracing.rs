@@ -5,9 +5,12 @@ use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vasovagal_tracing::{TailPolicy, validate_jsonl};
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
 fn unique_dir() -> PathBuf {
     let nonce = SystemTime::now()
@@ -19,8 +22,9 @@ fn unique_dir() -> PathBuf {
         .unwrap()
         .join("target/offline-tracing-tests")
         .join(format!(
-            "corti-offline-tracing-{}-{nonce}",
-            std::process::id()
+            "corti-offline-tracing-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed),
         ))
 }
 
