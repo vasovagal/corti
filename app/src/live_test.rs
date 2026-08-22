@@ -287,7 +287,6 @@ fn run_microphone_test(
 
     let engine = LocalTranscriber::new(LocalConfig {
         model_dir: cfg.local_model_dir.clone(),
-        provider: cfg.local_provider.clone(),
         num_threads: cfg.local_threads,
         diarize_far_end: false,
         asr_engine: cfg.local_asr_engine.clone(),

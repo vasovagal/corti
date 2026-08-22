@@ -50,7 +50,8 @@ the backend.
 per-region inference runtime behind `Asr::{Sherpa,Ggml}`:
 
 - `sherpa` (compatibility/default): int8 ONNX through the official `sherpa-onnx` Rust crate / ONNX
-  Runtime on CPU. CoreML measured 2.7–11× slower and is not shipped (ADR 0003).
+  Runtime on CPU — the only ONNX provider, and not configurable. CoreML measured 2.7–11× slower and its
+  opt-in knob was removed (ADR 0003).
 - `ggml`: the official Q8_0 GGUF through transcribe.cpp/GGML on Metal (ADR 0011), included in standard
   app builds and selected in Settings or with `CORTI_LOCAL_ASR_ENGINE=ggml`. Corti pins upstream revision
   `553f1099…` exactly while 0.2.0 is unreleased.

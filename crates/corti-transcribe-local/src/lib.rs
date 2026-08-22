@@ -43,11 +43,6 @@ pub struct LocalConfig {
     /// Directory holding the model files (Parakeet, pyannote segmentation, embedding, VAD).
     /// `None` ⇒ the default cache (`~/Library/Caches/corti/models/`), resolved by the backend.
     pub model_dir: Option<PathBuf>,
-    /// ONNX Runtime execution provider. `"cpu"` (default) is the only one that ships: the prebuilt
-    /// sherpa-onnx static lib has no CoreML execution provider, and CoreML measured 4.6–11× *slower* on the
-    /// int8 transducer anyway (see `resolve_provider` and design/adr/0003). A non-`cpu` value is honored
-    /// only in a build with the `coreml-lib` feature + a CoreML-enabled lib; otherwise it maps to `"cpu"`.
-    pub provider: String,
     /// Local inference threads: ONNX intra-op threads and transcribe.cpp session threads. Small by default
     /// (a short batch job → favours battery on the M1 Pro).
     pub num_threads: i32,
@@ -100,7 +95,6 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             model_dir: None,
-            provider: "cpu".to_string(),
             num_threads: 4,
             diarize_far_end: false,
             embedding_model: models::DEFAULT_EMBEDDING_ID.to_string(),
@@ -176,15 +170,13 @@ impl LocalTranscriber {
             self.cfg.diarize_far_end,
             &self.cfg.embedding_model,
         )?;
-        let provider = resolve_provider(self.cfg.provider.as_str()).to_string();
-        let asr = self.build_asr(wants_ggml, &m, &provider, &dir)?;
+        let asr = self.build_asr(wants_ggml, &m, &dir)?;
         let diarizer = self
             .cfg
             .diarize_far_end
             .then(|| {
                 engine::build_diarizer(
                     &m,
-                    &provider,
                     self.cfg.num_threads,
                     self.cfg.diarize_threshold,
                     self.cfg.diarize_num_clusters,
@@ -196,7 +188,6 @@ impl LocalTranscriber {
         Ok(LiveEngine::new(
             asr,
             m,
-            provider,
             self.cfg.vad_threshold,
             self.cfg.vad_min_silence,
             diarizer,
@@ -205,17 +196,10 @@ impl LocalTranscriber {
 
     /// Build the runtime-selected ASR engine (the only engine-specific seam — see [`Asr`]). `wants_ggml`
     /// comes from [`asr::wants_ggml`] so an unknown token has already errored by the time this runs.
-    fn build_asr(
-        &self,
-        wants_ggml: bool,
-        m: &models::Models,
-        provider: &str,
-        model_dir: &Path,
-    ) -> Result<Asr> {
+    fn build_asr(&self, wants_ggml: bool, m: &models::Models, model_dir: &Path) -> Result<Asr> {
         if !wants_ggml {
             return Ok(Asr::Sherpa(engine::build_recognizer(
                 m,
-                provider,
                 self.cfg.num_threads,
                 self.cfg.asr_decoding.as_deref(),
                 self.cfg.asr_max_active_paths,
@@ -261,22 +245,16 @@ impl Transcriber for LocalTranscriber {
             self.validate_ggml_model(&dir)?;
         }
         let track = audio::read_two_track(audio)?;
-        let provider = resolve_provider(self.cfg.provider.as_str());
         let threads = self.cfg.num_threads;
 
         // One ASR engine load per job, shared across both channels (and both `LiveTranscriber`s).
-        let rec = Arc::new(self.build_asr(wants_ggml, &m, provider, &dir)?);
+        let rec = Arc::new(self.build_asr(wants_ggml, &m, &dir)?);
         let mut segments = Vec::new();
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
         if !track.mic.is_empty() {
             let mic = engine::resample_to_16k(&track.mic, track.sample_rate)?;
-            let vad = engine::build_vad(
-                &m,
-                provider,
-                self.cfg.vad_threshold,
-                self.cfg.vad_min_silence,
-            )?;
+            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
             let words = engine::transcribe_channel(rec.clone(), vad, &mic);
             segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
         }
@@ -284,18 +262,12 @@ impl Transcriber for LocalTranscriber {
         // ch1 (system tap) → far end.
         if !track.them.is_empty() {
             let them = engine::resample_to_16k(&track.them, track.sample_rate)?;
-            let vad = engine::build_vad(
-                &m,
-                provider,
-                self.cfg.vad_threshold,
-                self.cfg.vad_min_silence,
-            )?;
+            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
             let words = engine::transcribe_channel(rec.clone(), vad, &them);
             if self.cfg.diarize_far_end {
                 // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
                 let diar = engine::build_diarizer(
                     &m,
-                    provider,
                     threads,
                     self.cfg.diarize_threshold,
                     self.cfg.diarize_num_clusters,
@@ -322,60 +294,10 @@ impl Transcriber for LocalTranscriber {
     }
 }
 
-/// Effective ONNX provider for this build, without loading a model or logging. Public so transcript
-/// provenance can record the provider that will really run rather than an unavailable configured token.
-pub fn effective_provider(requested: &str) -> &str {
-    if requested != "cpu" && !cfg!(feature = "coreml-lib") {
-        "cpu"
-    } else {
-        requested
-    }
-}
-
-/// Resolve the requested ONNX execution provider against what this build can actually honor.
-///
-/// A `coreml` request only works when the crate is compiled with the `coreml-lib` feature, which links a
-/// CoreML-enabled sherpa-onnx (see `build.rs`). The default crates.io prebuilt has **no** CoreML execution
-/// provider, so sherpa-onnx would silently fall back to CPU while printing a misleading
-/// `"CoreML is for Apple only since onnxruntime>=1.15. Fallback to cpu!"` line for *every* ONNX session
-/// (3 ASR + 2 VAD = 5 lines for a typical job) — which reads like platform misdetection on an Apple-Silicon
-/// Mac. When CoreML can't be honored, map the request to `cpu` ourselves and say so once, clearly.
-fn resolve_provider(requested: &str) -> &str {
-    let effective = effective_provider(requested);
-    if effective != requested {
-        tracing::warn!(
-            target: "corti::transcribe::local",
-            requested,
-            "provider unavailable in this build — running on CPU (build with the `coreml-lib` feature + a CoreML-enabled sherpa-onnx lib to enable it)"
-        );
-    }
-    effective
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "ggml"))]
 mod tests {
-    use super::{LocalConfig, LocalTranscriber, models, resolve_provider};
+    use super::{LocalConfig, LocalTranscriber, models};
 
-    #[test]
-    fn cpu_passes_through() {
-        assert_eq!(resolve_provider("cpu"), "cpu");
-    }
-
-    #[test]
-    #[cfg(not(feature = "coreml-lib"))]
-    fn coreml_falls_back_to_cpu_without_the_feature() {
-        // Default build links a sherpa-onnx with no CoreML EP, so we map it to cpu rather than let
-        // sherpa-onnx emit its misleading per-session fallback log.
-        assert_eq!(resolve_provider("coreml"), "cpu");
-    }
-
-    #[test]
-    #[cfg(feature = "coreml-lib")]
-    fn coreml_passes_through_with_the_feature() {
-        assert_eq!(resolve_provider("coreml"), "coreml");
-    }
-
-    #[cfg(feature = "ggml")]
     #[test]
     fn ggml_file_validation_does_not_require_onnx_parakeet() {
         let dir = std::env::temp_dir().join(format!(
@@ -403,7 +325,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(feature = "ggml")]
     #[test]
     #[ignore = "needs the real GGUF/VAD/diarization models; set CORTI_VERIFY_MODEL_DIR"]
     fn ggml_live_engine_coexists_with_sherpa_diarizer() {

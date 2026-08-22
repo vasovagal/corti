@@ -167,8 +167,6 @@ pub fn set_config(
     // would be a stale snapshot that this Save would write back, silently reverting a models dir just set via
     // the Storage section. `to_save` already carries the persisted value from `load_file()`, so leaving it
     // untouched preserves it.
-    // `local_provider` is no longer a webview setting (CPU is the only shipping provider — see ADR 0003); it
-    // stays on the file baseline `to_save` started from, settable only via `CORTI_LOCAL_PROVIDER`.
     if !pinned("local_threads") {
         to_save.local_threads = dto.local_threads;
     }

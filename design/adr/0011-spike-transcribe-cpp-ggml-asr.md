@@ -95,3 +95,32 @@ wide margin and also lowers peak RSS.
   transcribe.cpp's newer model-specific diarization families do not replace that path.
 - Remaining default-flip gate: run a real detector call with GGML live filing across at least one durability
   checkpoint, confirm no tee drops, inspect timestamps/note completion, and soak for crashes/truncation.
+
+## Addendum (2026-08-21): whole-corpus batch result — accuracy gate cleared, soak gate still open
+
+Issue #118 re-ran both engines over the full Planet Money corpus (three complete episodes, 5,568.7 s) rather
+than the single 300 s excerpt above. Spec `bench/configs/engine_round2.json`; rows `engine_round2.jsonl`;
+tables in `bench/results/RESULTS.md` §0b.
+
+| metric (3 full episodes) | sherpa ONNX / CPU | transcribe.cpp GGML / Metal |
+|---|---:|---:|
+| mean normalized WER | 0.1961 | **0.1840** (−1.22 pp) |
+| total ASR wall | 461.3 s (12.1× realtime) | **116.4 s (47.8× realtime)** — 3.96× |
+| mean peak RSS | 1,381 MB | **1,238 MB** (−10.3%) |
+
+GGML is slightly *more* accurate on all three episodes, not merely at parity. Absolute WER is inflated on
+both arms because the untrimmed NPR reference does not contain the mp3's inserted ads; the delta is the
+result. Hypothesis-vs-hypothesis divergence is 3.63% of words (657/18,114).
+
+This clears the **accuracy** half of a default flip on a corpus 18× larger than the original excerpt. It does
+**not** clear decision 5's gate, and the two are not substitutes: the open gate is a real detector-call soak
+with live filing across durability checkpoints (tee drops, timestamp continuity, note completion,
+truncation/crash behaviour). Those are streaming-path properties; this is a batch file-tier benchmark and
+exercises none of them. It also needs the macOS audio-capture (TCC) grant, so it cannot be run unattended.
+
+A second, separable blocker on *deleting* the sherpa recognizer: decision 4 defines
+`--no-default-features --features local` as a sherpa-only minimal build, and CI checks that lane. Removing
+the sherpa recognizer leaves that configuration with no ASR engine at all, so consolidation has to redefine
+what the minimal build is before it can compile — a build-topology decision, not a measurement.
+
+Status therefore unchanged: sherpa stays the persisted default, both engines stay selectable.
