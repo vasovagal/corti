@@ -335,17 +335,28 @@ impl LiveManager {
                 id: id.clone(),
                 hosted: self.hosted.clone(),
             };
+            let trace = crate::offline_trace::live_session("mixed", "local");
+            let dispatch = crate::offline_trace::Dispatch::capture();
             let thread = std::thread::Builder::new().name("corti-live".into()).spawn(
                 move || -> LiveOutcome {
-                    session_thread(
-                        pending.rx,
-                        verdict_rx,
-                        meta,
-                        sample_rate,
-                        cfg,
-                        pipe_tx,
-                        publisher,
-                    )
+                    dispatch.with_default(|| {
+                        let outcome = session_thread(
+                            pending.rx,
+                            verdict_rx,
+                            meta,
+                            sample_rate,
+                            cfg,
+                            pipe_tx,
+                            publisher,
+                            &trace,
+                        );
+                        match &outcome {
+                            LiveOutcome::Filed { .. } => trace.ok(),
+                            LiveOutcome::NoNote => trace.skipped(),
+                            LiveOutcome::Fallback { .. } => trace.fallback(),
+                        }
+                        outcome
+                    })
                 },
             );
             match thread {
@@ -766,6 +777,7 @@ fn discover_models(cfg: &AppConfig) -> Result<()> {
 /// Thread body: run the session with panics contained; any failure carries the partial note path so
 /// the caller can persist (fallback) or delete (discard) it.
 #[cfg(feature = "local")]
+#[allow(clippy::too_many_arguments)] // explicit worker handoff keeps ownership and trace parent visible
 fn session_thread(
     rx: Receiver<CaptureChunk>,
     verdict_rx: Receiver<Verdict>,
@@ -774,6 +786,7 @@ fn session_thread(
     cfg: AppConfig,
     pipe_tx: Sender<PipelineMsg>,
     publisher: StorePublisher,
+    trace: &crate::offline_trace::Span,
 ) -> LiveOutcome {
     // Hosted session setup is off capture/ASR and fails closed. Raw publication and filing do not depend on
     // this reply; the bounded row handoff below simply remains unavailable for this recording.
@@ -785,7 +798,15 @@ fn session_thread(
     let mut writer =
         NoteWriter::with_provenance(VagusFiler, meta.clone(), Some(pipe_tx), provenance);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_session(&rx, &verdict_rx, sample_rate, &cfg, &mut writer, &publisher)
+        run_session(
+            &rx,
+            &verdict_rx,
+            sample_rate,
+            &cfg,
+            &mut writer,
+            &publisher,
+            trace,
+        )
     }));
     let outcome = match result {
         Ok(Ok(outcome)) => outcome,
@@ -861,6 +882,33 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
     })
 }
 
+/// Aggregate live spans are created once, then repeatedly entered only around active model/chunk work.
+/// Blocking receives therefore accrue idle time rather than falsely inflating busy time.
+struct SessionTrace {
+    session: crate::offline_trace::Span,
+    transcription: crate::offline_trace::Span,
+    backend: crate::offline_trace::Span,
+    decode: crate::offline_trace::Span,
+    aec: crate::offline_trace::Span,
+    consume: crate::offline_trace::Span,
+}
+
+#[cfg(feature = "local")]
+impl SessionTrace {
+    fn new(session: &crate::offline_trace::Span, cfg: &AppConfig) -> Self {
+        let engine = crate::offline_trace::engine(&cfg.local_asr_engine);
+        let transcription = crate::offline_trace::transcription(session, "local", engine);
+        Self {
+            session: session.clone(),
+            backend: crate::offline_trace::transcription_backend(&transcription, "local", engine),
+            decode: crate::offline_trace::transcription_decode(&transcription, "local", engine),
+            aec: crate::offline_trace::transcription_aec(&transcription, "local", engine),
+            consume: crate::offline_trace::live_consume(session, "mixed", "local"),
+            transcription,
+        }
+    }
+}
+
 /// Load the engine and consume tee chunks, then act on the finish/discard verdict. Any error is
 /// **held until the verdict arrives** — the thread must outlive its recording so a Discard can still
 /// delete the note (the manager's discard path is non-joining); the bounded tee keeps dropping
@@ -873,8 +921,17 @@ fn run_session(
     cfg: &AppConfig,
     writer: &mut NoteWriter<VagusFiler>,
     publisher: &StorePublisher,
+    trace: &crate::offline_trace::Span,
 ) -> Result<LiveOutcome> {
-    let mut parts = build_parts(sample_rate, cfg);
+    let spans = SessionTrace::new(trace, cfg);
+    if !cfg.aec_enabled {
+        spans.aec.skipped();
+    }
+    let mut parts = spans.session.in_scope(|| {
+        spans
+            .transcription
+            .in_scope(|| spans.backend.in_scope(|| build_parts(sample_rate, cfg)))
+    });
     let consumed = match parts.as_mut() {
         Ok(p) => {
             publisher.listening();
@@ -888,6 +945,7 @@ fn run_session(
                 &mut p.window,
                 writer,
                 publisher,
+                Some(&spans),
             )
         }
         // Engine failed to load: surface it to the reader now, but still wait for the recording-specific
@@ -905,29 +963,63 @@ fn run_session(
         ));
     }
 
-    match verdict_rx.recv() {
-        Ok(Verdict::Finish(quality)) => {
-            let p = parts?;
-            consumed?;
-            finish_session(
-                sample_rate,
-                p.aec,
-                p.mic,
-                p.them,
-                p.engine,
-                p.window,
-                quality,
-                writer,
-                publisher,
-            )
+    let result = (|| -> Result<LiveOutcome> {
+        match verdict_rx.recv() {
+            Ok(Verdict::Finish(quality)) => {
+                let p = parts?;
+                consumed?;
+                finish_session(
+                    sample_rate,
+                    p.aec,
+                    p.mic,
+                    p.them,
+                    p.engine,
+                    p.window,
+                    quality,
+                    writer,
+                    publisher,
+                    Some(&spans),
+                )
+            }
+            Ok(Verdict::Discard) => {
+                writer.discard()?;
+                Ok(LiveOutcome::NoNote)
+            }
+            // Manager gone (app shutting down mid-call): leave whatever was written; don't flip.
+            Err(_) => anyhow::bail!("live session received no finish/discard verdict"),
         }
-        Ok(Verdict::Discard) => {
-            writer.discard()?;
-            Ok(LiveOutcome::NoNote)
+    })();
+    match &result {
+        Ok(LiveOutcome::NoNote) => {
+            spans.backend.skipped();
+            spans.decode.skipped();
+            if cfg.aec_enabled {
+                spans.aec.skipped();
+            }
+            spans.transcription.skipped();
         }
-        // Manager gone (app shutting down mid-call): leave whatever was written; don't flip.
-        Err(_) => anyhow::bail!("live session received no finish/discard verdict"),
+        Ok(_) => {
+            spans.backend.ok();
+            spans.decode.ok();
+            if cfg.aec_enabled {
+                spans.aec.ok();
+            }
+            spans.transcription.ok();
+        }
+        Err(_) => {
+            spans.backend.error(crate::offline_trace::ErrorCode::Other);
+            spans
+                .decode
+                .error(crate::offline_trace::ErrorCode::DecodeFailed);
+            if cfg.aec_enabled {
+                spans.aec.error(crate::offline_trace::ErrorCode::Other);
+            }
+            spans
+                .transcription
+                .error(crate::offline_trace::ErrorCode::DecodeFailed);
+        }
     }
+    result
 }
 
 /// Per-recording rolling state. Every collection is bounded by either the configured time window or an
@@ -1049,31 +1141,95 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
     publisher: &P,
+    trace: Option<&SessionTrace>,
 ) -> Result<()> {
+    // Do not enter any span across this blocking receive. One aggregate span is repeatedly entered for
+    // actual work, yielding useful busy/idle accounting without one record per audio chunk.
     while let Ok(chunk) = rx.recv() {
-        let chunk_frames = chunk.mic.len().max(chunk.tap.len());
-        let mut offset = 0usize;
-        while offset < chunk_frames {
-            let take = window.remaining_frames().min(chunk_frames - offset);
-            let end = offset + take;
-            let mic_slice = if chunk.mic.len() == chunk_frames {
-                &chunk.mic[offset..end]
-            } else {
-                &[]
-            };
-            let tap_slice = if chunk.tap.len() == chunk_frames {
-                &chunk.tap[offset..end]
-            } else {
-                &[]
-            };
+        let processed = match trace {
+            Some(trace) => trace.session.in_scope(|| {
+                trace.consume.in_scope(|| {
+                    trace.transcription.in_scope(|| {
+                        consume_chunk(
+                            chunk,
+                            sample_rate,
+                            aec,
+                            mic,
+                            them,
+                            diarizer,
+                            window,
+                            writer,
+                            publisher,
+                            Some(trace),
+                        )
+                    })
+                })
+            }),
+            None => consume_chunk(
+                chunk,
+                sample_rate,
+                aec,
+                mic,
+                them,
+                diarizer,
+                window,
+                writer,
+                publisher,
+                None,
+            ),
+        };
+        if let Err(error) = processed {
+            if let Some(trace) = trace {
+                trace.consume.error(crate::offline_trace::ErrorCode::Other);
+            }
+            return Err(error);
+        }
+    }
+    if let Some(trace) = trace {
+        trace.consume.ok();
+    }
+    Ok(())
+}
 
-            let clean = match aec.as_mut() {
-                Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => {
-                    aec.push(mic_slice, tap_slice)
-                }
-                Some(_) => Vec::new(),
-                None => mic_slice.to_vec(),
-            };
+#[allow(clippy::too_many_arguments)]
+fn consume_chunk<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
+    chunk: CaptureChunk,
+    sample_rate: u32,
+    aec: &mut Option<StreamingAec>,
+    mic: &mut C,
+    them: &mut C,
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    trace: Option<&SessionTrace>,
+) -> Result<()> {
+    let chunk_frames = chunk.mic.len().max(chunk.tap.len());
+    let mut offset = 0usize;
+    while offset < chunk_frames {
+        let take = window.remaining_frames().min(chunk_frames - offset);
+        let end = offset + take;
+        let mic_slice = if chunk.mic.len() == chunk_frames {
+            &chunk.mic[offset..end]
+        } else {
+            &[]
+        };
+        let tap_slice = if chunk.tap.len() == chunk_frames {
+            &chunk.tap[offset..end]
+        } else {
+            &[]
+        };
+
+        let clean = match aec.as_mut() {
+            Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => match trace
+            {
+                Some(trace) => trace.aec.in_scope(|| aec.push(mic_slice, tap_slice)),
+                None => aec.push(mic_slice, tap_slice),
+            },
+            Some(_) => Vec::new(),
+            None => mic_slice.to_vec(),
+        };
+        let mut decode = || {
             if !clean.is_empty() {
                 mic.push(&clean, sample_rate);
             }
@@ -1088,12 +1244,16 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 publisher.words(Speaker::Other("Them".to_string()), &words);
                 window.push_them_words(words);
             }
-            window.push_audio(tap_slice, take);
-            offset = end;
+        };
+        match trace {
+            Some(trace) => trace.decode.in_scope(|| trace.backend.in_scope(decode)),
+            None => decode(),
+        }
+        window.push_audio(tap_slice, take);
+        offset = end;
 
-            if window.due() {
-                checkpoint_and_flush(mic, them, diarizer, window, writer, publisher)?;
-            }
+        if window.due() {
+            checkpoint_and_flush(mic, them, diarizer, window, writer, publisher, trace)?;
         }
     }
     Ok(())
@@ -1106,14 +1266,21 @@ fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: Transc
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
     publisher: &P,
+    trace: Option<&SessionTrace>,
 ) -> Result<()> {
-    let mic_words = mic.checkpoint();
-    publisher.words(Speaker::Me, &mic_words);
-    window.push_mic_words(mic_words);
-    let them_words = them.checkpoint();
-    publisher.words(Speaker::Other("Them".to_string()), &them_words);
-    window.push_them_words(them_words);
-    flush_window(diarizer, window, writer)
+    let mut checkpoint = || {
+        let mic_words = mic.checkpoint();
+        publisher.words(Speaker::Me, &mic_words);
+        window.push_mic_words(mic_words);
+        let them_words = them.checkpoint();
+        publisher.words(Speaker::Other("Them".to_string()), &them_words);
+        window.push_them_words(them_words);
+    };
+    match trace {
+        Some(trace) => trace.decode.in_scope(checkpoint),
+        None => checkpoint(),
+    }
+    flush_window(diarizer, window, writer, trace)
 }
 
 /// Diarize and render one complete rolling window, then perform one OS-synced append. No state is cleared
@@ -1122,6 +1289,47 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     diarizer: &D,
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
+    trace: Option<&SessionTrace>,
+) -> Result<()> {
+    let window_trace = trace
+        .map(|trace| crate::offline_trace::live_window_flush(&trace.session, "mixed", "local"));
+    let result = match window_trace.as_ref() {
+        Some(span) => span.in_scope(|| flush_window_inner(diarizer, window, writer, span)),
+        None => flush_window_inner_without_trace(diarizer, window, writer),
+    };
+    if let Some(span) = window_trace.as_ref() {
+        span.record_window_count(1);
+        if result.is_ok() {
+            span.ok();
+        } else {
+            span.error(crate::offline_trace::ErrorCode::Other);
+        }
+    }
+    result
+}
+
+fn flush_window_inner<D: LiveDiarizer, F: NoteFiler>(
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    trace: &crate::offline_trace::Span,
+) -> Result<()> {
+    flush_window_work(diarizer, window, writer, Some(trace))
+}
+
+fn flush_window_inner_without_trace<D: LiveDiarizer, F: NoteFiler>(
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+) -> Result<()> {
+    flush_window_work(diarizer, window, writer, None)
+}
+
+fn flush_window_work<D: LiveDiarizer, F: NoteFiler>(
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    trace: Option<&crate::offline_trace::Span>,
 ) -> Result<()> {
     let mut segments = words_to_segments(&window.mic_words, Speaker::Me, SEGMENT_GAP);
     if !window.them_words.is_empty() {
@@ -1149,7 +1357,21 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     }
     let segments = merge_by_time(segments);
     if !segments.is_empty() {
-        writer.append_segments(&segments)?;
+        let synced = match trace {
+            Some(parent) => {
+                let sync = crate::offline_trace::live_note_sync(parent, "mixed", "local");
+                let result = sync.in_scope(|| writer.append_segments(&segments));
+                sync.record_item_count(segments.len());
+                if result.is_ok() {
+                    sync.ok();
+                } else {
+                    sync.error(crate::offline_trace::ErrorCode::Storage);
+                }
+                result
+            }
+            None => writer.append_segments(&segments),
+        };
+        synced?;
         info!(
             target: "corti::live",
             start_sec = window.start_sec(),
@@ -1168,6 +1390,60 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
 #[allow(clippy::too_many_arguments)]
 fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
     sample_rate: u32,
+    aec: Option<StreamingAec>,
+    mic: C,
+    them: C,
+    diarizer: D,
+    window: TranscriptWindow,
+    quality: FinishQuality,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    trace: Option<&SessionTrace>,
+) -> Result<LiveOutcome> {
+    match trace {
+        Some(trace) => {
+            let finish = crate::offline_trace::live_finish(&trace.session, "mixed", "local");
+            let result = trace.session.in_scope(|| {
+                finish.in_scope(|| {
+                    finish_session_inner(
+                        sample_rate,
+                        aec,
+                        mic,
+                        them,
+                        diarizer,
+                        window,
+                        quality,
+                        writer,
+                        publisher,
+                        Some(trace),
+                    )
+                })
+            });
+            if result.is_ok() {
+                finish.ok();
+            } else {
+                finish.error(crate::offline_trace::ErrorCode::Other);
+            }
+            result
+        }
+        None => finish_session_inner(
+            sample_rate,
+            aec,
+            mic,
+            them,
+            diarizer,
+            window,
+            quality,
+            writer,
+            publisher,
+            None,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_session_inner<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
+    sample_rate: u32,
     mut aec: Option<StreamingAec>,
     mut mic: C,
     mut them: C,
@@ -1176,11 +1452,18 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     quality: FinishQuality,
     writer: &mut NoteWriter<F>,
     publisher: &P,
+    trace: Option<&SessionTrace>,
 ) -> Result<LiveOutcome> {
     if let Some(aec) = aec.take() {
-        let tail = aec.finish();
+        let tail = match trace {
+            Some(trace) => trace.aec.in_scope(|| aec.finish()),
+            None => aec.finish(),
+        };
         if !tail.is_empty() {
-            mic.push(&tail, sample_rate);
+            match trace {
+                Some(trace) => trace.decode.in_scope(|| mic.push(&tail, sample_rate)),
+                None => mic.push(&tail, sample_rate),
+            }
         }
     }
     if let Some(words) = mic.poll_words() {
@@ -1197,7 +1480,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     let them_words = them.finish();
     publisher.words(Speaker::Other("Them".to_string()), &them_words);
     window.push_them_words(them_words);
-    flush_window(&diarizer, &mut window, writer)?;
+    flush_window(&diarizer, &mut window, writer, trace)?;
 
     match writer.path().cloned() {
         Some(note_path) if quality.dropped_chunks == 0 => {
@@ -1820,7 +2103,7 @@ mod tests {
         window.push_audio(&vec![0.0; 100], 100);
         window.push_them_words(vec![word(62.0, 62.5, "owned action item")]);
 
-        flush_window(&diarizer, &mut window, &mut writer).unwrap();
+        flush_window(&diarizer, &mut window, &mut writer, None).unwrap();
 
         assert_eq!(&*diarizer.calls.borrow(), &[(100, 10, 60.0)]);
         assert!(read(&note).contains("**[01:02] Them 7:** owned action item"));
@@ -1854,6 +2137,7 @@ mod tests {
             &mut TranscriptWindow::new(1, 1, false).unwrap(),
             &mut writer,
             &publisher,
+            None,
         )
         .unwrap();
 
@@ -1904,6 +2188,7 @@ mod tests {
             &mut window,
             &mut writer,
             &NoopPublisher,
+            None,
         )
         .unwrap();
 
@@ -1923,6 +2208,7 @@ mod tests {
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
             &NoopPublisher,
+            None,
         )
         .unwrap();
         let LiveOutcome::Filed { note_path } = outcome else {
@@ -1996,6 +2282,7 @@ mod tests {
             FinishQuality { dropped_chunks: 3 },
             &mut writer,
             &NoopPublisher,
+            None,
         )
         .unwrap();
 
@@ -2040,6 +2327,7 @@ mod tests {
             &mut window,
             &mut writer,
             &NoopPublisher,
+            None,
         )
         .unwrap();
         let outcome = finish_session(
@@ -2052,6 +2340,7 @@ mod tests {
             FinishQuality { dropped_chunks: 0 },
             &mut writer,
             &NoopPublisher,
+            None,
         )
         .unwrap();
         assert!(matches!(outcome, LiveOutcome::NoNote));

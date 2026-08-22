@@ -81,12 +81,42 @@ fn cleanup_payload(id: &str, audio: &Path) -> serde_json::Value {
 /// Dispatch one claimed job by kind. An unrecognized kind fails with backoff so version skew surfaces
 /// in the jobs table instead of crash-looping or silently vanishing.
 pub(crate) fn run(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
-    match job.kind.as_str() {
-        RETRY_TRANSCRIPTION => retry_transcription(ctx, job),
-        CLEANUP_AWS_STAGING => cleanup_aws_staging(ctx, job),
-        SWEEP_EXPIRED => sweep_expired(ctx),
-        other => anyhow::bail!("unknown job kind {other:?}"),
+    let attempt_kind = match job.payload["attempt_kind"].as_str() {
+        Some("manual_retry") => "manual_retry",
+        Some("recovery") => "recovery",
+        _ if job.kind == RETRY_TRANSCRIPTION => "automatic_retry",
+        _ => "initial",
+    };
+    let attempt_count = job.attempts.min(1_000);
+    let root = crate::offline_trace::background_job(attempt_kind, attempt_count);
+    let phase = match job.kind.as_str() {
+        RETRY_TRANSCRIPTION => {
+            crate::offline_trace::background_retry(&root, attempt_kind, attempt_count)
+        }
+        CLEANUP_AWS_STAGING => {
+            crate::offline_trace::background_cleanup(&root, attempt_kind, attempt_count)
+        }
+        SWEEP_EXPIRED => {
+            crate::offline_trace::background_retention(&root, attempt_kind, attempt_count)
+        }
+        _ => crate::offline_trace::background_retry(&root, "other", attempt_count),
+    };
+    let result = root.in_scope(|| {
+        phase.in_scope(|| match job.kind.as_str() {
+            RETRY_TRANSCRIPTION => retry_transcription(ctx, job),
+            CLEANUP_AWS_STAGING => cleanup_aws_staging(ctx, job),
+            SWEEP_EXPIRED => sweep_expired(ctx),
+            other => anyhow::bail!("unknown job kind {other:?}"),
+        })
+    });
+    if result.is_ok() {
+        phase.ok();
+        root.ok();
+    } else {
+        phase.error(crate::offline_trace::ErrorCode::Other);
+        root.error(crate::offline_trace::ErrorCode::Other);
     }
+    result
 }
 
 /// A transcription job ran out of attempts. The recording must become terminal before the caller parks
@@ -242,7 +272,7 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     )
                     .context("promoting recovered checkpoint to PendingNote")?;
             }
-            pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path)
+            pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path, None)
         }
         RetryAction::CompleteCanonicalNote => pipeline::complete_canonical_note(
             ctx,
@@ -263,11 +293,23 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     },
                 )
                 .context("persisting legacy recovery attempt name")?;
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
+            pipeline::transcribe_and_file(
+                ctx,
+                id,
+                &meta,
+                &row.audio_path,
+                owned_note.as_ref(),
+                None,
+            )
         }
-        RetryAction::Transcribe => {
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
-        }
+        RetryAction::Transcribe => pipeline::transcribe_and_file(
+            ctx,
+            id,
+            &meta,
+            &row.audio_path,
+            owned_note.as_ref(),
+            None,
+        ),
         RetryAction::MissingAudio => pipeline::fail_with_note(
             ctx,
             id,

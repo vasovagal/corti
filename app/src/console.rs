@@ -1,10 +1,13 @@
 //! In-app diagnostics console: an in-memory ring buffer of `tracing` events plus the Tauri commands the
 //! console webview calls (issue #76). The on-disk log sink lives alongside it (see [`init_file_layer`]).
 //!
-//! Two `tracing_subscriber::Layer`s feed off the same event stream:
+//! Two diagnostics `tracing_subscriber::Layer`s feed off the same event stream:
 //! - [`ConsoleLayer`] captures each event into a size-capped [`ConsoleBuffer`] the UI polls over `invoke`.
 //! - the file layer (built in [`init_file_layer`]) writes to a **daily-rolling** appender wrapped in a
 //!   **non-blocking** writer, so the single pipeline worker thread never blocks on disk I/O.
+//!
+//! An optional third layer emits independent local schema traces. Every diagnostics layer has its own
+//! `EnvFilter` and excludes that exact target; see ADR 0016.
 //!
 //! ## corti conventions (differ from the claria reference this was ported from)
 //! - [`ConsoleEntry`] derives serde **only** — no `specta`. The TypeScript mirror is hand-written in
@@ -25,9 +28,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
-use tracing::{Event, Subscriber, field::Visit};
+use tracing::{Event, Metadata, Subscriber, field::Visit};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{Layer, layer::Context};
+
+use crate::offline_trace;
 
 /// Maximum approximate byte size of the ring buffer (10 MB). Oldest entries are evicted FIFO past this.
 const MAX_BYTES: usize = 10 * 1024 * 1024;
@@ -232,62 +237,112 @@ pub fn logs_dir() -> Option<PathBuf> {
     corti_queue::data_dir().ok().map(|d| d.join("logs"))
 }
 
-/// Install the global `tracing` subscriber: an env-filter (`RUST_LOG`/`CORTI_LOG`, default `info`) feeding
-/// three layers — the in-memory [`ConsoleLayer`] (returned [`ConsoleBuffer`] is `.manage()`d for the
-/// commands), a daily-rolling non-blocking file layer under `<data_dir>/logs/`, and a stderr `fmt` layer.
-///
-/// Returns the shared [`ConsoleBuffer`] and the file writer's [`WorkerGuard`], **which the caller must keep
-/// alive for the process lifetime** (dropping it stops the writer thread and loses buffered lines). Call
-/// once, before the Tauri builder: it uses `.init()`, so a second call — or calling it after
-/// [`init_cli_tracing`] — panics because the global default is already set. The two init paths are mutually
-/// exclusive (the tray app vs. the headless CLI; see `main`). Pre-subscriber failures fall back to `eprintln!`.
-pub fn init_tracing() -> (ConsoleBuffer, Option<WorkerGuard>) {
+/// Owns both non-blocking writers for exactly as long as the selected app mode runs.
+pub struct SubscriberGuards {
+    diagnostics: Option<WorkerGuard>,
+    offline: offline_trace::Guard,
+}
+
+impl SubscriberGuards {
+    /// Gracefully drain offline records, then drop the diagnostics writer guard. Headless callers invoke
+    /// this before `process::exit`; the tray invokes it after `app.run` returns.
+    pub fn shutdown(self) {
+        let Self {
+            diagnostics,
+            offline,
+        } = self;
+        offline.shutdown();
+        drop(diagnostics);
+    }
+}
+
+/// RUST_LOG wins; fall back to CORTI_LOG; then preserve the historical `info` default. A fresh value is
+/// installed on every diagnostics layer so these directives cannot gate the independent offline layer.
+fn diagnostics_env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_from_env("CORTI_LOG"))
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+/// The schema target is never formatted as a log line or copied into the diagnostics UI.
+fn is_diagnostic(metadata: &Metadata<'_>) -> bool {
+    metadata.target() != offline_trace::TARGET
+}
+
+/// Install the tray subscriber. Each diagnostics sink owns both its own `EnvFilter` and an exact-target
+/// exclusion; the optional shared layer is composed directly onto the registry and remains independent of
+/// `RUST_LOG`/`CORTI_LOG`. Installation uses `try_init`, so a pre-existing subscriber disables offline
+/// storage without panicking or preventing Corti startup.
+pub fn init_tracing() -> (ConsoleBuffer, SubscriberGuards) {
+    use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
     let buffer = ConsoleBuffer::new();
+    let mut prepared = offline_trace::prepare();
+    let trace_layer = prepared.layer.take();
 
-    // RUST_LOG wins; fall back to CORTI_LOG; then default to `info`.
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_from_env("CORTI_LOG"))
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-
-    let (file_layer, guard) = match init_file_layer() {
-        Some((layer, guard)) => (Some(layer), Some(guard)),
+    let console_layer = ConsoleLayer::new(buffer.clone())
+        .with_filter(diagnostics_env_filter())
+        .with_filter(filter_fn(is_diagnostic));
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(diagnostics_env_filter())
+        .with_filter(filter_fn(is_diagnostic));
+    let (file_layer, diagnostics) = match init_file_layer() {
+        Some((layer, guard)) => (
+            Some(
+                layer
+                    .with_filter(diagnostics_env_filter())
+                    .with_filter(filter_fn(is_diagnostic)),
+            ),
+            Some(guard),
+        ),
         None => (None, None),
     };
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(ConsoleLayer::new(buffer.clone()))
+    let installed = tracing_subscriber::registry()
+        .with(trace_layer)
+        .with(console_layer)
         .with(file_layer)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .init();
+        .with(stderr_layer)
+        .try_init()
+        .is_ok();
+    let offline = prepared.finish(installed);
 
-    (buffer, guard)
+    (
+        buffer,
+        SubscriberGuards {
+            diagnostics,
+            offline,
+        },
+    )
 }
 
-/// Install a lightweight global subscriber for the headless CLI path (`corti --redo`/`--input`): just an
-/// env-filter (`RUST_LOG`/`CORTI_LOG`, default `info`) feeding a stderr `fmt` layer.
-///
-/// The diagnostics console buffer and the on-disk log are GUI-only, so the CLI deliberately skips them. This
-/// exists purely so the operator-facing diagnostics that used to be `eprintln!` and are now `tracing` events
-/// (AEC fallback, local provider falling back to CPU, AWS job failures, pipeline errors, …) still reach
-/// stderr in a headless run — without it those lines would be silently dropped. Mutually exclusive with
-/// [`init_tracing`]; exactly one of the two runs per process. Uses `try_init`, so a redundant call is a
-/// harmless no-op rather than a panic.
-pub fn init_cli_tracing() {
+/// Install the headless subscriber: an independently filtered stderr diagnostics layer plus the optional
+/// local JSONL layer. Both are composed in one `try_init`; the returned guards must be shut down before the
+/// caller's unconditional `process::exit`.
+pub fn init_cli_tracing() -> SubscriberGuards {
+    use tracing_subscriber::filter::filter_fn;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_from_env("CORTI_LOG"))
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let mut prepared = offline_trace::prepare();
+    let trace_layer = prepared.layer.take();
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(diagnostics_env_filter())
+        .with_filter(filter_fn(is_diagnostic));
+    let installed = tracing_subscriber::registry()
+        .with(trace_layer)
+        .with(stderr_layer)
+        .try_init()
+        .is_ok();
 
-    let _ = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .try_init();
+    SubscriberGuards {
+        diagnostics: None,
+        offline: prepared.finish(installed),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,5 +379,36 @@ pub fn save_console_logs(console: State<'_, ConsoleBuffer>) -> Result<bool, Stri
             Ok(true)
         }
         None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::filter_fn;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
+
+    #[test]
+    fn diagnostics_preserve_normal_format_and_exclude_exact_offline_target() {
+        let buffer = ConsoleBuffer::new();
+        let layer = ConsoleLayer::new(buffer.clone())
+            .with_filter(tracing_subscriber::EnvFilter::new("trace"))
+            .with_filter(filter_fn(is_diagnostic));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "corti::test", count = 3_u64, "unchanged diagnostic");
+            tracing::info!(
+                target: offline_trace::TARGET,
+                operation = "must-not-reach-diagnostics"
+            );
+        });
+
+        let entries = buffer.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target, "corti::test");
+        assert_eq!(entries[0].message, "unchanged diagnostic count=3");
     }
 }

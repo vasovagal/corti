@@ -296,8 +296,28 @@ impl LiveEngine {
 
     /// Spawn a [`LiveTranscriber`] for one channel: a fresh Silero VAD sharing the resident recognizer.
     pub fn channel(&self) -> Result<LiveTranscriber> {
-        let vad = engine::build_vad(&self.models, self.vad_threshold, self.vad_min_silence)?;
-        Ok(LiveTranscriber::new(self.rec.clone(), vad))
+        #[cfg(feature = "offline-tracing")]
+        let span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.channel",
+            backend = "local",
+            engine = self.rec.trace_engine(),
+            model_family = "speech_to_text",
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        let run = || {
+            let vad = engine::build_vad(&self.models, self.vad_threshold, self.vad_min_silence)?;
+            Ok(LiveTranscriber::new(self.rec.clone(), vad))
+        };
+        #[cfg(feature = "offline-tracing")]
+        let result = span.in_scope(run);
+        #[cfg(not(feature = "offline-tracing"))]
+        let result = run();
+        #[cfg(feature = "offline-tracing")]
+        crate::record_result(&span, &result, "model_unavailable");
+        result
     }
 
     /// Whether this engine loaded the optional far-end diarizer.
@@ -317,13 +337,41 @@ impl LiveEngine {
         let Some(diarizer) = self.diarizer.as_ref() else {
             return Ok(None);
         };
-        let samples_16k = engine::resample_to_16k(samples, sample_rate as i32)?;
-        let mut turns = engine::diarize_channel(diarizer, &samples_16k);
-        for turn in &mut turns {
-            turn.start += offset_sec;
-            turn.end += offset_sec;
+        #[cfg(feature = "offline-tracing")]
+        let span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.diarize",
+            backend = "local",
+            engine = "onnx",
+            model_family = "diarization",
+            sample_rate = u64::from(sample_rate),
+            sample_count = u64::try_from(samples.len()).unwrap_or(u64::MAX),
+            item_count = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        let run = || {
+            let samples_16k = engine::resample_to_16k(samples, sample_rate as i32)?;
+            let mut turns = engine::diarize_channel(diarizer, &samples_16k);
+            for turn in &mut turns {
+                turn.start += offset_sec;
+                turn.end += offset_sec;
+            }
+            Ok(Some(turns))
+        };
+        #[cfg(feature = "offline-tracing")]
+        let result = span.in_scope(run);
+        #[cfg(not(feature = "offline-tracing"))]
+        let result = run();
+        #[cfg(feature = "offline-tracing")]
+        {
+            crate::record_result(&span, &result, "decode_failed");
+            if let Ok(Some(turns)) = &result {
+                span.record("item_count", u64::try_from(turns.len()).unwrap_or(u64::MAX));
+            }
         }
-        Ok(Some(turns))
+        result
     }
 }
 

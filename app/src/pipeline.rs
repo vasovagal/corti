@@ -264,141 +264,169 @@ pub fn run(
                 meta,
                 audio_path,
                 capture_processing,
-            }) => match enqueue_captured(&ctx.queue, &meta, &capture_processing) {
-                Ok(id) => {
-                    info!(
-                        target: "corti::pipeline",
-                        job_id = %id,
-                        app = %meta.owning_app.name,
-                        path = %audio_path.display(),
-                        "enqueued recording for transcription"
-                    );
-                    // The capture-start site already pushed a `Recording` entry (keyed by this same id);
-                    // advance it to `Queued` and stamp the now-known end time before transcribing.
-                    tray::update_history(
-                        &ctx.app,
-                        &id,
-                        JobStatus::PendingTranscription,
-                        meta.ended_at,
-                        None,
-                        None,
-                    );
-                    // #87: a row created mid-call by LiveNoteCreated has no end time (this enqueue was
-                    // an INSERT OR IGNORE no-op for it) — stamp it now that the recording is over.
-                    if meta.ended_at.is_some()
-                        && let Err(e) = ctx.queue.update(
-                            &id,
-                            JobUpdate {
-                                ended_at: meta.ended_at,
-                                ..Default::default()
-                            },
-                        )
-                    {
-                        warn!(
+            }) => {
+                let capture_mode = trace_capture_mode(&meta);
+                let backend = crate::offline_trace::backend(ctx.backend_label);
+                let pipeline_trace =
+                    crate::offline_trace::pipeline_recording(None, capture_mode, backend);
+                let queue_trace =
+                    crate::offline_trace::pipeline_queue(&pipeline_trace, capture_mode, backend);
+                let enqueued = pipeline_trace.in_scope(|| {
+                    queue_trace
+                        .in_scope(|| enqueue_captured(&ctx.queue, &meta, &capture_processing))
+                });
+                if enqueued.is_ok() {
+                    queue_trace.ok();
+                } else {
+                    queue_trace.error(crate::offline_trace::ErrorCode::Storage);
+                }
+                match enqueued {
+                    Ok(id) => {
+                        info!(
                             target: "corti::pipeline",
                             job_id = %id,
-                            error = %format!("{e:#}"),
-                            "could not persist the recording end time"
+                            app = %meta.owning_app.name,
+                            path = %audio_path.display(),
+                            "enqueued recording for transcription"
                         );
-                    }
-                    // #87: the detector already delivered this recording's finish verdict before
-                    // queuing `Process`. Collect exactly that ID: a canonical, zero-drop live note skips
-                    // batch; every other outcome falls back to the lossless WAV. Persist a partial live
-                    // note first so the post-ASR checkpoint owns the same rewrite target.
-                    match resolve_live(ctx.live.collect(&id)) {
-                        LiveResolution::Filed(note_path) => {
-                            if let Err(e) =
-                                live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
-                            {
-                                let note = OwnedNote::canonical(note_path);
-                                schedule_retry(&ctx, &id, &meta, e, Some(&note));
-                            }
+                        // The capture-start site already pushed a `Recording` entry (keyed by this same id);
+                        // advance it to `Queued` and stamp the now-known end time before transcribing.
+                        tray::update_history(
+                            &ctx.app,
+                            &id,
+                            JobStatus::PendingTranscription,
+                            meta.ended_at,
+                            None,
+                            None,
+                        );
+                        // #87: a row created mid-call by LiveNoteCreated has no end time (this enqueue was
+                        // an INSERT OR IGNORE no-op for it) — stamp it now that the recording is over.
+                        if meta.ended_at.is_some()
+                            && let Err(e) = ctx.queue.update(
+                                &id,
+                                JobUpdate {
+                                    ended_at: meta.ended_at,
+                                    ..Default::default()
+                                },
+                            )
+                        {
+                            warn!(
+                                target: "corti::pipeline",
+                                job_id = %id,
+                                error = %format!("{e:#}"),
+                                "could not persist the recording end time"
+                            );
                         }
-                        LiveResolution::Batch { fallback } => {
-                            let preferred_note = if let Some(LiveFallback { reason, note_path }) =
-                                fallback
-                            {
-                                warn!(
-                                    target: "corti::live",
-                                    job_id = %id,
-                                    reason = %reason,
-                                    "live result is not canonical — falling back to batch transcription"
-                                );
-                                note_path
-                            } else {
-                                None
-                            };
-                            if let Some(partial) = preferred_note.as_ref()
-                                && let Err(e) = ctx.queue.update(
-                                    &id,
-                                    JobUpdate {
-                                        note_path: Some(partial.clone()),
-                                        ..Default::default()
-                                    },
-                                )
-                            {
-                                // Do not start batch with an untracked live note. The durable retry payload
-                                // carries the path even when this queue write is exactly what failed.
-                                let note = OwnedNote::partial(partial);
-                                schedule_retry(
-                                    &ctx,
+                        // #87: the detector already delivered this recording's finish verdict before
+                        // queuing `Process`. Collect exactly that ID: a canonical, zero-drop live note skips
+                        // batch; every other outcome falls back to the lossless WAV. Persist a partial live
+                        // note first so the post-ASR checkpoint owns the same rewrite target.
+                        match resolve_live(ctx.live.collect(&id)) {
+                            LiveResolution::Filed(note_path) => {
+                                if let Err(e) =
+                                    live_filed(&mut ctx, &id, &meta, &audio_path, &note_path)
+                                {
+                                    pipeline_trace.error(crate::offline_trace::ErrorCode::Storage);
+                                    let note = OwnedNote::canonical(note_path);
+                                    schedule_retry(&ctx, &id, &meta, e, Some(&note));
+                                } else {
+                                    pipeline_trace.ok();
+                                }
+                            }
+                            LiveResolution::Batch { fallback } => {
+                                let preferred_note = if let Some(LiveFallback {
+                                    reason,
+                                    note_path,
+                                }) = fallback
+                                {
+                                    warn!(
+                                        target: "corti::live",
+                                        job_id = %id,
+                                        reason = %reason,
+                                        "live result is not canonical — falling back to batch transcription"
+                                    );
+                                    note_path
+                                } else {
+                                    None
+                                };
+                                if let Some(partial) = preferred_note.as_ref()
+                                    && let Err(e) = ctx.queue.update(
+                                        &id,
+                                        JobUpdate {
+                                            note_path: Some(partial.clone()),
+                                            ..Default::default()
+                                        },
+                                    )
+                                {
+                                    // Do not start batch with an untracked live note. The durable retry payload
+                                    // carries the path even when this queue write is exactly what failed.
+                                    let note = OwnedNote::partial(partial);
+                                    schedule_retry(
+                                        &ctx,
+                                        &id,
+                                        &meta,
+                                        anyhow::anyhow!("persisting partial live note path: {e:#}"),
+                                        Some(&note),
+                                    );
+                                    pipeline_trace.error(crate::offline_trace::ErrorCode::Storage);
+                                    continue;
+                                }
+                                let preferred_note = preferred_note.map(OwnedNote::partial);
+                                if let Err(e) = transcribe_and_file(
+                                    &mut ctx,
                                     &id,
                                     &meta,
-                                    anyhow::anyhow!("persisting partial live note path: {e:#}"),
-                                    Some(&note),
-                                );
-                                continue;
-                            }
-                            let preferred_note = preferred_note.map(OwnedNote::partial);
-                            if let Err(e) = transcribe_and_file(
-                                &mut ctx,
-                                &id,
-                                &meta,
-                                &audio_path,
-                                preferred_note.as_ref(),
-                            ) {
-                                schedule_retry(&ctx, &id, &meta, e, preferred_note.as_ref());
+                                    &audio_path,
+                                    preferred_note.as_ref(),
+                                    Some(&pipeline_trace),
+                                ) {
+                                    pipeline_trace.error(crate::offline_trace::ErrorCode::Other);
+                                    schedule_retry(&ctx, &id, &meta, e, preferred_note.as_ref());
+                                } else {
+                                    pipeline_trace.ok();
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    error!(
-                        target: "corti::pipeline",
-                        path = %audio_path.display(),
-                        error = %format!("{e:#}"),
-                        "enqueue failed"
-                    );
-                    // #87: still collect this recording's already-delivered finish result so its model
-                    // session is released — with no queue row the outcome can only be logged/closed.
-                    match ctx.live.collect(&corti_queue::job_id(&meta)) {
-                        Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
-                            target: "corti::live",
-                            note_path = %note_path.display(),
-                            "live note filed but its recording row could not be created"
-                        ),
-                        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => {
-                            warn!(
+                    Err(e) => {
+                        error!(
+                            target: "corti::pipeline",
+                            path = %audio_path.display(),
+                            error = %format!("{e:#}"),
+                            "enqueue failed"
+                        );
+                        // #87: still collect this recording's already-delivered finish result so its model
+                        // session is released — with no queue row the outcome can only be logged/closed.
+                        match ctx.live.collect(&corti_queue::job_id(&meta)) {
+                            Some(crate::live::LiveOutcome::Filed { note_path }) => warn!(
                                 target: "corti::live",
-                                reason = %reason,
-                                note_path = ?note_path,
-                                "live session required fallback alongside the enqueue failure"
-                            );
-                            if let Some(note_path) = note_path {
-                                close_out_note(
-                                    &note_path,
-                                    "queue enqueue failed before canonical batch fallback",
+                                note_path = %note_path.display(),
+                                "live note filed but its recording row could not be created"
+                            ),
+                            Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => {
+                                warn!(
+                                    target: "corti::live",
+                                    reason = %reason,
+                                    note_path = ?note_path,
+                                    "live session required fallback alongside the enqueue failure"
                                 );
+                                if let Some(note_path) = note_path {
+                                    close_out_note(
+                                        &note_path,
+                                        "queue enqueue failed before canonical batch fallback",
+                                    );
+                                }
                             }
+                            Some(crate::live::LiveOutcome::NoNote) | None => {}
                         }
-                        Some(crate::live::LiveOutcome::NoNote) | None => {}
+                        // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
+                        // the diagram doesn't sit on Transcribing forever.
+                        set_stage(&ctx.app, Stage::Idle);
+                        tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
+                        pipeline_trace.error(crate::offline_trace::ErrorCode::Storage);
                     }
-                    // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
-                    // the diagram doesn't sit on Transcribing forever.
-                    set_stage(&ctx.app, Stage::Idle);
-                    tray::set_status(&ctx.app, format!("⚠ enqueue failed: {e}"));
                 }
-            },
+            }
             Ok(PipelineMsg::Retry { id }) => manual_retry(&mut ctx, &id),
             Ok(PipelineMsg::ReloadConfig) => reload_config(&mut ctx, &config),
             Ok(PipelineMsg::LiveNoteCreated { meta, note_path }) => {
@@ -421,6 +449,13 @@ pub fn run(
         // acknowledges only rows whose recording already exists.
         import_hosted_outbox(&ctx);
         drain_due_jobs(&mut ctx);
+    }
+}
+
+fn trace_capture_mode(meta: &RecordingMeta) -> &'static str {
+    match meta.mode() {
+        corti_core::RecordingMode::Call => "mixed",
+        corti_core::RecordingMode::Webinar => "system_audio",
     }
 }
 
@@ -783,18 +818,65 @@ pub(crate) fn complete_canonical_note(
     audio: &Path,
     note: &Path,
 ) -> Result<()> {
-    cleanup_aws_staging(ctx, audio)?;
+    let capture_mode = trace_capture_mode(meta);
+    let backend = crate::offline_trace::backend(ctx.backend_label);
+    let trace = crate::offline_trace::pipeline_recording(None, capture_mode, backend);
+    let result = trace.in_scope(|| {
+        complete_canonical_note_inner(ctx, id, meta, audio, note, &trace, capture_mode, backend)
+    });
+    if result.is_ok() {
+        trace.ok();
+    } else {
+        trace.error(crate::offline_trace::ErrorCode::Storage);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_canonical_note_inner(
+    ctx: &Ctx,
+    id: &str,
+    meta: &RecordingMeta,
+    audio: &Path,
+    note: &Path,
+    trace: &crate::offline_trace::Span,
+    capture_mode: &'static str,
+    backend: &'static str,
+) -> Result<()> {
+    let cleanup_trace = crate::offline_trace::pipeline_cloud_cleanup(trace, capture_mode, backend);
+    let cleaned = cleanup_trace.in_scope(|| cleanup_aws_staging(ctx, audio));
+    if cleaned.is_ok() {
+        cleanup_trace.ok();
+    } else {
+        cleanup_trace.error(crate::offline_trace::ErrorCode::BackendUnavailable);
+    }
+    cleaned?;
     let mut checkpoint = FilingCheckpoint::load(audio).unwrap_or_else(|_| {
         FilingCheckpoint::new(corti_core::DiarizedTranscript::new(Vec::new()), None, None)
     });
     checkpoint.set_canonical_note(note.to_path_buf());
-    let checkpoint_write = checkpoint
-        .store(audio)
-        .context("persisting canonical completion checkpoint");
-    let completion = ctx
-        .queue
-        .complete_with_note(id, note)
-        .context("persisting canonical note completion");
+    let checkpoint_trace = crate::offline_trace::pipeline_checkpoint(trace, capture_mode, backend);
+    let checkpoint_write = checkpoint_trace.in_scope(|| {
+        checkpoint
+            .store(audio)
+            .context("persisting canonical completion checkpoint")
+    });
+    if checkpoint_write.is_ok() {
+        checkpoint_trace.ok();
+    } else {
+        checkpoint_trace.error(crate::offline_trace::ErrorCode::Storage);
+    }
+    let complete_trace = crate::offline_trace::pipeline_complete(trace, capture_mode, backend);
+    let completion = complete_trace.in_scope(|| {
+        ctx.queue
+            .complete_with_note(id, note)
+            .context("persisting canonical note completion")
+    });
+    if completion.is_ok() {
+        complete_trace.ok();
+    } else {
+        complete_trace.error(crate::offline_trace::ErrorCode::Storage);
+    }
     match (checkpoint_write, completion) {
         (Ok(()), Ok(())) => {}
         (Err(error), Ok(())) => warn!(
@@ -1240,7 +1322,17 @@ pub(crate) fn transcribe_and_file(
     meta: &RecordingMeta,
     audio: &Path,
     preferred_note: Option<&OwnedNote>,
+    parent: Option<&crate::offline_trace::Span>,
 ) -> Result<()> {
+    let capture_mode = trace_capture_mode(meta);
+    let backend = crate::offline_trace::backend(ctx.backend_label);
+    let owned_trace = parent
+        .is_none()
+        .then(|| crate::offline_trace::pipeline_recording(None, capture_mode, backend));
+    let trace = parent
+        .or(owned_trace.as_ref())
+        .expect("pipeline trace is borrowed or locally owned");
+
     // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
     // transition failed (or the process died between them). Treat it as authoritative from every dispatch
     // path, including a duplicate first-attempt Process message.
@@ -1254,7 +1346,7 @@ pub(crate) fn transcribe_and_file(
                 },
             )
             .context("promoting durable checkpoint to PendingNote")?;
-        return file_checkpoint(ctx, id, meta, audio);
+        return file_checkpoint(ctx, id, meta, audio, Some(trace));
     }
 
     // Reuse the persisted stable Transcribe name across retries. Legacy PendingNote recovery writes a new
@@ -1301,13 +1393,16 @@ pub(crate) fn transcribe_and_file(
     // wholly-raw writer setup failure take the safe file pass selected above. Pipeline AWS attempts use the
     // row's stable name; one-shot CLI calls pass none.
     let t0 = std::time::Instant::now();
-    let transcribed = crate::transcribe::transcribe_recording(
-        &ctx.backend,
-        offline_aec.as_ref(),
-        crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
-        meta,
-        audio,
-    );
+    let transcribed = trace.in_scope(|| {
+        crate::transcribe::transcribe_recording(
+            &ctx.backend,
+            offline_aec.as_ref(),
+            crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job),
+            meta,
+            audio,
+            trace,
+        )
+    });
     ctx.stats
         .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
     let transcribe_secs = t0.elapsed().as_secs_f64();
@@ -1390,10 +1485,20 @@ pub(crate) fn transcribe_and_file(
     {
         checkpoint.set_canonical_note(note.path);
     }
-    if let Err(error) = checkpoint
-        .store(audio)
-        .context("persisting transcript checkpoint")
-    {
+    let checkpoint_trace = crate::offline_trace::pipeline_checkpoint(trace, capture_mode, backend);
+    let checkpointed = trace.in_scope(|| {
+        checkpoint_trace.in_scope(|| {
+            checkpoint
+                .store(audio)
+                .context("persisting transcript checkpoint")
+        })
+    });
+    if checkpointed.is_ok() {
+        checkpoint_trace.ok();
+    } else {
+        checkpoint_trace.error(crate::offline_trace::ErrorCode::Storage);
+    }
+    if let Err(error) = checkpointed {
         if final_applied {
             let _ = ctx.hosted.abandon_final_result(&settled.call_ids);
         }
@@ -1426,7 +1531,7 @@ pub(crate) fn transcribe_and_file(
         )
         .context("queue set PendingNote")?;
 
-    file_checkpoint(ctx, id, meta, audio)
+    file_checkpoint(ctx, id, meta, audio, Some(trace))
 }
 
 /// Load a durable transcript checkpoint and run only the filing stage. On success the raw recording stays
@@ -1436,7 +1541,16 @@ pub(crate) fn file_checkpoint(
     id: &str,
     meta: &RecordingMeta,
     audio: &Path,
+    parent: Option<&crate::offline_trace::Span>,
 ) -> Result<()> {
+    let capture_mode = trace_capture_mode(meta);
+    let backend = crate::offline_trace::backend(ctx.backend_label);
+    let owned_trace = parent
+        .is_none()
+        .then(|| crate::offline_trace::pipeline_recording(None, capture_mode, backend));
+    let trace = parent
+        .or(owned_trace.as_ref())
+        .expect("filing trace is borrowed or locally owned");
     FilingCheckpoint::load(audio).context("loading transcript checkpoint")?;
     set_stage(&ctx.app, Stage::Filing);
     tray::update_history(&ctx.app, id, JobStatus::PendingNote, None, None, None);
@@ -1444,11 +1558,18 @@ pub(crate) fn file_checkpoint(
 
     // Cloud cleanup gates filing and clears both pre/post-ASR owners. Reload afterward because cleanup may
     // have durably removed `aws_staging` from the checkpoint.
-    cleanup_aws_staging(ctx, audio)?;
+    let cleanup_trace = crate::offline_trace::pipeline_cloud_cleanup(trace, capture_mode, backend);
+    let cleaned = trace.in_scope(|| cleanup_trace.in_scope(|| cleanup_aws_staging(ctx, audio)));
+    if cleaned.is_ok() {
+        cleanup_trace.ok();
+    } else {
+        cleanup_trace.error(crate::offline_trace::ErrorCode::BackendUnavailable);
+    }
+    cleaned?;
     let mut checkpoint = FilingCheckpoint::load(audio).context("reloading cleaned checkpoint")?;
 
     let tf = std::time::Instant::now();
-    let result = file_and_done(ctx, id, meta, audio, &mut checkpoint);
+    let result = trace.in_scope(|| file_and_done(ctx, id, meta, audio, &mut checkpoint, trace));
     ctx.stats.record_stage("file", tf.elapsed(), "vagus");
     if result.is_ok() {
         cleanup_completed_artifacts(audio);
@@ -1492,72 +1613,96 @@ fn file_and_done(
     meta: &RecordingMeta,
     audio: &Path,
     checkpoint: &mut FilingCheckpoint,
+    trace: &crate::offline_trace::Span,
 ) -> Result<()> {
-    let queued_note = ctx
-        .queue
-        .get(id)
-        .context("reading recording before filing")?
-        .and_then(|row| row.note_path);
-    let was_canonical = checkpoint.note_canonical;
-    let note = if let Some(existing) = rewrite_checkpoint_note(meta, checkpoint, queued_note)? {
-        info!(
-            target: "corti::pipeline",
-            job_id = %id,
-            note_path = %existing.display(),
-            canonical = was_canonical,
-            "using checkpoint-owned note for completion"
-        );
-        existing
-    } else {
-        // Startup discovery may have failed only because vagus was not installed yet. Re-probe on every
-        // filing attempt so installing it during backoff does not require relaunching Corti.
-        if ctx.vagus.is_err() {
-            ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
-            if let Ok(v) = &ctx.vagus {
-                info!(
-                    target: "corti::pipeline",
-                    bin = %v.bin().display(),
-                    "vagus now available — filing enabled"
-                );
+    let capture_mode = trace_capture_mode(meta);
+    let backend = crate::offline_trace::backend(ctx.backend_label);
+    let filing_trace = crate::offline_trace::pipeline_vagus_file(trace, capture_mode, backend);
+    let filed = filing_trace.in_scope(|| -> Result<PathBuf> {
+        let queued_note = ctx
+            .queue
+            .get(id)
+            .context("reading recording before filing")?
+            .and_then(|row| row.note_path);
+        let was_canonical = checkpoint.note_canonical;
+        let note = if let Some(existing) = rewrite_checkpoint_note(meta, checkpoint, queued_note)? {
+            info!(
+                target: "corti::pipeline",
+                job_id = %id,
+                note_path = %existing.display(),
+                canonical = was_canonical,
+                "using checkpoint-owned note for completion"
+            );
+            existing
+        } else {
+            // Startup discovery may have failed only because vagus was not installed yet. Re-probe on every
+            // filing attempt so installing it during backoff does not require relaunching Corti.
+            if ctx.vagus.is_err() {
+                ctx.vagus = Vagus::discover().map_err(|e| format!("{e:#}"));
+                if let Ok(v) = &ctx.vagus {
+                    info!(
+                        target: "corti::pipeline",
+                        bin = %v.bin().display(),
+                        "vagus now available — filing enabled"
+                    );
+                }
             }
-        }
-        let vagus = match &ctx.vagus {
-            Ok(v) => v,
-            Err(e) => anyhow::bail!("vagus unavailable: {e}"),
+            let vagus = match &ctx.vagus {
+                Ok(v) => v,
+                Err(e) => anyhow::bail!("vagus unavailable: {e}"),
+            };
+            let note = vagus
+                .file_recording(meta, &checkpoint.transcript, &checkpoint.provenance)
+                .context("filing note failed")?;
+            info!(
+                target: "corti::pipeline",
+                job_id = %id,
+                note_path = %note.display(),
+                "note filed"
+            );
+            note
         };
-        let note = vagus
-            .file_recording(meta, &checkpoint.transcript, &checkpoint.provenance)
-            .context("filing note failed")?;
-        info!(
-            target: "corti::pipeline",
-            job_id = %id,
-            note_path = %note.display(),
-            "note filed"
-        );
-        note
-    };
+        Ok(note)
+    });
+    if filed.is_ok() {
+        filing_trace.ok();
+    } else {
+        filing_trace.error(crate::offline_trace::ErrorCode::Other);
+    }
+    let note = filed?;
 
     checkpoint.set_canonical_note(note.clone());
-    let checkpoint_write = checkpoint
-        .store(audio)
-        .context("persisting returned note path in transcript checkpoint");
-    let completion = ctx
-        .queue
-        .complete_with_note(id, &note)
-        .context("persisting note path and Done status");
+    let complete_trace = crate::offline_trace::pipeline_complete(trace, capture_mode, backend);
+    let (checkpoint_write, completion) = complete_trace.in_scope(|| {
+        let checkpoint_write = checkpoint
+            .store(audio)
+            .context("persisting returned note path in transcript checkpoint");
+        let completion = ctx
+            .queue
+            .complete_with_note(id, &note)
+            .context("persisting note path and Done status");
+        (checkpoint_write, completion)
+    });
 
     match (checkpoint_write, completion) {
-        (Ok(()), Ok(())) => {}
+        (Ok(()), Ok(())) => complete_trace.ok(),
         // The database is the durable authority once this succeeds; a checkpoint rewrite failure is no
         // longer dangerous and the successful cleanup below removes the stale checkpoint.
-        (Err(e), Ok(())) => warn!(
-            target: "corti::pipeline",
-            job_id = %id,
-            error = %format!("{e:#}"),
-            "recording completed but returned note path was not refreshed in checkpoint"
-        ),
-        (Ok(()), Err(e)) => return Err(e),
+        (Err(e), Ok(())) => {
+            complete_trace.ok();
+            warn!(
+                target: "corti::pipeline",
+                job_id = %id,
+                error = %format!("{e:#}"),
+                "recording completed but returned note path was not refreshed in checkpoint"
+            );
+        }
+        (Ok(()), Err(e)) => {
+            complete_trace.error(crate::offline_trace::ErrorCode::Storage);
+            return Err(e);
+        }
         (Err(checkpoint_err), Err(queue_err)) => {
+            complete_trace.error(crate::offline_trace::ErrorCode::Storage);
             return Err(anyhow::Error::new(OwnedNoteError {
                 note: OwnedNote::canonical(note),
                 message: format!(

@@ -479,11 +479,36 @@ impl AwsTranscriber {
 
 impl Transcriber for AwsTranscriber {
     fn transcribe(&self, audio: &Path, _meta: &RecordingMeta) -> Result<DiarizedTranscript> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building tokio runtime for AWS Transcribe")?;
-        rt.block_on(self.run(audio))
+        #[cfg(feature = "offline-tracing")]
+        let span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.backend",
+            backend = "aws",
+            engine = "system",
+            model_family = "speech_to_text",
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        let run = || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building tokio runtime for AWS Transcribe")?;
+            rt.block_on(self.run(audio))
+        };
+        #[cfg(feature = "offline-tracing")]
+        let result = span.in_scope(run);
+        #[cfg(not(feature = "offline-tracing"))]
+        let result = run();
+        #[cfg(feature = "offline-tracing")]
+        if result.is_ok() {
+            span.record("outcome", "ok");
+        } else {
+            span.record("outcome", "error");
+            span.record("error_code", "other");
+        }
+        result
     }
 }
 

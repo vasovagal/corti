@@ -40,3 +40,8 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
     provider/tool support tiers stay visible, ambiguous paid calls never auto-repeat, and unknown or
     subscription cost stays nullable rather than `$0.00`. Claude Free/Pro/Max routing is blocked absent
     written Anthropic permission. (ADR 0015)
+12. **Offline tracing is local, opt-in, schema-bound, and content-free.** It has no network collector/path
+    override/Settings surface. Only static catalogue operations and reviewed low-cardinality values may use
+    the exact `vasovagal::trace` target: never transcript/audio/title/app identity, recording/job IDs, paths,
+    cloud configuration/credentials, arguments/results, raw errors, or unbounded labels. Missing/invalid
+    activation, storage failure, subscriber conflict, and compiled-out support are no-ops. (ADR 0016)

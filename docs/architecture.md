@@ -138,6 +138,20 @@ Two things the diagram makes explicit because they are routinely misremembered:
    2: it opens the input device directly and intentionally creates no tap, aggregate, WAV, queue row, or note
    (ADR 0013).
 
+## Optional offline tracing
+
+The default `offline-tracing` build feature composes the shared local-only `vasovagal-tracing` layer into
+both tray and headless subscribers, but runtime output remains off unless exact `VASOVAGAL_TRACE=true` or
+strict `~/.config/vasovagal/corti.yaml` enables it. It writes private, rotated schema-v1 JSONL beneath
+`~/.local/state/vasovagal/traces/corti/`; there is no endpoint, collector, daemon, upload, arbitrary path, or
+Settings field. Console/file/stderr diagnostics retain independent `EnvFilter`s and exclude the schema target.
+
+Pipeline and live threads receive explicit parent spans/dispatchers. Aggregate live spans exit before blocking
+receives and re-enter only for chunk work; no callback/sample/frame/VAD-window/token/poll/UI loop is
+instrumented. Attributes are fixed low-cardinality values/counts and exclude transcript/audio/title/app
+identity, IDs, paths, cloud details/credentials, CLI arguments/results, and raw errors. See
+[ADR 0016](../design/adr/0016-local-offline-tracing.md).
+
 ## Async islands
 
 corti is **sync-core: no tokio** in `corti-detect`, `corti-capture`, `corti-coreaudio`, or

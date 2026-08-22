@@ -44,6 +44,11 @@ corti-queue = { path = "crates/corti-queue", version = "0.13.0" }
 corti-jobs = { path = "crates/corti-jobs", version = "0.13.0" }
 corti-aec = { path = "crates/corti-aec", version = "0.13.0" }
 
+# Shared local-only JSONL tracing. Until the independently reviewed registry release is available, pin the
+# exact pushed core revision so this integration cannot follow a moving branch. Replace this with the
+# reviewed crates.io 0.1.1 release before merge (ADR 0016).
+vasovagal-tracing = { git = "https://github.com/vasovagal/vasovagal-tracing.git", rev = "eebe5bbbba597b64dabd2d1981d18ba71bab9869" }
+
 # Shared third-party deps, pinned once here.
 anyhow = "1"
 thiserror = "2"

@@ -12,7 +12,9 @@ use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
-use crate::config::{AppConfig, BackendChoice};
+use crate::config::AppConfig;
+#[cfg(any(feature = "aws", feature = "local"))]
+use crate::config::BackendChoice;
 
 /// The transcription backend, built once at worker startup.
 pub struct Backend {
@@ -47,10 +49,37 @@ impl Backend {
                  (enable the `aws` or `local` feature)",
             ),
         };
+        #[allow(irrefutable_let_patterns)]
+        // tracing-only/no-backend builds contain only this variant
         if let BackendKind::Unavailable(reason) = &kind {
             error!(target: "corti::transcribe", "{reason}");
         }
         Self { cfg, kind }
+    }
+
+    /// Immutable-catalogue backend label; never forwards bucket/profile/config values.
+    pub fn trace_backend(&self) -> &'static str {
+        match &self.kind {
+            #[cfg(feature = "aws")]
+            BackendKind::Aws(_) => "aws",
+            #[cfg(feature = "local")]
+            BackendKind::Local => "local",
+            BackendKind::Unavailable(_) => "other",
+        }
+    }
+
+    /// Immutable-catalogue engine label. GGML is intentionally `other` until a future schema version names
+    /// it; the app never mislabels it as Whisper.
+    pub fn trace_engine(&self) -> &'static str {
+        match &self.kind {
+            #[cfg(feature = "aws")]
+            BackendKind::Aws(_) => "system",
+            #[cfg(feature = "local")]
+            BackendKind::Local if self.cfg.local_asr_engine == "sherpa" => "onnx",
+            #[cfg(feature = "local")]
+            BackendKind::Local => "other",
+            BackendKind::Unavailable(_) => "other",
+        }
     }
 
     /// Provenance with the recording's durable AEC execution record rather than current Settings.
@@ -71,8 +100,8 @@ impl Backend {
         audio: &Path,
         meta: &RecordingMeta,
     ) -> Result<DiarizedTranscript> {
-        // The job name is only used by the AWS arm; keep it referenced for builds without that feature.
-        let _ = aws_job_name;
+        // These are consumed only by concrete backend arms; keep tracing-only builds warning-free.
+        let _ = (aws_job_name, audio, meta);
         match &self.kind {
             #[cfg(feature = "aws")]
             BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), aws_job_name, audio, meta),
@@ -301,56 +330,81 @@ pub fn transcribe_recording(
     attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
+    parent: &crate::offline_trace::Span,
 ) -> Result<(DiarizedTranscript, PathBuf, OfflineAecOutcome)> {
-    // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
-    // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
-    // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
-    let (input, aec_outcome): (PathBuf, OfflineAecOutcome) = if let Some(aec) = aec {
-        match corti_capture::write_clean_wav_with_lookahead(
-            raw_audio,
-            &aec.config,
-            aec.lookahead_seconds,
-        ) {
-            Ok(Some(clean)) => {
-                info!(
-                    target: "corti::transcribe",
-                    job_id = %attempt.id,
-                    aec = true,
-                    input = %raw_audio.display(),
-                    output = %clean.display(),
-                    "AEC ran — cleaned recording"
-                );
-                (clean, OfflineAecOutcome::Applied)
+    let backend_label = backend.trace_backend();
+    let engine_label = backend.trace_engine();
+    let transcription = crate::offline_trace::transcription(parent, backend_label, engine_label);
+    let result = transcription.in_scope(|| {
+        // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
+        // touched. A tap-only recording has no mic track, so AEC is deliberately skipped; a genuine AEC
+        // failure falls back to raw so the functional pipeline never stalls.
+        let (input, aec_outcome): (PathBuf, OfflineAecOutcome) = if let Some(aec) = aec {
+            let aec_span = crate::offline_trace::transcription_aec(
+                &transcription,
+                backend_label,
+                engine_label,
+            );
+            let cleaned = aec_span.in_scope(|| {
+                corti_capture::write_clean_wav_with_lookahead(
+                    raw_audio,
+                    &aec.config,
+                    aec.lookahead_seconds,
+                )
+            });
+            match cleaned {
+                Ok(Some(clean)) => {
+                    aec_span.ok();
+                    info!(
+                        target: "corti::transcribe",
+                        job_id = %attempt.id,
+                        aec = true,
+                        input = %raw_audio.display(),
+                        output = %clean.display(),
+                        "AEC ran — cleaned recording"
+                    );
+                    (clean, OfflineAecOutcome::Applied)
+                }
+                Ok(None) => {
+                    aec_span.skipped();
+                    // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
+                    info!(
+                        target: "corti::transcribe",
+                        job_id = %attempt.id,
+                        aec = false,
+                        input = %raw_audio.display(),
+                        "tap-only recording — no mic track to clean; skipping AEC"
+                    );
+                    (raw_audio.to_path_buf(), OfflineAecOutcome::NotApplicable)
+                }
+                Err(e) => {
+                    aec_span.fallback();
+                    warn!(
+                        target: "corti::transcribe",
+                        job_id = %attempt.id,
+                        aec = false,
+                        input = %raw_audio.display(),
+                        error = %format!("{e:#}"),
+                        "AEC failed; using the raw recording"
+                    );
+                    (raw_audio.to_path_buf(), OfflineAecOutcome::Failed)
+                }
             }
-            Ok(None) => {
-                // Tap-only ("webinar"/listen-only) recording: no mic, nothing to cancel.
-                info!(
-                    target: "corti::transcribe",
-                    job_id = %attempt.id,
-                    aec = false,
-                    input = %raw_audio.display(),
-                    "tap-only recording — no mic track to clean; skipping AEC"
-                );
-                (raw_audio.to_path_buf(), OfflineAecOutcome::NotApplicable)
-            }
-            Err(e) => {
-                warn!(
-                    target: "corti::transcribe",
-                    job_id = %attempt.id,
-                    aec = false,
-                    input = %raw_audio.display(),
-                    error = %format!("{e:#}"),
-                    "AEC failed; using the raw recording"
-                );
-                (raw_audio.to_path_buf(), OfflineAecOutcome::Failed)
-            }
-        }
-    } else {
-        (raw_audio.to_path_buf(), OfflineAecOutcome::NotRequested)
-    };
+        } else {
+            (raw_audio.to_path_buf(), OfflineAecOutcome::NotRequested)
+        };
 
-    let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
-    Ok((transcript, input, aec_outcome))
+        let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
+        Ok((transcript, input, aec_outcome))
+    });
+    match &result {
+        Ok((transcript, _, _)) => {
+            transcription.record_item_count(transcript.segments.len());
+            transcription.ok();
+        }
+        Err(_) => transcription.error(crate::offline_trace::ErrorCode::Other),
+    }
+    result
 }
 
 /// Whether an env var is set and non-empty (after trim) — the conventional "this is configured" test, and

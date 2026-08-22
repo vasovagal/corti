@@ -110,6 +110,26 @@ The selected ASR artifact is a ~0.5–0.74 GB one-time download cached under
 transcript never leave the device. Prefer cloud accuracy? Select AWS Transcribe instead. Either way,
 capture and transcription run in the background; the UI never blocks. See [ADR 0011](./design/adr/0011-spike-transcribe-cpp-ggml-asr.md).
 
+### Optional local performance traces
+
+Official builds include privacy-bounded offline phase tracing, but it is **off at runtime by default** and is
+not a Settings control. Enable one launch with `VASOVAGAL_TRACE=true`, or create the exact strict config:
+
+```yaml
+# ~/.config/vasovagal/corti.yaml
+version: 1
+tracing:
+  enabled: true
+```
+
+Traces are local schema-v1 JSONL under
+`~/.local/state/vasovagal/traces/corti/` (or the corresponding absolute XDG directories), with private file
+permissions, bounded rotation, and retention. They contain operation/timing/outcome data and reviewed coarse
+counts only—never transcript/audio/title/app identity, recording/job IDs, paths, cloud configuration,
+credentials, arguments/results, or raw errors. There is no endpoint, collector, daemon, or upload mechanism.
+Invalid config/storage silently disables tracing. See [ADR 0016](./design/adr/0016-local-offline-tracing.md)
+and the shared [offline analysis guide](https://github.com/vasovagal/vasovagal-tracing/blob/eebe5bbbba597b64dabd2d1981d18ba71bab9869/docs/offline-analysis.md).
+
 ## AEC tuning
 
 The echo canceller works out of the box for typical laptop-speaker setups. Individual
