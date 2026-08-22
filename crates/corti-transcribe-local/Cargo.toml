@@ -37,6 +37,10 @@ futures-core = { workspace = true, optional = true }
 transcribe-cpp = { version = "0.2.0", git = "https://github.com/handy-computer/transcribe.cpp.git", rev = "553f1099a2b3a5bc4421894be171f09960fc0f3a", optional = true }
 
 [features]
+# App-controlled schema-v1 instrumentation. Empty because diagnostics already supply `tracing`; cfg-gating
+# removes every new offline span when the app integration feature is compiled out.
+offline-tracing = []
+
 # Async adapter: a `futures_core::Stream<Item = Vec<Word>>` over the sync `LiveTranscriber` (ADR 0009). OFF
 # by default — no tokio/futures in the default build; the core stays runtime-free (guardrail 9).
 stream = ["dep:tokio", "dep:futures-core"]

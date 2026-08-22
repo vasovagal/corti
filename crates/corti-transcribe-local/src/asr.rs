@@ -21,6 +21,15 @@ pub enum Asr {
 }
 
 impl Asr {
+    #[cfg(feature = "offline-tracing")]
+    pub(crate) const fn trace_engine(&self) -> &'static str {
+        match self {
+            Self::Sherpa(_) => "onnx",
+            #[cfg(feature = "ggml")]
+            Self::Ggml(_) => "other",
+        }
+    }
+
     /// Decode one 16 kHz mono VAD speech region and lift its word timestamps to absolute time.
     /// Engine trouble on a region yields no words (logged), never an error — one bad region must not
     /// sink the whole job.

@@ -849,6 +849,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_wire_shape_has_no_tracing_control() {
+        let value = serde_json::to_value(SettingsDto::from(&AppConfig::default())).unwrap();
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "aec_enabled",
+                "aws_bucket",
+                "aws_profile",
+                "aws_region",
+                "env_managed",
+                "language",
+                "live_buffer_minutes",
+                "live_filing",
+                "local_asr_engine",
+                "local_diarize_far_end",
+                "local_embedding_model",
+                "local_ggml_available",
+                "local_threads",
+                "retention_days",
+                "transcribe_backend",
+            ]
+        );
+    }
+
+    #[test]
     fn local_asr_engine_validation_matches_build_capability() {
         assert_eq!(validate_local_asr_engine(" sherpa ").unwrap(), "sherpa");
         if cfg!(feature = "local-ggml") {

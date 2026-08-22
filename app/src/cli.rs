@@ -77,6 +77,20 @@ pub enum Cli {
     Version,
 }
 
+impl Cli {
+    /// Privacy-safe schema-v1 command category. Arguments, paths, titles, and output are never attached.
+    pub fn trace_command(&self) -> &'static str {
+        match self {
+            Self::Run => "other",
+            Self::Redo(_) => "retry",
+            Self::Transcribe(_) => "transcribe",
+            Self::List => "other",
+            Self::Help => "other",
+            Self::Version => "other",
+        }
+    }
+}
+
 /// Options for `--redo`: corti resolves the recording (cache dir + queue) and files through vagus.
 #[derive(Debug, PartialEq)]
 pub struct RedoArgs {
@@ -206,7 +220,7 @@ fn parse_backend_flag(v: &str) -> Result<BackendChoice, String> {
 
 /// Run a parsed command (everything except `Run`, which [`crate::main`] handles by launching the tray) and
 /// return a process exit code (0 ok, 1 error/usage).
-pub fn dispatch(cli: Cli) -> i32 {
+pub fn dispatch(cli: Cli, trace_parent: &crate::offline_trace::Span) -> i32 {
     let result = match cli {
         Cli::Run => return 0, // main intercepts Run before dispatch; never reached.
         Cli::Help => {
@@ -218,8 +232,8 @@ pub fn dispatch(cli: Cli) -> i32 {
             return 0;
         }
         Cli::List => run_list(),
-        Cli::Redo(args) => run_redo(args),
-        Cli::Transcribe(args) => run_transcribe(args),
+        Cli::Redo(args) => run_redo(args, trace_parent),
+        Cli::Transcribe(args) => run_transcribe(args, trace_parent),
     };
     match result {
         Ok(()) => 0,
@@ -270,7 +284,7 @@ fn status_label(status: JobStatus) -> &'static str {
 
 /// `--redo`: re-transcribe `args.input` with the (optionally overridden) backend, then file a fresh note (or
 /// print it with `--print`).
-fn run_redo(args: RedoArgs) -> Result<()> {
+fn run_redo(args: RedoArgs, trace_parent: &crate::offline_trace::Span) -> Result<()> {
     // Load config, then let the CLI backend flag win for THIS run. Env (`CORTI_TRANSCRIBE_BACKEND`) still
     // applies underneath when no flag is given.
     let mut cfg = AppConfig::load();
@@ -312,14 +326,23 @@ fn run_redo(args: RedoArgs) -> Result<()> {
 
     let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
+    let pipeline_trace = crate::offline_trace::pipeline_recording(
+        Some(trace_parent),
+        "file",
+        backend.trace_backend(),
+    );
+    let transcribed = crate::transcribe::transcribe_recording(
         &backend,
         offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&resolved.id),
         &resolved.meta,
         &resolved.audio,
-    )
-    .context("transcription failed")?;
+        &pipeline_trace,
+    );
+    if transcribed.is_err() {
+        pipeline_trace.error(crate::offline_trace::ErrorCode::Other);
+    }
+    let (transcript, used, aec_outcome) = transcribed.context("transcription failed")?;
     eprintln!(
         "[corti] transcribed {} segment(s) from {}",
         transcript.segments.len(),
@@ -329,6 +352,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     if args.print_only {
         // Print mode: dump the transcript; leave the vault and queue untouched.
         print!("{}", transcript.to_markdown());
+        pipeline_trace.ok();
         return Ok(());
     }
 
@@ -343,11 +367,23 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         corti_vagus::provenance::GenerationMode::Batch,
         aec_execution,
     );
-    let vagus = Vagus::discover()
-        .context("vagus not available (needed to file the note; pass --print to skip filing)")?;
-    let note = vagus
-        .file_recording(&resolved.meta, &transcript, &provenance)
-        .context("filing the note into vagus")?;
+    let filing_trace =
+        crate::offline_trace::pipeline_vagus_file(&pipeline_trace, "file", backend.trace_backend());
+    let filed = filing_trace.in_scope(|| {
+        let vagus = Vagus::discover().context(
+            "vagus not available (needed to file the note; pass --print to skip filing)",
+        )?;
+        vagus
+            .file_recording(&resolved.meta, &transcript, &provenance)
+            .context("filing the note into vagus")
+    });
+    if filed.is_ok() {
+        filing_trace.ok();
+    } else {
+        filing_trace.error(crate::offline_trace::ErrorCode::Other);
+        pipeline_trace.error(crate::offline_trace::ErrorCode::Other);
+    }
+    let note = filed?;
     println!("filed note: {}", note.display());
 
     // Best-effort: point the queue row at the new note. The note is already filed, so this column is purely
@@ -377,6 +413,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         println!("  {}", old.display());
     }
 
+    pipeline_trace.ok();
     Ok(())
 }
 
@@ -422,7 +459,7 @@ fn redo_aec_execution<'a>(
 
 /// `--input`: the low-level primitive. Transcribe an explicit WAV and render a note to `--output` (or
 /// stdout). No cache/queue/vagus resolution — the caller owns the paths and any filing/indexing.
-fn run_transcribe(args: TranscribeArgs) -> Result<()> {
+fn run_transcribe(args: TranscribeArgs, trace_parent: &crate::offline_trace::Span) -> Result<()> {
     let mut cfg = AppConfig::load();
     if let Some(choice) = args.backend {
         cfg.transcribe_backend = choice;
@@ -464,14 +501,23 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     let offline_aec = aec_enabled.then(|| crate::transcribe::OfflineAec::current(aec_cfg));
     let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
+    let pipeline_trace = crate::offline_trace::pipeline_recording(
+        Some(trace_parent),
+        "file",
+        backend.trace_backend(),
+    );
+    let transcribed = crate::transcribe::transcribe_recording(
         &backend,
         offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&job_id),
         &meta,
         input,
-    )
-    .context("transcription failed")?;
+        &pipeline_trace,
+    );
+    if transcribed.is_err() {
+        pipeline_trace.error(crate::offline_trace::ErrorCode::Other);
+    }
+    let (transcript, used, aec_outcome) = transcribed.context("transcription failed")?;
     eprintln!(
         "[corti] transcribed {} segment(s) from {}",
         transcript.segments.len(),
@@ -501,14 +547,26 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     let note = render_note(&title, &source, &body, &provenance, Local::now())
         .context("rendering transcript provenance")?;
 
-    match &args.output {
-        Some(path) => {
-            std::fs::write(path, &note).with_context(|| format!("writing note to {path}"))?;
-            println!("wrote note: {path}");
+    let complete_trace =
+        crate::offline_trace::pipeline_complete(&pipeline_trace, "file", backend.trace_backend());
+    let completed = complete_trace.in_scope(|| -> Result<()> {
+        match &args.output {
+            Some(path) => {
+                std::fs::write(path, &note).with_context(|| format!("writing note to {path}"))?;
+                println!("wrote note: {path}");
+            }
+            None => print!("{note}"),
         }
-        None => print!("{note}"),
+        Ok(())
+    });
+    if completed.is_ok() {
+        complete_trace.ok();
+        pipeline_trace.ok();
+    } else {
+        complete_trace.error(crate::offline_trace::ErrorCode::Storage);
+        pipeline_trace.error(crate::offline_trace::ErrorCode::Storage);
     }
-    Ok(())
+    completed
 }
 
 /// Render a standalone note — YAML frontmatter + an H1 title + `body` — mirroring what `vagus add-note`

@@ -29,25 +29,107 @@ pub(crate) const SWEEP_EXPIRED: &str = "sweep_expired";
 pub(crate) const RETRY_MAX_ATTEMPTS: u32 = 5;
 
 pub(crate) const SWEEP_PERIOD: Duration = Duration::from_secs(3600);
+
+/// Privacy-safe provenance for one durable background attempt. This value is persisted so automatic
+/// rescheduling does not erase whether the work originated from a user retry or startup recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttemptKind {
+    AutomaticRetry,
+    ManualRetry,
+    Recovery,
+}
+
+impl AttemptKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticRetry => "automatic_retry",
+            Self::ManualRetry => "manual_retry",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        match payload["attempt_kind"].as_str() {
+            Some("automatic_retry") => Some(Self::AutomaticRetry),
+            Some("manual_retry") => Some(Self::ManualRetry),
+            Some("recovery") => Some(Self::Recovery),
+            _ => None,
+        }
+    }
+}
+
 /// Minimum terminal-row lifetime. The actual horizon is the maximum of this and configured audio
 /// retention, because deleting the path-bearing row first would orphan longer-retained audio forever.
 const MIN_ROW_RETENTION_DAYS: i64 = 90;
 /// Parked `failed` background-job rows are debris after this long.
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
-pub(crate) fn retry_payload(id: &str, preferred_note: Option<&OwnedNote>) -> serde_json::Value {
+pub(crate) fn retry_payload(
+    id: &str,
+    preferred_note: Option<&OwnedNote>,
+    attempt_kind: AttemptKind,
+) -> serde_json::Value {
     match preferred_note {
         Some(note) => serde_json::json!({
             "id": id,
             "preferred_note": note.path.to_string_lossy(),
             "note_canonical": note.canonical,
+            "attempt_kind": attempt_kind.as_str(),
         }),
-        None => serde_json::json!({ "id": id }),
+        None => serde_json::json!({
+            "id": id,
+            "attempt_kind": attempt_kind.as_str(),
+        }),
     }
 }
 
-pub(crate) fn id_payload(id: &str) -> serde_json::Value {
-    retry_payload(id, None)
+pub(crate) fn id_payload(id: &str, attempt_kind: AttemptKind) -> serde_json::Value {
+    retry_payload(id, None, attempt_kind)
+}
+
+/// Project a persisted attempt provenance into the immutable tracing catalogue. Legacy retry payloads
+/// predate this field and retain their historical automatic-retry interpretation.
+pub(crate) fn retry_attempt_kind(payload: &serde_json::Value) -> AttemptKind {
+    AttemptKind::from_payload(payload).unwrap_or(AttemptKind::AutomaticRetry)
+}
+
+pub(crate) fn trace_attempt_kind(kind: &str, payload: &serde_json::Value) -> &'static str {
+    AttemptKind::from_payload(payload).map_or_else(
+        || {
+            if kind == RETRY_TRANSCRIPTION {
+                "automatic_retry"
+            } else {
+                "initial"
+            }
+        },
+        AttemptKind::as_str,
+    )
+}
+
+/// Enqueue at most one active transcription retry per recording, independent of provenance or an owned
+/// note path. The jobs table's generic exact-JSON dedupe cannot provide this app-level identity by itself.
+pub(crate) fn enqueue_retry(
+    queue: &Queue,
+    id: &str,
+    preferred_note: Option<&OwnedNote>,
+    attempt_kind: AttemptKind,
+    max_attempts: u32,
+    run_at: DateTime<Utc>,
+) -> Result<Option<i64>> {
+    let jobs = queue.jobs();
+    if jobs
+        .active_for(RETRY_TRANSCRIPTION)?
+        .iter()
+        .any(|(payload, _)| payload["id"].as_str() == Some(id))
+    {
+        return Ok(None);
+    }
+    jobs.enqueue(
+        RETRY_TRANSCRIPTION,
+        &retry_payload(id, preferred_note, attempt_kind),
+        max_attempts,
+        run_at,
+    )
 }
 
 fn preferred_note(payload: &serde_json::Value) -> Option<OwnedNote> {
@@ -81,12 +163,37 @@ fn cleanup_payload(id: &str, audio: &Path) -> serde_json::Value {
 /// Dispatch one claimed job by kind. An unrecognized kind fails with backoff so version skew surfaces
 /// in the jobs table instead of crash-looping or silently vanishing.
 pub(crate) fn run(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
-    match job.kind.as_str() {
-        RETRY_TRANSCRIPTION => retry_transcription(ctx, job),
-        CLEANUP_AWS_STAGING => cleanup_aws_staging(ctx, job),
-        SWEEP_EXPIRED => sweep_expired(ctx),
-        other => anyhow::bail!("unknown job kind {other:?}"),
+    let attempt_kind = trace_attempt_kind(&job.kind, &job.payload);
+    let attempt_count = job.attempts.min(1_000);
+    let root = crate::offline_trace::background_job(attempt_kind, attempt_count);
+    let phase = match job.kind.as_str() {
+        RETRY_TRANSCRIPTION => {
+            crate::offline_trace::background_retry(&root, attempt_kind, attempt_count)
+        }
+        CLEANUP_AWS_STAGING => {
+            crate::offline_trace::background_cleanup(&root, attempt_kind, attempt_count)
+        }
+        SWEEP_EXPIRED => {
+            crate::offline_trace::background_retention(&root, attempt_kind, attempt_count)
+        }
+        _ => crate::offline_trace::background_retry(&root, "other", attempt_count),
+    };
+    let result = root.in_scope(|| {
+        phase.in_scope(|| match job.kind.as_str() {
+            RETRY_TRANSCRIPTION => retry_transcription(ctx, job),
+            CLEANUP_AWS_STAGING => cleanup_aws_staging(ctx, job),
+            SWEEP_EXPIRED => sweep_expired(ctx),
+            other => anyhow::bail!("unknown job kind {other:?}"),
+        })
+    });
+    if result.is_ok() {
+        phase.ok();
+        root.ok();
+    } else {
+        phase.error(crate::offline_trace::ErrorCode::Other);
+        root.error(crate::offline_trace::ErrorCode::Other);
     }
+    result
 }
 
 /// A transcription job ran out of attempts. The recording must become terminal before the caller parks
@@ -242,7 +349,7 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     )
                     .context("promoting recovered checkpoint to PendingNote")?;
             }
-            pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path)
+            pipeline::file_checkpoint(ctx, id, &meta, &row.audio_path, None)
         }
         RetryAction::CompleteCanonicalNote => pipeline::complete_canonical_note(
             ctx,
@@ -252,6 +359,7 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
             &owned_note
                 .context("canonical retry missing its note path")?
                 .path,
+            None,
         ),
         RetryAction::TranscribeLegacyPendingNote => {
             ctx.queue
@@ -263,11 +371,23 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     },
                 )
                 .context("persisting legacy recovery attempt name")?;
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
+            pipeline::transcribe_and_file(
+                ctx,
+                id,
+                &meta,
+                &row.audio_path,
+                owned_note.as_ref(),
+                None,
+            )
         }
-        RetryAction::Transcribe => {
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
-        }
+        RetryAction::Transcribe => pipeline::transcribe_and_file(
+            ctx,
+            id,
+            &meta,
+            &row.audio_path,
+            owned_note.as_ref(),
+            None,
+        ),
         RetryAction::MissingAudio => pipeline::fail_with_note(
             ctx,
             id,
@@ -567,16 +687,85 @@ mod tests {
     }
 
     #[test]
-    fn retry_payload_durably_carries_note_provenance() {
+    fn retry_payload_durably_carries_note_and_attempt_provenance() {
         let partial = OwnedNote::partial("/vault/live note.md");
-        let payload = retry_payload("recording", Some(&partial));
+        let payload = retry_payload("recording", Some(&partial), AttemptKind::AutomaticRetry);
         assert_eq!(payload["id"], "recording");
+        assert_eq!(payload["attempt_kind"], "automatic_retry");
         assert_eq!(preferred_note(&payload), Some(partial));
 
         let canonical = OwnedNote::canonical("/vault/filed note.md");
-        let payload = retry_payload("recording", Some(&canonical));
+        let payload = retry_payload("recording", Some(&canonical), AttemptKind::Recovery);
+        assert_eq!(payload["attempt_kind"], "recovery");
         assert_eq!(preferred_note(&payload), Some(canonical));
-        assert_eq!(preferred_note(&id_payload("recording")), None);
+        assert_eq!(
+            preferred_note(&id_payload("recording", AttemptKind::ManualRetry)),
+            None
+        );
+    }
+
+    #[test]
+    fn every_retry_attempt_kind_projects_to_the_catalogue_and_survives_payload_rewrites() {
+        for (kind, expected) in [
+            (AttemptKind::AutomaticRetry, "automatic_retry"),
+            (AttemptKind::ManualRetry, "manual_retry"),
+            (AttemptKind::Recovery, "recovery"),
+        ] {
+            let payload = retry_payload("recording", None, kind);
+            assert_eq!(trace_attempt_kind(RETRY_TRANSCRIPTION, &payload), expected);
+            let rewritten = retry_payload(
+                "recording",
+                Some(&OwnedNote::partial("/vault/note.md")),
+                retry_attempt_kind(&payload),
+            );
+            assert_eq!(
+                trace_attempt_kind(RETRY_TRANSCRIPTION, &rewritten),
+                expected
+            );
+        }
+        assert_eq!(
+            trace_attempt_kind(RETRY_TRANSCRIPTION, &serde_json::json!({ "id": "legacy" })),
+            "automatic_retry"
+        );
+        assert_eq!(
+            trace_attempt_kind(SWEEP_EXPIRED, &serde_json::json!({})),
+            "initial"
+        );
+    }
+
+    #[test]
+    fn retry_enqueue_dedupes_recording_identity_across_attempt_provenance() {
+        let dir = test_dir("retry-attempt-dedupe");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        assert!(
+            enqueue_retry(
+                &queue,
+                "recording",
+                None,
+                AttemptKind::AutomaticRetry,
+                RETRY_MAX_ATTEMPTS,
+                Utc::now(),
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            enqueue_retry(
+                &queue,
+                "recording",
+                None,
+                AttemptKind::Recovery,
+                RETRY_MAX_ATTEMPTS,
+                Utc::now(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let active = queue.jobs().active_for(RETRY_TRANSCRIPTION).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0["attempt_kind"], "automatic_retry");
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -615,7 +804,7 @@ mod tests {
     #[test]
     fn live_preferred_note_with_checkpoint_retries_filing_only_without_audio() {
         let note = OwnedNote::partial("/vault/live note.md");
-        let payload = retry_payload("recording", Some(&note));
+        let payload = retry_payload("recording", Some(&note), AttemptKind::AutomaticRetry);
         assert_eq!(preferred_note(&payload), Some(note));
         assert_eq!(
             retry_action(JobStatus::PendingTranscription, true, false, false),

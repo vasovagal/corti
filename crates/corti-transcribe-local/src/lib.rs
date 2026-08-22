@@ -162,6 +162,27 @@ impl LocalTranscriber {
     /// required. The selected ASR engine and Silero VAD are always required. Spawn one
     /// [`LiveTranscriber`] per channel via [`LiveEngine::channel`].
     pub fn live_engine(&self) -> Result<LiveEngine> {
+        #[cfg(feature = "offline-tracing")]
+        let span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.model_load",
+            backend = "local",
+            engine = trace_engine(&self.cfg.asr_engine),
+            model_family = "speech_to_text",
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        #[cfg(feature = "offline-tracing")]
+        let result = span.in_scope(|| self.live_engine_inner());
+        #[cfg(not(feature = "offline-tracing"))]
+        let result = self.live_engine_inner();
+        #[cfg(feature = "offline-tracing")]
+        record_result(&span, &result, "model_unavailable");
+        result
+    }
+
+    fn live_engine_inner(&self) -> Result<LiveEngine> {
         let dir = models::resolve_dir(self.cfg.model_dir.clone())?;
         let wants_ggml = asr::wants_ggml(&self.cfg.asr_engine)?;
         let m = models::discover_for(
@@ -224,8 +245,26 @@ impl LocalTranscriber {
     }
 }
 
-impl Transcriber for LocalTranscriber {
-    fn transcribe(&self, audio: &Path, _meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+#[cfg(feature = "offline-tracing")]
+fn trace_engine(configured: &str) -> &'static str {
+    match configured {
+        "" | "sherpa" => "onnx",
+        _ => "other",
+    }
+}
+
+#[cfg(feature = "offline-tracing")]
+fn record_result<T>(span: &tracing::Span, result: &Result<T>, error_code: &'static str) {
+    if result.is_ok() {
+        span.record("outcome", "ok");
+    } else {
+        span.record("outcome", "error");
+        span.record("error_code", error_code);
+    }
+}
+
+impl LocalTranscriber {
+    fn transcribe_inner(&self, audio: &Path) -> Result<DiarizedTranscript> {
         let job_started = std::time::Instant::now();
         tracing::info!(
             target: "corti::transcribe::local",
@@ -244,38 +283,173 @@ impl Transcriber for LocalTranscriber {
             // Fail before decoding a call-sized WAV when the selected GGUF/build is unavailable.
             self.validate_ggml_model(&dir)?;
         }
-        let track = audio::read_two_track(audio)?;
+
+        #[cfg(feature = "offline-tracing")]
+        let decode_span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.decode",
+            backend = "local",
+            engine = trace_engine(&self.cfg.asr_engine),
+            model_family = "speech_to_text",
+            sample_rate = tracing::field::Empty,
+            channel_count = tracing::field::Empty,
+            sample_count = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        #[cfg(feature = "offline-tracing")]
+        let decoded = decode_span.in_scope(|| audio::read_two_track(audio));
+        #[cfg(not(feature = "offline-tracing"))]
+        let decoded = audio::read_two_track(audio);
+        #[cfg(feature = "offline-tracing")]
+        {
+            record_result(&decode_span, &decoded, "decode_failed");
+            if let Ok(track) = &decoded {
+                decode_span.record("sample_rate", u64::try_from(track.sample_rate).unwrap_or(0));
+                decode_span.record("channel_count", u64::from(track.channel_count));
+                decode_span.record(
+                    "sample_count",
+                    u64::try_from(track.mic.len().saturating_add(track.them.len()))
+                        .unwrap_or(u64::MAX),
+                );
+            }
+        }
+        let track = decoded?;
         let threads = self.cfg.num_threads;
 
         // One ASR engine load per job, shared across both channels (and both `LiveTranscriber`s).
-        let rec = Arc::new(self.build_asr(wants_ggml, &m, &dir)?);
+        #[cfg(feature = "offline-tracing")]
+        let model_span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.model_load",
+            backend = "local",
+            engine = trace_engine(&self.cfg.asr_engine),
+            model_family = "speech_to_text",
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        #[cfg(feature = "offline-tracing")]
+        let model = model_span.in_scope(|| self.build_asr(wants_ggml, &m, &dir));
+        #[cfg(not(feature = "offline-tracing"))]
+        let model = self.build_asr(wants_ggml, &m, &dir);
+        #[cfg(feature = "offline-tracing")]
+        record_result(&model_span, &model, "model_unavailable");
+        let rec = Arc::new(model?);
         let mut segments = Vec::new();
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
         if !track.mic.is_empty() {
-            let mic = engine::resample_to_16k(&track.mic, track.sample_rate)?;
-            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
-            let words = engine::transcribe_channel(rec.clone(), vad, &mic);
-            segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
+            #[cfg(feature = "offline-tracing")]
+            let channel_span = tracing::span!(
+                target: "vasovagal::trace",
+                tracing::Level::INFO,
+                "corti.transcription.channel",
+                backend = "local",
+                engine = trace_engine(&self.cfg.asr_engine),
+                model_family = "speech_to_text",
+                sample_rate = u64::try_from(track.sample_rate).unwrap_or(0),
+                sample_count = u64::try_from(track.mic.len()).unwrap_or(u64::MAX),
+                item_count = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                error_code = tracing::field::Empty,
+            );
+            let run = || -> Result<Vec<corti_transcribe::segment::Word>> {
+                let mic = engine::resample_to_16k(&track.mic, track.sample_rate)?;
+                let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
+                Ok(engine::transcribe_channel(rec.clone(), vad, &mic))
+            };
+            #[cfg(feature = "offline-tracing")]
+            let words = channel_span.in_scope(run);
+            #[cfg(not(feature = "offline-tracing"))]
+            let words = run();
+            #[cfg(feature = "offline-tracing")]
+            {
+                record_result(&channel_span, &words, "decode_failed");
+                if let Ok(words) = &words {
+                    channel_span
+                        .record("item_count", u64::try_from(words.len()).unwrap_or(u64::MAX));
+                }
+            }
+            segments.extend(words_to_segments(&words?, Speaker::Me, SEGMENT_GAP));
         }
 
         // ch1 (system tap) → far end.
         if !track.them.is_empty() {
-            let them = engine::resample_to_16k(&track.them, track.sample_rate)?;
-            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
-            let words = engine::transcribe_channel(rec.clone(), vad, &them);
+            #[cfg(feature = "offline-tracing")]
+            let channel_span = tracing::span!(
+                target: "vasovagal::trace",
+                tracing::Level::INFO,
+                "corti.transcription.channel",
+                backend = "local",
+                engine = trace_engine(&self.cfg.asr_engine),
+                model_family = "speech_to_text",
+                sample_rate = u64::try_from(track.sample_rate).unwrap_or(0),
+                sample_count = u64::try_from(track.them.len()).unwrap_or(u64::MAX),
+                item_count = tracing::field::Empty,
+                outcome = tracing::field::Empty,
+                error_code = tracing::field::Empty,
+            );
+            let run = || -> Result<(Vec<f32>, Vec<corti_transcribe::segment::Word>)> {
+                let them = engine::resample_to_16k(&track.them, track.sample_rate)?;
+                let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
+                let words = engine::transcribe_channel(rec.clone(), vad, &them);
+                Ok((them, words))
+            };
+            #[cfg(feature = "offline-tracing")]
+            let decoded = channel_span.in_scope(run);
+            #[cfg(not(feature = "offline-tracing"))]
+            let decoded = run();
+            #[cfg(feature = "offline-tracing")]
+            {
+                record_result(&channel_span, &decoded, "decode_failed");
+                if let Ok((_, words)) = &decoded {
+                    channel_span
+                        .record("item_count", u64::try_from(words.len()).unwrap_or(u64::MAX));
+                }
+            }
+            let (them, words) = decoded?;
             if self.cfg.diarize_far_end {
                 // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
-                let diar = engine::build_diarizer(
-                    &m,
-                    threads,
-                    self.cfg.diarize_threshold,
-                    self.cfg.diarize_num_clusters,
-                    self.cfg.diarize_min_duration_on,
-                    self.cfg.diarize_min_duration_off,
-                )?;
-                let turns = engine::diarize_channel(&diar, &them);
-                segments.extend(diarize_words(&words, &turns, SEGMENT_GAP, "Them"));
+                #[cfg(feature = "offline-tracing")]
+                let diarize_span = tracing::span!(
+                    target: "vasovagal::trace",
+                    tracing::Level::INFO,
+                    "corti.transcription.diarize",
+                    backend = "local",
+                    engine = "onnx",
+                    model_family = "diarization",
+                    sample_rate = 16_000_u64,
+                    sample_count = u64::try_from(them.len()).unwrap_or(u64::MAX),
+                    item_count = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                    error_code = tracing::field::Empty,
+                );
+                let run = || -> Result<Vec<corti_transcribe::segment::SpeakerTurn>> {
+                    let diar = engine::build_diarizer(
+                        &m,
+                        threads,
+                        self.cfg.diarize_threshold,
+                        self.cfg.diarize_num_clusters,
+                        self.cfg.diarize_min_duration_on,
+                        self.cfg.diarize_min_duration_off,
+                    )?;
+                    Ok(engine::diarize_channel(&diar, &them))
+                };
+                #[cfg(feature = "offline-tracing")]
+                let turns = diarize_span.in_scope(run);
+                #[cfg(not(feature = "offline-tracing"))]
+                let turns = run();
+                #[cfg(feature = "offline-tracing")]
+                {
+                    record_result(&diarize_span, &turns, "decode_failed");
+                    if let Ok(turns) = &turns {
+                        diarize_span
+                            .record("item_count", u64::try_from(turns.len()).unwrap_or(u64::MAX));
+                    }
+                }
+                segments.extend(diarize_words(&words, &turns?, SEGMENT_GAP, "Them"));
             } else {
                 // Default: attribute the whole far end to a single speaker (like the AWS backend).
                 let them_speaker = Speaker::Other("Them".to_string());
@@ -291,6 +465,38 @@ impl Transcriber for LocalTranscriber {
             "local transcription finished"
         );
         Ok(transcript)
+    }
+}
+
+impl Transcriber for LocalTranscriber {
+    fn transcribe(&self, audio: &Path, _meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+        #[cfg(feature = "offline-tracing")]
+        let span = tracing::span!(
+            target: "vasovagal::trace",
+            tracing::Level::INFO,
+            "corti.transcription.backend",
+            backend = "local",
+            engine = trace_engine(&self.cfg.asr_engine),
+            model_family = "speech_to_text",
+            item_count = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+        );
+        #[cfg(feature = "offline-tracing")]
+        let result = span.in_scope(|| self.transcribe_inner(audio));
+        #[cfg(not(feature = "offline-tracing"))]
+        let result = self.transcribe_inner(audio);
+        #[cfg(feature = "offline-tracing")]
+        {
+            record_result(&span, &result, "other");
+            if let Ok(transcript) = &result {
+                span.record(
+                    "item_count",
+                    u64::try_from(transcript.segments.len()).unwrap_or(u64::MAX),
+                );
+            }
+        }
+        result
     }
 }
 

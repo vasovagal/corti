@@ -20,3 +20,6 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
   frontmatter—release, final live/batch path, model artifacts, and safe quality configuration—with
   checkpoint-stable retries, truthful live→batch fallback rewrites, and dedicated Vagus lexical/semantic
   metadata chunks (#110, ADR 0014; Vagus ADRs 0027/0028).
+- **Next / proposed:** runtime-opt-in, local-only schema-v1 JSONL phase tracing shared with Vagus, behind the
+  default `offline-tracing` build feature and outside Settings. Invalid activation/storage/subscriber state
+  fails closed; diagnostics remain independent and private-content fields are forbidden (#122, ADR 0016).

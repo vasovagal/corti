@@ -11,6 +11,10 @@ description: >
   No `ort` cache step (unlike vagus): corti has no `ort`.
 
 inputs:
+  toolchain:
+    description: "Rust toolchain to install (`stable` or an exact release such as `1.96.0`)."
+    required: false
+    default: stable
   components:
     description: "Extra rustup components, space-separated (e.g. 'clippy rustfmt')."
     required: false
@@ -27,15 +31,17 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Toolchain (latest stable)
+    - name: Toolchain (${{ inputs.toolchain }})
       shell: bash
       run: |
-        # corti's MSRV (Cargo.toml rust-version) tracks the latest stable, so CI must actually BE on the
-        # latest stable — NOT the runner image's baked-in (often weeks-old) stable. `rustup update stable`
-        # guarantees it; a bare `... || rustup toolchain install stable` would skip the update whenever the
-        # image already had an (older) stable active, which silently fails the MSRV check.
-        rustup update stable --no-self-update
-        rustup default stable
+        # The normal lane always refreshes latest stable; the MSRV lane installs one exact compiler.
+        # A bare `... || rustup toolchain install stable` would silently retain a stale baked-in stable.
+        if [ "${{ inputs.toolchain }}" = "stable" ]; then
+          rustup update stable --no-self-update
+        else
+          rustup toolchain install "${{ inputs.toolchain }}" --profile minimal --no-self-update
+        fi
+        rustup default "${{ inputs.toolchain }}"
         rustup target add aarch64-apple-darwin
         if [ -n "${{ inputs.components }}" ]; then rustup component add ${{ inputs.components }}; fi
         rustc -V && cargo -V

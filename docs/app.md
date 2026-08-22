@@ -22,6 +22,7 @@ Every AppKit / tray / window mutation is marshalled to the Tauri main thread via
 | `corti-detect` | inside `Detector::start` (`crates/corti-detect/src/platform.rs`) | the poller — mic-in-use state machine, owns the in-flight `Recorder` |
 | `corti-stats` | `main.rs:350` | 1 Hz sampler → `StatsBuffer` ring |
 | `corti-blink` | `tray.rs:297` | 500 ms tray-icon swap while recording |
+| `vasovagal-trace-writer` | shared crate, only after explicit runtime activation | Bounded local schema-v1 JSONL writer; no endpoint/collector/network path (ADR 0016) |
 
 #85's durable background jobs add **no** new OS thread — the retry and hourly retention sweep run on the
 existing `corti-pipeline` thread's tick loop, interleaved with recordings. While the explicit microphone test
@@ -233,13 +234,22 @@ so `live_filing` and its rolling interval need no reload either. Env knobs (`COR
 Settings screen also exposes `live_buffer_minutes` (default 1, range 1–10), the maximum ordinary interval
 between diarized + `sync_all` transcript commits. Both apply to the next recording.
 
+Offline performance tracing is deliberately separate from this flow: there is no `AppConfig`, Settings DTO,
+command, or UI field. The optional default build feature `offline-tracing` consults only exact
+`VASOVAGAL_TRACE=true|false` and strict `${XDG_CONFIG_HOME:-$HOME/.config}/vasovagal/corti.yaml`; runtime
+activation remains off when neither requests true (ADR 0016).
+
 ## Diagnostics console + stats sampler
 
 **Console** (`console.rs`): a `tracing` `ConsoleLayer` captures each event into a size-capped
 `ConsoleBuffer` ring (`console.rs:71,134`) that the `get_console_logs*` / `save_console_logs`
 commands read; a parallel **daily-rolling** file layer writes `<data_dir>/logs/corti.log`
 (`console.rs:201,218`). The buffer is `manage`d so the layer and the Tauri command observe the same
-entries.
+entries. Tray and headless startup also compose the optional shared offline layer using `try_init`. Each
+console/file/stderr diagnostics layer owns its own historical `RUST_LOG`/`CORTI_LOG` `EnvFilter` and excludes
+the exact `vasovagal::trace` target, so diagnostics filtering cannot alter schema traces or render them as log
+messages. Both guards live across `app.run`; tray shutdown joins live/pipeline/hosted span owners before
+emitting its summary, and headless dispatch drains the guards before `process::exit` (ADR 0016).
 
 **Stats** (`stats.rs`): `spawn_sampler` (`stats.rs:302`) runs the 1 Hz `corti-stats` thread — off the
 pipeline thread (guardrail 9) — sampling process RSS/CPU (libc self-introspection) plus the recording

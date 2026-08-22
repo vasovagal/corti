@@ -56,10 +56,12 @@ cd screenshots && npm install && npm run capture
 The screenshot harness needs Playwright Chromium once (`npx playwright install chromium`) and writes
 ignored Retina PNGs to `screenshots/output/`. See [`screenshots/README.md`](./screenshots/README.md).
 
-The app defaults are `aws`, `local`, and `local-ggml`. Select the active backend with
-`CORTI_TRANSCRIBE_BACKEND`; local ASR uses `CORTI_LOCAL_ASR_ENGINE=sherpa|ggml`. A minimal
-`sherpa`-only build is `cargo build -p corti-app --no-default-features --features local`.
-transcribe.cpp compiles pinned native C++/Metal source and requires CMake on the build machine.
+The app defaults are `aws`, `local`, `local-ggml`, and `offline-tracing`. Select the active backend with
+`CORTI_TRANSCRIBE_BACKEND`; local ASR uses `CORTI_LOCAL_ASR_ENGINE=sherpa|ggml`. Offline tracing remains
+runtime-off unless its strict env/YAML activation requests true (ADR 0016). A minimal `sherpa`-only build is
+`cargo build -p corti-app --no-default-features --features local`; a tracing-only integration check is
+`cargo check -p corti-app --no-default-features --features offline-tracing`. transcribe.cpp compiles pinned
+native C++/Metal source and requires CMake on the build machine.
 
 Build the frontend first: the app crate's `generate_context!()` reads `frontendDist`
 (`app/ui/dist`) from `tauri.conf.json`, so `cargo` won't compile the workspace until

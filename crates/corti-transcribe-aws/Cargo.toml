@@ -29,3 +29,8 @@ hound = "3.5"
 [dev-dependencies]
 # The example plays the app's role and builds a RecordingMeta, which carries chrono timestamps.
 chrono = { workspace = true }
+
+[features]
+# App-controlled schema-v1 instrumentation. Empty because this crate's diagnostics already depend on
+# `tracing`; cfg-gating keeps every new offline span out of compiled-out client builds.
+offline-tracing = []
