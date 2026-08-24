@@ -1,6 +1,6 @@
 # corti — status
 
-Current tree (latest tag **v0.13.0**): the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
+Current tree (latest tag **v0.14.0**): the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
 capture + in-flight writer-thread AEC (`StreamingAec`, ADR 0007/#74) → cleaned 2-track WAV →
 transcription (AWS batch or local offline Parakeet-TDT via sherpa/CPU or transcribe.cpp/Metal,
 runtime-selectable) → filed vagus note. Capture disposition/config is durable in `queue.db`, so legacy
@@ -20,3 +20,7 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
   frontmatter—release, final live/batch path, model artifacts, and safe quality configuration—with
   checkpoint-stable retries, truthful live→batch fallback rewrites, and dedicated Vagus lexical/semantic
   metadata chunks (#110, ADR 0014; Vagus ADRs 0027/0028).
+- **v0.14.0:** optional hosted-LLM cleanup for live and final transcripts, raw/clean/diff views,
+  configurable provider and language preferences, resumable encrypted request state, usage/cost accounting,
+  and transcript-grounded questions. Direct transports cover OpenAI, Anthropic, Vertex AI, and Amazon
+  Bedrock; experimental Codex broker support remains explicitly gated (#113, #115, ADR 0015).
