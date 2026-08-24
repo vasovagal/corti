@@ -3,8 +3,12 @@ Claude plans should be mirrored to github issues and labeled with either `Featur
 ## Releasing
 
 After pushing a `vX.Y.Z` tag, `release.yml` builds + publishes the ad-hoc-signed `.dmg` + `.app.zip` to the
-GitHub release (no signing/notarization; no PAT). **You must then update the Homebrew tap by hand — CI never
-writes it.** Regenerate the cask and commit it to the shared tap `vasovagal/homebrew-tap`:
+GitHub release (no signing/notarization; no PAT). Once the public two-asset contract passes, its final job
+updates `vasovagal.github.io` through the Corti-specific `LANDING_PAGE_DEPLOY_KEY`; that key can write only
+the site repository, and the idempotent site commit is `corti bumped to X.Y.Z`.
+
+**You must still update the Homebrew tap by hand — CI never writes it.** Regenerate the cask and commit it to
+the shared tap `vasovagal/homebrew-tap`:
 
     VERSION=X.Y.Z scripts/render-cask.sh > ~/code/vasovagal/homebrew-tap/Casks/corti.rb
 
