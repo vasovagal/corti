@@ -1388,6 +1388,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-sts",
+ "base64 0.22.1",
  "chrono",
  "corti-aec",
  "corti-capture",

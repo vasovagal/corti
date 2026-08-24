@@ -38,6 +38,9 @@ thiserror = { workspace = true }
 unicode-segmentation = { workspace = true }
 zeroize = { workspace = true }
 ring = "0.17"
+base64 = { workspace = true }
+# Vertex ADC token exchange POSTs to Google's OAuth endpoint over HTTPS on the app's own credential thread.
+ureq = "2"
 # Stable hosted-store and direct-provider keys live in explicitly non-synchronizing macOS Keychain items.
 security-framework = "3.7"
 security-framework-sys = "2.17"
@@ -87,7 +90,6 @@ corti-transcribe-local = { workspace = true, optional = true }
 # SHA-256 verification of the downloaded artifacts (tarballs extracted via the system `tar`, like
 # fetch-models.sh). Pulled in only when the local backend is compiled.
 sha2 = { version = "0.10", optional = true }
-ureq = { version = "2", optional = true }
 
 # Tauri's `set_focus` does not activate an Accessory app when a tray-opened window is behind another app.
 # Activate NSApplication explicitly on the main thread before focusing every singleton utility window.
@@ -114,7 +116,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 [features]
 default = ["aws", "local", "local-ggml"]
 aws = ["dep:corti-transcribe-aws", "dep:aws-config", "dep:aws-sdk-sts", "dep:aws-credential-types", "dep:tokio"]
-local = ["dep:corti-transcribe-local", "dep:sha2", "dep:ureq"]
+local = ["dep:corti-transcribe-local", "dep:sha2"]
 # ADR 0011: compile in the transcribe.cpp (GGML/Metal) ASR engine. Standard app/release builds include it;
 # a minimal `--no-default-features --features local` build keeps the old sherpa-only posture.
 local-ggml = ["local", "corti-transcribe-local/ggml"]
