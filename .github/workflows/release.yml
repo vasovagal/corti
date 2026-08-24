@@ -1,8 +1,9 @@
 name: release
 
-# LAWS §3: a tag is a vote of confidence — this workflow does only tag-specific build/bundle/publication.
-# The release stays draft until authenticated native inputs and the finished app bundle pass their gates.
-# Homebrew remains a manual post-release step (note at bottom). Distribution is explicitly ad-hoc signed;
+# LAWS §3: a tag is a vote of confidence — this workflow does only tag-specific build/bundle/publication
+# plus the final landing-page release pointer. The release stays draft until authenticated native inputs and
+# the finished app bundle pass their gates. Homebrew remains a manual post-release step (note at bottom).
+# Distribution is explicitly ad-hoc signed;
 # signingIdentity "-" is versioned in tauri.conf.json rather than inferred from absent Apple secrets.
 on:
   push:
@@ -162,6 +163,61 @@ jobs:
             exit 1
           fi
           gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
+
+  update-site:
+    needs: [check, create-release, build, publish]
+    # A normal run arrives through publish=success. A successful workflow re-run sees the release already
+    # public and all build/publish jobs skipped; revalidate its assets, then repair the site idempotently.
+    if: >-
+      always() &&
+      needs.check.result == 'success' &&
+      needs.create-release.result == 'success' &&
+      (needs.publish.result == 'success' || needs.create-release.outputs.already_published == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify public release and read publication time
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          info=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,publishedAt,assets)
+          [ "$(jq -r .isDraft <<<"$info")" = false ] || {
+            echo "::error::landing page cannot advertise a draft release"; exit 1;
+          }
+          published_at=$(jq -r .publishedAt <<<"$info")
+          [ -n "$published_at" ] && [ "$published_at" != null ] || {
+            echo "::error::published release has no publishedAt timestamp"; exit 1;
+          }
+          actual=$(jq -r '.assets[].name' <<<"$info" | LC_ALL=C sort)
+          expected=$(printf '%s\n' \
+            "Corti_${VERSION}_aarch64.app.zip" \
+            "Corti_${VERSION}_aarch64.dmg" | LC_ALL=C sort)
+          [ "$actual" = "$expected" ] || {
+            echo "::error::public release assets do not match the two-file contract"; exit 1;
+          }
+          echo "published_at=$published_at" >> "$GITHUB_OUTPUT"
+
+      - name: Check out landing page with Corti-scoped deploy key
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: vasovagal/vasovagal.github.io
+          path: landing-page
+          ssh-key: ${{ secrets.LANDING_PAGE_DEPLOY_KEY }}
+
+      - name: Set up Node for landing-page checks
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      - name: Publish landing-page release state
+        run: >-
+          landing-page/scripts/publish-release-update.sh
+          corti
+          "${{ needs.check.outputs.version }}"
+          "${{ steps.release.outputs.published_at }}"
 
 # NOTE: CI never updates Homebrew. After publication, regenerate Casks/corti.rb with
 # scripts/render-cask.sh and commit it to vasovagal/homebrew-tap (CLAUDE.md; ADR 0006).
