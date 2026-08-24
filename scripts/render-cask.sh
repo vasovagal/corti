@@ -33,12 +33,18 @@ fi
 SHA="$(curl -fsSL "$URL" | shasum -a 256 | awk '{print $1}')"
 [ -n "$SHA" ] || { echo "failed to compute sha256 for ${URL}" >&2; exit 1; }
 
+# Homebrew's audit requires the cask URL to express its version dynamically rather than embedding the
+# current literal version, even though URL above stays concrete for release discovery and hashing.
+CASK_VERSION='#{version}'
+CASK_DMG="${DMG//$VERSION/$CASK_VERSION}"
+CASK_URL="https://github.com/${REPO}/releases/download/v${CASK_VERSION}/${CASK_DMG}"
+
 cat <<RB
 cask "corti" do
   version "${VERSION}"
   sha256 "${SHA}"
 
-  url "${URL}"
+  url "${CASK_URL}"
   name "Corti"
   desc "Menu-bar app that auto-records meetings and files transcript notes to vagus"
   homepage "https://github.com/${REPO}"
