@@ -63,6 +63,8 @@ mod transcribe;
 #[cfg(target_os = "macos")]
 mod tray;
 #[cfg(target_os = "macos")]
+mod vertex_creds;
+#[cfg(target_os = "macos")]
 mod word_bank;
 
 #[cfg(target_os = "macos")]

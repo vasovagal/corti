@@ -30,7 +30,8 @@ use corti_postprocess_providers::{
     ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
     BEDROCK_CONVERSE_ADAPTER_VERSION, BedrockConverseAdapter, CredentialError, HttpTransport,
     OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter, SystemClock as ProviderSystemClock,
-    UreqTransport, VERTEX_REST_ADAPTER_VERSION, VertexResolutionAttempt, VertexResolutionOutcome,
+    UreqTransport, VERTEX_REST_ADAPTER_VERSION, VertexModel, VertexProjectMetadata,
+    VertexResolutionAttempt, VertexResolutionOutcome, VertexRestAdapter,
 };
 use corti_queue::{
     PostprocessCacheSource, PostprocessCallRecord, PostprocessCost, PostprocessOutcome, Queue,
@@ -62,6 +63,7 @@ use crate::postprocess_config::{
     ProviderScopePreferences, SecretPurpose,
 };
 use crate::private_file::{atomic_write_private, read_private};
+use crate::vertex_creds::{VertexAdapterCredentials, VertexAdcResolver, VertexConnectionConfig};
 
 pub(crate) const HOSTED_STATE_CHANGED_EVENT: &str = "hosted-state-changed";
 const SERVICE_COMMAND_CAPACITY: usize = 256;
@@ -945,6 +947,7 @@ pub(crate) fn start(
     let approval = durable_store_armed
         .then(ProductionApproval::from_environment)
         .flatten();
+    let vertex = VertexAdcResolver::production(vertex_config_source(preferences.clone()));
     let (executor, providers) = approval.map_or_else(
         || {
             (
@@ -958,6 +961,7 @@ pub(crate) fn start(
                 Arc::new(ProductionTransportFactory),
                 Arc::new(KeychainDirectSecretStore),
                 BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
+                vertex.clone(),
             )
         },
     );
@@ -971,7 +975,7 @@ pub(crate) fn start(
         executor,
         providers,
         Arc::new(NoPricing),
-        Arc::new(UnarmedVertex),
+        Arc::new(AdcVertexResolver(vertex)),
         notifier,
         digest_key,
         process_epoch,
@@ -1281,6 +1285,22 @@ fn bedrock_config_source(
     })
 }
 
+/// A live view of Vertex's non-secret connection scope, so a project/region change in Settings routes the
+/// next resolution without restarting the app. ADC itself is discovered from disk, not from these fields.
+fn vertex_config_source(
+    preferences: Arc<Mutex<HostedPreferences>>,
+) -> crate::vertex_creds::ConfigSource {
+    Arc::new(move || {
+        let preferences = preferences.lock().unwrap();
+        let vertex = &preferences.values().providers.vertex;
+        VertexConnectionConfig {
+            project: vertex.project.clone(),
+            region: vertex.region.clone(),
+            quota_project: vertex.quota_project.clone(),
+        }
+    })
+}
+
 fn copy_lane(source: &LaneControlDto, target: &mut crate::postprocess_config::LanePreferences) {
     target.enabled = source.enabled;
     target.provider = source.selection.provider.clone();
@@ -1357,6 +1377,7 @@ trait DirectTransportFactory: Send + Sync {
     fn openai(&self) -> Box<dyn HttpTransport>;
     fn anthropic(&self) -> Box<dyn HttpTransport>;
     fn bedrock(&self) -> Box<dyn HttpTransport>;
+    fn vertex(&self) -> Box<dyn HttpTransport>;
 }
 
 struct ProductionTransportFactory;
@@ -1371,6 +1392,10 @@ impl DirectTransportFactory for ProductionTransportFactory {
     }
 
     fn bedrock(&self) -> Box<dyn HttpTransport> {
+        Box::new(UreqTransport::new())
+    }
+
+    fn vertex(&self) -> Box<dyn HttpTransport> {
         Box::new(UreqTransport::new())
     }
 }
@@ -1554,6 +1579,7 @@ fn approved_direct_components(
     transports: Arc<dyn DirectTransportFactory>,
     secrets: Arc<dyn DirectSecretStore>,
     bedrock: Arc<BedrockCredentialResolver>,
+    vertex: Arc<VertexAdcResolver>,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
     let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
     let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
@@ -1589,6 +1615,16 @@ fn approved_direct_components(
         (bedrock_descriptor.provider, bedrock_descriptor.transport),
         Arc::new(Mutex::new(bedrock_adapter)),
     );
+    // Vertex, unlike the other transports, bakes project routing and a model catalog in at construction and
+    // does not self-discover them from the network. It can only be registered once the connection scope names
+    // a valid project/region; until then dispatch stays blocked while the resolver still arms in Settings.
+    if let Some(adapter) = vertex_adapter(transports.as_ref(), vertex) {
+        let descriptor = adapter.descriptor();
+        adapters.insert(
+            (descriptor.provider, descriptor.transport),
+            Arc::new(Mutex::new(adapter)),
+        );
+    }
     let directory = Arc::new(ApprovedProviderDirectory {
         adapters,
         credentials,
@@ -1616,12 +1652,65 @@ trait VertexResolver: Send + Sync {
     fn resolve(&self, attempt: &VertexResolutionAttempt) -> VertexResolutionOutcome;
 }
 
+#[cfg(test)]
 struct UnarmedVertex;
 
+#[cfg(test)]
 impl VertexResolver for UnarmedVertex {
     fn resolve(&self, _attempt: &VertexResolutionAttempt) -> VertexResolutionOutcome {
         VertexResolutionOutcome::Unarmed
     }
+}
+
+/// Drives the credential-arming state machine off the real ADC resolver. The resolution runs on the
+/// `corti-hosted-auth` thread, so its blocking file read and token exchange never touch the pipeline.
+struct AdcVertexResolver(Arc<VertexAdcResolver>);
+
+impl VertexResolver for AdcVertexResolver {
+    fn resolve(&self, _attempt: &VertexResolutionAttempt) -> VertexResolutionOutcome {
+        self.0.resolve_outcome()
+    }
+}
+
+/// Builds the Vertex adapter when the connection scope names a valid project/region. Returns `None` (rather
+/// than a misconfigured adapter) when routing is absent, so resolution can still arm while the user finishes
+/// configuring the scope.
+fn vertex_adapter(
+    transports: &dyn DirectTransportFactory,
+    vertex: Arc<VertexAdcResolver>,
+) -> Option<Box<dyn ProviderAdapter>> {
+    let config = vertex.config();
+    let metadata =
+        VertexProjectMetadata::new(config.project?, config.region?, config.quota_project).ok()?;
+    let adapter = VertexRestAdapter::new(
+        transports.vertex(),
+        Box::new(ProviderSystemClock::new()),
+        Box::new(VertexAdapterCredentials::new(vertex)),
+        metadata,
+        vertex_direct_models(),
+    )
+    .ok()?;
+    Some(Box::new(adapter))
+}
+
+/// A conservative, hand-curated Gemini catalog. The Vertex adapter needs models baked in at construction and
+/// does not discover them from the API; this stopgap keeps live benchmarking off (Live lane stays blocked)
+/// until account-scoped capability discovery lands. See the tracking follow-up on the PR.
+fn vertex_direct_models() -> Vec<VertexModel> {
+    [
+        ("gemini-2.5-flash", 1_000_000u64, 65_536u64),
+        ("gemini-2.5-pro", 1_000_000, 65_536),
+    ]
+    .into_iter()
+    .filter_map(|(id, max_context_tokens, max_output_tokens)| {
+        VertexModel::new(
+            ModelId::new(id).ok()?,
+            max_context_tokens,
+            max_output_tokens,
+        )
+        .ok()
+    })
+    .collect()
 }
 
 struct NoPricing;
@@ -4618,6 +4707,13 @@ mod tests {
                 sends: self.sends.clone(),
             })
         }
+
+        fn vertex(&self) -> Box<dyn HttpTransport> {
+            Box::new(InjectedTransport {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                sends: self.sends.clone(),
+            })
+        }
     }
 
     struct InjectedTransport {
@@ -5070,6 +5166,7 @@ mod tests {
             transports,
             Arc::new(InjectedSecrets),
             BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
+            VertexAdcResolver::production(vertex_config_source(preferences.clone())),
         );
         let (_, handle) = start_with_components(
             preferences,
