@@ -497,9 +497,9 @@ fn open_settings_window(app: &AppHandle) {
         app,
         "settings",
         "index.html?view=settings",
-        "Settings",
-        (720.0, 640.0),
-        (560.0, 420.0),
+        "Preferences",
+        (1040.0, 760.0),
+        (620.0, 500.0),
     );
 }
 

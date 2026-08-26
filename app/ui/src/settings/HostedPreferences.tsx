@@ -22,12 +22,21 @@ import {
   type SecretSlotRequest,
 } from "../lib/api";
 import { shouldInstallHostedSettings } from "../lib/liveHosted";
+import { credentialSummary, providerPresentation } from "../lib/hosted";
 import { HostedDialog, HostedSwitch } from "./HostedCommon";
 import { HostedLanguagePreferences } from "./HostedLanguage";
 import { HostedLanes } from "./HostedLanes";
 import { HostedProviders } from "./HostedProviders";
 
-export default function HostedPreferences() {
+export type HostedPreferencesSection = "overview" | "provider" | "routing" | "language" | "advanced";
+
+export default function HostedPreferences({
+  section,
+  onNavigate,
+}: {
+  section: HostedPreferencesSection;
+  onNavigate: (section: HostedPreferencesSection) => void;
+}) {
   const [settings, setSettings] = useState<HostedSettingsDto | null>(null);
   const settingsRef = useRef<HostedSettingsDto | null>(null);
   const busyRef = useRef(false);
@@ -332,71 +341,7 @@ export default function HostedPreferences() {
   };
 
   return (
-    <div className="hosted-stack">
-      <section className="card hosted-egress-card" aria-labelledby="hosted-master-heading">
-        <div className="hosted-master-layout">
-          <div>
-            <p className="hosted-eyebrow">Privacy boundary</p>
-            <h2 id="hosted-master-heading">Hosted rewrite</h2>
-            <p className="lead">
-              Optional paid text cleanup and questions after ASR. Raw transcript publication never waits for
-              this feature.
-            </p>
-          </div>
-          <HostedSwitch
-            compact
-            label="Master"
-            description={settings.control.master_enabled ? "Hosted egress allowed" : "All hosted egress held"}
-            checked={settings.control.master_enabled}
-            disabled={isBusy}
-            onChange={(enabled) => {
-              if (!enabled) {
-                void onPatch(
-                  { kind: "set_master", enabled: false },
-                  "Master disabled. In-flight work is canceled best effort; late text will not apply.",
-                );
-              } else if (settings.control.egress_acknowledged) {
-                void onPatch(
-                  { kind: "set_master", enabled: true },
-                  "Master enabled. Each lane remains independently controlled.",
-                );
-              } else {
-                setMasterDisclosure(true);
-              }
-            }}
-          />
-        </div>
-        <ul className="hosted-egress-facts">
-          <li><strong>Audio never leaves through hosted rewrite.</strong> Providers receive selected text only.</li>
-          <li>Transcript text, word-bank entries, steering, and questions may leave this Mac.</li>
-          <li>Connecting a provider never enables Master or any lane.</li>
-          <li>Cancellation is best effort after dispatch; provider billing may still occur.</li>
-        </ul>
-        <div className="hosted-master-state">
-          <span className={settings.control.master_enabled ? "hosted-state-on" : "hosted-state-off"}>
-            {settings.control.master_enabled ? "Master on" : "Master off"}
-          </span>
-          <span>
-            Disclosure {settings.control.egress_acknowledged ? "acknowledged" : "not acknowledged"}
-          </span>
-          {!settings.control.master_enabled && settings.control.egress_acknowledged && (
-            <button
-              className="btn-quiet"
-              type="button"
-              disabled={isBusy}
-              onClick={() =>
-                void onPatch(
-                  { kind: "set_egress_acknowledged", acknowledged: false },
-                  "Hosted egress disclosure acknowledgement reset.",
-                )
-              }
-            >
-              Reset acknowledgement
-            </button>
-          )}
-        </div>
-      </section>
-
+    <div className={`hosted-stack hosted-preferences-${section}`}>
       {(status || busy || loadError) && (
         <div
           className={`hosted-status-banner${loadError ? " hosted-status-error" : ""}`}
@@ -407,17 +352,104 @@ export default function HostedPreferences() {
         </div>
       )}
 
-      <HostedProviders
-        providers={settings.providers}
-        scopes={settings.scopes}
-        bedrock={settings.bedrock}
-        awsOptions={awsOptions}
-        actions={providerActions}
-      />
-      <HostedLanes settings={settings} busy={isBusy} onPatch={onPatch} />
-      <HostedLanguagePreferences settings={settings} actions={languageActions} />
-      <HostedDiagnostics settings={settings} busy={isBusy} onPatch={onPatch} />
-      <HostedTruthDisclosure finalDeadline={settings.final_deadline_seconds} />
+      <div className="hosted-preference-pane" hidden={section !== "overview"}>
+          <HostedSetupGuide settings={settings} onNavigate={onNavigate} />
+
+          <section className="card hosted-egress-card" aria-labelledby="hosted-master-heading">
+            <div className="hosted-master-layout">
+              <div>
+                <p className="hosted-eyebrow">Privacy boundary</p>
+                <h2 id="hosted-master-heading">Text egress</h2>
+                <p className="lead">
+                  One master control holds every hosted request. Local transcription and raw transcript filing
+                  continue whether this is on or off.
+                </p>
+              </div>
+              <HostedSwitch
+                compact
+                label="Master"
+                description={settings.control.master_enabled ? "Hosted text may leave" : "All hosted text held"}
+                checked={settings.control.master_enabled}
+                disabled={isBusy}
+                onChange={(enabled) => {
+                  if (!enabled) {
+                    void onPatch(
+                      { kind: "set_master", enabled: false },
+                      "Master disabled. In-flight work is canceled best effort; late text will not apply.",
+                    );
+                  } else if (settings.control.egress_acknowledged) {
+                    void onPatch(
+                      { kind: "set_master", enabled: true },
+                      "Master enabled. Each rewrite mode remains independently controlled.",
+                    );
+                  } else {
+                    setMasterDisclosure(true);
+                  }
+                }}
+              />
+            </div>
+
+            <div className="hosted-privacy-highlight">
+              <strong>Audio always stays on this Mac.</strong>
+              <span>Hosted providers receive text only, and only from a mode you explicitly enable.</span>
+            </div>
+
+            <details className="hosted-privacy-details">
+              <summary>What can leave this Mac?</summary>
+              <ul className="hosted-egress-facts">
+                <li>Selected transcript text, saved spellings, steering, and questions may be sent.</li>
+                <li>Connecting or refreshing a provider never enables Master or a rewrite mode.</li>
+                <li>Cancellation is best effort after dispatch; provider billing may still occur.</li>
+                <li>Provider retention, residency, and account terms continue to apply.</li>
+              </ul>
+            </details>
+
+            <div className="hosted-master-state">
+              <span className={settings.control.master_enabled ? "hosted-state-on" : "hosted-state-off"}>
+                {settings.control.master_enabled ? "Master on" : "Master off"}
+              </span>
+              <span>
+                Disclosure {settings.control.egress_acknowledged ? "acknowledged" : "not acknowledged"}
+              </span>
+              {!settings.control.master_enabled && settings.control.egress_acknowledged && (
+                <button
+                  className="btn-quiet"
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() =>
+                    void onPatch(
+                      { kind: "set_egress_acknowledged", acknowledged: false },
+                      "Hosted egress disclosure acknowledgement reset.",
+                    )
+                  }
+                >
+                  Reset acknowledgement
+                </button>
+              )}
+            </div>
+          </section>
+      </div>
+
+      <div className="hosted-preference-pane" hidden={section !== "provider"}>
+        <HostedProviders
+          providers={settings.providers}
+          scopes={settings.scopes}
+          bedrock={settings.bedrock}
+          awsOptions={awsOptions}
+          preferredSelection={settings.control.final_lane.selection}
+          actions={providerActions}
+        />
+      </div>
+      <div className="hosted-preference-pane" hidden={section !== "routing"}>
+        <HostedLanes settings={settings} busy={isBusy} onPatch={onPatch} />
+      </div>
+      <div className="hosted-preference-pane" hidden={section !== "language"}>
+        <HostedLanguagePreferences settings={settings} actions={languageActions} />
+      </div>
+      <div className="hosted-preference-pane" hidden={section !== "advanced"}>
+        <HostedDiagnostics settings={settings} busy={isBusy} onPatch={onPatch} />
+        <HostedTruthDisclosure finalDeadline={settings.final_deadline_seconds} />
+      </div>
 
       <HostedDialog
         open={masterDisclosure}
@@ -432,11 +464,81 @@ export default function HostedPreferences() {
           sent by hosted rewrite.
         </p>
         <p>
-          Paid calls use the exact provider/model selected in each enabled lane. Provider retention and account
+          Paid calls use the exact provider/model selected in each enabled mode. Provider retention and account
           terms apply, and cancellation may not prevent billing after dispatch.
         </p>
       </HostedDialog>
     </div>
+  );
+}
+
+function HostedSetupGuide({
+  settings,
+  onNavigate,
+}: {
+  settings: HostedSettingsDto;
+  onNavigate: (section: HostedPreferencesSection) => void;
+}) {
+  const finalSelection = settings.control.final_lane.selection;
+  const provider = settings.providers.find(
+    (candidate) =>
+      candidate.descriptor.provider === finalSelection.provider &&
+      candidate.descriptor.transport === finalSelection.transport,
+  );
+  const providerName = provider
+    ? providerPresentation(provider.descriptor.provider, provider.descriptor.transport).shortName
+    : null;
+  const providerState = provider
+    ? credentialSummary(provider.credential, provider.descriptor.transport).label
+    : "Not chosen";
+  const providerReady = provider?.credential.state === "ready";
+  const modelName = finalSelection.model;
+
+  return (
+    <section className="card hosted-guide-card" aria-labelledby="hosted-guide-heading">
+      <div className="hosted-card-head">
+        <div>
+          <p className="hosted-eyebrow">Recommended path</p>
+          <h2 id="hosted-guide-heading">One provider. Final rewrite first.</h2>
+          <p>
+            Most people need only a final cleanup pass. Live cleanup and automatic questions are optional and
+            can use the same provider later.
+          </p>
+        </div>
+      </div>
+      <ol className="hosted-setup-list">
+        <li className={providerReady ? "is-complete" : undefined}>
+          <span className="hosted-step-number">1</span>
+          <div>
+            <strong>Connect a provider</strong>
+            <p>{providerName ? `${providerName} · ${providerState}` : "Choose the API account you already trust and bill."}</p>
+          </div>
+          <button className="btn-secondary" type="button" onClick={() => onNavigate("provider")}>
+            {providerReady ? "Review" : provider ? "Connect" : "Choose"}
+          </button>
+        </li>
+        <li className={modelName ? "is-complete" : undefined}>
+          <span className="hosted-step-number">2</span>
+          <div>
+            <strong>Configure Final rewrite</strong>
+            <p>{modelName ?? "Pick one exact model, then enable the final cleanup pass."}</p>
+          </div>
+          <button className="btn-secondary" type="button" onClick={() => onNavigate("routing")}>
+            {modelName ? "Review" : "Configure"}
+          </button>
+        </li>
+        <li className={settings.control.master_enabled ? "is-complete" : undefined}>
+          <span className="hosted-step-number">3</span>
+          <div>
+            <strong>Allow text egress</strong>
+            <p>{settings.control.master_enabled ? "Master is on." : "Review the boundary below, then enable Master."}</p>
+          </div>
+          <span className={settings.control.master_enabled ? "hosted-state-on" : "hosted-state-off"}>
+            {settings.control.master_enabled ? "On" : "Off"}
+          </span>
+        </li>
+      </ol>
+    </section>
   );
 }
 

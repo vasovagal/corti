@@ -71,8 +71,12 @@ export function Transcription({ cfg, backends, onChange }: Props) {
       : AWS_REGIONS;
 
   return (
-    <section className="card">
-      <h2>Transcription</h2>
+    <>
+    <section className="card settings-form-card">
+      <header className="settings-card-intro">
+        <h2>Transcription engine</h2>
+        <p>Keep speech recognition fully local, or use your own AWS Transcribe account.</p>
+      </header>
 
       <div className="settings-field">
         <label>Backend{envBadge("transcribe_backend")}</label>
@@ -275,8 +279,15 @@ export function Transcription({ cfg, backends, onChange }: Props) {
           )}
         </>
       )}
+    </section>
 
-      <label className="radio">
+    <section className="card settings-form-card">
+      <header className="settings-card-intro">
+        <h2>Capture &amp; live filing</h2>
+        <p>Control audio cleanup and how quickly in-progress transcripts become durable notes.</p>
+      </header>
+
+      <label className="radio settings-choice-row">
         <input
           type="checkbox"
           checked={cfg.aec_enabled}
@@ -288,7 +299,7 @@ export function Transcription({ cfg, backends, onChange }: Props) {
       </label>
       <p className="muted small">Clean speaker bleed from the mic track before transcription.</p>
 
-      <label className="radio">
+      <label className="radio settings-choice-row">
         <input
           type="checkbox"
           checked={cfg.live_filing}
@@ -323,7 +334,8 @@ export function Transcription({ cfg, backends, onChange }: Props) {
         </p>
       </div>
 
-      <p className="callout">Changes apply to the next recording.</p>
+      <p className="callout">Saved changes apply to the next recording.</p>
     </section>
+    </>
   );
 }

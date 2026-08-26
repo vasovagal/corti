@@ -13,6 +13,7 @@ import {
   billingDisclosure,
   credentialSummary,
   errorLabel,
+  providerKey,
   providerPresentation,
   supportTierLabel,
 } from "../lib/hosted";
@@ -31,44 +32,151 @@ interface ProviderActions {
   bedrock: BedrockActions;
 }
 
+type PreferredProvider = { provider: string | null; transport: string | null };
+
+const PROVIDER_ORDER: Record<string, number> = {
+  openai_api: 0,
+  anthropic_api: 1,
+  vertex_api: 2,
+  bedrock_runtime: 3,
+  codex_app_server: 4,
+  claude_subscription: 5,
+};
+
 export function HostedProviders({
   providers,
   scopes,
   bedrock,
   awsOptions,
+  preferredSelection,
   actions,
 }: {
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
   bedrock: BedrockCredentialDto;
   awsOptions: AwsCredentialOptionsDto | null;
+  preferredSelection: PreferredProvider;
   actions: ProviderActions;
 }) {
+  const orderedProviders = useMemo(
+    () =>
+      [...providers].sort(
+        (left, right) =>
+          (PROVIDER_ORDER[left.descriptor.transport] ?? 99) -
+          (PROVIDER_ORDER[right.descriptor.transport] ?? 99),
+      ),
+    [providers],
+  );
+  const preferredKey =
+    preferredSelection.provider && preferredSelection.transport
+      ? providerKey(preferredSelection.provider, preferredSelection.transport)
+      : null;
+  const fallback =
+    orderedProviders.find((provider) => provider.credential.state === "ready") ??
+    orderedProviders.find((provider) => provider.descriptor.support_tier === "documented") ??
+    orderedProviders[0];
+  const initialKey =
+    preferredKey &&
+    orderedProviders.some(
+      (provider) =>
+        providerKey(provider.descriptor.provider, provider.descriptor.transport) === preferredKey,
+    )
+      ? preferredKey
+      : fallback
+        ? providerKey(fallback.descriptor.provider, fallback.descriptor.transport)
+        : "";
+  const [selectedKey, setSelectedKey] = useState(initialKey);
+
+  useEffect(() => {
+    if (
+      orderedProviders.some(
+        (provider) =>
+          providerKey(provider.descriptor.provider, provider.descriptor.transport) === selectedKey,
+      )
+    ) {
+      return;
+    }
+    setSelectedKey(initialKey);
+  }, [initialKey, orderedProviders, selectedKey]);
+
+  const selected = orderedProviders.find(
+    (provider) =>
+      providerKey(provider.descriptor.provider, provider.descriptor.transport) === selectedKey,
+  );
+  const selectedScope = selected
+    ? scopes.find(
+        (candidate) =>
+          candidate.provider === selected.descriptor.provider &&
+          candidate.transport === selected.descriptor.transport,
+      )
+    : undefined;
+  const guidance = selected
+    ? providerPresentation(selected.descriptor.provider, selected.descriptor.transport)
+    : null;
+
   return (
     <section aria-labelledby="hosted-providers-heading">
       <div className="hosted-section-heading">
         <div>
-          <p className="hosted-eyebrow">Connections</p>
-          <h2 id="hosted-providers-heading">Providers</h2>
+          <p className="hosted-eyebrow">Connection</p>
+          <h2 id="hosted-providers-heading">Choose one provider to configure</h2>
         </div>
-        <p>Connecting or refreshing a provider never turns on Master or a lane.</p>
+        <p>Switching this view never changes the provider or model already saved for a rewrite mode.</p>
       </div>
-      <div className="hosted-provider-grid">
-        {providers.map((provider) => (
+
+      <div className="hosted-provider-picker">
+        <label htmlFor="hosted-provider-picker">
+          <span>Provider to configure</span>
+          <select
+            id="hosted-provider-picker"
+            value={selectedKey}
+            disabled={actions.busy}
+            onChange={(event) => setSelectedKey(event.target.value)}
+          >
+            {orderedProviders.map((provider) => {
+              const presentation = providerPresentation(
+                provider.descriptor.provider,
+                provider.descriptor.transport,
+              );
+              const auth = credentialSummary(provider.credential, provider.descriptor.transport);
+              const key = providerKey(
+                provider.descriptor.provider,
+                provider.descriptor.transport,
+              );
+              return (
+                <option key={key} value={key}>
+                  {presentation.shortName} — {auth.label}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+        {guidance && (
+          <div className="hosted-provider-guidance">
+            <strong>{guidance.guidanceTitle}</strong>
+            <p>{guidance.guidance}</p>
+          </div>
+        )}
+      </div>
+
+      <ol className="hosted-provider-steps" aria-label="Provider setup steps">
+        <li><span>1</span> Choose the account where you already manage billing and data controls.</li>
+        <li><span>2</span> Connect it here, then refresh the authenticated model catalog.</li>
+        <li><span>3</span> Select an exact model under Rewrite modes; nothing is enabled automatically.</li>
+      </ol>
+
+      {selected && (
+        <div className="hosted-provider-grid">
           <HostedProviderCard
-            key={`${provider.descriptor.provider}:${provider.descriptor.transport}`}
-            state={provider}
-            scope={scopes.find(
-              (candidate) =>
-                candidate.provider === provider.descriptor.provider &&
-                candidate.transport === provider.descriptor.transport,
-            )}
+            key={`${selected.descriptor.provider}:${selected.descriptor.transport}`}
+            state={selected}
+            scope={selectedScope}
             bedrock={bedrock}
             awsOptions={awsOptions}
             actions={actions}
           />
-        ))}
-      </div>
+        </div>
+      )}
     </section>
   );
 }
