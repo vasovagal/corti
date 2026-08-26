@@ -1035,6 +1035,24 @@ fn buffered_word_bytes(words: &[Word]) -> usize {
     })
 }
 
+/// macOS drops Corti's TCC file-access grants whenever an ad-hoc-signed upgrade changes its code identity
+/// (ADR 0006), so vault writes can start failing mid-call while capture keeps its freshly re-prompted mic
+/// grant. Name the remedy: the raw `Operation not permitted` path is what reaches the tray, truncated.
+fn degraded_detail(error: &anyhow::Error) -> String {
+    let denied = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    if denied {
+        "Corti can't write to your vault — macOS revoked its file access, which happens after an update. \
+         Re-grant Full Disk Access in System Settings › Privacy & Security, then restart Corti."
+            .to_string()
+    } else {
+        format!("Live transcript paused ({error:#}); Corti will rebuild it after the call.")
+    }
+}
+
 /// Drain tee chunks until the sender (the capture writer) hangs up. Input chunks are split exactly at the
 /// rolling boundary, so even a surprising producer chunk cannot push retained audio beyond the configured/
 /// hard limit. AEC and ASR remain chunk-agnostic; only a full window forces their current tails final.
@@ -1050,6 +1068,7 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     writer: &mut NoteWriter<F>,
     publisher: &P,
 ) -> Result<()> {
+    let mut dropped_windows = 0u32;
     while let Ok(chunk) = rx.recv() {
         let chunk_frames = chunk.mic.len().max(chunk.tap.len());
         let mut offset = 0usize;
@@ -1091,8 +1110,37 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             window.push_audio(tap_slice, take);
             offset = end;
 
+            // A failed checkpoint degrades the session instead of ending it: filing is best-effort and the
+            // post-call batch pass rebuilds from the WAV, so retrying on the next window lets access
+            // restored mid-call recover on its own.
             if window.due() {
-                checkpoint_and_flush(mic, them, diarizer, window, writer, publisher)?;
+                match checkpoint_and_flush(mic, them, diarizer, window, writer, publisher) {
+                    Ok(()) if dropped_windows > 0 => {
+                        info!(target: "corti::live", dropped_windows, "live filing recovered");
+                        dropped_windows = 0;
+                        publisher.listening();
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        dropped_windows += 1;
+                        let detail = format!("{error:#}");
+                        warn!(
+                            target: "corti::live",
+                            dropped_windows,
+                            %detail,
+                            "live checkpoint failed; dropping this window"
+                        );
+                        // Clearing bounds the window when the failure persists for the rest of the call;
+                        // the incomplete mark keeps the batch rewrite from skipping the resulting gap.
+                        window.clear_after_flush();
+                        writer.mark_incomplete();
+                        // Leading edge only — a permission failure recurs every minute and would
+                        // otherwise rewrite the tray until the call ends.
+                        if dropped_windows == 1 {
+                            publisher.error(degraded_detail(&error));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1252,6 +1300,12 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
 trait TranscriptPublisher {
     fn words(&self, speaker: Speaker, words: &[Word]);
 
+    /// Live filing hit a durable-write error. Default no-op so test publishers opt in.
+    fn error(&self, _detail: String) {}
+
+    /// Live filing is healthy and appending again.
+    fn listening(&self) {}
+
     fn hosted(&self) -> Option<&crate::postprocess_app::HostedHandle> {
         None
     }
@@ -1268,19 +1322,8 @@ struct StorePublisher {
 }
 
 impl StorePublisher {
-    fn listening(&self) {
-        self.store.set_listening(
-            &self.id,
-            "Listening — lines appear when each speech region closes.",
-        );
-    }
-
     fn complete(&self, detail: impl Into<String>) {
         self.store.set_complete(&self.id, detail);
-    }
-
-    fn error(&self, detail: impl Into<String>) {
-        self.store.set_error(&self.id, detail);
     }
 }
 
@@ -1294,6 +1337,19 @@ impl TranscriptPublisher for StorePublisher {
         {
             let _ = hosted.try_observe_finalized_rows(&self.id, rows);
         }
+    }
+
+    /// The store is in-memory only — restarting the tray discards it, so the log is the copy that lasts.
+    fn error(&self, detail: String) {
+        warn!(target: "corti::live", recording_id = %self.id, %detail, "live transcript error");
+        self.store.set_error(&self.id, detail);
+    }
+
+    fn listening(&self) {
+        self.store.set_listening(
+            &self.id,
+            "Listening — lines appear when each speech region closes.",
+        );
     }
 
     fn hosted(&self) -> Option<&crate::postprocess_app::HostedHandle> {
@@ -1462,6 +1518,14 @@ impl<F: NoteFiler> NoteWriter<F> {
             }
         }
         Ok(())
+    }
+
+    /// Abandon the assembled final transcript: a dropped window leaves the note with a gap only the batch
+    /// pass can fill, so it must not be published as canonical.
+    fn mark_incomplete(&mut self) {
+        self.final_segments.clear();
+        self.final_transcript_bytes = 0;
+        self.final_transcript_incomplete = true;
     }
 
     fn final_transcript(&self) -> Option<DiarizedTranscript> {
@@ -1710,6 +1774,59 @@ mod tests {
         }
     }
 
+    /// `TempFiler` that refuses to create the note for its first `remaining` calls — the production shape
+    /// of a revoked vault grant, where the failure lands on creation rather than on the append.
+    struct FlakyFiler {
+        inner: TempFiler,
+        remaining: RefCell<usize>,
+    }
+
+    impl FlakyFiler {
+        fn new(name: &str, failures: usize) -> Self {
+            Self {
+                inner: TempFiler::new(name),
+                remaining: RefCell::new(failures),
+            }
+        }
+        fn note(&self) -> PathBuf {
+            self.inner.note()
+        }
+    }
+
+    impl NoteFiler for FlakyFiler {
+        fn create_note(
+            &self,
+            title: &str,
+            source: &str,
+            body: &str,
+            provenance: &corti_vagus::provenance::TranscriptProvenance,
+        ) -> Result<PathBuf> {
+            let mut remaining = self.remaining.borrow_mut();
+            if *remaining > 0 {
+                *remaining -= 1;
+                anyhow::bail!("vault unavailable");
+            }
+            self.inner.create_note(title, source, body, provenance)
+        }
+    }
+
+    /// Captures the status transitions `RecordingPublisher` ignores.
+    #[derive(Default)]
+    struct StatusPublisher {
+        errors: RefCell<Vec<String>>,
+        listening: RefCell<usize>,
+    }
+
+    impl TranscriptPublisher for StatusPublisher {
+        fn words(&self, _speaker: Speaker, _words: &[Word]) {}
+        fn error(&self, detail: String) {
+            self.errors.borrow_mut().push(detail);
+        }
+        fn listening(&self) {
+            *self.listening.borrow_mut() += 1;
+        }
+    }
+
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap()
     }
@@ -1938,6 +2055,76 @@ mod tests {
         ));
         assert!(final_content.contains("State: transcribed \n"));
         assert!(!final_content.contains("State: transcribing"));
+    }
+
+    /// A failed checkpoint degrades the session instead of ending it: the window is dropped, the note is
+    /// marked for the batch rewrite, the reader is told once, and the next checkpoint recovers.
+    #[test]
+    fn failed_checkpoint_drops_its_window_and_recovers() {
+        let filer = FlakyFiler::new("checkpoint-retry", 1);
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(
+            vec![
+                vec![word(0.0, 0.5, "dropped window")],
+                vec![],
+                vec![word(70.0, 70.5, "second window")],
+                vec![],
+            ],
+            vec![],
+        );
+        let (tx, rx) = sync_channel::<CaptureChunk>(8);
+        for _ in 0..4 {
+            tx.send(CaptureChunk {
+                mic: Vec::new(),
+                tap: vec![0.0; 30],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let publisher = StatusPublisher::default();
+        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &publisher,
+        )
+        .expect("a failed checkpoint must not end the session");
+
+        assert_eq!(publisher.errors.borrow().len(), 1, "leading edge only");
+        assert_eq!(*publisher.listening.borrow(), 1, "recovered once");
+        assert_eq!(
+            window.frames, 0,
+            "the failed window is cleared, not retained"
+        );
+        assert!(
+            writer.final_transcript().is_none(),
+            "a dropped window must force the batch rewrite"
+        );
+        let content = read(&note);
+        assert!(content.contains("second window"));
+        assert!(!content.contains("dropped window"));
+    }
+
+    /// A revoked vault grant must reach the tray as the remedy, not as a raw `Operation not permitted` path.
+    #[test]
+    fn degraded_detail_names_the_remedy_for_a_revoked_grant() {
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("opening newly-created note /Users/x/brain/00-Inbox/note.md");
+        let detail = degraded_detail(&denied);
+        assert!(detail.contains("Full Disk Access"), "{detail}");
+        assert!(!detail.contains("Operation not permitted"), "{detail}");
+
+        let other = anyhow::anyhow!("disk full");
+        assert!(degraded_detail(&other).contains("disk full"));
     }
 
     /// A later write failure cannot truncate a prior synced chunk.
