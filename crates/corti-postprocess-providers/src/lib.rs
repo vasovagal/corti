@@ -1,8 +1,8 @@
 //! Injected provider and credential edges for hosted transcript post-processing.
 //!
-//! Documented OpenAI, Anthropic, Vertex, and Bedrock adapters run only through injected HTTP, clock, and
-//! credential seams. The crate provides no ambient credential discovery. Experimental Codex broker authentication is
-//! compile- and approval-gated; Claude subscription routing is descriptor-only and blocked. Provider bodies
+//! Documented OpenAI, native ChatGPT subscription, Anthropic, Vertex, and Bedrock adapters run only through
+//! injected HTTP, clock, credential, and storage seams. The crate provides no ambient credential discovery
+//! and launches no model server. Claude subscription routing is descriptor-only and blocked. Provider bodies
 //! and credentials are excluded from public error and debug representations.
 
 #![forbid(unsafe_code)]
@@ -10,8 +10,7 @@
 mod anthropic;
 mod bedrock;
 mod blocked;
-#[cfg(feature = "codex-experimental")]
-mod codex;
+mod chatgpt;
 mod common;
 mod eventstream;
 mod openai;
@@ -30,11 +29,11 @@ pub use bedrock::{
     BEDROCK_CONVERSE_ADAPTER_VERSION, BEDROCK_EVENT_STREAM_CONTENT_TYPE, BedrockConverseAdapter,
 };
 pub use blocked::{ClaudeSubscriptionDescriptor, claude_subscription_descriptor};
-#[cfg(feature = "codex-experimental")]
-pub use codex::{
-    CodexAppServerBroker, CodexAppServerGate, CodexAuthorizationError, CodexBrokerError,
-    CodexBrokerPosture, CodexDeviceAuthorization, CodexDeviceCodeError, CodexDeviceCodeMachine,
-    CodexDeviceCodeState, CodexLoginPoll,
+pub use chatgpt::{
+    CHATGPT_CONSERVATIVE_MAX_OUTPUT_TOKENS, CHATGPT_DEVICE_VERIFICATION_URL,
+    CHATGPT_FALLBACK_CONTEXT_TOKENS, CHATGPT_SUBSCRIPTION_ADAPTER_VERSION, ChatGptAuthError,
+    ChatGptClock, ChatGptCredentialStore, ChatGptDeviceAuthorization, ChatGptLoginPoll,
+    ChatGptStoreError, ChatGptSubscriptionAdapter, ChatGptSubscriptionAuth,
 };
 pub use common::{CacheKeyError, DirectAdapterOptions, ProviderCacheKeySource};
 pub use openai::{
@@ -64,12 +63,6 @@ pub use corti_postprocess::{
     ProviderAdapter, ProviderDescriptor, ProviderEvent, ProviderEventSink, ProviderScope,
     ProviderTerminal, VERTEX_UNARMED_WARNING,
 };
-
-/// Codex app-server support is experimental and remains off in default builds. Even feature-enabled builds
-/// require an explicit product-approval gate before the broker can be touched.
-pub const CODEX_APP_SERVER_EXPERIMENTAL: bool = true;
-pub const CODEX_APP_SERVER_DEFAULT_ENABLED: bool = false;
-pub const CODEX_APP_SERVER_COMPILED: bool = cfg!(feature = "codex-experimental");
 
 /// Claude Free/Pro/Max routing has a blocked descriptor but no credential, connect, or execute adapter
 /// without written Anthropic permission.

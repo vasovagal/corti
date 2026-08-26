@@ -163,7 +163,7 @@ shared `open_app_window` singleton/focus/activation-policy lifecycle:
 | Window | view | opener |
 |---|---|---|
 | Ethics & Legality guide | *(none, default)* | `open_ethics_window` (`tray.rs:408`) |
-| Settings | `?view=settings` | `open_settings_window` (`tray.rs:420`) |
+| Preferences | `?view=settings` | `open_settings_window` (`tray.rs:420`) |
 | Recording Queue | `?view=queue` | `open_queue_window` (`tray.rs:432`, #85) |
 | Live Transcript / mic test | `?view=live` | contextual `live_transcript` tray action (#105) |
 | Diagnostics / console | `?view=console` | `open_console_window` |
@@ -183,8 +183,11 @@ Each is a singleton (focus-if-exists). The app launches windowless with
 `ActivationPolicy::Accessory` (no Dock icon, set at `setup`). The shared `open_app_window` flips to
 `ActivationPolicy::Regular`, explicitly activates `NSApplication` on the AppKit main thread, then
 unminimizes/shows/focuses the centered window; this prevents tray-opened windows hiding behind the current
-app (#105). On `WindowEvent::Destroyed`,
-`revert_activation_policy_if_no_windows` drops back to `Accessory` once the last window closes.
+app (#105). Opening `live` reserves a manager-owned window generation before any test can start. On
+`WindowEvent::Destroyed`, that exact generation is invalidated and requests `LiveTestManager::stop()` (a no-op
+while reading a real call). A queued command from the destroyed generation is rejected, and a canceled
+startup keeps its slot until detector/model cleanup completes, so stale cleanup cannot clobber a fast reopen.
+`revert_activation_policy_if_no_windows` then drops back to `Accessory` once the last window closes.
 
 ## Command surface — pull, plus one push
 
@@ -195,7 +198,11 @@ get_config · set_config · get_backends · get_aws_status · verify_aws · get_
 reveal_path · set_models_dir · get_models_status · get_embedding_models · download_model ·
 get_console_logs · get_console_logs_text · save_console_logs · get_stats · get_pipeline_activity ·
 list_recordings · retry_recording · open_note · reveal_audio          ← Recording Queue (#85)
-get_live_transcript · start_live_test · stop_live_test                 ← Live Transcript (#105)
+get_live_transcript · get_live_test_window_generation · start_live_test · stop_live_test
+                                                                        ← Live Transcript (#105/#129)
+get_hosted_settings · patch_hosted_settings · refresh_hosted_provider ·
+start_chatgpt_device_login · cancel_chatgpt_device_login ·
+sign_out_chatgpt_subscription · open_chatgpt_device_login             ← Hosted Preferences (#130)
 ```
 
 The Diagnostics console polls `get_stats` on a 1 s `setInterval` (`Console.tsx:113,148`); the How
@@ -207,6 +214,15 @@ connection so the pipeline thread stays the DB's only writer.
 The Live Transcript window subscribes before its initial `get_live_transcript` snapshot, applies only
 increasing revisions/row sequences, and reconciles slowly in case WKWebView suspended an event. The managed
 store retains at most 2,000 rows/~1 MiB; the Vagus note remains durable authority.
+
+ChatGPT subscription login is app-owned rather than server-owned: a bounded `corti-chatgpt-login` thread
+polls OpenAI's fixed device endpoint, while React sees only the verification URL, user code, and secret-free
+credential state. The rotating credential is one non-synchronizing Keychain document. Catalog and inference
+requests go directly to fixed `chatgpt.com/backend-api/codex/{models,responses}` endpoints; no Codex process is
+spawned and no credential from Codex, Pi, or Dekopon is imported. Each poller is bound to one opaque login id,
+so cancel/restart cannot let a stale worker mutate its replacement. Account identity derives an opaque live
+request/cache scope rather than a separately persisted value. A Keychain save failure projects not-saved
+state and prevents new dispatch, while preserving the just-rotated token for an already in-flight request.
 
 Rust→JS push events: **`live-transcript-changed`** — tiny state/row deltas from the bounded store;
 **`model-download-progress`** — `app.emit(...)` in `settings.rs:532,545,592` for

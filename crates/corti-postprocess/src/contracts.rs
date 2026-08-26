@@ -62,7 +62,7 @@ pub enum BillingBasis {
 pub enum KnownTransport {
     VertexDirect,
     OpenAiDirect,
-    CodexAppServer,
+    ChatGptSubscription,
     AnthropicDirect,
     ClaudeSubscription,
     BedrockRuntime,
@@ -75,7 +75,7 @@ impl KnownTransport {
             | Self::OpenAiDirect
             | Self::AnthropicDirect
             | Self::BedrockRuntime => SupportTier::Documented,
-            Self::CodexAppServer => SupportTier::Experimental,
+            Self::ChatGptSubscription => SupportTier::Experimental,
             Self::ClaudeSubscription => SupportTier::Blocked,
         }
     }
@@ -86,7 +86,7 @@ impl KnownTransport {
             | Self::OpenAiDirect
             | Self::AnthropicDirect
             | Self::BedrockRuntime => BillingBasis::MeteredEstimate,
-            Self::CodexAppServer => BillingBasis::IncludedSubscription,
+            Self::ChatGptSubscription => BillingBasis::IncludedSubscription,
             Self::ClaudeSubscription => BillingBasis::Unknown,
         }
     }
@@ -95,7 +95,11 @@ impl KnownTransport {
     pub const fn production_adapter_allowed(self) -> bool {
         matches!(
             self,
-            Self::VertexDirect | Self::OpenAiDirect | Self::AnthropicDirect | Self::BedrockRuntime
+            Self::VertexDirect
+                | Self::OpenAiDirect
+                | Self::ChatGptSubscription
+                | Self::AnthropicDirect
+                | Self::BedrockRuntime
         )
     }
 
@@ -103,7 +107,7 @@ impl KnownTransport {
         let (provider, transport) = match self {
             Self::VertexDirect => ("google", "vertex_api"),
             Self::OpenAiDirect => ("openai", "openai_api"),
-            Self::CodexAppServer => ("openai", "codex_app_server"),
+            Self::ChatGptSubscription => ("openai", "chatgpt_subscription"),
             Self::AnthropicDirect => ("anthropic", "anthropic_api"),
             Self::ClaudeSubscription => ("anthropic", "claude_subscription"),
             Self::BedrockRuntime => ("amazon", "bedrock_runtime"),
@@ -308,6 +312,7 @@ pub enum CredentialSourceKind {
     WorkloadIdentity,
     ApplicationDefaultCredentials,
     BrokerKeyring,
+    ChatGptDevice,
     AwsDefaultChain,
     AwsProfile,
     AwsStaticKeychain,
@@ -720,11 +725,11 @@ mod tests {
             KnownTransport::VertexDirect.support_tier(),
             SupportTier::Documented
         );
-        assert_eq!(
-            KnownTransport::CodexAppServer.support_tier(),
-            SupportTier::Experimental
-        );
-        assert!(!KnownTransport::CodexAppServer.production_adapter_allowed());
+        let chatgpt = KnownTransport::ChatGptSubscription.descriptor();
+        assert_eq!(chatgpt.support_tier, SupportTier::Experimental);
+        assert_eq!(chatgpt.billing_basis, BillingBasis::IncludedSubscription);
+        assert!(chatgpt.adapter_available);
+        assert_eq!(chatgpt.transport.as_str(), "chatgpt_subscription");
         assert_eq!(
             KnownTransport::ClaudeSubscription.support_tier(),
             SupportTier::Blocked

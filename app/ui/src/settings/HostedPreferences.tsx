@@ -1,15 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  cancelChatGptDeviceLogin,
   clearProviderSecret,
   getHostedSettings,
   listAwsCredentialOptions,
   onHostedStateChanged,
+  openChatGptDeviceLogin,
   patchHostedSettings,
   promptForProviderSecret,
   refreshHostedProvider,
   replaceHostedWordBank,
   setBedrockCredentialMode,
   setHostedPinnedQuestion,
+  signOutChatGptSubscription,
+  startChatGptDeviceLogin,
   updateHostedProviderScope,
   updateHostedSteering,
   type AwsCredentialMode,
@@ -229,6 +233,61 @@ export default function HostedPreferences({
     }
   }
 
+  async function onChatGptAction(
+    label: string,
+    success: string,
+    operation: () => Promise<unknown>,
+  ): Promise<boolean> {
+    if (busyRef.current) return false;
+    busyRef.current = true;
+    setBusy(label);
+    setStatus("");
+    try {
+      await operation();
+      await reload();
+      setStatus(success);
+      return true;
+    } catch (error) {
+      setStatus(`${label} failed: ${String(error)}`);
+      await reload();
+      return false;
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+    }
+  }
+
+  const onStartChatGpt = () =>
+    onChatGptAction(
+      "ChatGPT sign-in",
+      "Open the authorization page and enter the displayed code. Corti will finish in the background.",
+      startChatGptDeviceLogin,
+    );
+
+  const onCancelChatGpt = () =>
+    onChatGptAction(
+      "Cancel ChatGPT sign-in",
+      "ChatGPT sign-in cancelled; no new credential was stored.",
+      cancelChatGptDeviceLogin,
+    );
+
+  const onSignOutChatGpt = () =>
+    onChatGptAction(
+      "ChatGPT sign-out",
+      "Corti's ChatGPT credential was removed from the macOS Keychain.",
+      signOutChatGptSubscription,
+    );
+
+  async function onOpenChatGptLogin(): Promise<boolean> {
+    try {
+      await openChatGptDeviceLogin();
+      return true;
+    } catch (error) {
+      setStatus(`Could not open ChatGPT authorization: ${String(error)}`);
+      return false;
+    }
+  }
+
   async function onRefreshProvider(provider: string, transport: string): Promise<boolean> {
     if (busyRef.current) return false;
     busyRef.current = true;
@@ -325,12 +384,14 @@ export default function HostedPreferences({
   };
   const providerActions = {
     busy: isBusy,
-    codexApproved: settings.control.codex_experimental_approved,
     onRefresh: onRefreshProvider,
     onScope,
-    onPatch,
     onPromptSecret,
     onClearSecret,
+    onStartChatGpt,
+    onCancelChatGpt,
+    onSignOutChatGpt,
+    onOpenChatGptLogin,
     bedrock: {
       busy: isBusy,
       onMode: onBedrockMode,

@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
   AwsCredentialOptionsDto,
   BedrockCredentialDto,
-  HostedPatchInput,
   HostedProviderScope,
   HostedProviderScopeUpdate,
   HostedProviderState,
@@ -18,28 +17,29 @@ import {
   supportTierLabel,
 } from "../lib/hosted";
 import { HostedBedrockCredentials, type BedrockActions } from "./HostedBedrock";
-import { HostedSwitch } from "./HostedCommon";
 
 interface ProviderActions {
   busy: boolean;
-  codexApproved: boolean;
   onRefresh: (provider: string, transport: string) => Promise<boolean>;
   onScope: (update: HostedProviderScopeUpdate) => Promise<boolean>;
-  onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
   /** Opens the native secure-entry sheet; the key never returns through this callback. */
   onPromptSecret: (request: SecretSlotRequest) => Promise<boolean>;
   onClearSecret: (request: SecretSlotRequest) => Promise<boolean>;
+  onStartChatGpt: () => Promise<boolean>;
+  onCancelChatGpt: () => Promise<boolean>;
+  onSignOutChatGpt: () => Promise<boolean>;
+  onOpenChatGptLogin: () => Promise<boolean>;
   bedrock: BedrockActions;
 }
 
 type PreferredProvider = { provider: string | null; transport: string | null };
 
 const PROVIDER_ORDER: Record<string, number> = {
-  openai_api: 0,
-  anthropic_api: 1,
-  vertex_api: 2,
-  bedrock_runtime: 3,
-  codex_app_server: 4,
+  chatgpt_subscription: 0,
+  openai_api: 1,
+  anthropic_api: 2,
+  vertex_api: 3,
+  bedrock_runtime: 4,
   claude_subscription: 5,
 };
 
@@ -73,6 +73,7 @@ export function HostedProviders({
       : null;
   const fallback =
     orderedProviders.find((provider) => provider.credential.state === "ready") ??
+    orderedProviders.find((provider) => provider.descriptor.transport === "chatgpt_subscription") ??
     orderedProviders.find((provider) => provider.descriptor.support_tier === "documented") ??
     orderedProviders[0];
   const initialKey =
@@ -198,18 +199,16 @@ function HostedProviderCard({
   const presentation = providerPresentation(descriptor.provider, descriptor.transport);
   const auth = credentialSummary(credential, descriptor.transport);
   const isVertex = descriptor.transport === "vertex_api";
+  const isChatGpt = descriptor.transport === "chatgpt_subscription";
   const isDirectKey = descriptor.transport === "openai_api" || descriptor.transport === "anthropic_api";
-  const isCodex = descriptor.transport === "codex_app_server";
   const isClaudeSubscription = descriptor.transport === "claude_subscription";
   const isBedrock = descriptor.transport === "bedrock_runtime";
   const directSlot: SecretSlotRequest =
     descriptor.transport === "openai_api" ? { provider: "open_ai" } : { provider: "anthropic" };
   const canRefresh =
     Boolean(scope?.configured) &&
-    (descriptor.support_tier === "documented" ||
-      (descriptor.support_tier === "experimental" &&
-        descriptor.adapter_available &&
-        actions.codexApproved));
+    descriptor.adapter_available &&
+    (!isChatGpt || credential.state === "ready");
 
   return (
     <article className={`card hosted-provider-card hosted-tier-${descriptor.support_tier}`}>
@@ -230,33 +229,6 @@ function HostedProviderCard({
             Claude Free / Pro / Max credentials cannot be imported or routed without written Anthropic
             permission. Direct Anthropic API access is a separate, metered product.
           </p>
-        </div>
-      )}
-
-      {isCodex && (
-        <div className="hosted-policy-block hosted-policy-experimental">
-          <strong>Experimental · unavailable in production</strong>
-          <p>
-            App-server support is local-stdio, broker/keyring owned, denied tools, and off by default.
-            Subscription access is not a direct API credential and carries no dollar estimate.
-          </p>
-          <HostedSwitch
-            compact
-            label="Allow experimental Codex app-server"
-            description={
-              descriptor.adapter_available
-                ? "Approval alone does not enable egress or select a model."
-                : "This build has no approved app-server adapter."
-            }
-            checked={actions.codexApproved}
-            disabled={!descriptor.adapter_available || actions.busy}
-            onChange={(approved) =>
-              void actions.onPatch(
-                { kind: "set_codex_experimental_approved", approved },
-                approved ? "Experimental Codex approval saved." : "Experimental Codex access is off.",
-              )
-            }
-          />
         </div>
       )}
 
@@ -304,7 +276,61 @@ function HostedProviderCard({
           <p>
             User code <code>{credential.user_code}</code>
           </p>
-          <p className="muted small">Login id is broker-owned; tokens never enter this window.</p>
+          <p className="muted small">
+            {isChatGpt
+              ? "Corti is polling OpenAI directly. Access and refresh tokens stay in the macOS Keychain."
+              : "The login id is backend-owned; tokens never enter this window."}
+          </p>
+          {isChatGpt && (
+            <div className="other-row">
+              <button
+                className="btn-primary"
+                type="button"
+                disabled={actions.busy}
+                onClick={() => void actions.onOpenChatGptLogin()}
+              >
+                Open authorization page
+              </button>
+              <button
+                className="btn-secondary"
+                type="button"
+                disabled={actions.busy}
+                onClick={() => void actions.onCancelChatGpt()}
+              >
+                Cancel sign-in
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {isChatGpt && credential.state !== "device_authorization" && (
+        <div className="hosted-native-auth">
+          <div className="other-row">
+            {credential.state === "ready" ? (
+              <button
+                className="btn-secondary"
+                type="button"
+                disabled={actions.busy}
+                onClick={() => void actions.onSignOutChatGpt()}
+              >
+                Sign out
+              </button>
+            ) : (
+              <button
+                className="btn-primary"
+                type="button"
+                disabled={actions.busy || credential.state === "resolving" || credential.state === "refreshing"}
+                onClick={() => void actions.onStartChatGpt()}
+              >
+                Sign in with ChatGPT…
+              </button>
+            )}
+          </div>
+          <p className="muted small">
+            Corti uses OpenAI device authorization and the fixed ChatGPT Responses endpoint directly. It
+            does not launch a Codex server, import another app&apos;s login, or use OpenAI API billing.
+          </p>
         </div>
       )}
 
@@ -353,7 +379,7 @@ function HostedProviderCard({
         />
       )}
 
-      {scope && descriptor.support_tier === "documented" && (
+      {scope && descriptor.support_tier === "documented" && !isChatGpt && (
         <ProviderScopeEditor scope={scope} transport={descriptor.transport} actions={actions} />
       )}
 

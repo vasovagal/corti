@@ -116,8 +116,8 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         }
     }
 
-    // Settings section. The Backend:/Bucket: lines are a read-only summary derived live from the current
-    // config (so they reflect edits saved in the Settings window); the window itself is the editor.
+    // Preferences section. The Backend:/Bucket: lines are a read-only summary derived live from the current
+    // config (so they reflect saved edits); the Preferences window itself is the editor.
     let (backend_label, bucket_label) = settings_summary(app);
     items.push(Box::new(MenuItem::with_id(
         app,
@@ -145,7 +145,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     items.push(Box::new(MenuItem::with_id(
         app,
         "open_settings",
-        "Settings…",
+        "Preferences…",
         true,
         None::<&str>,
     )?));
@@ -207,6 +207,8 @@ fn live_transcript_menu_state(
 }
 
 fn handle_live_transcript_action(app: &AppHandle) {
+    let manager = app.try_state::<crate::live_test::LiveTestManager>();
+    let window_generation = manager.as_ref().map(|manager| manager.begin_live_window());
     let (detector_live, test_live) = app
         .try_state::<AppState>()
         .map(|state| {
@@ -217,10 +219,11 @@ fn handle_live_transcript_action(app: &AppHandle) {
         })
         .unwrap_or((false, false));
     if !detector_live && !test_live {
-        let result = app
-            .try_state::<crate::live_test::LiveTestManager>()
+        let result = manager
+            .as_ref()
+            .zip(window_generation)
             .ok_or_else(|| anyhow::anyhow!("microphone-test manager is unavailable"))
-            .and_then(|manager| manager.start(app));
+            .and_then(|(manager, generation)| manager.start_for_window(app, generation));
         if let Err(error) = result {
             let detail = format!("Could not start microphone test: {error:#}");
             // Do not overwrite a call that won the race after the tray menu snapshot was built.
@@ -232,7 +235,7 @@ fn handle_live_transcript_action(app: &AppHandle) {
             set_status(app, format!("⚠ {detail}"));
         }
     }
-    open_live_transcript_window(app);
+    open_live_transcript_window(app, window_generation);
 }
 
 /// Update the status line and rebuild the menu.
@@ -426,9 +429,11 @@ fn open_app_window(
     title: &'static str,
     size: (f64, f64),
     min_size: (f64, f64),
+    live_generation: Option<u64>,
 ) {
     let app = app.clone();
-    let _ = app.clone().run_on_main_thread(move || {
+    let cleanup_app = app.clone();
+    let scheduled = app.clone().run_on_main_thread(move || {
         // Singleton: focus the existing window instead of spawning a second.
         if let Some(win) = app.get_webview_window(label) {
             foreground_window(&app, &win);
@@ -452,17 +457,34 @@ fn open_app_window(
                 let app_for_evt = app.clone();
                 win.on_window_event(move |event| {
                     if matches!(event, WindowEvent::Destroyed) {
+                        if let Some(generation) = live_generation
+                            && let Some(manager) =
+                                app_for_evt.try_state::<crate::live_test::LiveTestManager>()
+                        {
+                            manager.close_live_window(generation);
+                        }
                         revert_activation_policy_if_no_windows(&app_for_evt);
                     }
                 });
             }
             Err(e) => {
                 eprintln!("[corti] opening {label} window failed: {e}");
+                if let Some(generation) = live_generation
+                    && let Some(manager) = app.try_state::<crate::live_test::LiveTestManager>()
+                {
+                    manager.close_live_window(generation);
+                }
                 // Don't leave a dangling Regular policy with no window.
                 revert_activation_policy_if_no_windows(&app);
             }
         }
     });
+    if scheduled.is_err()
+        && let Some(generation) = live_generation
+        && let Some(manager) = cleanup_app.try_state::<crate::live_test::LiveTestManager>()
+    {
+        manager.close_live_window(generation);
+    }
 }
 
 /// Activate Corti itself before focusing the webview. `set_focus` alone can leave an Accessory app's new
@@ -488,10 +510,11 @@ fn open_ethics_window(app: &AppHandle) {
         "Ethics & Legality Guide",
         (900.0, 700.0),
         (640.0, 480.0),
+        None,
     );
 }
 
-/// The Settings editor window.
+/// The Preferences editor window.
 fn open_settings_window(app: &AppHandle) {
     open_app_window(
         app,
@@ -500,11 +523,12 @@ fn open_settings_window(app: &AppHandle) {
         "Preferences",
         (1040.0, 760.0),
         (620.0, 500.0),
+        None,
     );
 }
 
 /// The timestamped live call / ephemeral microphone-test reader.
-fn open_live_transcript_window(app: &AppHandle) {
+fn open_live_transcript_window(app: &AppHandle, generation: Option<u64>) {
     open_app_window(
         app,
         "live",
@@ -512,6 +536,7 @@ fn open_live_transcript_window(app: &AppHandle) {
         "Live Transcript",
         (760.0, 620.0),
         (520.0, 360.0),
+        generation,
     );
 }
 
@@ -524,6 +549,7 @@ fn open_queue_window(app: &AppHandle) {
         "Recording Queue",
         (760.0, 560.0),
         (560.0, 400.0),
+        None,
     );
 }
 
@@ -537,6 +563,7 @@ fn open_console_window(app: &AppHandle) {
         "Diagnostics",
         (900.0, 640.0),
         (560.0, 420.0),
+        None,
     );
 }
 
@@ -550,6 +577,7 @@ fn open_how_window(app: &AppHandle) {
         "How Corti Works",
         (880.0, 560.0),
         (560.0, 420.0),
+        None,
     );
 }
 

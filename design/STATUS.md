@@ -23,4 +23,5 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
 - **v0.14.0:** optional hosted-LLM cleanup for live and final transcripts, raw/clean/diff views,
   configurable provider and language preferences, resumable encrypted request state, usage/cost accounting,
   and transcript-grounded questions. Direct transports cover OpenAI, Anthropic, Vertex AI, and Amazon
-  Bedrock; experimental Codex broker support remains explicitly gated (#113, #115, ADR 0015).
+  Bedrock, plus native ChatGPT subscription device auth and direct fixed-endpoint Responses access with no
+  Codex server (#113, #115, #130, ADR 0015).

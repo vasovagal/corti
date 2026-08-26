@@ -25,6 +25,14 @@ const OPENAI_MODEL_LIST: &str = r#"{
   ]
 }"#;
 
+const CHATGPT_MODEL_ID: &str = "gpt-5.6-sol";
+const CHATGPT_MODEL_LIST: &str = r#"{
+  "models":[
+    {"slug":"gpt-5.6-sol","supported_in_api":true,"visibility":"list","context_window":272000},
+    {"slug":"hidden-model","supported_in_api":true,"visibility":"hide","context_window":128000},
+    {"slug":"tool-only-model","supported_in_api":false,"visibility":"list","context_window":128000}
+  ]
+}"#;
 const ANTHROPIC_MODEL_ID: &str = "claude-haiku-4-5-20251001";
 const VERTEX_MODEL_ID: &str = "gemini-synthetic-001";
 const VERTEX_PROJECT_ID: &str = "synthetic-project";
@@ -61,6 +69,49 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn monotonic_micros(&self) -> u64 {
         self.now.fetch_add(10, Ordering::SeqCst)
+    }
+}
+
+impl WallClock for FakeClock {
+    fn unix_seconds(&self) -> i64 {
+        1_000
+    }
+}
+
+struct FakeChatGptStore {
+    document: Mutex<Option<Vec<u8>>>,
+}
+
+impl FakeChatGptStore {
+    fn ready() -> Self {
+        Self {
+            document: Mutex::new(Some(
+                serde_json::to_vec(&json!({
+                    "version": 1,
+                    "access": "synthetic-chatgpt-access-token",
+                    "refresh": "synthetic-chatgpt-refresh-token",
+                    "expiresAt": 10_000,
+                    "accountId": "synthetic-chatgpt-account"
+                }))
+                .unwrap(),
+            )),
+        }
+    }
+}
+
+impl ChatGptCredentialStore for FakeChatGptStore {
+    fn load(&self) -> Result<Option<Vec<u8>>, ChatGptStoreError> {
+        Ok(self.document.lock().unwrap().clone())
+    }
+
+    fn save(&self, document: &[u8]) -> Result<(), ChatGptStoreError> {
+        *self.document.lock().unwrap() = Some(document.to_vec());
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), ChatGptStoreError> {
+        *self.document.lock().unwrap() = None;
+        Ok(())
     }
 }
 
@@ -492,6 +543,37 @@ fn openai_stream() -> Vec<Vec<u8>> {
     ]
 }
 
+fn chatgpt_stream() -> Vec<Vec<u8>> {
+    let output = r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Subscription corrected sentence."}]}"#;
+    let split = output.find("corrected").unwrap();
+    let mut wire = Vec::new();
+    wire.extend(sse_event(
+        "response.output_text.delta",
+        json!({"type":"response.output_text.delta","delta":&output[..split]}),
+    ));
+    wire.extend(sse_event(
+        "response.output_text.delta",
+        json!({"type":"response.output_text.delta","delta":&output[split..]}),
+    ));
+    wire.extend(sse_event(
+        "response.completed",
+        json!({
+            "type":"response.completed",
+            "response":{
+                "model":CHATGPT_MODEL_ID,
+                "status":"completed",
+                "usage":{
+                    "input_tokens":30,
+                    "output_tokens":11,
+                    "input_tokens_details":{"cached_tokens":9},
+                    "output_tokens_details":{"reasoning_tokens":3}
+                }
+            }
+        }),
+    ));
+    vec![wire[..41].to_vec(), wire[41..].to_vec()]
+}
+
 fn vertex_stream() -> Vec<Vec<u8>> {
     let output = r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Synthetic corrected sentence."}]}"#;
     let split = output.find("corrected").unwrap();
@@ -611,6 +693,19 @@ fn openai_adapter(scripts: Vec<Script>) -> (FakeTransportHandle, OpenAiResponses
     (handle, adapter)
 }
 
+fn chatgpt_adapter(scripts: Vec<Script>) -> (FakeTransportHandle, ChatGptSubscriptionAdapter) {
+    let (handle, transport) = FakeTransportHandle::new(scripts);
+    let (_auth_handle, auth_transport) = FakeTransportHandle::new([]);
+    let auth = ChatGptSubscriptionAuth::new(
+        Box::new(auth_transport),
+        Arc::new(FakeClock::new(100)),
+        Arc::new(FakeChatGptStore::ready()),
+    );
+    let adapter =
+        ChatGptSubscriptionAdapter::new(Box::new(transport), Box::new(FakeClock::new(100)), auth);
+    (handle, adapter)
+}
+
 fn anthropic_adapter(scripts: Vec<Script>) -> (FakeTransportHandle, AnthropicMessagesAdapter) {
     let (handle, transport) = FakeTransportHandle::new(scripts);
     let (_, credentials) = credentials();
@@ -726,6 +821,73 @@ fn openai_responses_shape_stream_usage_cache_and_exact_catalog() {
     let debug = format!("{:?}", captured[1]);
     assert!(!debug.contains("Synthetic input"));
     assert!(!debug.contains("synthetic-fixture-api-key"));
+}
+
+#[test]
+fn chatgpt_subscription_uses_device_credential_and_fixed_direct_endpoints_without_a_server() {
+    let (handle, mut adapter) = chatgpt_adapter(vec![
+        Script::json(CHATGPT_MODEL_LIST),
+        Script::sse(chatgpt_stream()),
+    ]);
+    let catalog = adapter.catalog(&scope()).unwrap();
+    assert_eq!(catalog.models.len(), 1);
+    let descriptor = &catalog.models[0];
+    assert_eq!(descriptor.exact_model_id.as_str(), CHATGPT_MODEL_ID);
+    assert_eq!(descriptor.max_context_tokens, 272_000);
+    assert_eq!(
+        descriptor.billing_basis,
+        corti_postprocess::BillingBasis::IncludedSubscription
+    );
+    assert!(!descriptor.capabilities.explicit_prefix_cache);
+
+    let request = hosted_request(
+        KnownTransport::ChatGptSubscription,
+        CHATGPT_MODEL_ID,
+        ProviderCacheMode::Unavailable,
+    );
+    let sink = CollectingSink::default();
+    let terminal = adapter
+        .execute(&request, &CancellationToken::new(), &sink)
+        .unwrap();
+    assert_eq!(
+        sink.text(),
+        r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Subscription corrected sentence."}]}"#
+    );
+    assert_eq!(terminal.usage.input_tokens, Some(30));
+    assert_eq!(terminal.usage.cached_read_tokens, Some(9));
+    assert_eq!(terminal.usage.reasoning_tokens, Some(3));
+
+    let captured = handle.captured();
+    assert_eq!(captured.len(), 2);
+    assert!(
+        captured[0]
+            .url
+            .starts_with("https://chatgpt.com/backend-api/codex/models?client_version=")
+    );
+    assert_eq!(
+        captured[0].secret_headers,
+        ["authorization", "chatgpt-account-id"]
+    );
+    assert_eq!(
+        captured[1].url,
+        "https://chatgpt.com/backend-api/codex/responses"
+    );
+    assert_eq!(
+        captured[1].secret_headers,
+        ["authorization", "chatgpt-account-id"]
+    );
+    let body = captured[1].body.as_ref().unwrap();
+    assert_eq!(body["model"], CHATGPT_MODEL_ID);
+    assert_eq!(body["store"], false);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["input"].as_array().unwrap().len(), 4);
+    assert!(body["instructions"].as_str().unwrap().contains("schema"));
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert!(body.get("tools").is_none());
+    assert!(body.get("prompt_cache_key").is_none());
+    let debug = format!("{:?}", captured[1]);
+    assert!(!debug.contains("synthetic-chatgpt-access-token"));
+    assert!(!debug.contains("Synthetic input"));
 }
 
 #[test]
@@ -1333,6 +1495,40 @@ fn cancellation_is_free_before_send_and_best_effort_after_dispatch() {
             ..
         } if usage.output_tokens == Some(9) && usage.usage_complete
     )));
+
+    let (_, mut adapter) = chatgpt_adapter(vec![
+        Script::json(CHATGPT_MODEL_LIST),
+        Script::sse(chatgpt_stream()),
+    ]);
+    adapter.catalog(&scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::ChatGptSubscription,
+        CHATGPT_MODEL_ID,
+        ProviderCacheMode::Unavailable,
+    );
+    let cancel = CancellationToken::new();
+    let sink = CancelingSink {
+        events: Mutex::new(Vec::new()),
+        cancel: cancel.clone(),
+    };
+    let error = adapter.execute(&request, &cancel, &sink).unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::Canceled);
+    let events = sink.events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event.kind,
+        ProviderEventKind::Canceled {
+            provider_billing_may_still_occur: true,
+            ..
+        }
+    )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event.kind, ProviderEventKind::TextDelta(_)))
+            .count(),
+        1,
+        "no ChatGPT text delta may be emitted after cancellation"
+    );
 }
 
 #[test]
@@ -1360,9 +1556,6 @@ fn model_ids_are_never_substituted() {
 }
 
 const _: () = {
-    assert!(CODEX_APP_SERVER_EXPERIMENTAL);
-    assert!(!CODEX_APP_SERVER_DEFAULT_ENABLED);
-    assert!(CODEX_APP_SERVER_COMPILED == cfg!(feature = "codex-experimental"));
     assert!(CLAUDE_SUBSCRIPTION_ADAPTER_BLOCKED);
 };
 

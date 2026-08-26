@@ -1,5 +1,9 @@
 # Going LIVE with Corti — verification and metrics
 
+> **Historical v0.14 verification record.** The #130 native ChatGPT amendment later removed the Codex
+> app-server feature and the temporary `CORTI_HOSTED_PRODUCTION_ARMED` gate; statements below describe the
+> exact older build that was measured.
+
 > **Required release gate: RED.** Source, Rust, UI, deterministic-capture, and signed `.app` gates are green, but the canonical Tauri DMG command failed twice because Finder's styling AppleScript timed out with `-1712`. No current DMG size is inferred. Delivery should use a draft PR until that gate is rerun successfully.
 
 ## Scope and conditions

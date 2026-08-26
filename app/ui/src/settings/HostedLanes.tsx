@@ -404,13 +404,16 @@ function ProviderCacheControl({
       </>
     );
   }
-  if (selectedModel?.transport === "codex_app_server" || mode === "unavailable") {
+  if (
+    selectedModel?.transport === "chatgpt_subscription" ||
+    mode === "unavailable"
+  ) {
     return (
       <>
         <select id={id} className="jselect" value="unavailable" disabled>
           <option value="unavailable">Provider cache policy unavailable</option>
         </select>
-        <p className="muted small">The broker/model owns this behavior; Corti does not claim control.</p>
+        <p className="muted small">The subscription endpoint/model owns this behavior; Corti does not claim control.</p>
       </>
     );
   }

@@ -9,6 +9,7 @@ import {
 import {
   getHostedAssistant,
   getHostedSettings,
+  getLiveTestWindowGeneration,
   getLiveTranscript,
   onHostedStateChanged,
   onLiveTranscriptChanged,
@@ -61,6 +62,7 @@ export default function LiveTranscript() {
   const [liveError, setLiveError] = useState("");
   const [repairing, setRepairing] = useState(false);
   const [testBusy, setTestBusy] = useState(false);
+  const [windowGeneration, setWindowGeneration] = useState<number | null>(null);
   const [view, setView] = useState<TranscriptView>("clean");
   const [settings, setSettings] = useState<HostedSettingsDto | null>(null);
   const settingsRef = useRef<HostedSettingsDto | null>(null);
@@ -116,6 +118,20 @@ export default function LiveTranscript() {
             ? "waiting_for_phrase"
             : current.final,
     }));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    getLiveTestWindowGeneration()
+      .then((generation) => {
+        if (active) setWindowGeneration(generation);
+      })
+      .catch(() => {
+        if (active) setLiveError("The Live Transcript window lifecycle is unavailable.");
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const refreshSettings = useCallback(async () => {
@@ -507,10 +523,14 @@ export default function LiveTranscript() {
   );
 
   async function startTest() {
+    if (windowGeneration == null) {
+      setLiveError("The microphone test cannot start from a stale window.");
+      return;
+    }
     setTestBusy(true);
     setLiveError("");
     try {
-      await startLiveTest();
+      await startLiveTest(windowGeneration);
     } catch {
       setLiveError("The microphone test could not start.");
     } finally {
@@ -563,7 +583,8 @@ export default function LiveTranscript() {
 
   const mode = snapshot?.mode ?? "idle";
   const status = snapshot?.status ?? "loading";
-  const canStart = mode !== "call" && !snapshot?.active && status !== "stopping";
+  const canStart =
+    windowGeneration != null && mode !== "call" && !snapshot?.active && status !== "stopping";
   const canStop = mode === "test" && snapshot?.active;
   const rows = snapshot?.lines ?? [];
   const assistantPanel = (

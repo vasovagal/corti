@@ -34,9 +34,9 @@ use corti_postprocess::{
     parse_and_validate_rewrite,
 };
 use corti_postprocess_providers::{
-    CODEX_APP_SERVER_COMPILED, Clock as ProviderClock, VertexAutoPending, VertexCredentialResolver,
-    VertexCredentialState, VertexDispatchDisposition, VertexResolutionAttempt,
-    VertexResolutionOutcome, VertexResolverError,
+    Clock as ProviderClock, VertexAutoPending, VertexCredentialResolver, VertexCredentialState,
+    VertexDispatchDisposition, VertexResolutionAttempt, VertexResolutionOutcome,
+    VertexResolverError,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -166,7 +166,6 @@ pub(crate) struct ControlSnapshotDto {
     pub(crate) master_enabled: bool,
     pub(crate) egress_acknowledged: bool,
     pub(crate) pinned_auto_enabled: bool,
-    pub(crate) codex_experimental_approved: bool,
     pub(crate) live: LaneControlDto,
     pub(crate) final_lane: LaneControlDto,
     pub(crate) questions: LaneControlDto,
@@ -184,7 +183,6 @@ impl ControlSnapshotDto {
             master_enabled: false,
             egress_acknowledged: false,
             pinned_auto_enabled: false,
-            codex_experimental_approved: false,
             live: LaneControlDto::default(),
             final_lane: LaneControlDto::default(),
             questions: LaneControlDto::default(),
@@ -225,7 +223,6 @@ pub(crate) enum ControlPatch {
         selection: LaneSelectionDto,
     },
     SetPinnedAuto(bool),
-    SetCodexExperimentalApproved(bool),
     /// Non-secret provider scope (account alias/project/region) changed. It fences every lane because more
     /// than one lane may select the same transport.
     ProviderScopeChanged,
@@ -259,8 +256,6 @@ pub(crate) enum ControlError {
     ProviderUnavailable,
     #[error("the selected provider transport is blocked by policy")]
     ProviderBlocked,
-    #[error("the selected provider transport remains experimental and off")]
-    ExperimentalProviderOff,
     #[error("persisting hosted controls failed")]
     Persistence,
 }
@@ -365,14 +360,6 @@ impl PostprocessControl {
                 } else {
                     CancellationScope::Pinned(CancellationReason::LaneDisabled)
                 }
-            }
-            ControlPatch::SetCodexExperimentalApproved(approved) => {
-                if next.codex_experimental_approved == *approved {
-                    return Ok((next, CancellationScope::None));
-                }
-                next.codex_experimental_approved = *approved;
-                bump(&mut next.control_revision)?;
-                CancellationScope::All(CancellationReason::ModelChanged)
             }
             ControlPatch::ProviderScopeChanged => {
                 bump(&mut next.control_revision)?;
@@ -775,7 +762,7 @@ pub(crate) fn provider_support_catalog() -> Vec<ProviderDescriptor> {
     [
         corti_postprocess::KnownTransport::VertexDirect,
         corti_postprocess::KnownTransport::OpenAiDirect,
-        corti_postprocess::KnownTransport::CodexAppServer,
+        corti_postprocess::KnownTransport::ChatGptSubscription,
         corti_postprocess::KnownTransport::AnthropicDirect,
         corti_postprocess::KnownTransport::ClaudeSubscription,
         corti_postprocess::KnownTransport::BedrockRuntime,
@@ -786,6 +773,16 @@ pub(crate) fn provider_support_catalog() -> Vec<ProviderDescriptor> {
 }
 
 pub(crate) trait ProviderAccess: Send {
+    /// Provider-owned dynamic scope. ChatGPT derives this from the account id inside its credential so a
+    /// crash can never pair a new credential with an old persisted cache fence.
+    fn connection_scope(
+        &self,
+        _provider: &ProviderId,
+        _transport: &TransportId,
+    ) -> Option<ProviderScope> {
+        None
+    }
+
     fn descriptor(
         &mut self,
         provider: &ProviderId,
@@ -1220,7 +1217,7 @@ impl PostprocessCoordinator {
         clock: Arc<dyn CoordinatorClock>,
         persistence: Box<dyn ControlPersistence>,
         store: Box<dyn EncryptedPostprocessStore>,
-        providers: Box<dyn ProviderAccess>,
+        mut providers: Box<dyn ProviderAccess>,
         pricing: Arc<dyn PricingCatalog>,
     ) -> Self {
         let session_generation = snapshot.session_generation;
@@ -1230,12 +1227,12 @@ impl PostprocessCoordinator {
             .into_iter()
             .map(|descriptor| {
                 let credential = match descriptor.support_tier {
-                    SupportTier::Blocked | SupportTier::Experimental => {
-                        CredentialState::Unsupported {
-                            code: ErrorCode::PolicyBlocked,
-                        }
+                    SupportTier::Blocked => CredentialState::Unsupported {
+                        code: ErrorCode::PolicyBlocked,
+                    },
+                    SupportTier::Documented | SupportTier::Experimental => {
+                        providers.credential_state(&descriptor.provider, &descriptor.transport)
                     }
-                    SupportTier::Documented => CredentialState::Absent,
                 };
                 (
                     (descriptor.provider.clone(), descriptor.transport.clone()),
@@ -1281,6 +1278,14 @@ impl PostprocessCoordinator {
         self.provider_states.values()
     }
 
+    pub(crate) fn provider_connection_scope(
+        &self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) -> Option<ProviderScope> {
+        self.providers.connection_scope(provider, transport)
+    }
+
     pub(crate) fn watermark(&self) -> TranscriptWatermark {
         self.watermark
     }
@@ -1297,11 +1302,7 @@ impl PostprocessCoordinator {
             .providers
             .descriptor(provider, transport)
             .ok_or(ErrorCode::PolicyBlocked)?;
-        if descriptor.support_tier == SupportTier::Blocked
-            || (descriptor.support_tier == SupportTier::Experimental
-                && !(CODEX_APP_SERVER_COMPILED
-                    && self.control.snapshot().codex_experimental_approved))
-        {
+        if descriptor.support_tier == SupportTier::Blocked || !descriptor.adapter_available {
             return Err(ErrorCode::PolicyBlocked);
         }
         let credential = if descriptor.transport
@@ -1321,6 +1322,51 @@ impl PostprocessCoordinator {
                     .models
             }
             _ => Vec::new(),
+        };
+        let state = ProviderStateDto {
+            descriptor: descriptor.clone(),
+            credential,
+            models,
+            service_error: None,
+        };
+        self.provider_states.insert(
+            (descriptor.provider.clone(), descriptor.transport.clone()),
+            state.clone(),
+        );
+        self.push_event(CoordinatorEventDto::ProviderState(Box::new(state.clone())));
+        Ok(state)
+    }
+
+    /// Refresh only the secret-free credential projection. Device authorization uses this while a human
+    /// completes the browser step; catalog discovery waits for both authorization and a persisted scope.
+    pub(crate) fn sync_provider_credential(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) -> Result<ProviderStateDto, ErrorCode> {
+        let descriptor = self
+            .providers
+            .descriptor(provider, transport)
+            .ok_or(ErrorCode::PolicyBlocked)?;
+        if descriptor.support_tier == SupportTier::Blocked {
+            return Err(ErrorCode::PolicyBlocked);
+        }
+        let credential = if transport
+            == &corti_postprocess::KnownTransport::VertexDirect
+                .descriptor()
+                .transport
+        {
+            self.vertex.state().credential_state()
+        } else {
+            self.providers.credential_state(provider, transport)
+        };
+        let models = if matches!(credential, CredentialState::Ready { .. }) {
+            self.provider_states
+                .get(&(provider.clone(), transport.clone()))
+                .map(|state| state.models.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         let state = ProviderStateDto {
             descriptor: descriptor.clone(),
@@ -1416,14 +1462,8 @@ impl PostprocessCoordinator {
             let Some(descriptor) = self.providers.descriptor(provider, transport) else {
                 return Err(ControlError::ProviderUnavailable);
             };
-            match descriptor.support_tier {
-                SupportTier::Blocked => return Err(ControlError::ProviderBlocked),
-                SupportTier::Experimental
-                    if !(CODEX_APP_SERVER_COMPILED && snapshot.codex_experimental_approved) =>
-                {
-                    return Err(ControlError::ExperimentalProviderOff);
-                }
-                SupportTier::Documented | SupportTier::Experimental => {}
+            if descriptor.support_tier == SupportTier::Blocked || !descriptor.adapter_available {
+                return Err(ControlError::ProviderBlocked);
             }
         }
         Ok(())
@@ -1674,11 +1714,7 @@ impl PostprocessCoordinator {
         else {
             return Err(SubmitError::ProviderBlocked);
         };
-        if descriptor.support_tier == SupportTier::Blocked
-            || (descriptor.support_tier == SupportTier::Experimental
-                && !(CODEX_APP_SERVER_COMPILED
-                    && self.control.snapshot().codex_experimental_approved))
-        {
+        if descriptor.support_tier == SupportTier::Blocked || !descriptor.adapter_available {
             return Err(SubmitError::ProviderBlocked);
         }
         Ok(())
@@ -3863,7 +3899,7 @@ mod tests {
             KnownTransport::OpenAiDirect,
             KnownTransport::VertexDirect,
             KnownTransport::AnthropicDirect,
-            KnownTransport::CodexAppServer,
+            KnownTransport::ChatGptSubscription,
             KnownTransport::ClaudeSubscription,
             KnownTransport::BedrockRuntime,
         ]
@@ -5234,8 +5270,10 @@ mod tests {
             SupportTier::Blocked
         );
         assert_eq!(
-            KnownTransport::CodexAppServer.descriptor().support_tier,
-            SupportTier::Experimental
+            KnownTransport::ChatGptSubscription
+                .descriptor()
+                .billing_basis,
+            BillingBasis::IncludedSubscription
         );
         assert_eq!(
             KnownTransport::BedrockRuntime.descriptor().support_tier,
@@ -5253,21 +5291,10 @@ mod tests {
                 code: ErrorCode::PolicyBlocked
             }
         ));
-        let codex = KnownTransport::CodexAppServer.descriptor();
-        let codex_selection = LaneSelectionDto {
-            provider: Some(codex.provider),
-            transport: Some(codex.transport),
-            model: Some(ModelId::new("fixture-model-v1").unwrap()),
-            cache_policy: fixture_cache_policy(),
-        };
-        assert_eq!(
-            harness
-                .coordinator
-                .apply_patch(ControlPatch::SetLaneSelection {
-                    lane: LaneFamily::Live,
-                    selection: codex_selection,
-                }),
-            Err(ControlError::ExperimentalProviderOff)
+        assert!(
+            provider_support_catalog()
+                .iter()
+                .all(|descriptor| descriptor.transport.as_str() != "codex_app_server")
         );
     }
 

@@ -8,18 +8,14 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 corti-postprocess = { workspace = true }
 hmac = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 ureq = { version = "2", default-features = true }
 url = "2"
 zeroize = { workspace = true }
-
-[features]
-default = []
-# Experimental broker/device-code interfaces only. Still requires an explicit runtime product-approval gate;
-# no production provider factory or ambient Codex process launcher is supplied.
-codex-experimental = []

@@ -31,19 +31,19 @@ const PRESENTATION: Record<string, ProviderPresentation> = {
     guidanceTitle: "For Google Cloud organizations",
     guidance: "Best when project, region, IAM, quota, and billing are already managed in Google Cloud.",
   },
+  chatgpt_subscription: {
+    name: "ChatGPT subscription",
+    shortName: "ChatGPT",
+    auth: "Corti-owned OpenAI device authorization",
+    guidanceTitle: "Use your existing ChatGPT plan",
+    guidance: "Signs Corti in directly and uses the included subscription quota. No Codex server or OpenAI API key is involved.",
+  },
   openai_api: {
     name: "OpenAI direct API",
     shortName: "OpenAI API",
     auth: "API key in macOS Keychain or workload identity",
     guidanceTitle: "For an OpenAI API account",
     guidance: "Uses separate API billing and data controls. A ChatGPT subscription does not include API usage.",
-  },
-  codex_app_server: {
-    name: "Codex app-server",
-    shortName: "Codex",
-    auth: "Broker-owned device code and OS keyring",
-    guidanceTitle: "Experimental and unavailable in this build",
-    guidance: "Shown for policy transparency. Approval never substitutes for an approved adapter or direct API access.",
   },
   anthropic_api: {
     name: "Anthropic direct API",
@@ -111,6 +111,8 @@ function credentialSourceLabel(source: Extract<HostedCredentialState, { state: "
       return "Application Default Credentials";
     case "broker_keyring":
       return "broker-owned OS keyring";
+    case "chat_gpt_device":
+      return "Corti-owned ChatGPT device login";
     case "aws_default_chain":
       return "the default AWS credential chain";
     case "aws_profile":
@@ -201,17 +203,19 @@ export function credentialSummary(
   transport: string,
 ): CredentialSummary {
   const vertex = transport === "vertex_api";
-  const codex = transport === "codex_app_server";
+  const chatgpt = transport === "chatgpt_subscription";
   const bedrock = transport === "bedrock_runtime";
   switch (credential.state) {
     case "absent":
       return {
-        label: vertex ? "Unarmed" : codex ? "Disconnected" : "No credential",
+        label: vertex ? "Unarmed" : chatgpt ? "Not signed in" : "No credential",
         detail: vertex
           ? "No memory-only ADC access token is ready."
-          : bedrock
-            ? "No AWS credential resolved for the selected mode."
-            : "No backend-managed credential is ready.",
+          : chatgpt
+            ? "Authorize Corti with the ChatGPT account whose included quota you want to use."
+            : bedrock
+              ? "No AWS credential resolved for the selected mode."
+              : "No backend-managed credential is ready.",
         tone: "muted",
       };
     case "resolving":
@@ -222,7 +226,7 @@ export function credentialSummary(
       };
     case "ready":
       return {
-        label: vertex ? "Armed · token only" : codex ? "Broker ready" : "Ready",
+        label: vertex ? "Armed · token only" : chatgpt ? "Signed in" : "Ready",
         detail: `Credential source: ${credentialSourceLabel(credential.source)}.`,
         tone: "ok",
       };
@@ -235,7 +239,9 @@ export function credentialSummary(
     case "device_authorization":
       return {
         label: "Device authorization pending",
-        detail: "The local broker returned display-only verification details; no token enters React.",
+        detail: chatgpt
+          ? "Corti is waiting for approval in your browser; no token enters this window."
+          : "The backend returned display-only verification details; no token enters React.",
         tone: "caution",
       };
     case "refreshing":
@@ -262,8 +268,11 @@ export function credentialSummary(
       };
     case "error":
       return {
-        label: "Credential error",
-        detail: errorLabel(credential.code),
+        label: chatgpt && credential.code === "cache" ? "Sign-in not saved" : "Credential error",
+        detail:
+          chatgpt && credential.code === "cache"
+            ? "OpenAI authorized Corti, but the rotating credential could not be persisted in the macOS Keychain. Sign in again after fixing Keychain access."
+            : errorLabel(credential.code),
         tone: "error",
       };
   }
@@ -329,7 +338,9 @@ export function findExactModel(
 }
 
 export function defaultProviderCache(model: HostedModelDescriptor): HostedProviderCacheMode {
-  if (model.transport === "codex_app_server") return "unavailable";
+  if (model.transport === "chatgpt_subscription") {
+    return "unavailable";
+  }
   if (model.capabilities.implicit_cache_may_apply) return "unavoidable_implicit";
   return "off";
 }
