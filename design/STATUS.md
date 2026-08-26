@@ -1,6 +1,6 @@
 # corti — status
 
-Current tree (latest tag **v0.14.0**): the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
+Current tree (latest tag **v0.15.0**): the full menu-bar pipeline — mic-in-use detection → CoreAudio process-tap
 capture + in-flight writer-thread AEC (`StreamingAec`, ADR 0007/#74) → cleaned 2-track WAV →
 transcription (AWS batch or local offline Parakeet-TDT via sherpa/CPU or transcribe.cpp/Metal,
 runtime-selectable) → filed vagus note. Capture disposition/config is durable in `queue.db`, so legacy
@@ -23,5 +23,8 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
 - **v0.14.0:** optional hosted-LLM cleanup for live and final transcripts, raw/clean/diff views,
   configurable provider and language preferences, resumable encrypted request state, usage/cost accounting,
   and transcript-grounded questions. Direct transports cover OpenAI, Anthropic, Vertex AI, and Amazon
-  Bedrock, plus native ChatGPT subscription device auth and direct fixed-endpoint Responses access with no
-  Codex server (#113, #115, #130, ADR 0015).
+  Bedrock; experimental Codex broker support remains explicitly gated (#113, #115, ADR 0015).
+- **v0.15.0:** real Vertex Application Default Credential resolution, redesigned Preferences navigation,
+  and native ChatGPT subscription device authorization with direct fixed-endpoint Responses access and no
+  Codex server. Live Transcript microphone tests now belong to exact window generations, so closing the
+  window reliably releases or prevents the test microphone (#127, #131, #132; ADRs 0013 and 0015).
