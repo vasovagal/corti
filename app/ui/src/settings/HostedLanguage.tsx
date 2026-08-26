@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import type { HostedPatchInput, HostedSettingsDto } from "../lib/api";
 import {
   filterWordEntries,
@@ -14,6 +14,43 @@ interface LanguageActions {
   onWordBank: (entries: string[]) => Promise<boolean>;
   onPinned: (template: string) => Promise<boolean>;
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
+}
+
+function LanguageCard({
+  title,
+  description,
+  meta,
+  defaultOpen = false,
+  className = "",
+  children,
+}: {
+  title: string;
+  description: string;
+  meta?: ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <details
+      className={`card hosted-language-card hosted-disclosure-card ${className}`.trim()}
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="hosted-card-head hosted-disclosure-summary">
+        <div>
+          <h3>{title}</h3>
+          <p>{description}</p>
+        </div>
+        <span className="hosted-disclosure-meta">
+          {meta}
+          <span className="hosted-disclosure-chevron" aria-hidden="true">›</span>
+        </span>
+      </summary>
+      <div className="hosted-disclosure-body">{children}</div>
+    </details>
+  );
 }
 
 export function HostedLanguagePreferences({
@@ -59,14 +96,13 @@ function SteeringDefault({
   }
 
   return (
-    <article className="card hosted-language-card hosted-steering-card">
-      <header className="hosted-card-head">
-        <div>
-          <h3>Default steering</h3>
-          <p>One persistent instruction for live, final, and question requests.</p>
-        </div>
-        <span className="hosted-revision">rev {settings.control.steering_revision}</span>
-      </header>
+    <LanguageCard
+      title="Default steering"
+      description="One persistent instruction shared by live, final, and question requests."
+      meta={<span className="hosted-revision">rev {settings.control.steering_revision}</span>}
+      defaultOpen
+      className="hosted-steering-card"
+    >
       <form onSubmit={submit}>
         <label className="settings-field">
           <span>Instruction</span>
@@ -96,7 +132,7 @@ function SteeringDefault({
           </button>
         </div>
       </form>
-    </article>
+    </LanguageCard>
   );
 }
 
@@ -139,17 +175,16 @@ function WordBank({
   }
 
   return (
-    <article className="card hosted-language-card hosted-word-bank-card">
-      <header className="hosted-card-head">
-        <div>
-          <h3>Unique-word bank</h3>
-          <p>Canonical spellings in the stable prompt prefix; Corti never auto-learns provider output.</p>
-        </div>
+    <LanguageCard
+      title="Unique-word bank"
+      description="Canonical spellings in the stable prompt prefix; Corti never auto-learns provider output."
+      meta={
         <span className="hosted-revision">
           {entries.length} / 5,000 · rev {settings.word_bank.revision}
         </span>
-      </header>
-
+      }
+      className="hosted-word-bank-card"
+    >
       <form className="hosted-remember-row" onSubmit={(event) => void addOne(event)}>
         <label htmlFor="hosted-remember-spelling">Spelling to remember</label>
         <div className="other-row">
@@ -299,7 +334,7 @@ function WordBank({
           results. Provider-held cache cannot be purged by Corti.
         </p>
       </HostedDialog>
-    </article>
+    </LanguageCard>
   );
 }
 
@@ -322,17 +357,16 @@ function PinnedQuestion({
   }
 
   return (
-    <article className="card hosted-language-card hosted-pinned-card">
-      <header className="hosted-card-head">
-        <div>
-          <h3>Pinned question</h3>
-          <p>Exactly one saved template; its content is not returned in the Settings DTO.</p>
-        </div>
+    <LanguageCard
+      title="Pinned question"
+      description="Exactly one saved template; its content is never returned in the Settings document."
+      meta={
         <span className={templatePresent ? "hosted-configured" : "muted"}>
           {templatePresent ? "Template saved" : "No template"}
         </span>
-      </header>
-
+      }
+      className="hosted-pinned-card"
+    >
       <form onSubmit={(event) => void saveTemplate(event)}>
         <label className="settings-field">
           <span>{templatePresent ? "Replace saved template" : "New template"}</span>
@@ -411,6 +445,6 @@ function PinnedQuestion({
           switch does not change Master or that lane.
         </p>
       </HostedDialog>
-    </article>
+    </LanguageCard>
   );
 }

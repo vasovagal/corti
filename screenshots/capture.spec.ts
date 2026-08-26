@@ -425,10 +425,15 @@ test("hosted rewrite preferences", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
   await expect(page.getByRole("heading", { name: "Hosted rewrite", exact: true })).toBeVisible();
-  await expect(page.getByRole("alert")).toHaveText("gcloud token isn't armed");
-  await expect(page.locator("#hosted-model-final")).toHaveValue("gpt-5.6-luna");
+  await expect(page.getByRole("heading", { name: "One provider. Final rewrite first." })).toBeVisible();
   await capture(page, "preferences-desktop.png");
-  await capture(page, "settings-hosted.png", true);
+
+  await page.getByRole("button", { name: "Rewrite modes" }).click();
+  await expect(page.locator("#hosted-model-final")).toHaveValue("gpt-5.6-luna");
+  await page.getByRole("button", { name: "Provider", exact: true }).click();
+  await expect(page.locator(".hosted-provider-card")).toHaveCount(1);
+  await expect(page.getByRole("heading", { name: "OpenAI direct API" })).toBeVisible();
+  await capture(page, "settings-hosted.png");
 });
 
 test("hosted rewrite preferences narrow", async ({ page }) => {
@@ -443,11 +448,12 @@ test("Vertex warning and recovery", async ({ page }) => {
     has: page.getByRole("heading", { name: "Google Vertex direct API" }),
   });
   await page.setViewportSize({ width: 1200, height: 1000 });
-  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
-  // Element screenshots can be taller than the viewport; keep the sticky tab
-  // bar from overlaying the card while Playwright scrolls it into view.
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  await page.locator("#hosted-provider-picker").selectOption({ label: "Vertex — Unarmed" });
+  // Element screenshots can be taller than the viewport; keep the sticky status
+  // banner from overlaying the card while Playwright scrolls it into view.
   await page.addStyleTag({
-    content: ".settings-tabs, .hosted-status-banner { position: static !important; }",
+    content: ".hosted-status-banner { position: static !important; }",
   });
   await expect(vertexCard.getByRole("alert")).toHaveText("gcloud token isn't armed");
   await captureElement(vertexCard, "vertex-warning-desktop.png");
@@ -464,10 +470,11 @@ test("Vertex warning and recovery", async ({ page }) => {
   await captureElement(vertexCard, "vertex-recovery-desktop.png");
 });
 
-/** Bedrock's card, with the sticky chrome pinned so element captures aren't overlaid. */
+/** Select Bedrock's one-at-a-time provider card and unpin status chrome for element captures. */
 async function bedrockCard(page: Page) {
+  await page.locator("#hosted-provider-picker").selectOption({ label: "Bedrock — No credential" });
   await page.addStyleTag({
-    content: ".settings-tabs, .hosted-status-banner { position: static !important; }",
+    content: ".hosted-status-banner { position: static !important; }",
   });
   return page.locator(".hosted-provider-card").filter({
     has: page.getByRole("heading", { name: "Amazon Bedrock" }),
@@ -485,7 +492,7 @@ async function applySettings(page: Page, settings: unknown) {
 
 test("Bedrock credential modes", async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 1000 });
-  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
   const card = await bedrockCard(page);
 
   // Default chain: the pane is legible before any AWS setup exists.
@@ -505,7 +512,7 @@ test("Bedrock credential modes", async ({ page }) => {
 
 test("Bedrock key pair and assumed role", async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 1000 });
-  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
   const card = await bedrockCard(page);
 
   await applySettings(page, syntheticBedrockKeypairSettings);
@@ -532,7 +539,7 @@ test("Bedrock key pair and assumed role", async ({ page }) => {
 
 test("Bedrock expired SSO reads as recoverable", async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 1000 });
-  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
   const card = await bedrockCard(page);
 
   await applySettings(page, syntheticBedrockRejectedSsoSettings);
@@ -546,7 +553,7 @@ test("Bedrock expired SSO reads as recoverable", async ({ page }) => {
 });
 
 test("provider key entry uses the native sheet, never a browser field", async ({ page }) => {
-  await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
   const openAiCard = page.locator(".hosted-provider-card").filter({
     has: page.getByRole("heading", { name: "OpenAI direct API" }),
   });

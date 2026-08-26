@@ -55,21 +55,28 @@ export function HostedLanes({
       <div className="hosted-section-heading">
         <div>
           <p className="hosted-eyebrow">Routing</p>
-          <h2 id="hosted-lanes-heading">Independent lanes</h2>
+          <h2 id="hosted-lanes-heading">Choose only the modes you need</h2>
         </div>
-        <p>Every lane keeps its own exact provider, model, cache policy, and enable switch.</p>
+        <p>Each mode can keep its own exact model, but reusing one provider is the simplest setup.</p>
+      </div>
+      <div className="hosted-routing-guide">
+        <strong>Start with Final rewrite.</strong>
+        <span>
+          It improves the transcript once before filing. Add Live cleanup only for faster on-screen polish,
+          and Questions only if you use the transcript assistant.
+        </span>
       </div>
       <div className="hosted-lane-grid">
         <HostedLaneCard
-          lane="live"
-          control={settings.control.live}
+          lane="final"
+          control={settings.control.final_lane}
           settings={settings}
           busy={busy}
           onPatch={onPatch}
         />
         <HostedLaneCard
-          lane="final"
-          control={settings.control.final_lane}
+          lane="live"
+          control={settings.control.live}
           settings={settings}
           busy={busy}
           onPatch={onPatch}
@@ -104,6 +111,7 @@ function HostedLaneCard({
       ? providerKey(control.selection.provider, control.selection.transport)
       : "";
   const [draftProviderKey, setDraftProviderKey] = useState(selectedProviderKey);
+  const [expanded, setExpanded] = useState(lane === "final");
 
   useEffect(() => {
     setDraftProviderKey(selectedProviderKey);
@@ -148,16 +156,24 @@ function HostedLaneCard({
     onPatch(selectionPatch(lane, selection), message);
 
   return (
-    <article className={`card hosted-lane-card${effective ? " hosted-lane-effective" : ""}`}>
-      <header className="hosted-card-head hosted-lane-head">
+    <details
+      className={`card hosted-lane-card${effective ? " hosted-lane-effective" : ""}`}
+      open={expanded}
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary className="hosted-card-head hosted-lane-head">
         <div>
           <p className="hosted-eyebrow">{copy.eyebrow}</p>
           <h3>{copy.title}</h3>
         </div>
-        <span className={`hosted-lane-state${effective ? " hosted-state-on" : ""}`}>
-          {laneState}
+        <span className="hosted-lane-summary-status">
+          <span className={`hosted-lane-state${effective ? " hosted-state-on" : ""}`}>
+            {laneState}
+          </span>
+          <span className="hosted-disclosure-chevron" aria-hidden="true">›</span>
         </span>
-      </header>
+      </summary>
+      <div className="hosted-lane-body">
       <p className="muted small hosted-lane-description">
         {copy.description}
         {lane === "final" && ` Configured deadline: ${settings.final_deadline_seconds} seconds.`}
@@ -185,6 +201,7 @@ function HostedLaneCard({
         }
       />
 
+      <div className="hosted-lane-selection-grid">
       <div className="settings-field hosted-lane-field">
         <label htmlFor={`hosted-provider-${lane}`}>Provider catalog</label>
         <select
@@ -265,7 +282,11 @@ function HostedLaneCard({
           <p className="hosted-field-error">This catalog has no model that passed the live benchmark gate.</p>
         )}
       </div>
+      </div>
 
+      <details className="hosted-lane-advanced">
+        <summary>Cache, cost &amp; model details</summary>
+        <div className="hosted-lane-advanced-body">
       <div className="settings-field hosted-lane-field">
         <label htmlFor={`hosted-local-cache-${lane}`}>Local exact cache</label>
         <select
@@ -319,8 +340,10 @@ function HostedLaneCard({
           Saved selection is not in the current account/region catalog. It will not be silently substituted.
         </p>
       ) : (
-        <p className="muted small">No model selected. This lane cannot be enabled.</p>
+        <p className="muted small">No model selected. This mode cannot be enabled.</p>
       )}
+        </div>
+      </details>
 
       {!control.enabled && complete && (
         <button
@@ -337,7 +360,8 @@ function HostedLaneCard({
           Clear selection
         </button>
       )}
-    </article>
+      </div>
+    </details>
   );
 }
 

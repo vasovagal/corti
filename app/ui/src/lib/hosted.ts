@@ -19,6 +19,8 @@ export interface ProviderPresentation {
   name: string;
   shortName: string;
   auth: string;
+  guidanceTitle: string;
+  guidance: string;
 }
 
 const PRESENTATION: Record<string, ProviderPresentation> = {
@@ -26,31 +28,43 @@ const PRESENTATION: Record<string, ProviderPresentation> = {
     name: "Google Vertex direct API",
     shortName: "Vertex",
     auth: "Application Default Credentials (ADC)",
+    guidanceTitle: "For Google Cloud organizations",
+    guidance: "Best when project, region, IAM, quota, and billing are already managed in Google Cloud.",
   },
   openai_api: {
     name: "OpenAI direct API",
     shortName: "OpenAI API",
     auth: "API key in macOS Keychain or workload identity",
+    guidanceTitle: "For an OpenAI API account",
+    guidance: "Uses separate API billing and data controls. A ChatGPT subscription does not include API usage.",
   },
   codex_app_server: {
     name: "Codex app-server",
     shortName: "Codex",
     auth: "Broker-owned device code and OS keyring",
+    guidanceTitle: "Experimental and unavailable in this build",
+    guidance: "Shown for policy transparency. Approval never substitutes for an approved adapter or direct API access.",
   },
   anthropic_api: {
     name: "Anthropic direct API",
     shortName: "Anthropic API",
     auth: "API key in macOS Keychain or workload identity",
+    guidanceTitle: "For an Anthropic API account",
+    guidance: "Uses metered API billing. Claude Free, Pro, and Max subscriptions are separate products.",
   },
   claude_subscription: {
     name: "Claude subscription (Free / Pro / Max)",
     shortName: "Claude subscription",
     auth: "No credential import permitted",
+    guidanceTitle: "Consumer subscription credentials are blocked",
+    guidance: "Corti cannot import or route Claude subscription credentials without written provider permission.",
   },
   bedrock_runtime: {
     name: "Amazon Bedrock",
     shortName: "Bedrock",
     auth: "AWS credentials: default chain, profile, key pair, assumed role, or SSO",
+    guidanceTitle: "For AWS organizations",
+    guidance: "Uses a region-scoped Bedrock catalog and your chosen AWS credential chain, profile, role, or SSO session.",
   },
 };
 
@@ -60,6 +74,8 @@ export function providerPresentation(provider: string, transport: string): Provi
       name: `${provider} · ${transport}`,
       shortName: provider,
       auth: "Backend-managed credential",
+      guidanceTitle: "Backend-managed provider",
+      guidance: "Review the authenticated connection scope and catalog before selecting an exact model.",
     }
   );
 }
