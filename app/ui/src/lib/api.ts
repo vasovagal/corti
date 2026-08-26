@@ -442,6 +442,8 @@ export interface HostedSettingsDto {
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
   bedrock: BedrockCredentialDto;
+  /** Exact Vertex model ids the operator typed, in save order. */
+  vertex_models: string[];
   default_steering: string;
   word_bank: {
     revision: number;
@@ -730,6 +732,16 @@ export const setBedrockCredentialMode = (
       profile,
       role_arn: roleArn,
     },
+  });
+
+/** Vertex publishes no per-project listing of the models a caller may invoke, so the typed ids are the
+ * catalog. Saving rebuilds the Vertex adapter. */
+export const setHostedVertexModels = (
+  observedStateRevision: number,
+  models: string[],
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("set_hosted_vertex_models", {
+    request: { observed_state_revision: observedStateRevision, models },
   });
 
 /** Opens the native secure-entry sheet. The typed value goes straight to the Keychain; this call only

@@ -11,6 +11,7 @@ import {
   refreshHostedProvider,
   replaceHostedWordBank,
   setBedrockCredentialMode,
+  setHostedVertexModels,
   setHostedPinnedQuestion,
   signOutChatGptSubscription,
   startChatGptDeviceLogin,
@@ -174,6 +175,11 @@ export default function HostedPreferences({
       "Credential update",
       "AWS credential mode saved; Master and lanes were not changed.",
       (revision) => setBedrockCredentialMode(revision, mode, profile, roleArn),
+    );
+
+  const onVertexModels = (models: string[]) =>
+    runMutation("Vertex model update", "Vertex model list saved; refresh the catalog to use it.", (revision) =>
+      setHostedVertexModels(revision, models),
     );
 
   const onBedrockRegion = (region: string | null, alias: string | null) =>
@@ -392,6 +398,7 @@ export default function HostedPreferences({
     onCancelChatGpt,
     onSignOutChatGpt,
     onOpenChatGptLogin,
+    onVertexModels,
     bedrock: {
       busy: isBusy,
       onMode: onBedrockMode,
@@ -496,6 +503,7 @@ export default function HostedPreferences({
           providers={settings.providers}
           scopes={settings.scopes}
           bedrock={settings.bedrock}
+          vertexModels={settings.vertex_models}
           awsOptions={awsOptions}
           preferredSelection={settings.control.final_lane.selection}
           actions={providerActions}

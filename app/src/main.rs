@@ -315,6 +315,7 @@ pub(crate) mod imp {
                 crate::postprocess_app::get_hosted_assistant,
                 crate::postprocess_app::list_aws_credential_options,
                 crate::postprocess_app::set_bedrock_credential_mode,
+                crate::postprocess_app::set_hosted_vertex_models,
                 crate::postprocess_app::start_chatgpt_device_login,
                 crate::postprocess_app::cancel_chatgpt_device_login,
                 crate::postprocess_app::sign_out_chatgpt_subscription,

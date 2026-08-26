@@ -367,6 +367,7 @@ export const hostedSettings = {
     has_secret_access_key: false,
     has_session_token: false,
   },
+  vertex_models: [],
   default_steering: "Preserve speaker intent; correct only clear recognition errors.",
   word_bank: {
     revision: 7,

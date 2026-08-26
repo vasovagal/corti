@@ -25,6 +25,7 @@ pub(crate) const PROVIDER_CACHE_DISCLOSURE_VERSION: u32 = 1;
 const DEFAULT_FINAL_DEADLINE_SECONDS: u32 = 90;
 const MAX_FINAL_DEADLINE_SECONDS: u32 = 10 * 60;
 const MAX_HOSTED_PREFERENCES_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_VERTEX_MODELS: usize = 32;
 
 /// The host facility that owns a secret. No secret bytes, path, account id, or user-supplied label can be
 /// represented by this enum.
@@ -202,6 +203,9 @@ impl Default for BedrockProviderPreferences {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ProviderPreferences {
     pub(crate) vertex: ProviderScopePreferences,
+    /// Exact Vertex model ids typed by the operator. Vertex publishes no per-project listing of the models
+    /// a caller may invoke, so this is the only way to reach a model Corti does not already know about.
+    pub(crate) vertex_models: Vec<String>,
     pub(crate) vertex_provider_cache_acknowledgement_version: Option<u32>,
     pub(crate) openai: DirectProviderPreferences,
     pub(crate) anthropic: DirectProviderPreferences,
@@ -216,6 +220,7 @@ impl Default for ProviderPreferences {
     fn default() -> Self {
         Self {
             vertex: ProviderScopePreferences::default(),
+            vertex_models: Vec::new(),
             vertex_provider_cache_acknowledgement_version: None,
             openai: DirectProviderPreferences::openai(),
             anthropic: DirectProviderPreferences::anthropic(),
@@ -401,6 +406,7 @@ impl HostedPreferences {
             SecretPurpose::AnthropicApiKey,
         )?;
         validate_bedrock_provider(&self.preferences.providers.bedrock)?;
+        validate_vertex_models(&self.preferences.providers.vertex_models)?;
         for lane in [
             &self.preferences.live,
             &self.preferences.final_lane,
@@ -453,6 +459,30 @@ fn validate_direct_provider(
 ) -> Result<()> {
     if provider.credential.purpose() != expected {
         bail!("hosted credential reference does not match its provider slot");
+    }
+    Ok(())
+}
+
+/// Typed model ids are configuration, not free text: the same character set the Vertex adapter accepts,
+/// so a saved entry can never be one the adapter would refuse to build a catalog from.
+fn validate_vertex_models(models: &[String]) -> Result<()> {
+    ensure!(
+        models.len() <= MAX_VERTEX_MODELS,
+        "at most {MAX_VERTEX_MODELS} Vertex models can be pinned"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for model in models {
+        ensure!(
+            !model.is_empty()
+                && model.len() <= 256
+                && model.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b'@')),
+            "{model:?} is not a valid Vertex model id"
+        );
+        ensure!(
+            seen.insert(model.as_str()),
+            "duplicate Vertex model {model:?}"
+        );
     }
     Ok(())
 }
@@ -690,6 +720,45 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("requires a region"), "{error}");
+    }
+
+    #[test]
+    fn typed_vertex_models_round_trip_and_reject_anything_the_adapter_would_refuse() {
+        let path = test_path("vertex-models-round-trip");
+        let preferences = HostedPreferences::default()
+            .revise(|values| {
+                values.providers.vertex_models = vec![
+                    "gemini-2.5-flash-lite".into(),
+                    "claude-sonnet-4-5@20250929".into(),
+                ];
+            })
+            .unwrap();
+        preferences.save_at(&path).unwrap();
+        assert_eq!(HostedPreferences::load_at(&path).unwrap(), preferences);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+
+        // A malformed or repeated id would disarm the whole Vertex catalog, not just its own entry.
+        for models in [
+            vec!["gemini 2.5 flash".to_string()],
+            vec![String::new()],
+            vec!["gemini-2.5-pro".to_string(), "gemini-2.5-pro".to_string()],
+        ] {
+            assert!(
+                HostedPreferences::default()
+                    .revise(|values| values.providers.vertex_models = models.clone())
+                    .is_err(),
+                "{models:?} was accepted"
+            );
+        }
+
+        let too_many = (0..=MAX_VERTEX_MODELS)
+            .map(|index| format!("gemini-fixture-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            HostedPreferences::default()
+                .revise(|values| values.providers.vertex_models = too_many)
+                .is_err()
+        );
     }
 
     #[test]

@@ -61,8 +61,8 @@ use crate::postprocess::{
     TerminalOutcomeDto, TerminalTelemetryDto, TranscriptWatermark,
 };
 use crate::postprocess_config::{
-    EGRESS_DISCLOSURE_VERSION, HostedPreferences, PINNED_AUTO_DISCLOSURE_VERSION,
-    ProviderScopePreferences, SecretPurpose,
+    EGRESS_DISCLOSURE_VERSION, HostedPreferences, MAX_VERTEX_MODELS,
+    PINNED_AUTO_DISCLOSURE_VERSION, ProviderScopePreferences, SecretPurpose,
 };
 use crate::private_file::{atomic_write_private, read_private};
 use crate::vertex_creds::{VertexAdapterCredentials, VertexAdcResolver, VertexConnectionConfig};
@@ -102,6 +102,8 @@ const ANTHROPIC_API_KEY_ACCOUNT: &str = SecretPurpose::AnthropicApiKey.keychain_
 const FINGERPRINT_DOMAIN: &[u8] = b"corti-app-provenance-v1\0";
 const CHATGPT_PROVIDER: &str = "openai";
 const CHATGPT_TRANSPORT: &str = "chatgpt_subscription";
+const VERTEX_PROVIDER: &str = "google";
+const VERTEX_TRANSPORT: &str = "vertex_api";
 
 /// Managed Tauri state. The handle is cloneable; the coordinator itself never leaves its owner thread.
 pub(crate) struct HostedState {
@@ -373,6 +375,8 @@ pub(crate) struct HostedSettingsDto {
     pub(crate) control: ControlSnapshotDto,
     pub(crate) providers: Vec<ProviderStateDto>,
     pub(crate) scopes: Vec<HostedProviderScopeDto>,
+    /// Exact Vertex model ids the operator typed, in save order.
+    pub(crate) vertex_models: Vec<String>,
     pub(crate) bedrock: BedrockCredentialDto,
     pub(crate) default_steering: String,
     pub(crate) word_bank: HostedWordBankDto,
@@ -970,6 +974,35 @@ pub(crate) struct BedrockCredentialModeRequest {
     pub(crate) role_arn: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct VertexModelsRequest {
+    pub(crate) observed_state_revision: u64,
+    pub(crate) models: Vec<String>,
+}
+
+/// Replace the operator-typed Vertex model list. Vertex has no catalog API to discover these from, so the
+/// typed ids are the catalog; saving rebuilds the adapter on the next lookup.
+#[tauri::command]
+pub(crate) fn set_hosted_vertex_models(
+    request: VertexModelsRequest,
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<HostedMutationResult, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    state
+        .handle
+        .send(ServiceCommand::SetVertexModels {
+            request,
+            reply: reply_tx,
+        })
+        .map_err(sanitized_error)?;
+    reply_rx
+        .recv()
+        .map_err(|_| "hosted coordinator stopped".to_string())?
+        .map_err(sanitized_error)
+}
+
 #[tauri::command]
 pub(crate) fn list_aws_credential_options(
     window: tauri::WebviewWindow,
@@ -1143,6 +1176,7 @@ pub(crate) fn start(
                 chatgpt_auth.clone(),
                 BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
                 vertex.clone(),
+                vertex_models_source(preferences.clone()),
             )
         },
     );
@@ -1493,6 +1527,20 @@ fn vertex_config_source(
     })
 }
 
+fn vertex_models_source(
+    preferences: Arc<Mutex<HostedPreferences>>,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    Arc::new(move || {
+        preferences
+            .lock()
+            .unwrap()
+            .values()
+            .providers
+            .vertex_models
+            .clone()
+    })
+}
+
 fn copy_lane(source: &LaneControlDto, target: &mut crate::postprocess_config::LanePreferences) {
     target.enabled = source.enabled;
     target.provider = source.selection.provider.clone();
@@ -1714,6 +1762,54 @@ struct ApprovedProviderDirectory {
     /// Bedrock resolves through the AWS chain rather than a single Keychain item, so its readiness —
     /// including assumed-role and SSO expiry — comes from its own resolver.
     bedrock: Arc<BedrockCredentialResolver>,
+    vertex: VertexAdapterSlot,
+}
+
+impl ApprovedProviderDirectory {
+    fn adapter(&self, provider: &ProviderId, transport: &TransportId) -> Option<SharedAdapter> {
+        if (provider.as_str(), transport.as_str()) == (VERTEX_PROVIDER, VERTEX_TRANSPORT) {
+            return self.vertex.current();
+        }
+        self.adapters
+            .get(&(provider.clone(), transport.clone()))
+            .cloned()
+    }
+}
+
+/// Vertex is the one transport whose adapter bakes project routing and its model list in at construction.
+/// Rebuilding it whenever those inputs change is what lets a scope or model edit take effect without a
+/// relaunch — the previous build-once-at-startup wiring left a first-run configuration permanently
+/// catalog-less, and a later region edit permanently policy-blocked.
+struct VertexAdapterSlot {
+    transports: Arc<dyn DirectTransportFactory>,
+    resolver: Arc<VertexAdcResolver>,
+    models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    built: Mutex<Option<(VertexAdapterInputs, SharedAdapter)>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct VertexAdapterInputs {
+    config: VertexConnectionConfig,
+    models: Vec<String>,
+}
+
+impl VertexAdapterSlot {
+    fn current(&self) -> Option<SharedAdapter> {
+        let desired = VertexAdapterInputs {
+            config: self.resolver.config(),
+            models: (self.models)(),
+        };
+        let mut built = self.built.lock().ok()?;
+        if built.as_ref().map(|(inputs, _)| inputs) != Some(&desired) {
+            *built = vertex_adapter(
+                self.transports.as_ref(),
+                self.resolver.clone(),
+                &desired.models,
+            )
+            .map(|adapter| (desired, Arc::new(Mutex::new(adapter))));
+        }
+        built.as_ref().map(|(_, adapter)| adapter.clone())
+    }
 }
 
 struct ApprovedProviderAccess(Arc<ApprovedProviderDirectory>);
@@ -1778,8 +1874,7 @@ impl ProviderAccess for ApprovedProviderAccess {
     ) -> Result<ModelCatalog, corti_postprocess::PostprocessError> {
         let adapter = self
             .0
-            .adapters
-            .get(&(provider.clone(), transport.clone()))
+            .adapter(provider, transport)
             .ok_or_else(|| corti_postprocess::PostprocessError::from(ErrorCode::AuthUnarmed))?;
         adapter
             .lock()
@@ -1799,8 +1894,7 @@ impl TicketExecutor for ApprovedTicketExecutor {
         let request = ticket.request();
         let adapter = self
             .0
-            .adapters
-            .get(&(request.provider.clone(), request.transport.clone()))
+            .adapter(&request.provider, &request.transport)
             .ok_or_else(|| corti_postprocess::PostprocessError::from(ErrorCode::PolicyBlocked))?;
         ticket.execute_with(
             adapter
@@ -1819,6 +1913,7 @@ fn approved_direct_components(
     chatgpt_auth: ChatGptSubscriptionAuth,
     bedrock: Arc<BedrockCredentialResolver>,
     vertex: Arc<VertexAdcResolver>,
+    vertex_models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
     let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
     let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
@@ -1864,21 +1959,17 @@ fn approved_direct_components(
         (bedrock_descriptor.provider, bedrock_descriptor.transport),
         Arc::new(Mutex::new(bedrock_adapter)),
     );
-    // Vertex, unlike the other transports, bakes project routing and a model catalog in at construction and
-    // does not self-discover them from the network. It can only be registered once the connection scope names
-    // a valid project/region; until then dispatch stays blocked while the resolver still arms in Settings.
-    if let Some(adapter) = vertex_adapter(transports.as_ref(), vertex) {
-        let descriptor = adapter.descriptor();
-        adapters.insert(
-            (descriptor.provider, descriptor.transport),
-            Arc::new(Mutex::new(adapter)),
-        );
-    }
     let directory = Arc::new(ApprovedProviderDirectory {
         adapters,
         credentials,
         chatgpt: chatgpt_auth,
         bedrock,
+        vertex: VertexAdapterSlot {
+            transports,
+            resolver: vertex,
+            models: vertex_models,
+            built: Mutex::new(None),
+        },
     });
     (
         Arc::new(ApprovedTicketExecutor(directory.clone())),
@@ -1928,6 +2019,7 @@ impl VertexResolver for AdcVertexResolver {
 fn vertex_adapter(
     transports: &dyn DirectTransportFactory,
     vertex: Arc<VertexAdcResolver>,
+    typed_models: &[String],
 ) -> Option<Box<dyn ProviderAdapter>> {
     let config = vertex.config();
     let metadata =
@@ -1937,30 +2029,29 @@ fn vertex_adapter(
         Box::new(ProviderSystemClock::new()),
         Box::new(VertexAdapterCredentials::new(vertex)),
         metadata,
-        vertex_direct_models(),
+        vertex_direct_models(typed_models),
     )
     .ok()?;
     Some(Box::new(adapter))
 }
 
-/// A conservative, hand-curated Gemini catalog. The Vertex adapter needs models baked in at construction and
-/// does not discover them from the API; this stopgap keeps live benchmarking off (Live lane stays blocked)
-/// until account-scoped capability discovery lands. See the tracking follow-up on the PR.
-fn vertex_direct_models() -> Vec<VertexModel> {
-    [
-        ("gemini-2.5-flash", 1_000_000u64, 65_536u64),
-        ("gemini-2.5-pro", 1_000_000, 65_536),
-    ]
-    .into_iter()
-    .filter_map(|(id, max_context_tokens, max_output_tokens)| {
-        VertexModel::new(
-            ModelId::new(id).ok()?,
-            max_context_tokens,
-            max_output_tokens,
-        )
-        .ok()
-    })
-    .collect()
+/// The curated Gemini models plus whatever exact ids the operator typed in Settings. Vertex exposes no
+/// per-project listing of the models a caller may invoke — the publisher list is the whole Model Garden and
+/// needs a quota project the caller may not hold — so typing the id is the only discovery Corti can offer.
+/// Typed entries inherit the Gemini 2.5 limits: the adapter only uses them to refuse an output budget larger
+/// than the model allows, and Vertex rejects a genuinely wrong id on the first call with its own error.
+fn vertex_direct_models(typed: &[String]) -> Vec<VertexModel> {
+    const CURATED: [&str; 2] = ["gemini-2.5-flash", "gemini-2.5-pro"];
+    let mut seen = HashSet::new();
+    CURATED
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .chain(typed.iter().cloned())
+        // The adapter rejects the whole catalog on a duplicate, so a typed id that repeats a curated one
+        // must collapse rather than disarm every model.
+        .filter(|id| seen.insert(id.clone()))
+        .filter_map(|id| VertexModel::new(ModelId::new(id).ok()?, 1_000_000, 65_536).ok())
+        .collect()
 }
 
 struct NoPricing;
@@ -2668,6 +2759,10 @@ enum ServiceCommand {
         request: BedrockCredentialModeRequest,
         reply: Sender<Result<HostedMutationResult, ErrorCode>>,
     },
+    SetVertexModels {
+        request: VertexModelsRequest,
+        reply: Sender<Result<HostedMutationResult, ErrorCode>>,
+    },
     RefreshProvider {
         provider: ProviderId,
         transport: TransportId,
@@ -2896,6 +2991,10 @@ impl Service {
             }
             ServiceCommand::SetBedrockCredentialMode { request, reply } => {
                 let result = self.set_bedrock_credential_mode(request);
+                let _ = reply.send(result);
+            }
+            ServiceCommand::SetVertexModels { request, reply } => {
+                let result = self.set_vertex_models(request);
                 let _ = reply.send(result);
             }
             ServiceCommand::RefreshProvider {
@@ -3254,6 +3353,53 @@ impl Service {
         self.bump_state();
         self.refresh_snapshot();
         Ok(result)
+    }
+
+    fn set_vertex_models(
+        &mut self,
+        request: VertexModelsRequest,
+    ) -> Result<HostedMutationResult, ErrorCode> {
+        if request.observed_state_revision != self.state_revision {
+            return Ok(HostedMutationResult::Conflict {
+                settings: self.current_settings(),
+            });
+        }
+        let mut models = Vec::new();
+        for model in request.models {
+            let model = model.trim().to_owned();
+            if model.is_empty() || models.contains(&model) {
+                continue;
+            }
+            models.push(model);
+        }
+        if models.len() > MAX_VERTEX_MODELS {
+            return Err(ErrorCode::PolicyBlocked);
+        }
+        if self
+            .preferences
+            .lock()
+            .unwrap()
+            .values()
+            .providers
+            .vertex_models
+            == models
+        {
+            return Ok(HostedMutationResult::Unchanged {
+                settings: self.current_settings(),
+            });
+        }
+        // `revise` runs `validate`, so a malformed model id is rejected before it can disarm the catalog.
+        self.revise_preferences(|values| values.providers.vertex_models = models)
+            .map_err(|_| ErrorCode::PolicyBlocked)?;
+        let provider = ProviderId::new(VERTEX_PROVIDER).map_err(|_| ErrorCode::Internal)?;
+        let transport = TransportId::new(VERTEX_TRANSPORT).map_err(|_| ErrorCode::Internal)?;
+        self.coordinator
+            .invalidate_provider_scope(&provider, &transport);
+        self.bump_state();
+        self.refresh_snapshot();
+        Ok(HostedMutationResult::Applied {
+            settings: self.current_settings(),
+        })
     }
 
     fn set_bedrock_credential_mode(
@@ -4606,6 +4752,7 @@ fn settings_snapshot(
             ),
             scope_dto("amazon", "bedrock_runtime", &values.providers.bedrock.scope),
         ],
+        vertex_models: values.providers.vertex_models.clone(),
         bedrock: BedrockCredentialDto {
             mode: values.providers.bedrock.credential_mode,
             profile: values.providers.bedrock.profile.clone(),
@@ -5653,6 +5800,7 @@ mod tests {
             empty_chatgpt_auth(),
             BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
             VertexAdcResolver::production(vertex_config_source(preferences.clone())),
+            vertex_models_source(preferences.clone()),
         );
         let (_, handle) = start_with_components(
             preferences,
@@ -6720,6 +6868,103 @@ mod tests {
             assert!(!settled.hosted_text_applied);
             assert_eq!(settled.applied_postprocess.final_outcome(), Some(expected));
         }
+    }
+
+    #[test]
+    fn vertex_direct_models_keep_the_curated_ids_and_collapse_repeats() {
+        let ids = |models: &[VertexModel]| {
+            models
+                .iter()
+                .map(|model| model.exact_model_id().as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids(&vertex_direct_models(&[])),
+            ["gemini-2.5-flash", "gemini-2.5-pro"]
+        );
+        // A repeat of a curated id would make `VertexRestAdapter::new` reject the whole catalog.
+        assert_eq!(
+            ids(&vertex_direct_models(&[
+                "gemini-2.5-pro".to_owned(),
+                "gemini-2.5-flash-lite".to_owned(),
+            ])),
+            [
+                "gemini-2.5-flash",
+                "gemini-2.5-pro",
+                "gemini-2.5-flash-lite"
+            ]
+        );
+    }
+
+    #[test]
+    fn vertex_adapter_slot_rebuilds_when_the_scope_or_model_list_changes() {
+        let preferences = shared(HostedPreferences::default());
+        let transports = Arc::new(InjectedTransportFactory {
+            openai: Arc::new(Mutex::new(VecDeque::new())),
+            sends: Arc::new(AtomicUsize::new(0)),
+        });
+        let slot = VertexAdapterSlot {
+            transports,
+            resolver: VertexAdcResolver::production(vertex_config_source(preferences.clone())),
+            models: vertex_models_source(preferences.clone()),
+            built: Mutex::new(None),
+        };
+        let catalog = |region: &str| {
+            let scope = ProviderScope {
+                connection_scope_id: ConnectionScopeId::new("fixture-vertex-scope").unwrap(),
+                region: Some(region.to_owned()),
+            };
+            slot.current()
+                .ok_or(ErrorCode::AuthUnarmed)?
+                .lock()
+                .unwrap()
+                .catalog(&scope)
+                .map(|catalog| {
+                    catalog
+                        .models
+                        .iter()
+                        .map(|model| model.exact_model_id.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| error.code)
+        };
+        let revise = |edit: fn(&mut crate::postprocess_config::HostedPreferenceValues)| {
+            let mut guard = preferences.lock().unwrap();
+            *guard = guard.clone().revise(edit).unwrap();
+        };
+
+        // No routing yet: the scope has not been saved, so there is nothing to build.
+        assert_eq!(catalog("global"), Err(ErrorCode::AuthUnarmed));
+
+        // Saving the scope must arm the catalog without a relaunch.
+        revise(|values| {
+            values.providers.vertex.project = Some("fixture-project".to_owned());
+            values.providers.vertex.region = Some("global".to_owned());
+        });
+        assert_eq!(
+            catalog("global"),
+            Ok(vec![
+                "gemini-2.5-flash".to_owned(),
+                "gemini-2.5-pro".to_owned()
+            ])
+        );
+
+        // An adapter built for the old region rejects the new one outright.
+        revise(|values| values.providers.vertex.region = Some("us-east5".to_owned()));
+        assert_eq!(catalog("us-east5").map(|models| models.len()), Ok(2));
+
+        revise(|values| {
+            values.providers.vertex_models = vec!["gemini-2.5-flash-lite".to_owned()];
+        });
+        assert_eq!(
+            catalog("us-east5"),
+            Ok(vec![
+                "gemini-2.5-flash".to_owned(),
+                "gemini-2.5-pro".to_owned(),
+                "gemini-2.5-flash-lite".to_owned(),
+            ])
+        );
     }
 
     #[test]

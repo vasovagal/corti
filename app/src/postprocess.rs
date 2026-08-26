@@ -1314,27 +1314,29 @@ impl PostprocessCoordinator {
         } else {
             self.providers.credential_state(provider, transport)
         };
-        let models = match &credential {
-            CredentialState::Ready { .. } => {
-                self.providers
-                    .catalog(provider, transport, scope)
-                    .map_err(|error| error.code)?
-                    .models
-            }
-            _ => Vec::new(),
+        // A catalog failure is published on the card before it is returned. Reporting it only as a command
+        // error left the pane saying "no models" for causes — an unbuildable connection scope, a region the
+        // adapter was not built for — that say nothing about the catalog being empty.
+        let catalog = match &credential {
+            CredentialState::Ready { .. } => self
+                .providers
+                .catalog(provider, transport, scope)
+                .map(|catalog| catalog.models)
+                .map_err(|error| error.code),
+            _ => Ok(Vec::new()),
         };
         let state = ProviderStateDto {
             descriptor: descriptor.clone(),
             credential,
-            models,
-            service_error: None,
+            models: catalog.clone().unwrap_or_default(),
+            service_error: catalog.as_ref().err().copied(),
         };
         self.provider_states.insert(
             (descriptor.provider.clone(), descriptor.transport.clone()),
             state.clone(),
         );
         self.push_event(CoordinatorEventDto::ProviderState(Box::new(state.clone())));
-        Ok(state)
+        catalog.map(|_| state)
     }
 
     /// Refresh only the secret-free credential projection. Device authorization uses this while a human
@@ -5183,6 +5185,45 @@ mod tests {
             .unwrap();
         assert!(matches!(state.credential, CredentialState::Ready { .. }));
         assert_eq!(state.service_error, Some(ErrorCode::Permission));
+    }
+
+    #[test]
+    fn a_refresh_catalog_failure_is_published_on_the_card() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Live, KnownTransport::VertexDirect);
+        let attempt = harness.coordinator.drive_vertex().unwrap();
+        harness
+            .coordinator
+            .complete_vertex(
+                attempt,
+                VertexResolutionOutcome::Ready {
+                    expires_at_unix_ms: None,
+                },
+            )
+            .unwrap();
+        harness.providers.lock().unwrap().catalog_error = Some(ErrorCode::PolicyBlocked);
+        let descriptor = KnownTransport::VertexDirect.descriptor();
+        let scope = ProviderScope {
+            connection_scope_id: ConnectionScopeId::new("fixture-scope").unwrap(),
+            region: Some("global".to_owned()),
+        };
+
+        assert_eq!(
+            harness.coordinator.refresh_provider(
+                &descriptor.provider,
+                &descriptor.transport,
+                &scope
+            ),
+            Err(ErrorCode::PolicyBlocked)
+        );
+        // Without this the pane fell through to "No selectable models returned", which is a different fact.
+        let state = harness
+            .coordinator
+            .provider_states()
+            .find(|state| state.descriptor.transport == descriptor.transport)
+            .unwrap();
+        assert_eq!(state.service_error, Some(ErrorCode::PolicyBlocked));
+        assert!(state.models.is_empty());
     }
 
     #[test]

@@ -1457,6 +1457,26 @@ summary:focus-visible,
 .hosted-scope .hosted-field-error {
   align-self: end;
 }
+.hosted-vertex-models > p,
+.hosted-vertex-model-list {
+  grid-column: 1 / -1;
+}
+.hosted-vertex-model-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.hosted-vertex-model-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
 .hosted-bedrock {
   border-top: 1px solid var(--border);
   margin-top: 12px;

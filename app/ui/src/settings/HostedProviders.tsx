@@ -29,6 +29,7 @@ interface ProviderActions {
   onCancelChatGpt: () => Promise<boolean>;
   onSignOutChatGpt: () => Promise<boolean>;
   onOpenChatGptLogin: () => Promise<boolean>;
+  onVertexModels: (models: string[]) => Promise<boolean>;
   bedrock: BedrockActions;
 }
 
@@ -47,6 +48,7 @@ export function HostedProviders({
   providers,
   scopes,
   bedrock,
+  vertexModels,
   awsOptions,
   preferredSelection,
   actions,
@@ -54,6 +56,7 @@ export function HostedProviders({
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
   bedrock: BedrockCredentialDto;
+  vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
   preferredSelection: PreferredProvider;
   actions: ProviderActions;
@@ -173,6 +176,7 @@ export function HostedProviders({
             state={selected}
             scope={selectedScope}
             bedrock={bedrock}
+            vertexModels={vertexModels}
             awsOptions={awsOptions}
             actions={actions}
           />
@@ -186,12 +190,14 @@ function HostedProviderCard({
   state,
   scope,
   bedrock,
+  vertexModels,
   awsOptions,
   actions,
 }: {
   state: HostedProviderState;
   scope?: HostedProviderScope;
   bedrock: BedrockCredentialDto;
+  vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
   actions: ProviderActions;
 }) {
@@ -383,6 +389,8 @@ function HostedProviderCard({
         <ProviderScopeEditor scope={scope} transport={descriptor.transport} actions={actions} />
       )}
 
+      {isVertex && <VertexModelEditor models={vertexModels} actions={actions} />}
+
       {!isClaudeSubscription && (
         <div className="hosted-provider-actions">
           <button
@@ -397,7 +405,9 @@ function HostedProviderCard({
             {scope && !scope.configured
               ? "Save a connection scope first."
               : state.models.length === 0
-                ? "No selectable models returned."
+                ? isVertex
+                  ? "No models yet — add one above."
+                  : "No selectable models returned."
                 : `${state.models.length} exact catalog ${state.models.length === 1 ? "model" : "models"}.`}
           </span>
         </div>
@@ -429,6 +439,85 @@ function HostedProviderCard({
         exact model selection.
       </p>
     </article>
+  );
+}
+
+const MAX_VERTEX_MODELS = 32;
+const VERTEX_MODEL_ID = /^[A-Za-z0-9\-_.@]{1,256}$/u;
+
+/** Vertex has no per-project listing of the models a caller may invoke, so the catalog is whatever the
+ * operator types here plus the curated Gemini ids. A wrong id is only found out on the first call. */
+function VertexModelEditor({ models, actions }: { models: string[]; actions: ProviderActions }) {
+  const [draft, setDraft] = useState("");
+  const trimmed = draft.trim();
+  const duplicate = models.includes(trimmed);
+  const malformed = trimmed.length > 0 && !VERTEX_MODEL_ID.test(trimmed);
+  const full = models.length >= MAX_VERTEX_MODELS;
+  const canAdd = trimmed.length > 0 && !duplicate && !malformed && !full;
+
+  function add(event: FormEvent) {
+    event.preventDefault();
+    if (!canAdd) return;
+    void actions.onVertexModels([...models, trimmed]).then((accepted) => {
+      if (accepted) setDraft("");
+    });
+  }
+
+  return (
+    <form className="hosted-scope hosted-vertex-models" onSubmit={add}>
+      <div className="hosted-scope-head">
+        <strong>Vertex models</strong>
+        <span className="muted">{models.length ? `${models.length} added` : "Gemini 2.5 only"}</span>
+      </div>
+      <p className="muted small">
+        Google publishes no API that lists the models a project may call, so type the exact publisher model
+        id — for example <code>gemini-2.5-flash-lite</code>. <code>gemini-2.5-flash</code> and{" "}
+        <code>gemini-2.5-pro</code> are always available. Added ids appear in the catalog after the next
+        refresh; Vertex rejects a wrong one on the first request.
+      </p>
+      {models.length > 0 && (
+        <ul className="hosted-vertex-model-list">
+          {models.map((model) => (
+            <li key={model}>
+              <code>{model}</code>
+              <button
+                className="btn-secondary"
+                type="button"
+                disabled={actions.busy}
+                onClick={() => void actions.onVertexModels(models.filter((other) => other !== model))}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <label>
+        <span>Add model id</span>
+        <input
+          type="text"
+          value={draft}
+          maxLength={256}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="publisher model id"
+          onChange={(event) => setDraft(event.target.value)}
+        />
+      </label>
+      {(duplicate || malformed || full) && (
+        <p className="hosted-field-error">
+          {full
+            ? `At most ${MAX_VERTEX_MODELS} models can be pinned.`
+            : duplicate
+              ? "That model is already listed."
+              : "Model ids use letters, digits, and - _ . @ only."}
+        </p>
+      )}
+      <button className="btn-secondary" type="submit" disabled={!canAdd || actions.busy}>
+        Add model
+      </button>
+    </form>
   );
 }
 
