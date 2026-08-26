@@ -446,7 +446,7 @@ const MAX_VERTEX_MODELS = 32;
 const VERTEX_MODEL_ID = /^[A-Za-z0-9\-_.@]{1,256}$/u;
 
 /** Vertex has no per-project listing of the models a caller may invoke, so the catalog is whatever the
- * operator types here plus the curated Gemini ids. A wrong id is only found out on the first call. */
+ * operator types here plus the curated ids. A wrong id is only found out on the first call. */
 function VertexModelEditor({ models, actions }: { models: string[]; actions: ProviderActions }) {
   const [draft, setDraft] = useState("");
   const trimmed = draft.trim();
@@ -467,13 +467,15 @@ function VertexModelEditor({ models, actions }: { models: string[]; actions: Pro
     <form className="hosted-scope hosted-vertex-models" onSubmit={add}>
       <div className="hosted-scope-head">
         <strong>Vertex models</strong>
-        <span className="muted">{models.length ? `${models.length} added` : "Gemini 2.5 only"}</span>
+        <span className="muted">{models.length ? `${models.length} added` : "Curated only"}</span>
       </div>
       <p className="muted small">
         Google publishes no API that lists the models a project may call, so type the exact publisher model
-        id — for example <code>gemini-2.5-flash-lite</code>. <code>gemini-2.5-flash</code> and{" "}
-        <code>gemini-2.5-pro</code> are always available. Added ids appear in the catalog after the next
-        refresh; Vertex rejects a wrong one on the first request.
+        id — for example <code>gemini-2.5-flash-lite</code>. <code>gemini-2.5-flash</code>,{" "}
+        <code>gemini-2.5-pro</code>, and <code>claude-sonnet-4-5</code> are always available. An id starting
+        with <code>claude-</code> is served by the Anthropic publisher and must be enabled for the project in
+        Model Garden. Added ids appear in the catalog after the next refresh; Vertex rejects a wrong one on
+        the first request.
       </p>
       {models.length > 0 && (
         <ul className="hosted-vertex-model-list">
