@@ -28,14 +28,57 @@ const TEST_TEE_BACKLOG: usize = 128;
 
 pub(crate) struct LiveTestManager {
     inner: Mutex<Option<TestSlot>>,
+    window: LiveWindowLifecycle,
     next_generation: AtomicU64,
     live: Arc<crate::live::LiveManager>,
     config: SharedConfig,
     transcript: LiveTranscriptStore,
 }
 
+#[derive(Default)]
+struct LiveWindowLifecycle {
+    current: Mutex<Option<u64>>,
+    next_generation: AtomicU64,
+}
+
+impl LiveWindowLifecycle {
+    fn begin(&self) -> u64 {
+        let mut current = self.current.lock().unwrap();
+        if let Some(generation) = *current {
+            return generation;
+        }
+        let generation = self
+            .next_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        *current = Some(generation);
+        generation
+    }
+
+    fn current(&self) -> Option<u64> {
+        *self.current.lock().unwrap()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.current() == Some(generation)
+    }
+
+    fn close(&self, generation: u64) -> bool {
+        let mut current = self.current.lock().unwrap();
+        if *current != Some(generation) {
+            return false;
+        }
+        *current = None;
+        true
+    }
+}
+
 enum TestSlot {
-    Starting { generation: u64 },
+    Starting {
+        generation: u64,
+        window_generation: u64,
+        stop_requested: bool,
+    },
     Running(TestSession),
 }
 
@@ -54,6 +97,7 @@ impl LiveTestManager {
     ) -> Self {
         Self {
             inner: Mutex::new(None),
+            window: LiveWindowLifecycle::default(),
             next_generation: AtomicU64::new(1),
             live,
             config,
@@ -81,7 +125,21 @@ impl LiveTestManager {
         }
     }
 
-    pub(crate) fn start(&self, app: &AppHandle) -> Result<()> {
+    pub(crate) fn begin_live_window(&self) -> u64 {
+        self.window.begin()
+    }
+
+    pub(crate) fn close_live_window(&self, window_generation: u64) {
+        if self.window.close(window_generation) {
+            self.stop();
+        }
+    }
+
+    pub(crate) fn current_live_window_generation(&self) -> Option<u64> {
+        self.window.current()
+    }
+
+    pub(crate) fn start_for_window(&self, app: &AppHandle, window_generation: u64) -> Result<()> {
         self.reap_finished();
         if crate::imp::detector_recording(app) {
             anyhow::bail!("a call is already recording; use Read live transcript instead");
@@ -98,26 +156,20 @@ impl LiveTestManager {
             return Ok(());
         }
 
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if inner.is_some() {
-                anyhow::bail!("the previous microphone test is still stopping");
-            }
-            *inner = Some(TestSlot::Starting { generation });
-        }
+        let generation = self.reserve_start_slot(window_generation)?;
         // Publish the reservation before any fallible preflight so a concurrent webinar tray click cannot
         // start another capture between our earlier check and the microphone opening.
         crate::imp::set_live_test_active(app, true);
 
-        let start = self.start_reserved(app, generation);
+        let start = self.start_reserved(app, generation, window_generation);
         if start.is_err() {
             crate::imp::set_live_test_active(app, false);
             let mut inner = self.inner.lock().unwrap();
             if matches!(
                 inner.as_ref(),
                 Some(TestSlot::Starting {
-                    generation: current
+                    generation: current,
+                    ..
                 }) if *current == generation
             ) {
                 *inner = None;
@@ -126,14 +178,53 @@ impl LiveTestManager {
         start
     }
 
-    fn start_reserved(&self, app: &AppHandle, generation: u64) -> Result<()> {
+    fn reserve_start_slot(&self, window_generation: u64) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.is_some() {
+            anyhow::bail!("the previous microphone test is still stopping");
+        }
+        // Check lifecycle while holding the same slot lock that publishes Starting. Window destruction
+        // invalidates the lifecycle before requesting stop, so it either wins here or observes this slot.
+        if !self.window.is_current(window_generation) {
+            anyhow::bail!("the Live Transcript window closed before the microphone test started");
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        *inner = Some(TestSlot::Starting {
+            generation,
+            window_generation,
+            stop_requested: false,
+        });
+        Ok(generation)
+    }
+
+    fn start_reserved(
+        &self,
+        app: &AppHandle,
+        generation: u64,
+        window_generation: u64,
+    ) -> Result<()> {
         let cfg = self.config.lock().unwrap().clone();
         validate_test_config(&cfg)?;
+        if self.starting_canceled(generation, window_generation) {
+            self.finish_canceled_start(app, generation);
+            return Ok(());
+        }
         crate::imp::pause_detector(app)
             .context("pausing call detection for the microphone test")?;
+        if self.starting_canceled(generation, window_generation) {
+            crate::imp::resume_detector(app);
+            self.finish_canceled_start(app, generation);
+            return Ok(());
+        }
         if !self.live.reserve_test(generation) {
             crate::imp::resume_detector(app);
             anyhow::bail!("the local transcription model is still in use by a call");
+        }
+        if self.starting_canceled(generation, window_generation) {
+            self.live.release_test(generation);
+            crate::imp::resume_detector(app);
+            self.finish_canceled_start(app, generation);
+            return Ok(());
         }
 
         let id = format!("microphone-test-{generation}");
@@ -170,12 +261,24 @@ impl LiveTestManager {
         };
 
         let mut inner = self.inner.lock().unwrap();
+        let stop_immediately = matches!(
+            inner.as_ref(),
+            Some(TestSlot::Starting {
+                generation: current,
+                stop_requested: true,
+                ..
+            }) if *current == generation
+        );
         debug_assert!(matches!(
             inner.as_ref(),
             Some(TestSlot::Starting {
-                generation: current
+                generation: current,
+                ..
             }) if *current == generation
         ));
+        if stop_immediately {
+            let _ = stop_tx.send(());
+        }
         *inner = Some(TestSlot::Running(TestSession {
             generation,
             id,
@@ -185,17 +288,54 @@ impl LiveTestManager {
         Ok(())
     }
 
+    fn starting_canceled(&self, generation: u64, window_generation: u64) -> bool {
+        if !self.window.is_current(window_generation) {
+            return true;
+        }
+        let inner = self.inner.lock().unwrap();
+        !matches!(
+            inner.as_ref(),
+            Some(TestSlot::Starting {
+                generation: current,
+                window_generation: owner,
+                stop_requested: false,
+            }) if *current == generation && *owner == window_generation
+        )
+    }
+
+    /// Keep the canceled generation installed until every reservation has been released. Clearing the
+    /// global flag before conditionally removing the slot means a racing restart either sees Active or the
+    /// old slot; stale cleanup can never run underneath a new generation.
+    fn finish_canceled_start(&self, app: &AppHandle, generation: u64) {
+        crate::imp::set_live_test_active(app, false);
+        let mut inner = self.inner.lock().unwrap();
+        if matches!(
+            inner.as_ref(),
+            Some(TestSlot::Starting {
+                generation: current,
+                ..
+            }) if *current == generation
+        ) {
+            *inner = None;
+        }
+    }
+
     pub(crate) fn stop(&self) {
         self.reap_finished();
         let (id, generation, sent) = {
-            let inner = self.inner.lock().unwrap();
-            match inner.as_ref() {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.as_mut() {
                 Some(TestSlot::Running(session)) => (
                     session.id.clone(),
                     session.generation,
                     session.stop_tx.send(()).is_ok(),
                 ),
-                Some(TestSlot::Starting { generation }) => {
+                Some(TestSlot::Starting {
+                    generation,
+                    stop_requested,
+                    ..
+                }) => {
+                    *stop_requested = true;
                     (format!("microphone-test-{generation}"), *generation, false)
                 }
                 None => return,
@@ -383,21 +523,91 @@ fn run_microphone_test(
 }
 
 #[tauri::command]
-pub(crate) fn start_live_test(
-    app: AppHandle,
+pub(crate) fn get_live_test_window_generation(
     manager: State<'_, LiveTestManager>,
-) -> Result<(), String> {
-    manager.start(&app).map_err(|error| format!("{error:#}"))
+    window: tauri::WebviewWindow,
+) -> Result<u64, String> {
+    if window.label() != "live" {
+        return Err("microphone test is unavailable from this window".to_string());
+    }
+    manager
+        .current_live_window_generation()
+        .ok_or_else(|| "the Live Transcript window lifecycle is unavailable".to_string())
 }
 
 #[tauri::command]
-pub(crate) fn stop_live_test(manager: State<'_, LiveTestManager>) {
+pub(crate) fn start_live_test(
+    window_generation: u64,
+    app: AppHandle,
+    manager: State<'_, LiveTestManager>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    if window.label() != "live" {
+        return Err("microphone test is unavailable from this window".to_string());
+    }
+    manager
+        .start_for_window(&app, window_generation)
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+pub(crate) fn stop_live_test(
+    manager: State<'_, LiveTestManager>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    if window.label() != "live" {
+        return Err("microphone test is unavailable from this window".to_string());
+    }
     manager.stop();
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn manager_for_lifecycle_test() -> LiveTestManager {
+        LiveTestManager::new(
+            Arc::new(crate::live::LiveManager::new()),
+            Arc::new(Mutex::new(AppConfig::default())),
+            LiveTranscriptStore::detached(),
+        )
+    }
+
+    #[test]
+    fn closed_window_cannot_reserve_a_late_microphone_start() {
+        let manager = manager_for_lifecycle_test();
+        let closed = manager.begin_live_window();
+        manager.close_live_window(closed);
+        let current = manager.begin_live_window();
+        let error = manager.reserve_start_slot(closed).unwrap_err().to_string();
+        assert!(error.contains("window closed"), "{error}");
+
+        let test_generation = manager.reserve_start_slot(current).unwrap();
+        manager.close_live_window(current);
+        assert!(manager.starting_canceled(test_generation, current));
+    }
+
+    #[test]
+    fn live_window_generations_reject_stale_close_and_start_owners() {
+        let lifecycle = LiveWindowLifecycle::default();
+        let first = lifecycle.begin();
+        assert_eq!(
+            lifecycle.begin(),
+            first,
+            "one singleton window keeps one owner"
+        );
+        assert!(lifecycle.is_current(first));
+        assert!(lifecycle.close(first));
+        assert!(!lifecycle.is_current(first));
+        let second = lifecycle.begin();
+        assert_ne!(second, first);
+        assert!(
+            !lifecycle.close(first),
+            "stale destruction cannot close replacement"
+        );
+        assert!(lifecycle.is_current(second));
+    }
 
     #[test]
     fn aws_configuration_is_rejected_before_any_model_or_microphone_work() {

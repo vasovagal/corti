@@ -5,7 +5,8 @@
   (narrow AppKit secure-entry + Security.framework Keychain binding), ADR 0010 (final publication boundary),
   ADR 0014 (provenance schema 2 may describe applied hosted text)
 - **References:** [design 07](../07-paid-model-post-processing.md), ADRs 0009/0012/0013,
-  [#112](https://github.com/vasovagal/corti/issues/112)
+  [#112](https://github.com/vasovagal/corti/issues/112),
+  [#130](https://github.com/vasovagal/corti/issues/130)
 
 ## Context
 
@@ -16,10 +17,11 @@ questions are sensitive egress. Cancellation can race provider billing. Existing
 created and OS-synced during a call so a crash does not lose every transcript window.
 
 The requested provider transports are not equally supportable. Vertex ADC and direct OpenAI/Anthropic APIs
-have documented application contracts. OpenAI documents a Codex app-server device-code flow but also says
-app-server is experimental and unsupported for production workloads. Anthropic explicitly says third-party
-developers may not offer Claude.ai login or route Free/Pro/Max credentials. Treating all of these as ordinary
-shipping providers would misstate product/legal support and cost.
+have documented application contracts. Corti also needs ChatGPT-plan access without making a local Codex
+app-server a runtime dependency; Dekopon's proven direct device authorization and fixed Responses transport
+provide that narrower implementation pattern. Anthropic explicitly says third-party developers may not offer
+Claude.ai login or route Free/Pro/Max credentials. Treating all provider logins as interchangeable would
+misstate product/legal support and cost.
 
 ## Decision
 
@@ -35,16 +37,19 @@ shipping providers would misstate product/legal support and cost.
    recording. Provider adapters receive typed rows and return typed replacements/metadata; they never see a
    note path or touch Vagus/index state. No other vault read/write is permitted.
 4. **Make provider support status part of the contract.** Vertex direct API, OpenAI direct API, Anthropic
-   direct API, and Amazon Bedrock are documented transports. Codex app-server/device code is compile- and approval-gated
-   experimental support; it owns token persistence/refresh and must use local stdio, a dedicated private home,
-   OS keyring, an empty private cwd, and denied tools/approvals. Claude subscription routing is blocked with no
+   direct API and Amazon Bedrock are documented shipping transports. Native ChatGPT subscription access is
+   an experimental shipping transport because its fixed endpoint is provider-controlled and not a public API
+   contract. ChatGPT uses
+   OpenAI's device authorization, authenticated model catalog, and fixed Codex Responses HTTP endpoint directly;
+   Corti launches no Codex app-server and exposes no tools. Claude subscription routing is blocked with no
    adapter/import command absent written Anthropic permission. Direct API billing must not masquerade as
    subscription access.
-5. **Use host-owned secret storage.** Direct API keys and local-cache master key are non-synchronizing macOS
-   generic-password Keychain items. React/config/SQLite/Vagus/logs/events/subprocess arguments never contain
-   them. A narrow app-only AppKit secure-entry sheet and Security.framework wrapper are approved platform
-   bindings under guardrail 3. Vertex access tokens are memory-only and Corti does not copy ADC refresh
-   credentials. Corti never reads ordinary Codex/Claude credential files.
+5. **Use host-owned secret storage.** Direct API keys, the local-cache master key, and Corti's complete
+   rotating ChatGPT credential document are separate non-synchronizing macOS generic-password Keychain items.
+   React/config/SQLite/Vagus/logs/events/subprocess arguments never contain them. A narrow app-only AppKit
+   secure-entry sheet and Security.framework wrapper are approved platform bindings under guardrail 3. Vertex
+   access tokens are memory-only and Corti does not copy ADC refresh credentials. Corti never reads credentials
+   owned by Codex, Pi, Dekopon, or Claude.
 6. **Fence every result and journal paid boundaries.** A managed monotonic control state applies switches,
    models, steering, and word-bank changes to the next request during a call. Every event carries complete
    session/transcript/control/lane/steering/bank/question generations. Cancellation is best effort; late
@@ -77,6 +82,26 @@ Keychain wrapper decision 5 approved, which also retires the disabled OpenAI/Ant
 `hosted.toml` gains the credential mode, profile name, region, and role ARN; key material stays in the
 Keychain, unchanged in kind from the other direct providers.
 
+### Amendment — native ChatGPT subscription transport replaces the app-server proposal (#130)
+
+Corti implements the device flow directly against fixed `auth.openai.com` endpoints, stores its own versioned
+access/rotating-refresh credential in the Keychain, refreshes before expiry, and retries once after a 401. A
+bounded, login-id-owned worker polls only while Preferences displays the fixed verification URL and user code.
+Tokens, OAuth bodies, and the ChatGPT account id cannot cross IPC or appear in logs/debug output. The account
+id instead derives an opaque live connection scope inside the credential owner; that scope is not persisted
+separately, so a crash or account switch cannot pair a new credential with an old cache fence. A rotated
+credential that cannot be saved remains usable only by the current in-flight call and projects a non-durable
+Keychain error rather than `Ready`.
+
+After login, Corti queries `https://chatgpt.com/backend-api/codex/models` and offers only account-returned
+models marked API-supported. Rewrite/question calls go straight to
+`https://chatgpt.com/backend-api/codex/responses`, with no tools, shell, file access, or local server. The
+provider controls quota and model availability; Corti records reported usage and `included_subscription` with
+a null dollar amount. OpenAI Platform API keys remain a separate metered transport.
+
+The old `codex_app_server` descriptor is removed from the production provider catalog. No Codex process,
+`CODEX_HOME`, app-server protocol, or imported Codex/Pi/Dekopon credential participates in this path.
+
 ## Consequences
 
 - Live cleanup latency is phrase-closure latency; Corti does not invent unstable ASR partials.
@@ -84,8 +109,9 @@ Keychain, unchanged in kind from the other direct providers.
   failed, or crash-ambiguous.
 - A literal requirement that no Vagus file exist before final processing is not met for live calls; changing
   that requires explicitly superseding ADRs 0010/0012 and accepting greater crash loss.
-- Claude Free/Pro/Max support remains a product/legal blocker, not an engineering TODO. Codex remains visibly
-  experimental until OpenAI approves and supports the use.
+- Claude Free/Pro/Max support remains a product/legal blocker, not an engineering TODO. ChatGPT subscription
+  access is a distinct fixed-endpoint transport with included-quota accounting and no dollar estimate; model
+  availability and limits remain controlled by OpenAI.
 - Keychain/AppKit integration and an encrypted cache store add macOS-specific code, but they prevent secret
   exposure to the webview/config and preserve Corti's Apple-only platform stance.
 - SigV4 and the `vnd.amazon.eventstream` decoder are Corti's own ~350 lines rather than an AWS dependency.

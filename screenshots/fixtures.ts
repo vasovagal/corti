@@ -114,6 +114,19 @@ const recordings = [
   },
 ];
 
+const chatGptSubscription = {
+  descriptor: {
+    provider: "openai",
+    transport: "chatgpt_subscription",
+    support_tier: "experimental",
+    billing_basis: "included_subscription",
+    adapter_available: true,
+  },
+  credential: { state: "absent" },
+  models: [],
+  service_error: null,
+};
+
 const openAiDirect = {
   descriptor: {
     provider: "openai",
@@ -222,7 +235,6 @@ export const hostedSettings = {
     master_enabled: true,
     egress_acknowledged: true,
     pinned_auto_enabled: false,
-    codex_experimental_approved: false,
     live: {
       enabled: false,
       revision: 2,
@@ -291,18 +303,7 @@ export const hostedSettings = {
       models: [],
       service_error: null,
     },
-    {
-      descriptor: {
-        provider: "openai",
-        transport: "codex_app_server",
-        support_tier: "experimental",
-        billing_basis: "included_subscription",
-        adapter_available: false,
-      },
-      credential: { state: "unsupported", code: "policy_blocked" },
-      models: [],
-      service_error: null,
-    },
+    chatGptSubscription,
     openAiDirect,
     {
       descriptor: bedrockDescriptor,
@@ -319,6 +320,15 @@ export const hostedSettings = {
       alias: "Screenshot Vertex",
       project: "corti-screenshot-project",
       region: "global",
+      quota_project: null,
+    },
+    {
+      provider: "openai",
+      transport: "chatgpt_subscription",
+      configured: false,
+      alias: null,
+      project: null,
+      region: null,
       quota_project: null,
     },
     {
@@ -514,6 +524,7 @@ export const syntheticBedrockRejectedSsoSettings = {
 
 export const fixtures: Record<string, unknown> = {
   get_live_transcript: liveTranscript,
+  get_live_test_window_generation: 41,
   start_live_test: null,
   stop_live_test: null,
   list_recordings: recordings,
@@ -553,6 +564,10 @@ export const fixtures: Record<string, unknown> = {
   replace_hosted_word_bank: { status: "unchanged", settings: hostedSettings },
   update_hosted_provider_scope: { status: "unchanged", settings: hostedSettings },
   refresh_hosted_provider: openAiDirect,
+  start_chatgpt_device_login: chatGptSubscription,
+  cancel_chatgpt_device_login: chatGptSubscription,
+  sign_out_chatgpt_subscription: chatGptSubscription,
+  open_chatgpt_device_login: null,
   list_aws_credential_options: {
     profiles: ["default", "corti-screenshot", "corti-sso"],
   },

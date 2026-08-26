@@ -42,6 +42,12 @@ signals. Exactly what this app does: audio → notes.
 - **Timestamped live reader + microphone test.** During a local call, choose **Read live transcript…**
   from the tray to follow call-relative **Me** / **Them 1** rows as speech regions close. While idle, the same
   tray action runs an ephemeral microphone/ASR test: microphone only, with no audio file, queue row, or note.
+  Closing that test window closes the microphone and resumes automatic call detection.
+- **Optional hosted text cleanup and questions.** Raw ASR remains immediate and durable; separately enabled
+  modes can rewrite finalized text or answer transcript questions through direct APIs, Vertex, Bedrock, or a
+  ChatGPT subscription. ChatGPT sign-in uses a Corti-owned device credential in the macOS Keychain and calls
+  OpenAI's fixed Responses endpoint directly—there is no Codex server and no OpenAI API-key charge for that
+  transport.
 - **Crash-safe live inbox filing.** With the local backend, the app transcribes continuously and
   commits bounded, optionally diarized windows to the vagus note mid-call (one minute by default,
   configurable to 1–10). Every chunk is OS-synced before its memory is reused, so a Corti/macOS crash
@@ -81,8 +87,9 @@ Internals — the same data flow with `file:line` anchors — live in
 
 ## In the app
 
-Past the tray menu, corti ships a timestamped **Live Transcript** reader, **Settings** (backend/local engine,
-S3 bucket, verified model download), an **Ethics & Legality** guide (recording-consent norms by jurisdiction),
+Past the tray menu, corti ships a timestamped **Live Transcript** reader, **Preferences** (transcription,
+hosted rewrite providers/modes, storage, and verified local models), an **Ethics & Legality** guide
+(recording-consent norms by jurisdiction),
 and a **Diagnostics** console with a live stats panel (CPU/RSS, per-stage timings, rolling logs). Tray-opened
 windows activate and come to the foreground. From the shell,
 `corti --list` prints every tracked recording with its pipeline status and filed note.
@@ -126,8 +133,9 @@ persisted in `config.toml`.
 ## Status
 
 Pre-1.0. The full signed-app pipeline ships end-to-end (detect → capture + in-flight AEC → live/batch
-ASR → vagus) with both backends working, crash-safe local live filing, the bounded timestamped reader, and an
-on-device microphone/transcription test for validating TCC + local models without a call.
+ASR → optional hosted text processing → vagus) with both transcription backends working, crash-safe local
+live filing, the bounded timestamped reader, and an on-device microphone/transcription test for validating
+TCC + local models without a call.
 
 ## More
 

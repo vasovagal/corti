@@ -40,9 +40,12 @@ application.
 3. **Add one contextual tray action and singleton window.** During a detector call it reads **Read live
    transcript…** and only opens/focuses the existing stream. While idle it reads **Test microphone & live
    transcription…** and starts the explicit test before opening the same `?view=live` window. An active test
-   becomes **Read microphone test transcript…**. Webinar capture disables the test action because webinar
-   streaming remains batch-only. Rows show speaker, start/end timestamp (`MM:SS`, or hours), and text; automatic
-   scroll follows only while the reader remains near the bottom.
+   becomes **Read microphone test transcript…**. A generation-owned window lifecycle is reserved before test
+   startup; destroying the window invalidates that generation and stops an ephemeral microphone test, but never
+   a real detector call. A queued webview command from a destroyed generation cannot open the microphone.
+   Webinar capture disables the test action because webinar streaming remains
+   batch-only. Rows show speaker, start/end timestamp (`MM:SS`, or hours), and text; automatic scroll follows
+   only while the reader remains near the bottom.
 4. **Make test mode microphone-only and non-persistent.** `MicrophoneCapture` opens the default input device
    directly and sends bounded mono `CaptureChunk { mic, tap: [] }` values through the existing wait-free
    ring/`try_send` discipline. It creates no process tap, aggregate, WAV, queue row, note, or retained
@@ -65,8 +68,11 @@ application.
   no second model, and no disagreement caused by speculative partial decoding.
 - The UI can omit old rows on very long/dense calls, explicitly saying how many were evicted. The durable note
   is unaffected and continues to commit its independently bounded windows.
-- Closing or reloading the window does not stop a call or microphone test. Reopening snapshots the retained
-  rows and resumes deltas.
+- Closing the window never stops a real call. It does stop an ephemeral microphone test—even if startup is
+  queued or still validating/loading—so no invisible test retains the microphone or detector reservation.
+  Canceled generations remain installed until detector/model cleanup finishes, preventing a racing restart
+  from being clobbered by stale cleanup. Reloading an
+  open window keeps the active source and reconciles from the retained snapshot.
 - Test mode validates the exact configured local ASR/VAD and default microphone while making a strong privacy
   promise: nothing from the test is filed or written to disk. It intentionally does not test system-audio
   capture, AEC, far-end ASR, or diarization.

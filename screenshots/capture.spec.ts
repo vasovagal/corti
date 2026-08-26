@@ -434,6 +434,11 @@ test("hosted rewrite preferences", async ({ page }) => {
   await expect(page.locator(".hosted-provider-card")).toHaveCount(1);
   await expect(page.getByRole("heading", { name: "OpenAI direct API" })).toBeVisible();
   await capture(page, "settings-hosted.png");
+
+  await page.locator("#hosted-provider-picker").selectOption({ label: "ChatGPT — Not signed in" });
+  await expect(page.getByRole("heading", { name: "ChatGPT subscription" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in with ChatGPT…" })).toBeVisible();
+  await expect(page.getByText("does not launch a Codex server", { exact: false })).toBeVisible();
 });
 
 test("hosted rewrite preferences narrow", async ({ page }) => {

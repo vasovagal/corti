@@ -236,7 +236,11 @@ export interface LiveTranscriptEvent extends Omit<LiveTranscriptSnapshot, "lines
 export const getLiveTranscript = (): Promise<LiveTranscriptSnapshot> =>
   invoke<LiveTranscriptSnapshot>("get_live_transcript");
 
-export const startLiveTest = (): Promise<void> => invoke<void>("start_live_test");
+export const getLiveTestWindowGeneration = (): Promise<number> =>
+  invoke<number>("get_live_test_window_generation");
+
+export const startLiveTest = (windowGeneration: number): Promise<void> =>
+  invoke<void>("start_live_test", { windowGeneration });
 export const stopLiveTest = (): Promise<void> => invoke<void>("stop_live_test");
 
 export const onLiveTranscriptChanged = (
@@ -275,6 +279,7 @@ export type HostedCredentialSource =
   | "workload_identity"
   | "application_default_credentials"
   | "broker_keyring"
+  | "chat_gpt_device"
   | "aws_default_chain"
   | "aws_profile"
   | "aws_static_keychain"
@@ -377,7 +382,6 @@ export interface HostedControlSnapshot {
   master_enabled: boolean;
   egress_acknowledged: boolean;
   pinned_auto_enabled: boolean;
-  codex_experimental_approved: boolean;
   live: HostedLaneControl;
   final_lane: HostedLaneControl;
   questions: HostedLaneControl;
@@ -462,7 +466,6 @@ export type HostedPatchInput =
   | { kind: "set_lane_enabled"; lane: HostedLane; enabled: boolean }
   | { kind: "set_lane_selection"; lane: HostedLane; selection: HostedSelectionInput }
   | { kind: "set_pinned_auto"; enabled: boolean; acknowledged: boolean }
-  | { kind: "set_codex_experimental_approved"; approved: boolean }
   | {
       kind: "set_display_preferences";
       show_history_diagnostics: boolean;
@@ -697,6 +700,18 @@ export const setHostedPinnedQuestion = (
   invoke<HostedMutationResult>("set_hosted_pinned_question", {
     request: { observed_state_revision: observedStateRevision, template },
   });
+
+export const startChatGptDeviceLogin = (): Promise<HostedProviderState> =>
+  invoke<HostedProviderState>("start_chatgpt_device_login");
+
+export const cancelChatGptDeviceLogin = (): Promise<HostedProviderState> =>
+  invoke<HostedProviderState>("cancel_chatgpt_device_login");
+
+export const signOutChatGptSubscription = (): Promise<HostedProviderState> =>
+  invoke<HostedProviderState>("sign_out_chatgpt_subscription");
+
+export const openChatGptDeviceLogin = (): Promise<void> =>
+  invoke<void>("open_chatgpt_device_login");
 
 /** The `~/.aws` profile names available on this machine. */
 export const listAwsCredentialOptions = (): Promise<AwsCredentialOptionsDto> =>

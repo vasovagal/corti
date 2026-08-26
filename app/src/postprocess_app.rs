@@ -28,10 +28,12 @@ use corti_postprocess::{
 };
 use corti_postprocess_providers::{
     ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
-    BEDROCK_CONVERSE_ADAPTER_VERSION, BedrockConverseAdapter, CredentialError, HttpTransport,
-    OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter, SystemClock as ProviderSystemClock,
-    UreqTransport, VERTEX_REST_ADAPTER_VERSION, VertexModel, VertexProjectMetadata,
-    VertexResolutionAttempt, VertexResolutionOutcome, VertexRestAdapter,
+    BEDROCK_CONVERSE_ADAPTER_VERSION, BedrockConverseAdapter, CHATGPT_DEVICE_VERIFICATION_URL,
+    CHATGPT_SUBSCRIPTION_ADAPTER_VERSION, ChatGptAuthError, ChatGptCredentialStore,
+    ChatGptLoginPoll, ChatGptStoreError, ChatGptSubscriptionAdapter, ChatGptSubscriptionAuth,
+    CredentialError, HttpTransport, OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter,
+    SystemClock as ProviderSystemClock, UreqTransport, VERTEX_REST_ADAPTER_VERSION, VertexModel,
+    VertexProjectMetadata, VertexResolutionAttempt, VertexResolutionOutcome, VertexRestAdapter,
 };
 use corti_queue::{
     PostprocessCacheSource, PostprocessCallRecord, PostprocessCost, PostprocessOutcome, Queue,
@@ -97,12 +99,14 @@ const HOSTED_KEYCHAIN_SERVICE: &str = "com.vasovagal.corti.hosted";
 const HOSTED_MASTER_KEY_ACCOUNT: &str = "encrypted-store-master-v1";
 const OPENAI_API_KEY_ACCOUNT: &str = SecretPurpose::OpenAiApiKey.keychain_account();
 const ANTHROPIC_API_KEY_ACCOUNT: &str = SecretPurpose::AnthropicApiKey.keychain_account();
-const PRODUCTION_ARM_ENV: &str = "CORTI_HOSTED_PRODUCTION_ARMED";
 const FINGERPRINT_DOMAIN: &[u8] = b"corti-app-provenance-v1\0";
+const CHATGPT_PROVIDER: &str = "openai";
+const CHATGPT_TRANSPORT: &str = "chatgpt_subscription";
 
 /// Managed Tauri state. The handle is cloneable; the coordinator itself never leaves its owner thread.
 pub(crate) struct HostedState {
     handle: HostedHandle,
+    chatgpt_auth: Option<ChatGptSubscriptionAuth>,
 }
 
 impl HostedState {
@@ -292,6 +296,32 @@ impl HostedHandle {
         reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
     }
 
+    fn sync_chatgpt_credential(&self) -> Result<ProviderStateDto, ErrorCode> {
+        let provider = ProviderId::new(CHATGPT_PROVIDER).map_err(|_| ErrorCode::Internal)?;
+        let transport = TransportId::new(CHATGPT_TRANSPORT).map_err(|_| ErrorCode::Internal)?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ServiceCommand::SyncProviderCredential {
+            provider,
+            transport,
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
+    }
+
+    fn install_chatgpt_scope(
+        &self,
+        scope_id: Option<ConnectionScopeId>,
+        refresh_catalog: bool,
+    ) -> Result<ProviderStateDto, ErrorCode> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ServiceCommand::InstallChatGptScope {
+            scope_id,
+            refresh_catalog,
+            reply: reply_tx,
+        })?;
+        reply_rx.recv().unwrap_or(Err(ErrorCode::Internal))
+    }
+
     fn send(&self, command: ServiceCommand) -> Result<(), ErrorCode> {
         self.command_tx
             .send(command)
@@ -399,9 +429,6 @@ pub(crate) enum HostedPatchInput {
     SetPinnedAuto {
         enabled: bool,
         acknowledged: bool,
-    },
-    SetCodexExperimentalApproved {
-        approved: bool,
     },
     SetDisplayPreferences {
         show_history_diagnostics: bool,
@@ -700,6 +727,156 @@ pub(crate) fn get_hosted_assistant(
         .map_err(|_| "hosted coordinator stopped".to_string())
 }
 
+fn configured_chatgpt_auth(state: &HostedState) -> Result<ChatGptSubscriptionAuth, String> {
+    state
+        .chatgpt_auth
+        .clone()
+        .ok_or_else(|| "ChatGPT subscription authentication is unavailable".to_string())
+}
+
+#[tauri::command]
+pub(crate) fn start_chatgpt_device_login(
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<ProviderStateDto, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let auth = configured_chatgpt_auth(&state)?;
+    let authorization = auth
+        .start_device_login()
+        .map_err(|error| error.to_string())?;
+    let login_id = authorization.login_id().to_owned();
+    let retained_scope = auth.connection_scope_id().ok();
+    let provider_state = match state
+        .handle
+        .install_chatgpt_scope(retained_scope.clone(), false)
+    {
+        Ok(provider_state) => provider_state,
+        Err(error) => {
+            let _ = auth.cancel_device_login(&login_id);
+            let _ = reconcile_chatgpt_after_login(&auth, &state.handle);
+            return Err(sanitized_error(error));
+        }
+    };
+    let worker_auth = auth.clone();
+    let worker_handle = state.handle.clone();
+    let spawn = std::thread::Builder::new()
+        .name("corti-chatgpt-login".into())
+        .spawn({
+            let login_id = login_id.clone();
+            move || drive_chatgpt_device_login(worker_auth, worker_handle, login_id)
+        });
+    if spawn.is_err() {
+        let _ = auth.cancel_device_login(&login_id);
+        let _ = reconcile_chatgpt_after_login(&auth, &state.handle);
+        return Err("the ChatGPT authorization worker could not start".to_string());
+    }
+    Ok(provider_state)
+}
+
+fn reconcile_chatgpt_after_login(
+    auth: &ChatGptSubscriptionAuth,
+    handle: &HostedHandle,
+) -> Result<ProviderStateDto, ErrorCode> {
+    let scope = auth.connection_scope_id().ok();
+    let refresh_catalog = matches!(auth.credential_state(), CredentialState::Ready { .. });
+    handle.install_chatgpt_scope(scope, refresh_catalog)
+}
+
+fn drive_chatgpt_device_login(
+    auth: ChatGptSubscriptionAuth,
+    handle: HostedHandle,
+    login_id: String,
+) {
+    loop {
+        let interval = match auth.poll_interval(&login_id) {
+            Ok(interval) => interval,
+            Err(_) => return,
+        };
+        std::thread::sleep(interval);
+        match auth.poll_device_login(&login_id) {
+            Ok(ChatGptLoginPoll::Pending) => {
+                let _ = handle.sync_chatgpt_credential();
+            }
+            Ok(ChatGptLoginPoll::Authorized { durable }) => {
+                let result = auth
+                    .connection_scope_id()
+                    .map_err(|error| error.error_code())
+                    .and_then(|scope| handle.install_chatgpt_scope(Some(scope), durable));
+                if let Err(code) = result {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        error = %code,
+                        "ChatGPT authorization completed but its account catalog could not be installed"
+                    );
+                    let _ = handle.sync_chatgpt_credential();
+                }
+                return;
+            }
+            Ok(ChatGptLoginPoll::Denied | ChatGptLoginPoll::Expired) => {
+                let _ = reconcile_chatgpt_after_login(&auth, &handle);
+                return;
+            }
+            Err(
+                ChatGptAuthError::Network | ChatGptAuthError::Timeout | ChatGptAuthError::Provider,
+            ) => {
+                // A browser flow should survive a dropped packet or transient 5xx. The auth object owns
+                // the hard deadline and bounded backoff; this worker simply tries the next poll.
+                let _ = handle.sync_chatgpt_credential();
+            }
+            Err(_) => {
+                let _ = auth.cancel_device_login(&login_id);
+                let _ = reconcile_chatgpt_after_login(&auth, &handle);
+                return;
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn cancel_chatgpt_device_login(
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<ProviderStateDto, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let auth = configured_chatgpt_auth(&state)?;
+    let login_id = auth.current_login_id().map_err(|error| error.to_string())?;
+    auth.cancel_device_login(&login_id)
+        .map_err(|error| error.to_string())?;
+    reconcile_chatgpt_after_login(&auth, &state.handle).map_err(sanitized_error)
+}
+
+#[tauri::command]
+pub(crate) fn sign_out_chatgpt_subscription(
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<ProviderStateDto, String> {
+    require_hosted_window(&window, &["settings"])?;
+    let auth = configured_chatgpt_auth(&state)?;
+    let retained_scope = auth.connection_scope_id().ok();
+    state
+        .handle
+        .install_chatgpt_scope(retained_scope, false)
+        .map_err(sanitized_error)?;
+    if let Err(error) = auth.sign_out() {
+        let _ = reconcile_chatgpt_after_login(&auth, &state.handle);
+        return Err(error.to_string());
+    }
+    state
+        .handle
+        .install_chatgpt_scope(None, false)
+        .map_err(sanitized_error)
+}
+
+#[tauri::command]
+pub(crate) fn open_chatgpt_device_login(window: tauri::WebviewWindow) -> Result<(), String> {
+    require_hosted_window(&window, &["settings"])?;
+    std::process::Command::new("open")
+        .arg(CHATGPT_DEVICE_VERIFICATION_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "the ChatGPT authorization page could not be opened".to_string())
+}
+
 /// The `~/.aws` profile names the Bedrock pane offers. Keychain presence deliberately lives only on the
 /// settings document, so the pane has one source of truth for it rather than two that can disagree.
 #[derive(Debug, Clone, Serialize)]
@@ -883,9 +1060,9 @@ fn sanitized_error(code: ErrorCode) -> String {
 }
 
 /// Start production wiring. Paid egress remains deny-by-default and is enabled only by the exact explicit
-/// production arm gate plus the persisted disclosure/lane controls. The approved factory supports direct
-/// OpenAI/Anthropic API keys from non-synchronizing Keychain items; Claude subscriptions stay blocked and
-/// Codex app-server remains experimental/off. Tests inject transports and secrets and never use ambient keys.
+/// persisted disclosure/lane controls. The approved factory supports direct OpenAI/Anthropic API keys,
+/// native ChatGPT subscription device auth, Vertex, and Bedrock; Claude subscriptions remain blocked. Tests
+/// inject transports and secrets and never use ambient credentials.
 pub(crate) fn start(
     app: AppHandle,
     live_view: LiveTranscriptStore,
@@ -944,9 +1121,12 @@ pub(crate) fn start(
         let _ = app.emit_to("live", HOSTED_STATE_CHANGED_EVENT, event);
         let _ = app.emit_to("settings", HOSTED_STATE_CHANGED_EVENT, event);
     });
-    let approval = durable_store_armed
-        .then(ProductionApproval::from_environment)
-        .flatten();
+    let chatgpt_auth = ChatGptSubscriptionAuth::new(
+        Box::new(UreqTransport::new()),
+        Arc::new(ProviderSystemClock::new()),
+        Arc::new(KeychainChatGptStore),
+    );
+    let approval = durable_store_armed.then_some(ProductionApproval::for_durable_store());
     let vertex = VertexAdcResolver::production(vertex_config_source(preferences.clone()));
     let (executor, providers) = approval.map_or_else(
         || {
@@ -960,13 +1140,14 @@ pub(crate) fn start(
                 approval,
                 Arc::new(ProductionTransportFactory),
                 Arc::new(KeychainDirectSecretStore),
+                chatgpt_auth.clone(),
                 BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
                 vertex.clone(),
             )
         },
     );
     let process_epoch = live_view.process_epoch();
-    start_with_components(
+    let (mut state, handle) = start_with_components(
         preferences,
         word_bank,
         live_view,
@@ -982,7 +1163,9 @@ pub(crate) fn start(
         true,
         Some(store),
         None,
-    )
+    )?;
+    state.chatgpt_auth = Some(chatgpt_auth);
+    Ok((state, handle))
 }
 
 type EventNotifier = Arc<dyn Fn(&CoordinatorEventDto) + Send + Sync>;
@@ -1016,6 +1199,7 @@ fn start_with_components(
         &word_bank,
         &initial_control,
         &initial_provider_states(),
+        false,
     );
     let observed_pinned_revision = initial_control.pinned_question_revision;
     let snapshot = Arc::new(Mutex::new(initial_settings));
@@ -1043,6 +1227,15 @@ fn start_with_components(
         store,
         providers,
         pricing,
+    );
+    let startup_providers = coordinator.provider_states().cloned().collect::<Vec<_>>();
+    *snapshot.lock().unwrap() = settings_snapshot(
+        1,
+        &preferences.lock().unwrap(),
+        &word_bank,
+        coordinator.control_snapshot(),
+        &startup_providers,
+        chatgpt_scope_configured(&coordinator),
     );
     let (ingress, ingress_rx) = CoordinatorIngress::standard();
     let (command_tx, command_rx) = sync_channel(SERVICE_COMMAND_CAPACITY);
@@ -1097,6 +1290,7 @@ fn start_with_components(
     Ok((
         HostedState {
             handle: handle.clone(),
+            chatgpt_auth: None,
         },
         handle,
     ))
@@ -1232,7 +1426,6 @@ fn control_from_preferences(
         egress_acknowledged: values.egress_acknowledgement_version
             == Some(EGRESS_DISCLOSURE_VERSION),
         pinned_auto_enabled: values.pinned_auto_enabled,
-        codex_experimental_approved: values.providers.codex_experimental_approved,
         live: lane(&values.live),
         final_lane: lane(&values.final_lane),
         questions: lane(&values.questions),
@@ -1257,7 +1450,6 @@ impl ControlPersistence for HostedControlPersistence {
                 copy_lane(&snapshot.final_lane, &mut values.final_lane);
                 copy_lane(&snapshot.questions, &mut values.questions);
                 values.pinned_auto_enabled = snapshot.pinned_auto_enabled;
-                values.providers.codex_experimental_approved = snapshot.codex_experimental_approved;
             })
             .map_err(|_| ErrorCode::Cache)?;
         if self.persist_to_disk {
@@ -1363,8 +1555,8 @@ trait TicketExecutor: Send + Sync {
 struct ProductionApproval(());
 
 impl ProductionApproval {
-    fn from_environment() -> Option<Self> {
-        (std::env::var(PRODUCTION_ARM_ENV).ok().as_deref() == Some("1")).then_some(Self(()))
+    const fn for_durable_store() -> Self {
+        Self(())
     }
 
     #[cfg(test)]
@@ -1375,6 +1567,7 @@ impl ProductionApproval {
 
 trait DirectTransportFactory: Send + Sync {
     fn openai(&self) -> Box<dyn HttpTransport>;
+    fn chatgpt(&self) -> Box<dyn HttpTransport>;
     fn anthropic(&self) -> Box<dyn HttpTransport>;
     fn bedrock(&self) -> Box<dyn HttpTransport>;
     fn vertex(&self) -> Box<dyn HttpTransport>;
@@ -1384,6 +1577,10 @@ struct ProductionTransportFactory;
 
 impl DirectTransportFactory for ProductionTransportFactory {
     fn openai(&self) -> Box<dyn HttpTransport> {
+        Box::new(UreqTransport::new())
+    }
+
+    fn chatgpt(&self) -> Box<dyn HttpTransport> {
         Box::new(UreqTransport::new())
     }
 
@@ -1405,6 +1602,25 @@ trait DirectSecretStore: Send + Sync {
 }
 
 struct KeychainDirectSecretStore;
+
+struct KeychainChatGptStore;
+
+impl ChatGptCredentialStore for KeychainChatGptStore {
+    fn load(&self) -> Result<Option<Vec<u8>>, ChatGptStoreError> {
+        crate::keychain::read(SecretPurpose::ChatGptSubscriptionCredential)
+            .map_err(|_| ChatGptStoreError::Unavailable)
+    }
+
+    fn save(&self, document: &[u8]) -> Result<(), ChatGptStoreError> {
+        crate::keychain::write(SecretPurpose::ChatGptSubscriptionCredential, document)
+            .map_err(|_| ChatGptStoreError::Unavailable)
+    }
+
+    fn clear(&self) -> Result<(), ChatGptStoreError> {
+        crate::keychain::delete(SecretPurpose::ChatGptSubscriptionCredential)
+            .map_err(|_| ChatGptStoreError::Unavailable)
+    }
+}
 
 impl DirectSecretStore for KeychainDirectSecretStore {
     fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
@@ -1494,6 +1710,7 @@ type SharedAdapter = Arc<Mutex<Box<dyn ProviderAdapter>>>;
 struct ApprovedProviderDirectory {
     adapters: HashMap<(ProviderId, TransportId), SharedAdapter>,
     credentials: HashMap<(ProviderId, TransportId), Arc<DirectCredential>>,
+    chatgpt: ChatGptSubscriptionAuth,
     /// Bedrock resolves through the AWS chain rather than a single Keychain item, so its readiness —
     /// including assumed-role and SSO expiry — comes from its own resolver.
     bedrock: Arc<BedrockCredentialResolver>,
@@ -1502,6 +1719,24 @@ struct ApprovedProviderDirectory {
 struct ApprovedProviderAccess(Arc<ApprovedProviderDirectory>);
 
 impl ProviderAccess for ApprovedProviderAccess {
+    fn connection_scope(
+        &self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) -> Option<ProviderScope> {
+        if (provider.as_str(), transport.as_str()) != (CHATGPT_PROVIDER, CHATGPT_TRANSPORT) {
+            return None;
+        }
+        self.0
+            .chatgpt
+            .connection_scope_id()
+            .ok()
+            .map(|connection_scope_id| ProviderScope {
+                connection_scope_id,
+                region: None,
+            })
+    }
+
     fn descriptor(
         &mut self,
         provider: &ProviderId,
@@ -1518,6 +1753,9 @@ impl ProviderAccess for ApprovedProviderAccess {
         let key = (provider.clone(), transport.clone());
         if let Some(credential) = self.0.credentials.get(&key) {
             return credential.state();
+        }
+        if (provider.as_str(), transport.as_str()) == (CHATGPT_PROVIDER, CHATGPT_TRANSPORT) {
+            return self.0.chatgpt.credential_state();
         }
         if (provider.as_str(), transport.as_str()) == ("amazon", "bedrock_runtime") {
             return self.0.bedrock.state();
@@ -1578,6 +1816,7 @@ fn approved_direct_components(
     _approval: ProductionApproval,
     transports: Arc<dyn DirectTransportFactory>,
     secrets: Arc<dyn DirectSecretStore>,
+    chatgpt_auth: ChatGptSubscriptionAuth,
     bedrock: Arc<BedrockCredentialResolver>,
     vertex: Arc<VertexAdcResolver>,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
@@ -1587,6 +1826,11 @@ fn approved_direct_components(
         transports.openai(),
         Box::new(ProviderSystemClock::new()),
         Box::new(DirectApiKeySource(openai_credential.clone())),
+    ));
+    let chatgpt: Box<dyn ProviderAdapter> = Box::new(ChatGptSubscriptionAdapter::new(
+        transports.chatgpt(),
+        Box::new(ProviderSystemClock::new()),
+        chatgpt_auth.clone(),
     ));
     let anthropic: Box<dyn ProviderAdapter> = Box::new(AnthropicMessagesAdapter::new(
         transports.anthropic(),
@@ -1610,6 +1854,11 @@ fn approved_direct_components(
         adapters.insert(key.clone(), Arc::new(Mutex::new(adapter)));
         credentials.insert(key, credential);
     }
+    let chatgpt_descriptor = chatgpt.descriptor();
+    adapters.insert(
+        (chatgpt_descriptor.provider, chatgpt_descriptor.transport),
+        Arc::new(Mutex::new(chatgpt)),
+    );
     let bedrock_descriptor = bedrock_adapter.descriptor();
     adapters.insert(
         (bedrock_descriptor.provider, bedrock_descriptor.transport),
@@ -1628,6 +1877,7 @@ fn approved_direct_components(
     let directory = Arc::new(ApprovedProviderDirectory {
         adapters,
         credentials,
+        chatgpt: chatgpt_auth,
         bedrock,
     });
     (
@@ -1718,10 +1968,14 @@ struct NoPricing;
 impl PricingCatalog for NoPricing {
     fn estimate(
         &self,
-        _query: PricingQuery<'_>,
+        query: PricingQuery<'_>,
         _usage: &corti_postprocess::NormalizedUsage,
     ) -> Result<CostEstimate, PricingError> {
-        Ok(CostEstimate::unavailable())
+        Ok(match query.billing_basis {
+            BillingBasis::IncludedSubscription => CostEstimate::included_subscription(),
+            BillingBasis::NoProviderRequest => CostEstimate::no_provider_request(),
+            BillingBasis::MeteredEstimate | BillingBasis::Unknown => CostEstimate::unavailable(),
+        })
     }
 }
 
@@ -2419,6 +2673,16 @@ enum ServiceCommand {
         transport: TransportId,
         reply: Sender<Result<ProviderStateDto, ErrorCode>>,
     },
+    SyncProviderCredential {
+        provider: ProviderId,
+        transport: TransportId,
+        reply: Sender<Result<ProviderStateDto, ErrorCode>>,
+    },
+    InstallChatGptScope {
+        scope_id: Option<ConnectionScopeId>,
+        refresh_catalog: bool,
+        reply: Sender<Result<ProviderStateDto, ErrorCode>>,
+    },
     Finalize {
         recording_id: String,
         transcript: DiarizedTranscript,
@@ -2642,6 +2906,28 @@ impl Service {
                 let result = self.refresh_provider(&provider, &transport);
                 let _ = reply.send(result);
             }
+            ServiceCommand::SyncProviderCredential {
+                provider,
+                transport,
+                reply,
+            } => {
+                let result = self
+                    .coordinator
+                    .sync_provider_credential(&provider, &transport);
+                if result.is_ok() {
+                    self.bump_state();
+                    self.refresh_snapshot();
+                }
+                let _ = reply.send(result);
+            }
+            ServiceCommand::InstallChatGptScope {
+                scope_id,
+                refresh_catalog,
+                reply,
+            } => {
+                let result = self.install_chatgpt_scope(scope_id, refresh_catalog);
+                let _ = reply.send(result);
+            }
             ServiceCommand::Finalize {
                 recording_id,
                 transcript,
@@ -2765,9 +3051,6 @@ impl Service {
                 }
             }
             HostedPatchInput::SetPinnedAuto { enabled, .. } => ControlPatch::SetPinnedAuto(enabled),
-            HostedPatchInput::SetCodexExperimentalApproved { approved } => {
-                ControlPatch::SetCodexExperimentalApproved(approved)
-            }
             HostedPatchInput::SetDisplayPreferences { .. } => unreachable!(),
         };
         let outcome = self
@@ -2938,6 +3221,41 @@ impl Service {
         })
     }
 
+    fn install_chatgpt_scope(
+        &mut self,
+        scope_id: Option<ConnectionScopeId>,
+        refresh_catalog: bool,
+    ) -> Result<ProviderStateDto, ErrorCode> {
+        let provider = ProviderId::new(CHATGPT_PROVIDER).map_err(|_| ErrorCode::Internal)?;
+        let transport = TransportId::new(CHATGPT_TRANSPORT).map_err(|_| ErrorCode::Internal)?;
+        let actual_scope = self
+            .coordinator
+            .provider_connection_scope(&provider, &transport);
+        if actual_scope
+            .as_ref()
+            .map(|scope| &scope.connection_scope_id)
+            != scope_id.as_ref()
+        {
+            return Err(ErrorCode::Internal);
+        }
+        // Scope is derived live from the credential account id, never persisted independently. Fence every
+        // successful login/logout so an in-flight request from the previous account cannot apply.
+        self.coordinator
+            .apply_patch(ControlPatch::ProviderScopeChanged)
+            .map_err(control_error_code)?;
+        self.coordinator
+            .invalidate_provider_scope(&provider, &transport);
+        let result = if refresh_catalog {
+            self.refresh_provider(&provider, &transport)
+        } else {
+            self.coordinator
+                .sync_provider_credential(&provider, &transport)
+        }?;
+        self.bump_state();
+        self.refresh_snapshot();
+        Ok(result)
+    }
+
     fn set_bedrock_credential_mode(
         &mut self,
         request: BedrockCredentialModeRequest,
@@ -3051,12 +3369,29 @@ impl Service {
         transport: &TransportId,
     ) -> Result<ProviderStateDto, ErrorCode> {
         let scope = self.scope_for(provider, transport)?;
-        let state = self
+        let catalog = self
             .coordinator
-            .refresh_provider(provider, transport, &scope)?;
-        self.bump_state();
-        self.refresh_snapshot();
-        Ok(state)
+            .refresh_provider(provider, transport, &scope);
+        // Catalog discovery can refresh/rotate authentication. Re-sample afterward on both success and
+        // failure so a rejected or rotated-but-unsaved credential cannot remain projected as Ready.
+        let credential = self
+            .coordinator
+            .sync_provider_credential(provider, transport);
+        match catalog {
+            Ok(state) => {
+                let state = credential.unwrap_or(state);
+                self.bump_state();
+                self.refresh_snapshot();
+                Ok(state)
+            }
+            Err(error) => {
+                if credential.is_ok() {
+                    self.bump_state();
+                    self.refresh_snapshot();
+                }
+                Err(error)
+            }
+        }
     }
 
     fn set_pinned_template(
@@ -3777,12 +4112,19 @@ impl Service {
         provider: &ProviderId,
         transport: &TransportId,
     ) -> Result<ProviderScope, ErrorCode> {
+        if (provider.as_str(), transport.as_str()) == (CHATGPT_PROVIDER, CHATGPT_TRANSPORT) {
+            return self
+                .coordinator
+                .provider_connection_scope(provider, transport)
+                .ok_or(ErrorCode::PolicyBlocked);
+        }
         let preferences = self.preferences.lock().unwrap();
         let values = preferences.values();
         let scope = match (provider.as_str(), transport.as_str()) {
             ("google", "vertex_api") => &values.providers.vertex,
             ("openai", "openai_api") => &values.providers.openai.scope,
             ("anthropic", "anthropic_api") => &values.providers.anthropic.scope,
+            ("amazon", "bedrock_runtime") => &values.providers.bedrock.scope,
             _ => return Err(ErrorCode::PolicyBlocked),
         };
         Ok(ProviderScope {
@@ -3917,7 +4259,19 @@ impl Service {
                 break;
             };
             let call_id = completion.ticket.request().call_id.clone();
+            let provider = completion.ticket.request().provider.clone();
+            let transport = completion.ticket.request().transport.clone();
             self.call_cache.insert(call_id.clone(), completion.cache);
+            // Refresh auth projection before applying/releasing the provider result. This surfaces a
+            // rotated-but-unsaved ChatGPT credential (and direct-provider rejection) before any waiter can
+            // observe completion while Preferences still says Ready.
+            if self
+                .coordinator
+                .sync_provider_credential(&provider, &transport)
+                .is_ok()
+            {
+                self.refresh_snapshot();
+            }
             match self
                 .coordinator
                 .complete(completion.ticket, completion.result)
@@ -4167,6 +4521,7 @@ impl Service {
             &self.word_bank,
             self.coordinator.control_snapshot(),
             &providers,
+            chatgpt_scope_configured(&self.coordinator),
         );
     }
 
@@ -4213,6 +4568,7 @@ fn settings_snapshot(
     word_bank: &WordBankDocument,
     control: &ControlSnapshotDto,
     providers: &[ProviderStateDto],
+    chatgpt_scope_configured: bool,
 ) -> HostedSettingsDto {
     let values = preferences.values();
     let mut providers = providers.to_vec();
@@ -4234,6 +4590,15 @@ fn settings_snapshot(
         scopes: vec![
             scope_dto("google", "vertex_api", &values.providers.vertex),
             scope_dto("openai", "openai_api", &values.providers.openai.scope),
+            HostedProviderScopeDto {
+                provider: CHATGPT_PROVIDER.to_owned(),
+                transport: CHATGPT_TRANSPORT.to_owned(),
+                configured: chatgpt_scope_configured,
+                alias: chatgpt_scope_configured.then(|| "ChatGPT subscription".to_owned()),
+                project: None,
+                region: None,
+                quota_project: None,
+            },
             scope_dto(
                 "anthropic",
                 "anthropic_api",
@@ -4276,16 +4641,30 @@ fn scope_dto(
     }
 }
 
+fn chatgpt_scope_configured(coordinator: &PostprocessCoordinator) -> bool {
+    let Ok(provider) = ProviderId::new(CHATGPT_PROVIDER) else {
+        return false;
+    };
+    let Ok(transport) = TransportId::new(CHATGPT_TRANSPORT) else {
+        return false;
+    };
+    coordinator
+        .provider_connection_scope(&provider, &transport)
+        .is_some()
+}
+
 fn initial_provider_states() -> Vec<ProviderStateDto> {
     crate::postprocess::provider_support_catalog()
         .into_iter()
         .map(|descriptor| ProviderStateDto {
-            credential: if descriptor.support_tier == SupportTier::Documented {
-                CredentialState::Absent
-            } else {
+            credential: if descriptor.support_tier == SupportTier::Blocked
+                || !descriptor.adapter_available
+            {
                 CredentialState::Unsupported {
                     code: ErrorCode::PolicyBlocked,
                 }
+            } else {
+                CredentialState::Absent
             },
             descriptor,
             models: Vec::new(),
@@ -4313,6 +4692,7 @@ fn adapter_version(transport: &TransportId) -> u32 {
     match transport.as_str() {
         "vertex_api" => VERTEX_REST_ADAPTER_VERSION,
         "openai_api" => OPENAI_RESPONSES_ADAPTER_VERSION,
+        "chatgpt_subscription" => CHATGPT_SUBSCRIPTION_ADAPTER_VERSION,
         "anthropic_api" => ANTHROPIC_MESSAGES_ADAPTER_VERSION,
         "bedrock_runtime" => BEDROCK_CONVERSE_ADAPTER_VERSION,
         _ => 1,
@@ -4541,8 +4921,7 @@ fn control_error_code(error: ControlError) -> ErrorCode {
         | ControlError::IncompleteLaneSelection
         | ControlError::PartialLaneSelection
         | ControlError::ProviderUnavailable
-        | ControlError::ProviderBlocked
-        | ControlError::ExperimentalProviderOff => ErrorCode::PolicyBlocked,
+        | ControlError::ProviderBlocked => ErrorCode::PolicyBlocked,
         ControlError::Persistence => ErrorCode::Cache,
         ControlError::GenerationOverflow => ErrorCode::Internal,
     }
@@ -4637,6 +5016,61 @@ mod tests {
         }
     }
 
+    struct MutatingCatalogProviders {
+        fixture: FixtureProviders,
+        credential: Arc<Mutex<CredentialState>>,
+        mutate_on_catalog: bool,
+    }
+
+    impl ProviderAccess for MutatingCatalogProviders {
+        fn descriptor(
+            &mut self,
+            provider: &ProviderId,
+            transport: &TransportId,
+        ) -> Option<ProviderDescriptor> {
+            (&self.fixture.descriptor.provider == provider
+                && &self.fixture.descriptor.transport == transport)
+                .then(|| self.fixture.descriptor.clone())
+        }
+
+        fn credential_state(
+            &mut self,
+            provider: &ProviderId,
+            transport: &TransportId,
+        ) -> CredentialState {
+            if &self.fixture.descriptor.provider == provider
+                && &self.fixture.descriptor.transport == transport
+            {
+                self.credential.lock().unwrap().clone()
+            } else {
+                CredentialState::Unsupported {
+                    code: ErrorCode::PolicyBlocked,
+                }
+            }
+        }
+
+        fn catalog(
+            &mut self,
+            provider: &ProviderId,
+            transport: &TransportId,
+            _scope: &ProviderScope,
+        ) -> Result<ModelCatalog, corti_postprocess::PostprocessError> {
+            if &self.fixture.descriptor.provider != provider
+                || &self.fixture.descriptor.transport != transport
+            {
+                return Err(ErrorCode::PolicyBlocked.into());
+            }
+            if self.mutate_on_catalog {
+                *self.credential.lock().unwrap() = CredentialState::Error {
+                    code: ErrorCode::Cache,
+                };
+            }
+            Ok(ModelCatalog {
+                models: vec![self.fixture.model.clone()],
+            })
+        }
+    }
+
     impl ProviderAccess for FixtureProviders {
         fn descriptor(
             &mut self,
@@ -4694,6 +5128,13 @@ mod tests {
             })
         }
 
+        fn chatgpt(&self) -> Box<dyn HttpTransport> {
+            Box::new(InjectedTransport {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                sends: self.sends.clone(),
+            })
+        }
+
         fn anthropic(&self) -> Box<dyn HttpTransport> {
             Box::new(InjectedTransport {
                 responses: Arc::new(Mutex::new(VecDeque::new())),
@@ -4743,6 +5184,33 @@ mod tests {
         fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
             Ok(self.0.pop_front())
         }
+    }
+
+    struct EmptyChatGptStore;
+
+    impl ChatGptCredentialStore for EmptyChatGptStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, ChatGptStoreError> {
+            Ok(None)
+        }
+
+        fn save(&self, _document: &[u8]) -> Result<(), ChatGptStoreError> {
+            Ok(())
+        }
+
+        fn clear(&self) -> Result<(), ChatGptStoreError> {
+            Ok(())
+        }
+    }
+
+    fn empty_chatgpt_auth() -> ChatGptSubscriptionAuth {
+        ChatGptSubscriptionAuth::new(
+            Box::new(InjectedTransport {
+                responses: Arc::new(Mutex::new(VecDeque::new())),
+                sends: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ProviderSystemClock::new()),
+            Arc::new(EmptyChatGptStore),
+        )
     }
 
     struct InjectedSecrets;
@@ -4867,6 +5335,23 @@ mod tests {
                     expires_at_unix_ms: Some(1_800_003_600_000),
                 }
             }
+        }
+    }
+
+    struct CredentialMutatingExecutor {
+        credential: Arc<Mutex<CredentialState>>,
+    }
+
+    impl TicketExecutor for CredentialMutatingExecutor {
+        fn execute(
+            &self,
+            ticket: &DispatchTicket,
+            sink: &dyn ProviderEventSink,
+        ) -> Result<ProviderTerminal, corti_postprocess::PostprocessError> {
+            *self.credential.lock().unwrap() = CredentialState::Error {
+                code: ErrorCode::Cache,
+            };
+            RewriteExecutor.execute(ticket, sink)
         }
     }
 
@@ -5165,6 +5650,7 @@ mod tests {
             ProductionApproval::for_test(),
             transports,
             Arc::new(InjectedSecrets),
+            empty_chatgpt_auth(),
             BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
             VertexAdcResolver::production(vertex_config_source(preferences.clone())),
         );
@@ -5347,6 +5833,123 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(accepted, HostedMutationResult::Applied { .. }));
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn catalog_refresh_reprojects_credentials_mutated_during_the_provider_call() {
+        let path = dir("catalog-auth-mutation");
+        let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
+        let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
+        let fixture = FixtureProviders::openai();
+        let descriptor = fixture.descriptor.clone();
+        let credential = Arc::new(Mutex::new(CredentialState::Ready {
+            expires_at_unix_ms: None,
+            source: CredentialSourceKind::Keychain,
+        }));
+        let (_, handle) = start_with_components(
+            shared(configured_preferences()),
+            WordBankDocument::empty(),
+            LiveTranscriptStore::detached(),
+            pipeline_tx,
+            outbox,
+            Arc::new(DenyExecutor),
+            Box::new(MutatingCatalogProviders {
+                fixture,
+                credential,
+                mutate_on_catalog: true,
+            }),
+            Arc::new(NoPricing),
+            Arc::new(UnarmedVertex),
+            Arc::new(|_| {}),
+            DigestKey::new([29; 32]),
+            ProcessEpoch(129),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let (reply, receive) = std::sync::mpsc::channel();
+        handle
+            .send(ServiceCommand::RefreshProvider {
+                provider: descriptor.provider.clone(),
+                transport: descriptor.transport.clone(),
+                reply,
+            })
+            .unwrap();
+        let refreshed = receive.recv().unwrap().unwrap();
+        assert!(refreshed.models.is_empty());
+        assert!(matches!(
+            refreshed.credential,
+            CredentialState::Error {
+                code: ErrorCode::Cache
+            }
+        ));
+        let snapshot = handle.snapshot();
+        let projected = snapshot
+            .providers
+            .iter()
+            .find(|state| state.descriptor == descriptor)
+            .unwrap();
+        assert!(matches!(
+            projected.credential,
+            CredentialState::Error {
+                code: ErrorCode::Cache
+            }
+        ));
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn normal_provider_completion_reprojects_auth_mutated_during_execution() {
+        let path = dir("request-auth-mutation");
+        let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
+        let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
+        let fixture = FixtureProviders::openai();
+        let descriptor = fixture.descriptor.clone();
+        let credential = Arc::new(Mutex::new(CredentialState::Ready {
+            expires_at_unix_ms: None,
+            source: CredentialSourceKind::Keychain,
+        }));
+        let (_, handle) = start_with_components(
+            shared(configured_preferences()),
+            WordBankDocument::empty(),
+            LiveTranscriptStore::detached(),
+            pipeline_tx,
+            outbox,
+            Arc::new(CredentialMutatingExecutor {
+                credential: credential.clone(),
+            }),
+            Box::new(MutatingCatalogProviders {
+                fixture,
+                credential,
+                mutate_on_catalog: false,
+            }),
+            Arc::new(NoPricing),
+            Arc::new(UnarmedVertex),
+            Arc::new(|_| {}),
+            DigestKey::new([31; 32]),
+            ProcessEpoch(131),
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let settled = handle.finalize("recording", raw_transcript(), false);
+        assert!(settled.hosted_text_applied);
+        let snapshot = handle.snapshot();
+        let projected = snapshot
+            .providers
+            .iter()
+            .find(|state| state.descriptor == descriptor)
+            .unwrap();
+        assert!(matches!(
+            projected.credential,
+            CredentialState::Error {
+                code: ErrorCode::Cache
+            }
+        ));
+        assert!(projected.models.is_empty());
         std::fs::remove_dir_all(path).ok();
     }
 
@@ -6029,6 +6632,7 @@ mod tests {
             &word_bank,
             &control,
             &initial_provider_states(),
+            false,
         )));
         let handle = HostedHandle {
             command_tx,
@@ -6219,11 +6823,17 @@ mod tests {
             .find(|descriptor| descriptor.transport.as_str() == "claude_subscription")
             .unwrap();
         assert_eq!(claude.support_tier, SupportTier::Blocked);
-        let codex = descriptors
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor.transport.as_str() != "codex_app_server")
+        );
+        let chatgpt = descriptors
             .iter()
-            .find(|descriptor| descriptor.transport.as_str() == "codex_app_server")
+            .find(|descriptor| descriptor.transport.as_str() == "chatgpt_subscription")
             .unwrap();
-        assert_eq!(codex.support_tier, SupportTier::Experimental);
-        assert!(!codex.adapter_available);
+        assert_eq!(chatgpt.support_tier, SupportTier::Experimental);
+        assert_eq!(chatgpt.billing_basis, BillingBasis::IncludedSubscription);
+        assert!(chatgpt.adapter_available);
     }
 }

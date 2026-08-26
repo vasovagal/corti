@@ -334,9 +334,13 @@ impl HttpRequest {
         Ok(self)
     }
 
-    pub fn with_json_body(mut self, body: Vec<u8>) -> Self {
+    pub fn with_body(mut self, body: Vec<u8>) -> Self {
         self.body = body;
         self
+    }
+
+    pub fn with_json_body(self, body: Vec<u8>) -> Self {
+        self.with_body(body)
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -363,6 +367,12 @@ impl HttpRequest {
 
     pub const fn timeout(&self) -> Option<Duration> {
         self.timeout
+    }
+}
+
+impl Drop for HttpRequest {
+    fn drop(&mut self) {
+        self.body.zeroize();
     }
 }
 

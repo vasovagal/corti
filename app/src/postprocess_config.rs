@@ -41,6 +41,7 @@ pub(crate) enum SecretBackend {
 #[allow(clippy::enum_variant_names)] // Explicit Key suffixes keep fixed Keychain slots unambiguous.
 pub(crate) enum SecretPurpose {
     OpenAiApiKey,
+    ChatGptSubscriptionCredential,
     AnthropicApiKey,
     PostprocessCacheMasterKey,
     AwsAccessKeyId,
@@ -54,6 +55,7 @@ impl SecretPurpose {
     pub(crate) const fn keychain_account(self) -> &'static str {
         match self {
             Self::OpenAiApiKey => "openai-api-key-v1",
+            Self::ChatGptSubscriptionCredential => "chatgpt-subscription-credential-v1",
             Self::AnthropicApiKey => "anthropic-api-key-v1",
             Self::PostprocessCacheMasterKey => "encrypted-store-master-v1",
             Self::AwsAccessKeyId => "aws-access-key-id-v1",
@@ -204,8 +206,10 @@ pub(crate) struct ProviderPreferences {
     pub(crate) openai: DirectProviderPreferences,
     pub(crate) anthropic: DirectProviderPreferences,
     pub(crate) bedrock: BedrockProviderPreferences,
-    /// Product/legal approval is distinct from build capability. This persisted gate starts false.
-    pub(crate) codex_experimental_approved: bool,
+    /// Read-only migration sink for schema-v1 files written before the app-server proposal was removed.
+    /// New saves omit it; no runtime behavior consumes the legacy approval bit.
+    #[serde(rename = "codex_experimental_approved", skip_serializing)]
+    legacy_codex_experimental_approved: bool,
 }
 
 impl Default for ProviderPreferences {
@@ -216,7 +220,7 @@ impl Default for ProviderPreferences {
             openai: DirectProviderPreferences::openai(),
             anthropic: DirectProviderPreferences::anthropic(),
             bedrock: BedrockProviderPreferences::default(),
-            codex_experimental_approved: false,
+            legacy_codex_experimental_approved: false,
         }
     }
 }
@@ -529,7 +533,12 @@ mod tests {
         assert!(!preferences.values().final_lane.enabled);
         assert!(!preferences.values().questions.enabled);
         assert!(!preferences.values().pinned_auto_enabled);
-        assert!(!preferences.values().providers.codex_experimental_approved);
+        assert!(
+            !preferences
+                .values()
+                .providers
+                .legacy_codex_experimental_approved
+        );
 
         let unchanged = preferences.revise(|_| {}).unwrap();
         assert_eq!(unchanged.revision(), 0);
@@ -690,6 +699,7 @@ mod tests {
             SecretPurpose::AwsSecretAccessKey,
             SecretPurpose::AwsSessionToken,
             SecretPurpose::OpenAiApiKey,
+            SecretPurpose::ChatGptSubscriptionCredential,
             SecretPurpose::AnthropicApiKey,
             SecretPurpose::PostprocessCacheMasterKey,
         ];
@@ -706,6 +716,10 @@ mod tests {
         assert_eq!(
             SecretPurpose::OpenAiApiKey.keychain_account(),
             "openai-api-key-v1"
+        );
+        assert_eq!(
+            SecretPurpose::ChatGptSubscriptionCredential.keychain_account(),
+            "chatgpt-subscription-credential-v1"
         );
         assert_eq!(
             SecretPurpose::PostprocessCacheMasterKey.keychain_account(),
@@ -745,6 +759,22 @@ mod tests {
             SecretPurpose::AnthropicApiKey
         );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn legacy_codex_approval_is_accepted_for_migration_but_never_written_again() {
+        let document = r#"
+schema = 1
+revision = 4
+
+[preferences.providers]
+codex_experimental_approved = true
+"#;
+        let loaded: HostedPreferences = toml::from_str(document).unwrap();
+        loaded.validate().unwrap();
+        assert!(loaded.values().providers.legacy_codex_experimental_approved);
+        let rewritten = toml::to_string_pretty(&loaded).unwrap();
+        assert!(!rewritten.contains("codex"), "{rewritten}");
     }
 
     #[test]

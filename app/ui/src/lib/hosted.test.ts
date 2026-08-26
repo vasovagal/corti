@@ -76,6 +76,33 @@ describe("hosted provider and catalog truth", () => {
     });
   });
 
+  it("presents native ChatGPT device auth as subscription access, not an API key or server", () => {
+    const presentation = providerPresentation("openai", "chatgpt_subscription");
+    expect(presentation.name).toBe("ChatGPT subscription");
+    expect(presentation.guidance).toContain("No Codex server");
+    expect(credentialSummary({ state: "absent" }, "chatgpt_subscription").label).toBe(
+      "Not signed in",
+    );
+    expect(
+      credentialSummary(
+        { state: "ready", expires_at_unix_ms: 10_000, source: "chat_gpt_device" },
+        "chatgpt_subscription",
+      ),
+    ).toMatchObject({ label: "Signed in", tone: "ok" });
+    expect(
+      credentialSummary({ state: "error", code: "cache" }, "chatgpt_subscription"),
+    ).toMatchObject({ label: "Sign-in not saved", tone: "error" });
+    expect(
+      defaultProviderCache(
+        model({
+          provider: "openai",
+          transport: "chatgpt_subscription",
+          billing_basis: "included_subscription",
+        }),
+      ),
+    ).toBe("unavailable");
+  });
+
   it("never invents a model and applies the live benchmark gate", () => {
     const finalOnly = model();
     const liveReady = model({ exact_model_id: "catalog-fixture-live", benchmarked_for_live: true });
