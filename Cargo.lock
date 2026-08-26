@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "corti-aec"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "hound",
  "rustfft",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "corti-app"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "corti-bench"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "corti-capture"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "corti-core"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "chrono",
  "serde",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "corti-coreaudio"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.1",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "corti-detect"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "corti-jobs"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "corti-postprocess"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "corti-postprocess-providers"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "base64 0.22.1",
  "corti-postprocess",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "corti-queue"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "corti-tap"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "corti-core",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe-aws"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "corti-transcribe-local"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "corti-vagus"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "chrono",
