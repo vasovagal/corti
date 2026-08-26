@@ -552,10 +552,10 @@ impl ChatGptSubscriptionAuth {
     pub fn cancel_device_login(&self, login_id: &str) -> Result<(), ChatGptAuthError> {
         let _operation = self.inner.operation.lock().unwrap();
         let mut state = self.inner.state.lock().unwrap();
-        if !state
+        if state
             .pending
             .as_ref()
-            .is_some_and(|pending| pending.login_id == login_id)
+            .is_none_or(|pending| pending.login_id != login_id)
         {
             return Err(ChatGptAuthError::InvalidState);
         }
