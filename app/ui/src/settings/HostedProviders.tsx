@@ -284,7 +284,7 @@ function HostedProviderCard({
           </p>
           <p className="muted small">
             {isChatGpt
-              ? "Corti is polling OpenAI directly. Access and refresh tokens stay in the macOS Keychain."
+              ? "Corti is polling OpenAI directly. Access and refresh tokens stay in Corti's private secret store."
               : "The login id is backend-owned; tokens never enter this window."}
           </p>
           {isChatGpt && (
@@ -369,7 +369,8 @@ function HostedProviderCard({
             )}
           </div>
           <p className="muted small">
-            The key is typed into a native macOS sheet and written straight to the Keychain. This window
+            The key is typed into a native macOS sheet and written straight to Corti's private secret store
+            (owner-only files under ~/.local/share/corti/hosted-secrets). This window
             never receives it, and no browser field accepts a key.
           </p>
         </div>

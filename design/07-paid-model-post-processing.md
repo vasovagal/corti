@@ -13,7 +13,7 @@ telemetry without adding another transcription backend or a downloadable/local r
 
 Vertex ADC and direct OpenAI/Anthropic APIs are viable. ChatGPT subscription access is implemented without
 an app-server: Corti follows the direct device authorization and fixed HTTP Responses pattern proven in
-Dekopon, owns its rotating credential in the macOS Keychain, and exposes no tool surface. Anthropic explicitly
+Dekopon, owns its rotating credential in Corti's private secret store, and exposes no tool surface. Anthropic explicitly
 prohibits a third-party product from routing requests through a user's Claude Free/Pro/Max credentials. Corti
 must keep direct API billing, included ChatGPT quota, and blocked Claude subscription access distinct.
 
@@ -112,10 +112,10 @@ Support tier is data returned by Rust and shown beside every provider/model. It 
 | Provider/transport | Tier and release posture | Authentication | Cache/cost behavior | Binding limitations |
 |---|---|---|---|---|
 | **Google Vertex direct API** | `documented`; ship-capable after project/region tests | ADC discovered by Google's auth library. Setup text is `gcloud auth application-default login`. Access tokens are memory-only. | Encrypted local exact cache. Provider context/implicit caching is separately disclosed. Use versioned provider/model/region tariffs and terminal usage. | A token proves neither project, quota project, IAM, API enablement, billing, quota, region, nor model availability. Ordinary `gcloud auth login` is not ADC. |
-| **OpenAI direct API** | `documented`; ship-capable | Platform API key in macOS Keychain or an approved workload identity. | Responses streaming/structured output; explicit stable-prefix caching when enabled; terminal cached/read/write/reasoning usage retained. | This path is usage-billed and separate from ChatGPT subscription access. |
-| **ChatGPT subscription (direct fixed endpoints)** | `experimental`; ship-capable with the private-endpoint limitation visible | Corti-owned OpenAI device authorization; the versioned access/rotating-refresh document lives in a non-synchronizing Keychain item. | Authenticated `/backend-api/codex/models` catalog; streaming `/backend-api/codex/responses`; reported tokens retained; dollar cost is null with `included_subscription`; provider-cache controls are unavailable. | No Codex server or tools. Endpoints are fixed and provider-controlled; quota/model availability can change. Corti never imports Codex, Pi, or Dekopon credentials. |
-| **Anthropic direct API** | `documented`; ship-capable if API billing is acceptable | Anthropic API key in Keychain or supported workload identity. | Encrypted local exact cache and explicit provider cache blocks only when enabled; terminal usage + audited tariff estimate. | This is API billing, not a Claude.ai subscription. |
-| **Amazon Bedrock (`ConverseStream`)** | `documented`; ship-capable | Resolved AWS credentials in any of five flavors: default chain, named profile, static key pair in the Keychain, assumed role, or IAM Identity Center (SSO). Requests are SigV4-signed. | Encrypted local exact cache. Explicit provider caching is not offered: `ListFoundationModels` does not disclose which models honour Converse cache points. Terminal usage from the trailing `metadata` frame. | Regional — the catalog and model availability differ per region. `ListFoundationModels` publishes no token limits, so the catalog declares conservative floors. Structured output rides forced tool use, not a JSON-schema response format. |
+| **OpenAI direct API** | `documented`; ship-capable | Platform API key in Corti's private secret store or an approved workload identity. | Responses streaming/structured output; explicit stable-prefix caching when enabled; terminal cached/read/write/reasoning usage retained. | This path is usage-billed and separate from ChatGPT subscription access. |
+| **ChatGPT subscription (direct fixed endpoints)** | `experimental`; ship-capable with the private-endpoint limitation visible | Corti-owned OpenAI device authorization; the versioned access/rotating-refresh document lives in Corti's private secret store. | Authenticated `/backend-api/codex/models` catalog; streaming `/backend-api/codex/responses`; reported tokens retained; dollar cost is null with `included_subscription`; provider-cache controls are unavailable. | No Codex server or tools. Endpoints are fixed and provider-controlled; quota/model availability can change. Corti never imports Codex, Pi, or Dekopon credentials. |
+| **Anthropic direct API** | `documented`; ship-capable if API billing is acceptable | Anthropic API key in Corti's private secret store or supported workload identity. | Encrypted local exact cache and explicit provider cache blocks only when enabled; terminal usage + audited tariff estimate. | This is API billing, not a Claude.ai subscription. |
+| **Amazon Bedrock (`ConverseStream`)** | `documented`; ship-capable | Resolved AWS credentials in any of five flavors: default chain, named profile, static key pair in Corti's private secret store, assumed role, or IAM Identity Center (SSO). Requests are SigV4-signed. | Encrypted local exact cache. Explicit provider caching is not offered: `ListFoundationModels` does not disclose which models honour Converse cache points. Terminal usage from the trailing `metadata` frame. | Regional — the catalog and model availability differ per region. `ListFoundationModels` publishes no token limits, so the catalog declares conservative floors. Structured output rides forced tool use, not a JSON-schema response format. |
 | **Claude subscription (Free/Pro/Max)** | `blocked`; descriptor only, no adapter or setup command | None in Corti. | None. | Anthropic states that third-party developers must use API keys/cloud providers and may not offer Claude.ai login or route Free/Pro/Max credentials. Written commercial permission is required before this row changes. |
 
 A provider connection **never** turns on transcript egress. Connecting, selecting, and enabling are three
@@ -177,7 +177,7 @@ app (Tauri integration) ───────────► corti-queue (schema
 ```
 
 `corti-postprocess` may depend on small serialization/crypto-hash crates and `corti-core`, but not Tokio,
-Tauri, HTTP, Keychain, SQLite, or Vagus. Provider adapters are blocking from the coordinator's perspective;
+Tauri, HTTP, the secret store, SQLite, or Vagus. Provider adapters are blocking from the coordinator's perspective;
 each adapter hides its private current-thread Tokio runtime and injected transport.
 
 ### 5.2 Core API shape
@@ -290,9 +290,10 @@ corti-pipeline (sole queue.db writer)
   It is atomically replaced, synced, and mode 0600.
 - New `~/.local/share/corti/word-bank.json` contains `WordBankDocument`; it is atomically replaced, synced,
   and mode 0600.
-- API keys, cache keys, and Corti's ChatGPT rotating credential document are separate non-synchronizing
-  macOS generic-password Keychain items. They never enter TOML, JSON DTOs, React, SQLite, logs, Vagus,
-  screenshots, or subprocess arguments.
+- API keys, cache keys, and Corti's ChatGPT rotating credential document are separate owner-only files
+  (mode 0600 in a mode-0700 directory) under `~/.local/share/corti/hosted-secrets/`; the macOS Keychain is
+  unusable for an ad-hoc-signed app (ADR 0015 amendment, 2026-08-26). They never enter TOML, JSON DTOs,
+  React, SQLite, logs, Vagus, screenshots, or subprocess arguments.
 - Vertex tokens stay in memory. Corti uses ADC but never copies its refresh credential into Corti storage.
 - ChatGPT access/refresh tokens are Corti-owned; other applications' credential files are never read.
 
@@ -564,7 +565,7 @@ Any word-bank content change invalidates affected request keys and fences in-fli
 Authoritative storage is `~/Library/Caches/corti/postprocess/cache.sqlite3` in WAL mode, owned by one
 `corti-hosted-store` thread. Content tables contain only ciphertext plus low-sensitivity metadata.
 
-- A 256-bit random Keychain master key is generated locally and non-synchronizing.
+- A 256-bit random master key is generated locally and stored as one private file (§6.1).
 - HKDF-SHA-256 derives distinct `digest-v1`, `cache-aead-v1`, `ledger-aead-v1`, and
   `provenance-fingerprint-v1` keys.
 - XChaCha20-Poly1305 uses a random 192-bit nonce per row and authenticates schema/table/key metadata as AAD.
@@ -575,7 +576,7 @@ Authoritative storage is `~/Library/Caches/corti/postprocess/cache.sqlite3` in W
 - Default reusable rewrite cache: enabled, 30-day TTL, 512 MiB LRU cap. Q&A: memory-only; optional durable
   cache requires a separate acknowledgement, 24-hour TTL, and shares the cap.
 - `Purge hosted text` closes the store, removes DB/WAL/SHM, and recreates it. `Rotate encryption key` purges,
-  deletes the Keychain key, and generates a new one. APFS/SSD secure erasure is not promised; destroying the
+  deletes the stored key, and generates a new one. APFS/SSD secure erasure is not promised; destroying the
   key makes surviving ciphertext unusable.
 
 The session ledger is append-on-disk and call-memory-bounded. It stores encrypted immediate view rows,
@@ -888,11 +889,11 @@ when unknown calls exist.
 | Word bank | mode-0600 document + encrypted cache | Yes, in stable prompt prefix | keyed fingerprint/count only |
 | Steering | hosted prefs/session memory + encrypted cache | Yes | keyed fingerprint only |
 | Questions/answers | bounded session memory; optional encrypted 24 h cache | Yes | no body/content |
-| API keys/cache key/ChatGPT rotating credential | Keychain only | Selected provider authorization only | never |
+| API keys/cache key/ChatGPT rotating credential | private secret store only | Selected provider authorization only | never |
 | Vertex token | memory only | Vertex authorization header | never |
 | Usage/timing/cost | queue DB | provider already knows its call | content-free history |
 
-Trust boundaries are React ↔ Tauri commands, Rust ↔ Keychain/ADC, Rust ↔ cache filesystem, adapter ↔ remote
+Trust boundaries are React ↔ Tauri commands, Rust ↔ secret store/ADC, Rust ↔ cache filesystem, adapter ↔ remote
 provider, app ↔ native ChatGPT device-auth worker, and `corti-vagus` ↔ the current returned note.
 
 ### 12.2 Threats and controls
@@ -906,10 +907,10 @@ provider, app ↔ native ChatGPT device-auth worker, and `corti-vagus` ↔ the c
   strictly validated; malformed or non-schema text falls back to immutable raw ASR.
 - **Stale/racing output:** full fences on every event; immutable raw; mismatched content is discarded.
 - **Cache disclosure/dictionary attack:** AEAD content, HMAC keys, opaque account scope, no plaintext file
-  names. Keychain loss fails closed. WAL/SHM contain ciphertext, not prompts/results.
+  names. Master-key loss fails closed. WAL/SHM contain ciphertext, not prompts/results.
 - **Provider retention/training/cache:** separate acknowledgement, provider-specific disclosure, no false
   “off” when implicit caching exists, and no claim that local purge reaches provider storage.
-- **Credential confusion:** the ChatGPT transport uses only Corti's fixed Keychain slot and fixed auth/model
+- **Credential confusion:** the ChatGPT transport uses only Corti's fixed secret slot and fixed auth/model
   hosts. It never imports `~/.codex/auth.json`, Pi/Dekopon credentials, or Claude credential files, and no
   model subprocess exists to compromise.
 - **Vagus overreach:** providers return typed text only. `corti-vagus` owns an opaque current-note handle/path
@@ -1093,8 +1094,8 @@ property.
 - [ ] Vertex uses ADC from `gcloud auth application-default login`, polls every exactly five seconds while
       unarmed, emits exactly `gcloud token isn't armed` once per episode on an intended dispatch, and catches
       up only newest valid auto-lane state.
-- [ ] Direct OpenAI/Anthropic use Keychain/workload identity and never claim subscription/device auth.
-- [ ] ChatGPT device auth is Corti-owned, Keychain-backed, bounded, fixed-host, refresh-token rotating, and
+- [ ] Direct OpenAI/Anthropic use the private secret store/workload identity and never claim subscription/device auth.
+- [ ] ChatGPT device auth is Corti-owned, secret-store-backed, bounded, fixed-host, refresh-token rotating, and
       never exposes tokens/account ids over IPC, logs, debug, or preferences; no Codex server/tools exist.
 - [ ] Claude subscription has no adapter/import/setup command absent written permission.
 - [ ] Model choices come from provider/account/region catalogs plus capability/benchmark gates; no silent
@@ -1123,7 +1124,7 @@ property.
 - [ ] Word bank normalizes/validates/deduplicates/sorts deterministically, increments revision only on canonical
       change, and occupies the stable prompt prefix.
 - [ ] Exact keys include every semantic dimension and exclude session/time/display-only dimensions as specified.
-- [ ] Cache/ledger/recovery content is AEAD-encrypted with a non-synchronizing Keychain key; HMAC identities,
+- [ ] Cache/ledger/recovery content is AEAD-encrypted with a locally stored master key; HMAC identities,
       TTL/LRU cap, purge, and key rotation work with no plaintext in DB/WAL/file names.
 - [ ] Provider caching is separate, privacy-gated, accurately discloses implicit behavior, and is never claimed
       purgeable by Corti.
@@ -1151,7 +1152,7 @@ property.
 ### Test safety
 
 - [ ] Automated tests ignore ambient credentials and deny provider domains/non-loopback networking, installed
-      `gcloud`/Claude processes, and real Keychain items unless an injected fake is used.
+      `gcloud`/Claude processes, and the real secret store unless an injected fake is used.
 - [ ] Every adapter/auth/cache/pricing/UI path has deterministic fixtures; no test makes a real paid API call.
 
 ## 17. Test plan — no paid inference
@@ -1174,7 +1175,7 @@ property.
 - Vertex fake clock advances 4.999 s then 1 ms; assert exact poll count, one exact warning per episode,
   `Arming -> Catching up -> Ready`, newest-only auto catch-up, final expiry, and token-ready/service-failed
   distinction.
-- Fake Keychain tests absent/store/replace/read/delete/locked/rotation; supplied secret never appears in any
+- Secret-store tests cover absent/store/replace/read/delete/loosened-mode/symlink/rotation; supplied secret never appears in any
   serialized DTO/event/log/screenshot.
 - Scripted native ChatGPT HTTP fixtures for device code/pending/denial/expiry, transient-poll backoff,
   rotating refresh persistence, 401 refresh/retry, authenticated model list, malformed OAuth/SSE, and logout.
@@ -1216,7 +1217,7 @@ property.
 ## 18. Implementation sequence and file map
 
 1. Ratify ADR 0015/guardrails and land domain types, prompt/word-bank goldens, pure schedulers, pricing types.
-2. Add queue v2 migration/call APIs and encrypted store/keychain seams with fake-only tests.
+2. Add queue v2 migration/call APIs and encrypted store/secret-store seams with fake-only tests.
 3. Add managed control/patch commands/provider descriptors and Hosted rewrite Settings with every provider
    still blocked/off.
 4. Add injected documented adapters/auth/catalog fixtures; complete benchmarks/privacy/tariff gates before
@@ -1229,7 +1230,7 @@ property.
 9. Ship native fixed-endpoint ChatGPT subscription access without an app-server; do not implement Claude subscription routing.
 
 Expected production files include new crates under `crates/corti-postprocess*`; app modules
-`postprocess.rs`, `postprocess_auth.rs`, `postprocess_store.rs`, `keychain.rs`, and `word_bank.rs`; extensions
+`postprocess.rs`, `postprocess_auth.rs`, `postprocess_store.rs`, `secret_store.rs`, and `word_bank.rs`; extensions
 to `live.rs`, `live_view.rs`, `pipeline.rs`, `checkpoint.rs`, `config/settings/main/queue_ui/provenance`; queue and
 Vagus migrations/helpers; and focused React components under `app/ui/src/settings/` and `app/ui/src/live/`.
 Current-state `docs/` and `design/STATUS.md` update only when implementation ships.

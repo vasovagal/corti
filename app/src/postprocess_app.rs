@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -95,10 +95,8 @@ const STORE_NONCE_BYTES: usize = 12;
 const MAX_STORE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STORE_JOURNALS: usize = 1_024;
 const MAX_STORE_CACHE_ENTRIES: usize = 1_024;
-const HOSTED_KEYCHAIN_SERVICE: &str = "com.vasovagal.corti.hosted";
-const HOSTED_MASTER_KEY_ACCOUNT: &str = "encrypted-store-master-v1";
-const OPENAI_API_KEY_ACCOUNT: &str = SecretPurpose::OpenAiApiKey.keychain_account();
-const ANTHROPIC_API_KEY_ACCOUNT: &str = SecretPurpose::AnthropicApiKey.keychain_account();
+const OPENAI_API_KEY_ACCOUNT: &str = SecretPurpose::OpenAiApiKey.slot_name();
+const ANTHROPIC_API_KEY_ACCOUNT: &str = SecretPurpose::AnthropicApiKey.slot_name();
 const FINGERPRINT_DOMAIN: &[u8] = b"corti-app-provenance-v1\0";
 const CHATGPT_PROVIDER: &str = "openai";
 const CHATGPT_TRANSPORT: &str = "chatgpt_subscription";
@@ -355,7 +353,7 @@ pub(crate) struct HostedProviderScopeDto {
 }
 
 /// Bedrock's credential configuration as the pane sees it: the mode plus its non-secret companions, and
-/// booleans for the Keychain slots. No key, token, or account id is representable.
+/// booleans for the secret slots. No key, token, or account id is representable.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BedrockCredentialDto {
     pub(crate) mode: crate::postprocess_config::AwsCredentialMode,
@@ -881,7 +879,7 @@ pub(crate) fn open_chatgpt_device_login(window: tauri::WebviewWindow) -> Result<
         .map_err(|_| "the ChatGPT authorization page could not be opened".to_string())
 }
 
-/// The `~/.aws` profile names the Bedrock pane offers. Keychain presence deliberately lives only on the
+/// The `~/.aws` profile names the Bedrock pane offers. Secret presence deliberately lives only on the
 /// settings document, so the pane has one source of truth for it rather than two that can disagree.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AwsCredentialOptionsDto {
@@ -910,11 +908,11 @@ impl AwsKeySlotDto {
         match self {
             Self::AccessKeyId => (
                 "AWS access key ID",
-                "Stored in the macOS Keychain and never shown to the Corti window.",
+                "Stored in Corti's private secret store and never shown to the Corti window.",
             ),
             Self::SecretAccessKey => (
                 "AWS secret access key",
-                "Stored in the macOS Keychain and never shown to the Corti window.",
+                "Stored in Corti's private secret store and never shown to the Corti window.",
             ),
             Self::SessionToken => (
                 "AWS session token",
@@ -947,11 +945,11 @@ impl SecretSlotRequest {
         match self {
             Self::OpenAi => (
                 "OpenAI API key",
-                "Stored in the macOS Keychain and never shown to the Corti window.",
+                "Stored in Corti's private secret store and never shown to the Corti window.",
             ),
             Self::Anthropic => (
                 "Anthropic API key",
-                "Stored in the macOS Keychain and never shown to the Corti window.",
+                "Stored in Corti's private secret store and never shown to the Corti window.",
             ),
             Self::Aws { slot } => slot.prompt(),
         }
@@ -1054,7 +1052,7 @@ pub(crate) fn prompt_for_provider_secret(
             Ok(SecretEntryResultDto::Cancelled)
         }
         Ok(crate::secure_entry::SecureEntryOutcome::Rejected) => Ok(SecretEntryResultDto::Rejected),
-        // The anyhow chain can name a Keychain failure but never the value.
+        // The anyhow chain can name a secret-store failure but never the value.
         Err(_) => Err("the secure-entry sheet could not store the value".to_string()),
     }
 }
@@ -1065,7 +1063,7 @@ pub(crate) fn clear_provider_secret(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     require_hosted_window(&window, &["settings"])?;
-    crate::keychain::delete(request.purpose())
+    crate::secret_store::delete(request.purpose())
         .map_err(|_| "the stored value could not be removed".to_string())
 }
 
@@ -1120,8 +1118,12 @@ pub(crate) fn start(
     });
     let outbox = Arc::new(TelemetryOutbox::open(default_outbox_path()?)?);
     let durable = load_or_create_master_keys().and_then(|keys| {
+        let path = default_store_path()?;
+        if keys.created {
+            discard_store_sealed_under_lost_key(&path)?;
+        }
         let store = RuntimeStore::open_encrypted(
-            default_store_path()?,
+            path,
             keys.encryption,
             outbox.clone(),
             pipeline_tx.clone(),
@@ -1134,8 +1136,9 @@ pub(crate) fn start(
     let (digest_key, store, durable_store_armed) = match durable {
         Ok((digest_key, store)) => (digest_key, store, true),
         Err(_) => {
-            // A locked/missing Keychain or unreadable authenticated store must not brick raw capture, but it
-            // must make paid egress impossible for this process. Never replace or bypass the suspect store.
+            // An unreadable secret store or authenticated store must not brick raw capture, but it
+            // must make paid egress impossible for this process. Never replace or bypass the suspect store;
+            // the one exception is `discard_store_sealed_under_lost_key`, which runs only when no key exists.
             tracing::warn!(
                 target: "corti::hosted",
                 "durable hosted store is unavailable; hosted egress remains off"
@@ -1157,7 +1160,7 @@ pub(crate) fn start(
     let chatgpt_auth = ChatGptSubscriptionAuth::new(
         Box::new(UreqTransport::new()),
         Arc::new(ProviderSystemClock::new()),
-        Arc::new(KeychainChatGptStore),
+        Arc::new(FileChatGptStore),
     );
     let approval = durable_store_armed.then_some(ProductionApproval::for_durable_store());
     let vertex = VertexAdcResolver::production(vertex_config_source(preferences.clone()));
@@ -1172,7 +1175,7 @@ pub(crate) fn start(
             approved_direct_components(
                 approval,
                 Arc::new(ProductionTransportFactory),
-                Arc::new(KeychainDirectSecretStore),
+                Arc::new(FileDirectSecretStore),
                 chatgpt_auth.clone(),
                 BedrockCredentialResolver::new(bedrock_config_source(preferences.clone())),
                 vertex.clone(),
@@ -1365,46 +1368,41 @@ fn unix_millis() -> i64 {
 struct MasterKeys {
     digest: DigestKey,
     encryption: [u8; 32],
+    /// The master key was generated on this launch; see `discard_store_sealed_under_lost_key`.
+    created: bool,
 }
 
 fn load_or_create_master_keys() -> Result<MasterKeys> {
-    use security_framework::passwords::{
-        PasswordOptions, generic_password, set_generic_password_options,
-    };
-    use security_framework_sys::base::errSecItemNotFound;
-    use zeroize::Zeroize as _;
-
-    let options = || {
-        let mut options = PasswordOptions::new_generic_password(
-            HOSTED_KEYCHAIN_SERVICE,
-            HOSTED_MASTER_KEY_ACCOUNT,
-        );
-        // Explicit false is important: this key must never enter iCloud Keychain synchronization.
-        options.set_access_synchronized(Some(false));
-        options
-    };
-    let mut master = match generic_password(options()) {
-        Ok(value) => value,
-        Err(error) if error.code() == errSecItemNotFound => {
-            let mut value = vec![0u8; 32];
-            random_bytes(&mut value)?;
-            set_generic_password_options(&value, options())
-                .context("storing non-synchronizing hosted master key")?;
-            value
-        }
-        Err(error) => return Err(error).context("reading non-synchronizing hosted master key"),
-    };
-    if master.len() != 32 {
-        master.zeroize();
-        bail!("hosted master key has an invalid length");
-    }
-    let digest = derive_master_subkey(&master, b"corti-hosted-digest-v1");
-    let encryption = derive_master_subkey(&master, b"corti-hosted-encryption-v1");
-    master.zeroize();
+    let master = crate::secret_store::load_or_create_master_key(random_bytes)?;
+    let digest = derive_master_subkey(master.bytes.as_slice(), b"corti-hosted-digest-v1");
+    let encryption = derive_master_subkey(master.bytes.as_slice(), b"corti-hosted-encryption-v1");
     Ok(MasterKeys {
         digest: DigestKey::new(digest),
         encryption,
+        created: master.created,
     })
+}
+
+/// A freshly generated master key means no key exists anywhere for ciphertext already on disk: the first
+/// launch after secrets moved out of the Keychain (#145), or a deliberately deleted key, which is design
+/// 07 §9.1's "rotate encryption key" semantics. Such a store can never be opened again, so it is discarded
+/// rather than left to fail authentication on every launch. A store that fails to open under a key that
+/// *did* exist is never touched.
+fn discard_store_sealed_under_lost_key(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::warn!(
+                target: "corti::hosted",
+                path = %path.display(),
+                "hosted master key was regenerated; discarded the encrypted hosted store sealed under the previous key"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).context("discarding the encrypted hosted store sealed under a lost key")
+        }
+    }
 }
 
 fn derive_master_subkey(master: &[u8], domain: &[u8]) -> [u8; 32] {
@@ -1649,35 +1647,35 @@ trait DirectSecretStore: Send + Sync {
     fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError>;
 }
 
-struct KeychainDirectSecretStore;
+struct FileDirectSecretStore;
 
-struct KeychainChatGptStore;
+struct FileChatGptStore;
 
-impl ChatGptCredentialStore for KeychainChatGptStore {
+impl ChatGptCredentialStore for FileChatGptStore {
     fn load(&self) -> Result<Option<Vec<u8>>, ChatGptStoreError> {
-        crate::keychain::read(SecretPurpose::ChatGptSubscriptionCredential)
+        crate::secret_store::read(SecretPurpose::ChatGptSubscriptionCredential)
             .map_err(|_| ChatGptStoreError::Unavailable)
     }
 
     fn save(&self, document: &[u8]) -> Result<(), ChatGptStoreError> {
-        crate::keychain::write(SecretPurpose::ChatGptSubscriptionCredential, document)
+        crate::secret_store::write(SecretPurpose::ChatGptSubscriptionCredential, document)
             .map_err(|_| ChatGptStoreError::Unavailable)
     }
 
     fn clear(&self) -> Result<(), ChatGptStoreError> {
-        crate::keychain::delete(SecretPurpose::ChatGptSubscriptionCredential)
+        crate::secret_store::delete(SecretPurpose::ChatGptSubscriptionCredential)
             .map_err(|_| ChatGptStoreError::Unavailable)
     }
 }
 
-impl DirectSecretStore for KeychainDirectSecretStore {
+impl DirectSecretStore for FileDirectSecretStore {
     fn read(&self, account: &str) -> Result<Option<Vec<u8>>, CredentialError> {
         let purpose = match account {
             OPENAI_API_KEY_ACCOUNT => SecretPurpose::OpenAiApiKey,
             ANTHROPIC_API_KEY_ACCOUNT => SecretPurpose::AnthropicApiKey,
             _ => return Err(CredentialError::Unavailable),
         };
-        crate::keychain::read(purpose).map_err(|_| CredentialError::Unavailable)
+        crate::secret_store::read(purpose).map_err(|_| CredentialError::Unavailable)
     }
 }
 
@@ -1759,7 +1757,7 @@ struct ApprovedProviderDirectory {
     adapters: HashMap<(ProviderId, TransportId), SharedAdapter>,
     credentials: HashMap<(ProviderId, TransportId), Arc<DirectCredential>>,
     chatgpt: ChatGptSubscriptionAuth,
-    /// Bedrock resolves through the AWS chain rather than a single Keychain item, so its readiness —
+    /// Bedrock resolves through the AWS chain rather than a single stored secret, so its readiness —
     /// including assumed-role and SSO expiry — comes from its own resolver.
     bedrock: Arc<BedrockCredentialResolver>,
     vertex: VertexAdapterSlot,
@@ -4757,9 +4755,11 @@ fn settings_snapshot(
             mode: values.providers.bedrock.credential_mode,
             profile: values.providers.bedrock.profile.clone(),
             role_arn: values.providers.bedrock.role_arn.clone(),
-            has_access_key_id: crate::keychain::is_present(SecretPurpose::AwsAccessKeyId),
-            has_secret_access_key: crate::keychain::is_present(SecretPurpose::AwsSecretAccessKey),
-            has_session_token: crate::keychain::is_present(SecretPurpose::AwsSessionToken),
+            has_access_key_id: crate::secret_store::is_present(SecretPurpose::AwsAccessKeyId),
+            has_secret_access_key: crate::secret_store::is_present(
+                SecretPurpose::AwsSecretAccessKey,
+            ),
+            has_session_token: crate::secret_store::is_present(SecretPurpose::AwsSessionToken),
         },
         default_steering: values.default_steering.clone(),
         word_bank: HostedWordBankDto {

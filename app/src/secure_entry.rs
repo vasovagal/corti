@@ -1,6 +1,6 @@
 //! App-owned AppKit secure entry for provider secrets.
 //!
-//! The typed value goes from `NSSecureTextField` straight into the Keychain on the main thread. It never
+//! The typed value goes from `NSSecureTextField` straight into the private secret store on the main thread. It never
 //! crosses the IPC boundary, so no browser field ever holds a key and React learns only presence. ADR
 //! 0015 §5 grants this macOS binding.
 
@@ -15,7 +15,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use tauri::AppHandle;
 use zeroize::Zeroize as _;
 
-use crate::{keychain, postprocess_config::SecretPurpose};
+use crate::{postprocess_config::SecretPurpose, secret_store};
 
 /// Longest value the sheet will accept. AWS secret keys and API keys are far shorter; the cap only stops
 /// a paste of something that could not possibly be a credential.
@@ -63,7 +63,7 @@ fn show_sheet(purpose: SecretPurpose, title: &str, detail: &str) -> Result<Secur
     alert.setAlertStyle(NSAlertStyle::Informational);
     alert.setMessageText(&NSString::from_str(title));
     alert.setInformativeText(&NSString::from_str(detail));
-    alert.addButtonWithTitle(&NSString::from_str("Save to Keychain"));
+    alert.addButtonWithTitle(&NSString::from_str("Save"));
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
 
     let field: Retained<NSSecureTextField> = NSSecureTextField::new(mtm);
@@ -97,7 +97,7 @@ fn show_sheet(purpose: SecretPurpose, title: &str, detail: &str) -> Result<Secur
     }
     let mut stored = trimmed.to_owned();
     value.zeroize();
-    let result = keychain::write(purpose, stored.as_bytes());
+    let result = secret_store::write(purpose, stored.as_bytes());
     stored.zeroize();
     result?;
     Ok(SecureEntryOutcome::Stored)

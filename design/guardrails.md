@@ -13,8 +13,10 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
    no support for macOS more than one release behind current. (ADR 0002)
 3. **Own the platform bindings.** No far-reaching third-party macOS-binding dependency without an ADR;
    prefer thin safe wrappers over `coreaudio-sys` / `objc2-*` in `corti-coreaudio`. ADR 0015 narrowly permits
-   an app-only AppKit secure-entry sheet and Security.framework Keychain wrapper for hosted API/cache keys;
-   secrets must never cross into React/config/SQLite/logs/events/subprocess arguments. (ADRs 0002, 0015)
+   an app-only AppKit secure-entry sheet for hosted API/cache keys, which land in owner-only files under
+   `~/.local/share/corti/hosted-secrets/` (the Keychain is unusable for an ad-hoc-signed app; ADR 0015
+   amendment 2026-08-26); secrets must never cross into React/config/SQLite/logs/events/subprocess
+   arguments. (ADRs 0002, 0015)
 4. **Capture is CoreAudio (process tap + aggregate device)**; ScreenCaptureKit is a fallback only. (ADR 0002)
 5. **Audio and other large/derived artifacts live outside any vault** — recordings under
    `~/Library/Caches/corti/`, job state under `~/.local/share/corti/`. Never in `~/brain`.

@@ -3,7 +3,7 @@
 //! This document is deliberately separate from [`crate::config::AppConfig`]: hosted controls need their
 //! own monotonic revision and must never become enabled as a side effect of saving transcription settings
 //! or connecting a credential. Secret values are unrepresentable here; fixed [`SecretReference`] values
-//! are lookup handles for a later app-owned macOS Keychain boundary.
+//! are lookup handles for the app-owned `secret_store` boundary.
 
 // This phase intentionally lands the boundary before coordinator/Settings wiring.
 #![allow(dead_code)]
@@ -35,11 +35,10 @@ pub(crate) enum SecretBackend {
     MacosNonSynchronizingGenericPassword,
 }
 
-/// Fixed app-owned Keychain slots. A future Security.framework adapter maps these handles to service/account
-/// constants and reports presence separately; TOML never contains key material.
+/// Fixed app-owned secret slots. `secret_store` maps each handle to one private file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(clippy::enum_variant_names)] // Explicit Key suffixes keep fixed Keychain slots unambiguous.
+#[allow(clippy::enum_variant_names)] // Explicit Key suffixes keep fixed secret slots unambiguous.
 pub(crate) enum SecretPurpose {
     OpenAiApiKey,
     ChatGptSubscriptionCredential,
@@ -51,9 +50,10 @@ pub(crate) enum SecretPurpose {
 }
 
 impl SecretPurpose {
-    /// Fixed Keychain account name for this slot. Values are versioned so a format change can never
+    /// Fixed file name for this slot in the private secret store. Values are versioned so a format
+    /// change can never
     /// silently reinterpret an existing item.
-    pub(crate) const fn keychain_account(self) -> &'static str {
+    pub(crate) const fn slot_name(self) -> &'static str {
         match self {
             Self::OpenAiApiKey => "openai-api-key-v1",
             Self::ChatGptSubscriptionCredential => "chatgpt-subscription-credential-v1",
@@ -67,7 +67,7 @@ impl SecretPurpose {
 }
 
 /// How AWS credentials are resolved for Bedrock. This is a non-secret preference; the values it selects
-/// live in `~/.aws` or the Keychain, never in this document.
+/// live in `~/.aws` or Corti's private secret store, never in this document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AwsCredentialMode {
@@ -774,24 +774,21 @@ mod tests {
         ];
         let accounts = slots
             .iter()
-            .map(|slot| slot.keychain_account())
+            .map(|slot| slot.slot_name())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(accounts.len(), slots.len());
         assert_eq!(
             SecretReference::aws_secret_access_key().purpose(),
             SecretPurpose::AwsSecretAccessKey
         );
-        // The pre-existing accounts must not move, or a running install loses its stored keys.
+        // The slot names must not move, or a running install loses its stored keys.
+        assert_eq!(SecretPurpose::OpenAiApiKey.slot_name(), "openai-api-key-v1");
         assert_eq!(
-            SecretPurpose::OpenAiApiKey.keychain_account(),
-            "openai-api-key-v1"
-        );
-        assert_eq!(
-            SecretPurpose::ChatGptSubscriptionCredential.keychain_account(),
+            SecretPurpose::ChatGptSubscriptionCredential.slot_name(),
             "chatgpt-subscription-credential-v1"
         );
         assert_eq!(
-            SecretPurpose::PostprocessCacheMasterKey.keychain_account(),
+            SecretPurpose::PostprocessCacheMasterKey.slot_name(),
             "encrypted-store-master-v1"
         );
     }

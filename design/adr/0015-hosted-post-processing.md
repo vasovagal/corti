@@ -121,3 +121,33 @@ The old `codex_app_server` descriptor is removed from the production provider ca
   Corti cannot erase provider-side cache or guarantee cancellation prevented billing.
 - Queue schema additions are content-free and additive; existing recording status strings remain unchanged so
   downgrade readers do not fail merely because final post-processing was active.
+
+### Amendment — hosted secrets move from the Keychain to private files (2026-08-26, #145)
+
+Decision 5 named non-synchronizing login-keychain items as the host-owned secret storage. In practice every
+Corti launch raised "Corti wants to use your confidential information stored in com.vasovagal.corti.hosted…
+enter the login keychain password", and "Always Allow" lasted one build. A login-keychain item is guarded by
+two checks keyed on code-signing identity — the decrypt ACL's trusted-application list and, since macOS
+10.12, a partition list — and for an ad-hoc-signed bundle (ADR 0006) that identity is the cdhash, new on
+every build. Because an ad-hoc requester has no certificate to validate, macOS also escalates the dialog from
+"Allow" to the login password. Measured on macOS 26: an item created with a NULL (any-application) decrypt
+ACL — `security add-generic-password -A` semantics — still raised the dialog when the next build read it,
+because the partition list is consulted regardless. The data-protection keychain never prompts but needs an
+application-identifier entitlement that ad-hoc signing cannot carry.
+
+Decision 5 now reads: direct API keys, the ChatGPT rotating credential, and the local-cache master key are
+owner-only files (mode 0600 in a mode-0700 directory) under `~/.local/share/corti/hosted-secrets/`,
+written atomically by the existing private-file helper, which also refuses symlinks, foreign owners, and
+loosened modes on read. Everything else in decision 5 stands: the AppKit secure-entry sheet is the only
+input path, and secrets never cross into React/config/SQLite/Vagus/logs/events/subprocess arguments. The
+accepted cost is stated flatly: any process running as the user can read those files — which is also what a
+"readable by any application" Keychain item would have granted, and is the `~/.aws/credentials` posture.
+The Security.framework wrapper and its dependencies are retired, and the guardrail-3 grant narrows to the
+secure-entry sheet. A stale `com.vasovagal.corti.hosted` item from an earlier build is inert and can be
+removed by hand in Keychain Access. A Developer ID signature would make the Keychain (or the
+data-protection keychain) an option again; that is ADR 0006's decision to revisit, not this one's.
+
+The master key's move is a rotation: on the first launch that finds no stored key, the encrypted hosted store
+sealed under the old Keychain key is discarded (design 07 §9.1 "rotate encryption key" semantics) rather
+than left to fail authentication on every launch. A store that fails to open under a key that *does* exist
+is still never touched.

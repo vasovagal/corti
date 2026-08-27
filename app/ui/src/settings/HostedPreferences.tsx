@@ -51,7 +51,7 @@ export default function HostedPreferences({
   const [masterDisclosure, setMasterDisclosure] = useState(false);
   const [awsOptions, setAwsOptions] = useState<AwsCredentialOptionsDto | null>(null);
 
-  // Profile names and Keychain presence are read separately from the settings document: they describe the
+  // Profile names and secret presence are read separately from the settings document: they describe the
   // machine, not the saved preferences, and an older backend simply leaves them null.
   const refreshAwsOptions = useCallback(async () => {
     try {
@@ -202,7 +202,7 @@ export default function HostedPreferences({
       const outcome = await promptForProviderSecret(request);
       setStatus(
         outcome === "stored"
-          ? "Stored in the macOS Keychain. No lane was enabled."
+          ? "Stored in Corti's private secret store. No lane was enabled."
           : outcome === "rejected"
             ? "That value cannot be a credential; nothing was stored."
             : "Cancelled; nothing was stored.",
@@ -226,7 +226,7 @@ export default function HostedPreferences({
     setStatus("");
     try {
       await clearProviderSecret(request);
-      setStatus("Removed from the macOS Keychain.");
+      setStatus("Removed from Corti's private secret store.");
       return true;
     } catch (error) {
       setStatus(`Removal failed: ${String(error)}`);
@@ -280,7 +280,7 @@ export default function HostedPreferences({
   const onSignOutChatGpt = () =>
     onChatGptAction(
       "ChatGPT sign-out",
-      "Corti's ChatGPT credential was removed from the macOS Keychain.",
+      "Corti's ChatGPT credential was removed from its private secret store.",
       signOutChatGptSubscription,
     );
 

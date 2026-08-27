@@ -41,9 +41,6 @@ ring = "0.17"
 base64 = { workspace = true }
 # Vertex ADC token exchange POSTs to Google's OAuth endpoint over HTTPS on the app's own credential thread.
 ureq = "2"
-# Stable hosted-store and direct-provider keys live in explicitly non-synchronizing macOS Keychain items.
-security-framework = "3.7"
-security-framework-sys = "2.17"
 # Persisted, hand-editable config file (`~/.local/share/corti/config.toml`). Flat scalar struct only.
 toml = "0.8"
 

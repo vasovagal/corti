@@ -29,8 +29,6 @@ mod console;
 #[cfg(target_os = "macos")]
 mod jobs;
 #[cfg(target_os = "macos")]
-mod keychain;
-#[cfg(target_os = "macos")]
 mod live;
 #[cfg(target_os = "macos")]
 mod live_test;
@@ -52,6 +50,8 @@ mod private_file;
 mod provenance;
 #[cfg(target_os = "macos")]
 mod queue_ui;
+#[cfg(target_os = "macos")]
+mod secret_store;
 #[cfg(target_os = "macos")]
 mod secure_entry;
 #[cfg(target_os = "macos")]

@@ -11,8 +11,8 @@ use corti_postprocess::{CredentialSourceKind, CredentialState, ErrorCode};
 use corti_postprocess_providers::{AwsCredentialSource, AwsCredentials, CredentialError};
 
 use crate::{
-    keychain,
     postprocess_config::{AwsCredentialMode, SecretPurpose},
+    secret_store,
 };
 
 /// Refresh this far ahead of expiry so a session cannot lapse mid-stream.
@@ -106,7 +106,7 @@ impl BedrockCredentialResolver {
         config: &BedrockCredentialConfig,
     ) -> Result<AwsCredentials, CredentialError> {
         match config.mode {
-            AwsCredentialMode::StaticKeychain => keychain_credentials(),
+            AwsCredentialMode::StaticKeychain => stored_key_pair_credentials(),
             #[cfg(feature = "aws")]
             _ => chain_credentials(config),
             #[cfg(not(feature = "aws"))]
@@ -128,11 +128,12 @@ fn unix_millis() -> i64 {
 }
 
 /// The static keypair a user pasted through the secure-entry sheet.
-fn keychain_credentials() -> Result<AwsCredentials, CredentialError> {
+fn stored_key_pair_credentials() -> Result<AwsCredentials, CredentialError> {
     use zeroize::Zeroize as _;
 
     fn slot(purpose: SecretPurpose) -> Result<Option<String>, CredentialError> {
-        let Some(bytes) = keychain::read(purpose).map_err(|_| CredentialError::Unavailable)? else {
+        let Some(bytes) = secret_store::read(purpose).map_err(|_| CredentialError::Unavailable)?
+        else {
             return Ok(None);
         };
         let value = String::from_utf8(bytes).map_err(|error| {
