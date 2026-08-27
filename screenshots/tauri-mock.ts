@@ -13,7 +13,13 @@ export function buildInitScript(overrides: Record<string, unknown> = {}): string
       const fixtureState = ${fixtureJson};
       const listeners = new Map();
       const invocations = [];
+      const heldCommands = new Set();
+      const pendingCommands = new Map();
       let listenerId = 0;
+
+      function clone(value) {
+        return typeof structuredClone === "function" ? structuredClone(value) : value;
+      }
 
       function removeListener(event, id) {
         const byId = listeners.get(event);
@@ -27,6 +33,23 @@ export function buildInitScript(overrides: Record<string, unknown> = {}): string
       };
       window.__cortiInvocations = function(command) {
         return invocations.filter(function(item) { return !command || item.command === command; });
+      };
+      window.__cortiHoldCommand = function(command) {
+        heldCommands.add(command);
+      };
+      window.__cortiResolveCommand = function(command, value) {
+        heldCommands.delete(command);
+        const pending = pendingCommands.get(command) ?? [];
+        const waiter = pending.shift();
+        if (pending.length === 0) pendingCommands.delete(command);
+        if (waiter) waiter.resolve(clone(value));
+      };
+      window.__cortiRejectCommand = function(command, reason) {
+        heldCommands.delete(command);
+        const pending = pendingCommands.get(command) ?? [];
+        const waiter = pending.shift();
+        if (pending.length === 0) pendingCommands.delete(command);
+        if (waiter) waiter.reject(reason);
       };
       window.__cortiEmit = function(event, payload) {
         const byId = listeners.get(event);
@@ -64,9 +87,15 @@ export function buildInitScript(overrides: Record<string, unknown> = {}): string
             removeListener(args.event, args.eventId);
             return null;
           }
+          if (heldCommands.has(command)) {
+            return new Promise(function(resolve, reject) {
+              const pending = pendingCommands.get(command) ?? [];
+              pending.push({ resolve: resolve, reject: reject });
+              pendingCommands.set(command, pending);
+            });
+          }
           if (command in fixtureState) {
-            const value = fixtureState[command];
-            return typeof structuredClone === "function" ? structuredClone(value) : value;
+            return clone(fixtureState[command]);
           }
           return null;
         },

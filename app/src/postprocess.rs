@@ -19,19 +19,19 @@ use std::{
     fmt,
     sync::{
         Arc,
-        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
 };
 
 use corti_postprocess::{
     CacheObservation, CachePolicy, CallId, CancellationReason, CancellationToken, CostEstimate,
-    CredentialState, ErrorCode, EventContext, HostedRequest, Lane, LatencyFields, LocalCacheMode,
-    ModelCatalog, ModelDescriptor, ModelId, MonotonicDeadline, NormalizedUsage, PostprocessError,
-    PricingCatalog, PricingQuery, ProcessEpoch, ProviderAdapter, ProviderCacheMode,
-    ProviderDescriptor, ProviderEvent, ProviderEventKind, ProviderEventSink, ProviderId,
-    ProviderOutput, ProviderScope, RequestFence, RequestKey, RewriteValidationLimits, SupportTier,
-    TranscriptRow, TransportId, ValidatedQuestion, ValidatedRewrite, parse_and_validate_question,
-    parse_and_validate_rewrite,
+    CredentialState, DigestKey, ErrorCode, EventContext, HostedRequest, Lane, LatencyFields,
+    LocalCacheMode, ModelCatalog, ModelDescriptor, ModelId, MonotonicDeadline, NormalizedUsage,
+    PostprocessError, PricingCatalog, PricingQuery, ProcessEpoch, ProviderAdapter,
+    ProviderCacheMode, ProviderDescriptor, ProviderEvent, ProviderEventKind, ProviderEventSink,
+    ProviderId, ProviderOutput, ProviderScope, RequestFence, RequestKey, RewriteValidationLimits,
+    SupportTier, TranscriptRow, TransportId, ValidatedQuestion, ValidatedRewrite,
+    parse_and_validate_question, parse_and_validate_rewrite,
 };
 use corti_postprocess_providers::{
     Clock as ProviderClock, VertexAutoPending, VertexCredentialResolver, VertexCredentialState,
@@ -464,6 +464,9 @@ pub(crate) struct RequestSubmission {
     pub(crate) request_max_output_bytes: usize,
     pub(crate) catalog_max_output_bytes: usize,
     pub(crate) expected_context_truncated: bool,
+    /// A previous process durably reached ResultCached/Applied for this recording. The current
+    /// credential-bound key must recover that journal; a cache miss is not permission for new egress.
+    pub(crate) requires_final_recovery: bool,
 }
 
 impl fmt::Debug for RequestSubmission {
@@ -480,6 +483,7 @@ impl fmt::Debug for RequestSubmission {
                 "expected_context_truncated",
                 &self.expected_context_truncated,
             )
+            .field("requires_final_recovery", &self.requires_final_recovery)
             .finish()
     }
 }
@@ -515,6 +519,7 @@ impl RequestSubmission {
             request_max_output_bytes,
             catalog_max_output_bytes,
             expected_context_truncated,
+            requires_final_recovery: false,
         })
     }
 }
@@ -604,6 +609,35 @@ impl fmt::Debug for FinalJournalBoundary {
 pub(crate) struct FinalRecoveryRecord {
     pub(crate) call_id: CallId,
     pub(crate) state: FinalJournalState,
+}
+
+pub(crate) struct FinalRecoveryHit {
+    pub(crate) boundary: FinalJournalBoundary,
+    pub(crate) state: FinalJournalState,
+    pub(crate) output: ProviderOutput,
+    pub(crate) terminal: Option<TerminalTelemetryDto>,
+}
+
+pub(crate) enum FinalRecoveryLookup {
+    None,
+    Hit(Box<FinalRecoveryHit>),
+    /// A recoverable group exists for this recording, but the current credential-bound request key is not
+    /// one of its chunks. Repeating provider egress would no longer be crash recovery.
+    Mismatch,
+}
+
+impl fmt::Debug for FinalRecoveryLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("FinalRecoveryLookup::None"),
+            Self::Mismatch => f.write_str("FinalRecoveryLookup::Mismatch"),
+            Self::Hit(hit) => f
+                .debug_struct("FinalRecoveryLookup::Hit")
+                .field("boundary", &hit.boundary)
+                .field("state", &hit.state)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -734,7 +768,23 @@ pub(crate) struct StoreCommit<'a> {
 pub(crate) trait EncryptedPostprocessStore: Send {
     fn lookup_exact(&mut self, key: RequestKey) -> Result<ExactLookup, ErrorCode>;
     fn evict_corrupt(&mut self, key: RequestKey) -> Result<(), ErrorCode>;
-    fn prepare_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
+    fn purge_reusable_cache(&mut self) -> Result<usize, ErrorCode> {
+        Ok(0)
+    }
+    fn prepare_final(
+        &mut self,
+        boundary: &FinalJournalBoundary,
+        output_reserve_bytes: usize,
+    ) -> Result<(), ErrorCode>;
+    fn prepare_final_group(
+        &mut self,
+        reservations: &[(FinalJournalBoundary, usize)],
+    ) -> Result<(), ErrorCode> {
+        for (boundary, output_reserve_bytes) in reservations {
+            self.prepare_final(boundary, *output_reserve_bytes)?;
+        }
+        Ok(())
+    }
     /// Persist the conservative ambiguous-dispatch state before a ticket may reach any egress transport.
     fn mark_final_dispatched(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode>;
     /// For final calls this must atomically persist encrypted output and move the journal to ResultCached.
@@ -753,6 +803,19 @@ pub(crate) trait EncryptedPostprocessStore: Send {
         &mut self,
         recording_id: &str,
     ) -> Result<Option<FinalRecoveryRecord>, ErrorCode>;
+    fn lookup_final_recovery(
+        &mut self,
+        _recording_id: &str,
+        _request_key: RequestKey,
+    ) -> Result<FinalRecoveryLookup, ErrorCode> {
+        Ok(FinalRecoveryLookup::None)
+    }
+    fn recover_final_boundaries(
+        &mut self,
+        _call_ids: &[CallId],
+    ) -> Result<Vec<FinalJournalBoundary>, ErrorCode> {
+        Err(ErrorCode::Cache)
+    }
     fn record_terminal(&mut self, telemetry: &TerminalTelemetryDto) -> Result<(), ErrorCode>;
 }
 
@@ -772,7 +835,7 @@ pub(crate) fn provider_support_catalog() -> Vec<ProviderDescriptor> {
     .collect()
 }
 
-pub(crate) trait ProviderAccess: Send {
+pub(crate) trait ProviderAccess: Send + Sync {
     /// Provider-owned dynamic scope. ChatGPT derives this from the account id inside its credential so a
     /// crash can never pair a new credential with an old persisted cache fence.
     fn connection_scope(
@@ -784,21 +847,54 @@ pub(crate) trait ProviderAccess: Send {
     }
 
     fn descriptor(
-        &mut self,
+        &self,
         provider: &ProviderId,
         transport: &TransportId,
     ) -> Option<ProviderDescriptor>;
-    fn credential_state(
-        &mut self,
+    fn credential_state(&self, provider: &ProviderId, transport: &TransportId) -> CredentialState;
+    /// Resolve only in response to explicit refresh or selected queued work. The default is sufficient for
+    /// injected/direct providers whose projection lookup is already complete and non-networked.
+    fn resolve_credential(
+        &self,
         provider: &ProviderId,
         transport: &TransportId,
-    ) -> CredentialState;
+    ) -> CredentialState {
+        self.credential_state(provider, transport)
+    }
+    /// Opaque identity of the credential lease actually selected by `resolve_credential`. Production
+    /// overrides this for direct keys and Bedrock; injected providers retain a deterministic scope-bound id.
+    fn credential_cache_identity(
+        &self,
+        provider: &ProviderId,
+        transport: &TransportId,
+        scope: &ProviderScope,
+    ) -> Option<[u8; 32]> {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(provider.as_str().as_bytes());
+        digest.update(&[0]);
+        digest.update(transport.as_str().as_bytes());
+        digest.update(&[0]);
+        digest.update(scope.connection_scope_id.as_str().as_bytes());
+        digest.finish().as_ref().try_into().ok()
+    }
+    /// Clear cached/rejected credential state after an app-owned secret or account configuration changes.
+    /// The default keeps injected and unsupported directories source-compatible.
+    fn invalidate_credentials(&self, _provider: &ProviderId, _transport: &TransportId) {}
     fn catalog(
-        &mut self,
+        &self,
         provider: &ProviderId,
         transport: &TransportId,
         scope: &ProviderScope,
     ) -> Result<ModelCatalog, PostprocessError>;
+    fn refresh_catalog(
+        &self,
+        provider: &ProviderId,
+        transport: &TransportId,
+        scope: &ProviderScope,
+    ) -> Result<ModelCatalog, PostprocessError> {
+        self.catalog(provider, transport, scope)
+    }
+    fn invalidate_catalog(&self, _provider: &ProviderId, _transport: &TransportId) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -960,6 +1056,10 @@ enum QueueStage {
     WaitingCredential,
     WaitingVertex,
     ReadyForCatalog,
+    PreparingProvider,
+    WaitingIdentical,
+    WaitingFinalReservation,
+    Prepared,
 }
 
 struct QueuedCall {
@@ -1017,9 +1117,22 @@ impl PinnedProgress {
     }
 }
 
+struct TransientResult {
+    output: ProviderOutput,
+    remaining_waiters: usize,
+}
+
+#[derive(Clone)]
+struct AwaitingFinalApply {
+    boundary: FinalJournalBoundary,
+    application_fence: RequestFence,
+    terminal: TerminalTelemetryDto,
+}
+
 #[derive(Debug)]
 struct ActiveCall {
     sequence: u64,
+    request_key: RequestKey,
     recording_id: String,
     context: EventContext,
     cancel: CancellationToken,
@@ -1087,6 +1200,8 @@ impl DispatchTicket {
 /// recovery-committed before this value exists. Debug output cannot reveal replacement/answer text.
 pub(crate) struct ApplyReady {
     pub(crate) call_id: CallId,
+    /// Differs only when an encrypted Final journal from an earlier process is being resumed.
+    pub(crate) journal_call_id: Option<CallId>,
     pub(crate) lane: Lane,
     pub(crate) fence: RequestFence,
     pub(crate) output: ValidatedOutput,
@@ -1097,6 +1212,7 @@ impl fmt::Debug for ApplyReady {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ApplyReady")
             .field("call_id", &self.call_id)
+            .field("journal_call_id", &self.journal_call_id)
             .field("lane", &self.lane)
             .field("fence", &self.fence)
             .field("output", &self.output)
@@ -1105,8 +1221,72 @@ impl fmt::Debug for ApplyReady {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderPrepareSpec {
+    pub(crate) provider: ProviderId,
+    pub(crate) transport: TransportId,
+    pub(crate) scope: ProviderScope,
+    /// Vertex has its own asynchronous credential state machine; once it is Ready, catalog preparation uses
+    /// that projection instead of asking the generic directory to rediscover ADC.
+    pub(crate) credential_override: Option<CredentialState>,
+    pub(crate) force_refresh: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedProviderPrepare {
+    pub(crate) call_id: CallId,
+    pub(crate) spec: ProviderPrepareSpec,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderPreparation {
+    pub(crate) credential: CredentialState,
+    pub(crate) projected_credential: CredentialState,
+    pub(crate) credential_identity: Option<[u8; 32]>,
+    pub(crate) catalog: Result<ModelCatalog, ErrorCode>,
+}
+
+pub(crate) fn prepare_provider(
+    providers: &dyn ProviderAccess,
+    spec: &ProviderPrepareSpec,
+) -> ProviderPreparation {
+    let credential = spec
+        .credential_override
+        .clone()
+        .unwrap_or_else(|| providers.resolve_credential(&spec.provider, &spec.transport));
+    let credential_identity = matches!(credential, CredentialState::Ready { .. })
+        .then(|| providers.credential_cache_identity(&spec.provider, &spec.transport, &spec.scope))
+        .flatten();
+    let catalog = if matches!(credential, CredentialState::Ready { .. }) {
+        let result = if spec.force_refresh {
+            providers.refresh_catalog(&spec.provider, &spec.transport, &spec.scope)
+        } else {
+            providers.catalog(&spec.provider, &spec.transport, &spec.scope)
+        };
+        result.map_err(|error| error.code)
+    } else {
+        Ok(ModelCatalog { models: Vec::new() })
+    };
+    let sampled = providers.credential_state(&spec.provider, &spec.transport);
+    let projected_credential = if spec.credential_override.is_some()
+        || matches!(sampled, CredentialState::Absent)
+            && matches!(credential, CredentialState::Ready { .. })
+    {
+        credential.clone()
+    } else {
+        sampled
+    };
+    ProviderPreparation {
+        credential,
+        projected_credential,
+        credential_identity,
+        catalog,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum DispatchOutcome {
+    Prepare(QueuedProviderPrepare),
     Ticket(DispatchTicket),
     CacheApply(ApplyReady),
     Waiting,
@@ -1147,15 +1327,18 @@ impl From<VertexResolverError> for CoordinatorError {
 /// [`CoordinatorIngress::try_send`] below.
 pub(crate) struct PostprocessCoordinator {
     clock: Arc<dyn CoordinatorClock>,
+    digest_key: Arc<DigestKey>,
     control: PostprocessControl,
     persistence: Box<dyn ControlPersistence>,
     store: Box<dyn EncryptedPostprocessStore>,
-    providers: Box<dyn ProviderAccess>,
+    providers: Arc<dyn ProviderAccess>,
     pricing: Arc<dyn PricingCatalog>,
     vertex: VertexCredentialResolver,
     provider_states: HashMap<(ProviderId, TransportId), ProviderStateDto>,
     queue: VecDeque<QueuedCall>,
     active: HashMap<CallId, ActiveCall>,
+    transient_results: HashMap<RequestKey, TransientResult>,
+    pending_live_applications: HashMap<CallId, TerminalTelemetryDto>,
     next_sequence: u64,
     next_question_revision: u64,
     watermark: TranscriptWatermark,
@@ -1163,7 +1346,7 @@ pub(crate) struct PostprocessCoordinator {
     pinned: PinnedProgress,
     pinned_template: Option<SensitiveText>,
     ad_hoc: VecDeque<AdHocEntry>,
-    awaiting_final_apply: HashMap<CallId, FinalJournalBoundary>,
+    awaiting_final_apply: HashMap<CallId, AwaitingFinalApply>,
     events: VecDeque<CoordinatorEventDto>,
 }
 
@@ -1191,6 +1374,7 @@ impl PostprocessCoordinator {
     pub(crate) fn new(
         process_epoch: ProcessEpoch,
         clock: Arc<dyn CoordinatorClock>,
+        digest_key: Arc<DigestKey>,
         persistence: Box<dyn ControlPersistence>,
         store: Box<dyn EncryptedPostprocessStore>,
         providers: Box<dyn ProviderAccess>,
@@ -1200,6 +1384,7 @@ impl PostprocessCoordinator {
             ControlSnapshotDto::defaults(process_epoch),
             None,
             clock,
+            digest_key,
             persistence,
             store,
             providers,
@@ -1215,11 +1400,13 @@ impl PostprocessCoordinator {
         snapshot: ControlSnapshotDto,
         pinned_template: Option<String>,
         clock: Arc<dyn CoordinatorClock>,
+        digest_key: Arc<DigestKey>,
         persistence: Box<dyn ControlPersistence>,
         store: Box<dyn EncryptedPostprocessStore>,
-        mut providers: Box<dyn ProviderAccess>,
+        providers: Box<dyn ProviderAccess>,
         pricing: Arc<dyn PricingCatalog>,
     ) -> Self {
+        let providers: Arc<dyn ProviderAccess> = Arc::from(providers);
         let session_generation = snapshot.session_generation;
         let control = PostprocessControl { snapshot };
         let vertex = VertexCredentialResolver::new(Box::new(VertexClock(clock.clone())));
@@ -1247,6 +1434,7 @@ impl PostprocessCoordinator {
             .collect();
         Self {
             clock,
+            digest_key,
             control,
             persistence,
             store,
@@ -1256,6 +1444,8 @@ impl PostprocessCoordinator {
             provider_states,
             queue: VecDeque::new(),
             active: HashMap::new(),
+            transient_results: HashMap::new(),
+            pending_live_applications: HashMap::new(),
             next_sequence: 1,
             next_question_revision: 1,
             watermark: TranscriptWatermark::initial(session_generation),
@@ -1286,8 +1476,16 @@ impl PostprocessCoordinator {
         self.providers.connection_scope(provider, transport)
     }
 
+    pub(crate) fn provider_access(&self) -> Arc<dyn ProviderAccess> {
+        self.providers.clone()
+    }
+
     pub(crate) fn watermark(&self) -> TranscriptWatermark {
         self.watermark
+    }
+
+    pub(crate) fn purge_reusable_cache(&mut self) -> Result<usize, ErrorCode> {
+        self.store.purge_reusable_cache()
     }
 
     /// Explicit Settings refresh. Catalog discovery remains injected and returns only typed descriptors;
@@ -1312,7 +1510,7 @@ impl PostprocessCoordinator {
         {
             self.vertex.state().credential_state()
         } else {
-            self.providers.credential_state(provider, transport)
+            self.providers.resolve_credential(provider, transport)
         };
         // A catalog failure is published on the card before it is returned. Reporting it only as a command
         // error left the pane saying "no models" for causes — an unbuildable connection scope, a region the
@@ -1320,7 +1518,7 @@ impl PostprocessCoordinator {
         let catalog = match &credential {
             CredentialState::Ready { .. } => self
                 .providers
-                .catalog(provider, transport, scope)
+                .refresh_catalog(provider, transport, scope)
                 .map(|catalog| catalog.models)
                 .map_err(|error| error.code),
             _ => Ok(Vec::new()),
@@ -1328,6 +1526,48 @@ impl PostprocessCoordinator {
         let state = ProviderStateDto {
             descriptor: descriptor.clone(),
             credential,
+            models: catalog.clone().unwrap_or_default(),
+            service_error: catalog.as_ref().err().copied(),
+        };
+        self.provider_states.insert(
+            (descriptor.provider.clone(), descriptor.transport.clone()),
+            state.clone(),
+        );
+        self.push_event(CoordinatorEventDto::ProviderState(Box::new(state.clone())));
+        catalog.map(|_| state)
+    }
+
+    /// Install a worker-produced explicit refresh without repeating credential/catalog I/O on the serial
+    /// coordinator. Settings, cancellation, and deadline ticks remain serviceable while the worker is slow.
+    pub(crate) fn complete_provider_refresh(
+        &mut self,
+        spec: &ProviderPrepareSpec,
+        preparation: ProviderPreparation,
+    ) -> Result<ProviderStateDto, ErrorCode> {
+        let descriptor = self
+            .providers
+            .descriptor(&spec.provider, &spec.transport)
+            .ok_or(ErrorCode::PolicyBlocked)?;
+        if descriptor.support_tier == SupportTier::Blocked || !descriptor.adapter_available {
+            return Err(ErrorCode::PolicyBlocked);
+        }
+        let catalog = if matches!(preparation.credential, CredentialState::Ready { .. }) {
+            preparation.catalog.map(|catalog| {
+                if matches!(
+                    preparation.projected_credential,
+                    CredentialState::Ready { .. }
+                ) {
+                    catalog.models
+                } else {
+                    Vec::new()
+                }
+            })
+        } else {
+            Ok(Vec::new())
+        };
+        let state = ProviderStateDto {
+            descriptor: descriptor.clone(),
+            credential: preparation.projected_credential,
             models: catalog.clone().unwrap_or_default(),
             service_error: catalog.as_ref().err().copied(),
         };
@@ -1473,11 +1713,19 @@ impl PostprocessCoordinator {
 
     pub(crate) fn begin_session(&mut self) -> Result<ControlSnapshotDto, ControlError> {
         self.cancel_scope(CancellationScope::All(CancellationReason::SessionEnded));
+        let pending_live = self
+            .pending_live_applications
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for call_id in pending_live {
+            let _ = self.acknowledge_live_application(&call_id, Err(ErrorCode::Superseded));
+        }
         let snapshot = self.control.begin_session()?;
         self.queue.clear();
         self.ad_hoc.clear();
-        for boundary in self.awaiting_final_apply.values() {
-            let _ = self.store.abandon_final(boundary);
+        for awaiting in self.awaiting_final_apply.values() {
+            let _ = self.store.abandon_final(&awaiting.boundary);
         }
         self.awaiting_final_apply.clear();
         self.vertex.clear_pending();
@@ -1553,7 +1801,14 @@ impl PostprocessCoordinator {
         self.control
             .commit_pinned_question_revision()
             .map_err(|_| SubmitError::GenerationOverflow)?;
-        self.pinned.request_watermark = self.watermark;
+        // A newly saved question should be able to answer the substantial transcript already on screen.
+        // Starting its progress baseline at "now" made late setup look broken until another 40 words arrived.
+        // Subsequent accepted runs still advance the baseline normally, preserving bounded coalesced updates.
+        self.pinned.request_watermark = if self.pinned_template.is_some() {
+            TranscriptWatermark::initial(self.watermark.session_generation)
+        } else {
+            self.watermark
+        };
         self.pinned.quiet_due_at_micros = None;
         self.pinned.dirty_while_running = false;
         self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
@@ -1756,7 +2011,7 @@ impl PostprocessCoordinator {
             watermark,
             descriptor,
             submission,
-            stage: QueueStage::NeedsCache,
+            stage: QueueStage::NeedsAuth,
             final_prepared: false,
         });
         self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
@@ -1835,6 +2090,12 @@ impl PostprocessCoordinator {
         self.maybe_queue_pinned(now);
         self.expire_queued(now);
         self.expire_active(now);
+        self.transient_results.retain(|key, _| {
+            self.queue.iter().any(|queued| {
+                queued.stage == QueueStage::WaitingIdentical
+                    && queued.submission.request_key == *key
+            })
+        });
     }
 
     fn meaningful_pinned_progress(&self, watermark: TranscriptWatermark) -> bool {
@@ -1999,6 +2260,7 @@ impl PostprocessCoordinator {
         provider: &ProviderId,
         transport: &TransportId,
     ) {
+        self.providers.invalidate_catalog(provider, transport);
         let key = (provider.clone(), transport.clone());
         if let Some(state) = self.provider_states.get_mut(&key) {
             state.models.clear();
@@ -2015,11 +2277,15 @@ impl PostprocessCoordinator {
         provider: &ProviderId,
         transport: &TransportId,
     ) {
+        self.providers.invalidate_credentials(provider, transport);
+        let projected = self.providers.credential_state(provider, transport);
         if let Some(state) = self
             .provider_states
             .get_mut(&(provider.clone(), transport.clone()))
         {
-            state.credential = CredentialState::Resolving;
+            // Invalidation only makes a check pending. `Resolving` is reserved for a worker that is actually
+            // running; projecting it here left Settings claiming an indefinite active check after Save.
+            state.credential = projected;
             state.service_error = None;
             let state = state.clone();
             self.push_event(CoordinatorEventDto::ProviderState(Box::new(state)));
@@ -2041,6 +2307,58 @@ impl PostprocessCoordinator {
         }
     }
 
+    /// Fence only work routed through the changed provider. Persisted scope/credential identity is already
+    /// part of new request keys, so unrelated transports neither need a global control revision nor a raw
+    /// fallback when one provider is edited.
+    pub(crate) fn cancel_provider_requests(
+        &mut self,
+        provider: &ProviderId,
+        transport: &TransportId,
+    ) {
+        let reason = CancellationReason::ModelChanged;
+        for active in self.active.values() {
+            if &active.descriptor.provider == provider && &active.descriptor.transport == transport
+            {
+                active.cancel.cancel(reason);
+                if let Some(boundary) = active.final_boundary.as_ref() {
+                    let _ = self.store.abandon_final(boundary);
+                }
+            }
+        }
+        let pending_live = self
+            .pending_live_applications
+            .iter()
+            .filter(|(_, telemetry)| {
+                &telemetry.provider == provider && &telemetry.transport == transport
+            })
+            .map(|(call_id, _)| call_id.clone())
+            .collect::<Vec<_>>();
+        for call_id in pending_live {
+            let _ = self.acknowledge_live_application(&call_id, Err(ErrorCode::Superseded));
+        }
+        let mut retained = VecDeque::with_capacity(self.queue.len());
+        let mut removed = Vec::new();
+        while let Some(queued) = self.queue.pop_front() {
+            if &queued.descriptor.provider == provider && &queued.descriptor.transport == transport
+            {
+                removed.push(queued);
+            } else {
+                retained.push_back(queued);
+            }
+        }
+        self.queue = retained;
+        for queued in removed {
+            self.finish_queued_canceled(&queued, reason);
+        }
+        if self.pinned.candidate.as_ref().is_some_and(|candidate| {
+            &candidate.submission.request.provider == provider
+                && &candidate.submission.request.transport == transport
+        }) {
+            self.pinned.candidate = None;
+            self.pinned.quiet_due_at_micros = None;
+        }
+    }
+
     /// Perform one scheduler step. Repeated calls drain ready work; each returned ticket must go to a bounded
     /// provider worker rather than execute on this coordinator or a capture/ASR thread.
     pub(crate) fn dispatch_next(&mut self) -> DispatchOutcome {
@@ -2051,7 +2369,11 @@ impl PostprocessCoordinator {
                 now >= queued.eligible_at_micros
                     && !matches!(
                         queued.stage,
-                        QueueStage::WaitingCredential | QueueStage::WaitingVertex
+                        QueueStage::WaitingCredential
+                            | QueueStage::WaitingVertex
+                            | QueueStage::PreparingProvider
+                            | QueueStage::WaitingIdentical
+                            | QueueStage::WaitingFinalReservation
                     )
             }) {
                 DispatchOutcome::Backpressured
@@ -2067,6 +2389,9 @@ impl PostprocessCoordinator {
             .expect("selected queue index exists");
         let call_id = queued.submission.request.call_id.clone();
         let lane = queued.submission.request.lane;
+        if queued.stage == QueueStage::WaitingIdentical {
+            queued.stage = QueueStage::NeedsCache;
+        }
 
         if !self
             .control
@@ -2079,19 +2404,51 @@ impl PostprocessCoordinator {
             };
         }
 
-        if lane == Lane::Final && !queued.final_prepared {
-            let boundary = final_boundary(&queued.submission);
-            if self.store.prepare_final(&boundary).is_err() {
-                self.finish_queued_failure(&queued, ErrorCode::Cache);
-                return DispatchOutcome::Failed {
-                    call_id,
-                    code: ErrorCode::Cache,
-                };
-            }
-            queued.final_prepared = true;
-        }
-
         if queued.stage == QueueStage::NeedsCache {
+            let transient = self
+                .transient_results
+                .get_mut(&queued.submission.request_key)
+                .map(|entry| {
+                    entry.remaining_waiters = entry.remaining_waiters.saturating_sub(1);
+                    (entry.output.clone(), entry.remaining_waiters == 0)
+                });
+            if let Some((output, exhausted)) = transient {
+                if exhausted {
+                    self.transient_results
+                        .remove(&queued.submission.request_key);
+                }
+                return self.finish_cache_hit(queued, output);
+            }
+            if lane == Lane::Final {
+                match self.store.lookup_final_recovery(
+                    &queued.submission.recording_id,
+                    queued.submission.request_key,
+                ) {
+                    Ok(FinalRecoveryLookup::Hit(hit)) => {
+                        return self.finish_recovery_hit(
+                            queued,
+                            hit.boundary,
+                            hit.output,
+                            hit.terminal,
+                        );
+                    }
+                    Ok(FinalRecoveryLookup::Mismatch) | Err(_) => {
+                        self.finish_queued_failure(&queued, ErrorCode::Cache);
+                        return DispatchOutcome::Failed {
+                            call_id,
+                            code: ErrorCode::Cache,
+                        };
+                    }
+                    Ok(FinalRecoveryLookup::None) if queued.submission.requires_final_recovery => {
+                        self.finish_queued_failure(&queued, ErrorCode::Cache);
+                        return DispatchOutcome::Failed {
+                            call_id,
+                            code: ErrorCode::Cache,
+                        };
+                    }
+                    Ok(FinalRecoveryLookup::None) => {}
+                }
+            }
             match self.store.lookup_exact(queued.submission.request_key) {
                 Ok(ExactLookup::Hit(output)) => {
                     return self.finish_cache_hit(queued, output);
@@ -2108,15 +2465,36 @@ impl PostprocessCoordinator {
                             code: ErrorCode::Cache,
                         };
                     }
-                    queued.stage = QueueStage::NeedsAuth;
+                    queued.stage = QueueStage::Prepared;
                 }
-                Ok(ExactLookup::Miss) => queued.stage = QueueStage::NeedsAuth,
+                Ok(ExactLookup::Miss) => queued.stage = QueueStage::Prepared,
                 Err(_) => {
                     self.finish_queued_failure(&queued, ErrorCode::Cache);
                     return DispatchOutcome::Failed {
                         call_id,
                         code: ErrorCode::Cache,
                     };
+                }
+            }
+        }
+
+        if lane == Lane::Final && queued.stage == QueueStage::Prepared && !queued.final_prepared {
+            let group_id = queued.submission.request.group_id.clone();
+            queued.stage = QueueStage::WaitingFinalReservation;
+            self.queue.push_back(queued);
+            match self.prepare_waiting_final_group(&group_id) {
+                Ok(_) => return DispatchOutcome::Waiting,
+                Err(code) => {
+                    let calls = self
+                        .queue
+                        .iter()
+                        .filter(|queued| queued.submission.request.group_id == group_id)
+                        .map(|queued| queued.submission.request.call_id.clone())
+                        .collect::<Vec<_>>();
+                    for failed in calls {
+                        self.fail_queued_call(&failed, code);
+                    }
+                    return DispatchOutcome::Failed { call_id, code };
                 }
             }
         }
@@ -2202,83 +2580,50 @@ impl PostprocessCoordinator {
                     queued.submission.request.provider.clone(),
                     queued.submission.request.transport.clone(),
                 );
-                let credential = if self
+                if self
                     .provider_states
                     .get(&provider_key)
                     .is_some_and(|state| state.credential == CredentialState::Rejected)
                 {
-                    CredentialState::Rejected
-                } else {
-                    self.providers.credential_state(
-                        &queued.submission.request.provider,
-                        &queued.submission.request.transport,
-                    )
-                };
-                self.publish_provider_credential(&queued, credential.clone());
-                match credential {
-                    CredentialState::Ready { .. } => queued.stage = QueueStage::ReadyForCatalog,
-                    CredentialState::Absent
-                    | CredentialState::Resolving
-                    | CredentialState::AwaitingUser
-                    | CredentialState::DeviceAuthorization { .. }
-                    | CredentialState::Refreshing => {
-                        queued.stage = QueueStage::WaitingCredential;
-                        if lane.is_question() {
-                            self.set_question_status(
-                                &call_id,
-                                QuestionStatusDto::WaitingForCredential,
-                                None,
-                            );
-                        }
-                        self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
-                            lane,
-                            state: LaneStateDto::Arming,
-                            code: None,
-                            fence: ui_fence(&queued.submission.request.fence),
-                        }));
-                        self.queue.push_back(queued);
-                        return DispatchOutcome::Waiting;
-                    }
-                    CredentialState::Rejected => {
-                        self.finish_queued_failure(&queued, ErrorCode::AuthRejected);
-                        return DispatchOutcome::Failed {
-                            call_id,
-                            code: ErrorCode::AuthRejected,
-                        };
-                    }
-                    CredentialState::Unsupported { code } | CredentialState::Error { code } => {
-                        self.finish_queued_failure(&queued, code);
-                        return DispatchOutcome::Failed { call_id, code };
-                    }
+                    self.finish_queued_failure(&queued, ErrorCode::AuthRejected);
+                    return DispatchOutcome::Failed {
+                        call_id,
+                        code: ErrorCode::AuthRejected,
+                    };
                 }
+                queued.stage = QueueStage::ReadyForCatalog;
             }
         }
 
         if queued.stage == QueueStage::ReadyForCatalog {
-            let catalog = self.providers.catalog(
-                &queued.submission.request.provider,
-                &queued.submission.request.transport,
-                &queued.submission.scope,
-            );
-            let catalog = match catalog {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    self.publish_service_error(&queued, error.code);
-                    self.finish_queued_failure(&queued, error.code);
-                    return DispatchOutcome::Failed {
-                        call_id,
-                        code: error.code,
-                    };
-                }
+            let credential_override = is_vertex(&queued.submission.request)
+                .then(|| self.vertex.state().credential_state());
+            let prepare = QueuedProviderPrepare {
+                call_id: call_id.clone(),
+                spec: ProviderPrepareSpec {
+                    provider: queued.submission.request.provider.clone(),
+                    transport: queued.submission.request.transport.clone(),
+                    scope: queued.submission.scope.clone(),
+                    credential_override,
+                    force_refresh: false,
+                },
             };
-            self.publish_catalog(&queued, &catalog);
-            if let Err(code) = validate_exact_model(&queued, &catalog) {
-                self.publish_service_error(&queued, code);
-                self.finish_queued_failure(&queued, code);
-                return DispatchOutcome::Failed { call_id, code };
-            }
+            queued.stage = QueueStage::PreparingProvider;
+            self.queue.push_back(queued);
+            return DispatchOutcome::Prepare(prepare);
         }
 
+        if self
+            .active
+            .values()
+            .any(|active| active.request_key == queued.submission.request_key)
+        {
+            // The first identical request owns provider egress. Re-enter exact lookup after it settles so a
+            // validated result fans out through the encrypted/memory cache instead of issuing a duplicate.
+            queued.stage = QueueStage::WaitingIdentical;
+            self.queue.push_back(queued);
+            return DispatchOutcome::Backpressured;
+        }
         if !self.has_provider_capacity(&queued) {
             self.queue.push_back(queued);
             return DispatchOutcome::Backpressured;
@@ -2289,6 +2634,27 @@ impl PostprocessCoordinator {
                 MonotonicDeadline(now.saturating_add(LIVE_TERMINAL_DEADLINE_MICROS));
         }
         if lane == Lane::Final {
+            if !queued.final_prepared {
+                let boundary = final_boundary(&queued.submission);
+                if self
+                    .store
+                    .prepare_final(
+                        &boundary,
+                        queued
+                            .submission
+                            .request_max_output_bytes
+                            .min(queued.submission.catalog_max_output_bytes),
+                    )
+                    .is_err()
+                {
+                    self.finish_queued_failure(&queued, ErrorCode::Cache);
+                    return DispatchOutcome::Failed {
+                        call_id,
+                        code: ErrorCode::Cache,
+                    };
+                }
+                queued.final_prepared = true;
+            }
             // Persist the ambiguous-dispatch boundary before handing any ticket to a transport thread. A
             // crash after this point may require explicit retry even if the OS never scheduled the worker,
             // but it can never silently repeat a paid request whose body may have left the process.
@@ -2309,6 +2675,7 @@ impl PostprocessCoordinator {
             call_id.clone(),
             ActiveCall {
                 sequence: queued.sequence,
+                request_key: submission.request_key,
                 recording_id: submission.recording_id.clone(),
                 context,
                 cancel: cancel.clone(),
@@ -2351,6 +2718,154 @@ impl PostprocessCoordinator {
         })
     }
 
+    pub(crate) fn provider_prepare_is_current(&self, request: &QueuedProviderPrepare) -> bool {
+        self.queue.iter().any(|queued| {
+            queued.submission.request.call_id == request.call_id
+                && queued.stage == QueueStage::PreparingProvider
+                && queued.submission.request.provider == request.spec.provider
+                && queued.submission.request.transport == request.spec.transport
+                && queued.submission.scope == request.spec.scope
+        })
+    }
+
+    pub(crate) fn complete_provider_prepare(
+        &mut self,
+        request: QueuedProviderPrepare,
+        preparation: ProviderPreparation,
+    ) -> DispatchOutcome {
+        let Some(index) = self.queue.iter().position(|queued| {
+            queued.submission.request.call_id == request.call_id
+                && queued.stage == QueueStage::PreparingProvider
+                && queued.submission.request.provider == request.spec.provider
+                && queued.submission.request.transport == request.spec.transport
+                && queued.submission.scope == request.spec.scope
+        }) else {
+            // Cancellation, a deadline, or a settings fence may have removed the call while resolution was
+            // blocked. Its late secret-free completion has no state to mutate.
+            return DispatchOutcome::Waiting;
+        };
+        let mut queued = self
+            .queue
+            .remove(index)
+            .expect("matched prepare queue index");
+        let call_id = queued.submission.request.call_id.clone();
+        let lane = queued.submission.request.lane;
+        self.publish_provider_credential(&queued, preparation.projected_credential);
+        match preparation.credential {
+            CredentialState::Ready { .. } => {
+                let Some(credential_identity) = preparation.credential_identity else {
+                    self.finish_queued_failure(&queued, ErrorCode::Internal);
+                    return DispatchOutcome::Failed {
+                        call_id,
+                        code: ErrorCode::Internal,
+                    };
+                };
+                queued.submission.request_key = queued
+                    .submission
+                    .request_key
+                    .bind_credential(&self.digest_key, &credential_identity);
+                if let Some(provider_key) = queued.submission.request.provider_cache_key.as_mut() {
+                    *provider_key =
+                        provider_key.bind_credential(&self.digest_key, &credential_identity);
+                }
+                let catalog = match preparation.catalog {
+                    Ok(catalog) => catalog,
+                    Err(code) => {
+                        self.publish_service_error(&queued, code);
+                        self.finish_queued_failure(&queued, code);
+                        return DispatchOutcome::Failed { call_id, code };
+                    }
+                };
+                self.publish_catalog(&queued, &catalog);
+                if let Err(code) = validate_exact_model(&queued, &catalog) {
+                    self.publish_service_error(&queued, code);
+                    self.finish_queued_failure(&queued, code);
+                    return DispatchOutcome::Failed { call_id, code };
+                }
+                queued.stage = QueueStage::NeedsCache;
+                self.queue.push_back(queued);
+                DispatchOutcome::Waiting
+            }
+            CredentialState::Absent
+            | CredentialState::Resolving
+            | CredentialState::AwaitingUser
+            | CredentialState::DeviceAuthorization { .. }
+            | CredentialState::Refreshing => {
+                queued.stage = QueueStage::WaitingCredential;
+                if lane.is_question() {
+                    self.set_question_status(
+                        &call_id,
+                        QuestionStatusDto::WaitingForCredential,
+                        None,
+                    );
+                }
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane,
+                    state: LaneStateDto::Arming,
+                    code: None,
+                    fence: ui_fence(&queued.submission.request.fence),
+                }));
+                self.queue.push_back(queued);
+                DispatchOutcome::Waiting
+            }
+            CredentialState::Rejected => {
+                self.finish_queued_failure(&queued, ErrorCode::AuthRejected);
+                DispatchOutcome::Failed {
+                    call_id,
+                    code: ErrorCode::AuthRejected,
+                }
+            }
+            CredentialState::Unsupported { code } | CredentialState::Error { code } => {
+                self.finish_queued_failure(&queued, code);
+                DispatchOutcome::Failed { call_id, code }
+            }
+        }
+    }
+
+    fn prepare_waiting_final_group(
+        &mut self,
+        group_id: &corti_postprocess::RequestGroupId,
+    ) -> Result<bool, ErrorCode> {
+        let group = self
+            .queue
+            .iter()
+            .filter(|queued| {
+                queued.submission.request.lane == Lane::Final
+                    && &queued.submission.request.group_id == group_id
+            })
+            .collect::<Vec<_>>();
+        if group.is_empty()
+            || group
+                .iter()
+                .any(|queued| queued.stage != QueueStage::WaitingFinalReservation)
+        {
+            return Ok(false);
+        }
+        let reservations = group
+            .iter()
+            .map(|queued| {
+                (
+                    final_boundary(&queued.submission),
+                    queued
+                        .submission
+                        .request_max_output_bytes
+                        .min(queued.submission.catalog_max_output_bytes),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.store.prepare_final_group(&reservations)?;
+        for queued in &mut self.queue {
+            if queued.submission.request.lane == Lane::Final
+                && &queued.submission.request.group_id == group_id
+                && queued.stage == QueueStage::WaitingFinalReservation
+            {
+                queued.final_prepared = true;
+                queued.stage = QueueStage::Prepared;
+            }
+        }
+        Ok(true)
+    }
+
     fn select_candidate(&self, now: u64) -> Option<usize> {
         let promoted_final = self
             .queue
@@ -2389,8 +2904,16 @@ impl PostprocessCoordinator {
         if now < queued.eligible_at_micros
             || matches!(
                 queued.stage,
-                QueueStage::WaitingCredential | QueueStage::WaitingVertex
+                QueueStage::WaitingCredential
+                    | QueueStage::WaitingVertex
+                    | QueueStage::PreparingProvider
+                    | QueueStage::WaitingFinalReservation
             )
+            || (queued.stage == QueueStage::WaitingIdentical
+                && self
+                    .active
+                    .values()
+                    .any(|active| active.request_key == queued.submission.request_key))
         {
             return false;
         }
@@ -2438,8 +2961,87 @@ impl PostprocessCoordinator {
             .count()
     }
 
-    fn finish_cache_hit(&mut self, queued: QueuedCall, output: ProviderOutput) -> DispatchOutcome {
+    fn finish_recovery_hit(
+        &mut self,
+        queued: QueuedCall,
+        boundary: FinalJournalBoundary,
+        output: ProviderOutput,
+        terminal: Option<TerminalTelemetryDto>,
+    ) -> DispatchOutcome {
         let call_id = queued.submission.request.call_id.clone();
+        if !self.transcript_application_is_current(
+            queued.submission.request.lane,
+            &queued.submission.request.fence,
+        ) {
+            self.finish_queued_failure(&queued, ErrorCode::Superseded);
+            return DispatchOutcome::Failed {
+                call_id,
+                code: ErrorCode::Superseded,
+            };
+        }
+        let validated = match validate_output(&queued.submission, output) {
+            Ok(output) => output,
+            Err(code) => {
+                self.finish_queued_failure(&queued, code);
+                return DispatchOutcome::Failed { call_id, code };
+            }
+        };
+        let mut terminal = terminal.unwrap_or_else(|| {
+            self.telemetry_for_queued(
+                &queued,
+                TerminalOutcomeDto::Completed,
+                None,
+                false,
+                false,
+                CacheObservation::Local,
+                NormalizedUsage::unknown(),
+                CostEstimate::no_provider_request(),
+                LatencyFields::default(),
+                None,
+            )
+        });
+        if let Err(code) = self.prepare_waiting_final_group(&queued.submission.request.group_id) {
+            self.finish_queued_failure(&queued, code);
+            return DispatchOutcome::Failed { call_id, code };
+        }
+        // Legacy journals may not contain terminal telemetry. Bind synthesized metadata to the durable call
+        // rather than publishing the throwaway recovery-attempt identity.
+        terminal.call_id = boundary.call_id.clone();
+        terminal.request_group_id = boundary.request_group_id.clone();
+        self.awaiting_final_apply.insert(
+            boundary.call_id.clone(),
+            AwaitingFinalApply {
+                boundary: boundary.clone(),
+                application_fence: queued.submission.request.fence.clone(),
+                terminal,
+            },
+        );
+        DispatchOutcome::CacheApply(ApplyReady {
+            call_id,
+            journal_call_id: Some(boundary.call_id),
+            lane: Lane::Final,
+            fence: queued.submission.request.fence,
+            output: validated,
+            recovery_committed: true,
+        })
+    }
+
+    fn finish_cache_hit(
+        &mut self,
+        mut queued: QueuedCall,
+        output: ProviderOutput,
+    ) -> DispatchOutcome {
+        let call_id = queued.submission.request.call_id.clone();
+        if !self.transcript_application_is_current(
+            queued.submission.request.lane,
+            &queued.submission.request.fence,
+        ) {
+            self.finish_queued_failure(&queued, ErrorCode::Superseded);
+            return DispatchOutcome::Failed {
+                call_id,
+                code: ErrorCode::Superseded,
+            };
+        }
         let cache_output = output.clone();
         let validated = match validate_output(&queued.submission, output) {
             Ok(output) => output,
@@ -2463,6 +3065,28 @@ impl PostprocessCoordinator {
         );
         let final_boundary = (queued.submission.request.lane == Lane::Final)
             .then(|| final_boundary(&queued.submission));
+        if let Some(boundary) = final_boundary.as_ref()
+            && !queued.final_prepared
+        {
+            if self
+                .store
+                .prepare_final(
+                    boundary,
+                    queued
+                        .submission
+                        .request_max_output_bytes
+                        .min(queued.submission.catalog_max_output_bytes),
+                )
+                .is_err()
+            {
+                self.finish_queued_failure(&queued, ErrorCode::Cache);
+                return DispatchOutcome::Failed {
+                    call_id,
+                    code: ErrorCode::Cache,
+                };
+            }
+            queued.final_prepared = true;
+        }
         let store_result = if let Some(boundary) = final_boundary.as_ref() {
             self.store.commit_validated(StoreCommit {
                 request_key: queued.submission.request_key,
@@ -2474,7 +3098,7 @@ impl PostprocessCoordinator {
                 telemetry: &telemetry,
             })
         } else {
-            self.store.record_terminal(&telemetry)
+            Ok(())
         };
         if store_result.is_err() {
             self.finish_queued_failure(&queued, ErrorCode::Cache);
@@ -2483,19 +3107,47 @@ impl PostprocessCoordinator {
                 code: ErrorCode::Cache,
             };
         }
-        self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
-        self.finish_question_success(&call_id, &validated, &telemetry);
-        if let Some(boundary) = final_boundary {
-            self.awaiting_final_apply.insert(call_id.clone(), boundary);
+        if queued.submission.request.lane == Lane::Final
+            && let Err(code) = self.prepare_waiting_final_group(&queued.submission.request.group_id)
+        {
+            if let Some(boundary) = final_boundary.as_ref() {
+                let _ = self.store.abandon_final(boundary);
+            }
+            self.finish_queued_failure(&queued, code);
+            return DispatchOutcome::Failed { call_id, code };
         }
-        self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
-            lane: queued.submission.request.lane,
-            state: LaneStateDto::Clean,
-            code: None,
-            fence: ui_fence(&queued.submission.request.fence),
-        }));
+        match queued.submission.request.lane {
+            Lane::Final => {
+                let boundary = final_boundary.expect("Final cache hit prepared a journal");
+                self.awaiting_final_apply.insert(
+                    call_id.clone(),
+                    AwaitingFinalApply {
+                        boundary,
+                        application_fence: queued.submission.request.fence.clone(),
+                        terminal: telemetry.clone(),
+                    },
+                );
+            }
+            Lane::Live => {
+                self.pending_live_applications
+                    .insert(call_id.clone(), telemetry.clone());
+            }
+            Lane::PinnedQuestion | Lane::AdHocQuestion => {
+                let _ = self.store.record_terminal(&telemetry);
+                self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
+                self.finish_question_success(&call_id, &validated, &telemetry);
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane: queued.submission.request.lane,
+                    state: LaneStateDto::Clean,
+                    code: None,
+                    fence: ui_fence(&queued.submission.request.fence),
+                }));
+                self.after_lane_completion(queued.submission.request.lane);
+            }
+        }
         DispatchOutcome::CacheApply(ApplyReady {
             call_id,
+            journal_call_id: None,
             lane: queued.submission.request.lane,
             fence: queued.submission.request.fence.clone(),
             output: validated,
@@ -2606,13 +3258,17 @@ impl PostprocessCoordinator {
         let controls_current = self
             .control
             .fence_controls_are_current(lane, &ticket.call.request.fence);
+        let transcript_current =
+            self.transcript_application_is_current(lane, &ticket.call.request.fence);
         let deadline_expired = ticket
             .call
             .request
             .deadline
             .is_expired_at(self.clock.monotonic_micros());
         let stale_reason = canceled_reason
-            .or_else(|| (!controls_current).then_some(CancellationReason::Superseded))
+            .or_else(|| {
+                (!controls_current || !transcript_current).then_some(CancellationReason::Superseded)
+            })
             .or_else(|| deadline_expired.then_some(CancellationReason::Deadline));
 
         let (terminal_usage, latency, cache, output, provider_error) = match result {
@@ -2755,27 +3411,73 @@ impl PostprocessCoordinator {
             if let Some(boundary) = final_boundary.as_ref() {
                 let _ = self.store.abandon_final(boundary);
             }
-            self.finish_question_failure(&call_id, ErrorCode::Cache, &telemetry);
+            let mut failed = telemetry.clone();
+            failed.outcome = TerminalOutcomeDto::Failed;
+            failed.error = Some(ErrorCode::Cache);
+            let _ = self.store.record_terminal(&failed);
+            self.push_terminal_events(&failed, AccountingFinalityDto::Final);
+            self.finish_question_failure(&call_id, ErrorCode::Cache, &failed);
+            self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                lane,
+                state: LaneStateDto::Failed,
+                code: Some(ErrorCode::Cache),
+                fence: ui_fence(&ticket.call.request.fence),
+            }));
             self.after_lane_completion(lane);
             return CompletionOutcome::Failed {
                 call_id,
                 code: ErrorCode::Cache,
             };
         }
-        self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
-        self.finish_question_success(&call_id, &validated, &telemetry);
-        if let Some(boundary) = final_boundary {
-            self.awaiting_final_apply.insert(call_id.clone(), boundary);
+        let waiter_count = self
+            .queue
+            .iter()
+            .filter(|queued| {
+                queued.stage == QueueStage::WaitingIdentical
+                    && queued.submission.request_key == ticket.call.request_key
+            })
+            .count();
+        if waiter_count > 0 {
+            self.transient_results.insert(
+                ticket.call.request_key,
+                TransientResult {
+                    output: cache_output,
+                    remaining_waiters: waiter_count,
+                },
+            );
         }
-        self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
-            lane,
-            state: LaneStateDto::Clean,
-            code: None,
-            fence: ui_fence(&ticket.call.request.fence),
-        }));
-        self.after_lane_completion(lane);
+        match lane {
+            Lane::Final => {
+                let boundary = final_boundary.expect("Final provider result committed a journal");
+                self.awaiting_final_apply.insert(
+                    call_id.clone(),
+                    AwaitingFinalApply {
+                        boundary,
+                        application_fence: ticket.call.request.fence.clone(),
+                        terminal: telemetry.clone(),
+                    },
+                );
+            }
+            Lane::Live => {
+                self.pending_live_applications
+                    .insert(call_id.clone(), telemetry.clone());
+            }
+            Lane::PinnedQuestion | Lane::AdHocQuestion => {
+                let _ = self.store.record_terminal(&telemetry);
+                self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
+                self.finish_question_success(&call_id, &validated, &telemetry);
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane,
+                    state: LaneStateDto::Clean,
+                    code: None,
+                    fence: ui_fence(&ticket.call.request.fence),
+                }));
+                self.after_lane_completion(lane);
+            }
+        }
         CompletionOutcome::Apply(ApplyReady {
             call_id,
+            journal_call_id: None,
             lane,
             fence: ticket.call.request.fence.clone(),
             output: validated,
@@ -2796,9 +3498,64 @@ impl PostprocessCoordinator {
         self.trim_ad_hoc();
     }
 
+    fn transcript_application_is_current(&self, lane: Lane, fence: &RequestFence) -> bool {
+        lane != Lane::Live
+            || (fence.session_generation == self.watermark.session_generation
+                && fence.transcript_revision == self.watermark.transcript_revision)
+    }
+
     pub(crate) fn application_is_current(&self, apply: &ApplyReady) -> bool {
         self.control
             .fence_controls_are_current(apply.lane, &apply.fence)
+            && self.transcript_application_is_current(apply.lane, &apply.fence)
+    }
+
+    pub(crate) fn acknowledge_live_application(
+        &mut self,
+        call_id: &CallId,
+        result: Result<(), ErrorCode>,
+    ) -> Result<(), CoordinatorError> {
+        let mut telemetry = self
+            .pending_live_applications
+            .remove(call_id)
+            .ok_or(CoordinatorError::UnknownCall)?;
+        match result {
+            Ok(()) => {
+                if self.store.record_terminal(&telemetry).is_err() {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        call_id = %call_id,
+                        "Live application succeeded but history outbox persistence failed"
+                    );
+                }
+                self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane: Lane::Live,
+                    state: LaneStateDto::Clean,
+                    code: None,
+                    fence: ui_fence(&telemetry.fence),
+                }));
+            }
+            Err(code) => {
+                telemetry.outcome = if code == ErrorCode::Superseded {
+                    TerminalOutcomeDto::Superseded
+                } else {
+                    TerminalOutcomeDto::Failed
+                };
+                telemetry.error = Some(code);
+                telemetry.late_content_discarded = true;
+                let _ = self.store.record_terminal(&telemetry);
+                self.push_terminal_events(&telemetry, AccountingFinalityDto::Final);
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane: Lane::Live,
+                    state: LaneStateDto::UsingRaw,
+                    code: Some(code),
+                    fence: ui_fence(&telemetry.fence),
+                }));
+            }
+        }
+        self.after_lane_completion(Lane::Live);
+        Ok(())
     }
 
     pub(crate) fn cancel_call(&mut self, call_id: &CallId, reason: CancellationReason) -> bool {
@@ -2818,8 +3575,8 @@ impl PostprocessCoordinator {
             self.finish_queued_canceled(&queued, reason);
             return true;
         }
-        if let Some(boundary) = self.awaiting_final_apply.remove(call_id) {
-            let _ = self.store.abandon_final(&boundary);
+        if let Some(awaiting) = self.awaiting_final_apply.remove(call_id) {
+            let _ = self.store.abandon_final(&awaiting.boundary);
             return true;
         }
         false
@@ -2835,25 +3592,29 @@ impl PostprocessCoordinator {
         &mut self,
         call_ids: &[CallId],
     ) -> Result<(), CoordinatorError> {
-        let mut boundaries = Vec::with_capacity(call_ids.len());
+        let mut awaiting = Vec::with_capacity(call_ids.len());
         for call_id in call_ids {
-            boundaries.push(
+            awaiting.push(
                 self.awaiting_final_apply
                     .get(call_id)
                     .cloned()
                     .ok_or(CoordinatorError::UnknownCall)?,
             );
         }
-        if boundaries.iter().any(|boundary| {
+        if awaiting.iter().any(|entry| {
             !self
                 .control
-                .fence_controls_are_current(Lane::Final, &boundary.fence)
+                .fence_controls_are_current(Lane::Final, &entry.application_fence)
         }) {
-            for boundary in &boundaries {
-                let _ = self.store.abandon_final(boundary);
+            for entry in &awaiting {
+                let _ = self.store.abandon_final(&entry.boundary);
             }
             return Err(CoordinatorError::StaleApplication);
         }
+        let boundaries = awaiting
+            .iter()
+            .map(|entry| entry.boundary.clone())
+            .collect::<Vec<_>>();
         self.store
             .mark_final_group_applied(&boundaries)
             .map_err(|_| CoordinatorError::Store)
@@ -2870,18 +3631,41 @@ impl PostprocessCoordinator {
         &mut self,
         call_ids: &[CallId],
     ) -> Result<(), CoordinatorError> {
-        let mut boundaries = Vec::with_capacity(call_ids.len());
-        for call_id in call_ids {
-            boundaries.push(
-                self.awaiting_final_apply
-                    .get(call_id)
-                    .cloned()
-                    .ok_or(CoordinatorError::UnknownCall)?,
-            );
-        }
+        let awaiting = call_ids
+            .iter()
+            .map(|call_id| self.awaiting_final_apply.get(call_id).cloned())
+            .collect::<Option<Vec<_>>>();
+        let boundaries = if let Some(entries) = awaiting.as_ref() {
+            entries
+                .iter()
+                .map(|entry| entry.boundary.clone())
+                .collect::<Vec<_>>()
+        } else {
+            // A FilingCheckpoint can outlive the coordinator process. Recover its already-Applied journal
+            // boundaries by the content-free call ids and make acknowledgement retryable after restart.
+            self.store
+                .recover_final_boundaries(call_ids)
+                .map_err(|_| CoordinatorError::Store)?
+        };
         self.store
             .mark_final_group_checkpointed(&boundaries)
             .map_err(|_| CoordinatorError::Store)?;
+        if let Some(entries) = awaiting {
+            for entry in entries {
+                self.push_terminal_events(&entry.terminal, AccountingFinalityDto::Final);
+            }
+            if let Some(entry) = call_ids
+                .first()
+                .and_then(|call_id| self.awaiting_final_apply.get(call_id))
+            {
+                self.push_event(CoordinatorEventDto::LaneState(LaneStateEventDto {
+                    lane: Lane::Final,
+                    state: LaneStateDto::Clean,
+                    code: None,
+                    fence: ui_fence(&entry.application_fence),
+                }));
+            }
+        }
         for call_id in call_ids {
             self.awaiting_final_apply.remove(call_id);
         }
@@ -3078,6 +3862,16 @@ impl PostprocessCoordinator {
                 if let Some(boundary) = active.final_boundary.as_ref() {
                     let _ = self.store.abandon_final(boundary);
                 }
+            }
+        }
+        if matches(Lane::Live) {
+            let pending_live = self
+                .pending_live_applications
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            for call_id in pending_live {
+                let _ = self.acknowledge_live_application(&call_id, Err(ErrorCode::Superseded));
             }
         }
         let mut retained = VecDeque::with_capacity(self.queue.len());
@@ -3432,7 +4226,6 @@ fn validate_exact_model(queued: &QueuedCall, catalog: &ModelCatalog) -> Result<(
         || !model.capabilities.text_input
         || !model.capabilities.text_output
         || !model.capabilities.structured_output
-        || (request.lane == Lane::Live && !model.benchmarked_for_live)
     {
         return Err(ErrorCode::PolicyBlocked);
     }
@@ -3546,8 +4339,8 @@ fn cancellation_outcome(reason: CancellationReason) -> (TerminalOutcomeDto, Erro
     }
 }
 
-/// Bounded hot-path handoff. Only `try_send` is exposed, so capture/live-ASR code cannot accidentally wait
-/// behind cache, auth, provider, or store work.
+/// Bounded hot-path handoff. Capture/live-ASR uses only `try_send`; the separate blocking barrier is reserved
+/// for the already-finished ASR/final boundary and cannot enter a capture callback.
 pub(crate) struct CoordinatorIngress {
     sender: SyncSender<HotPathCommand>,
 }
@@ -3569,6 +4362,8 @@ pub(crate) enum HotPathCommand {
         submission: Box<RequestSubmission>,
         watermark: TranscriptWatermark,
     },
+    /// Off-hot-path FIFO fence used after ASR is complete, before a final request snapshots the ledger.
+    Barrier { reply: Sender<()> },
 }
 
 impl fmt::Debug for HotPathCommand {
@@ -3587,6 +4382,7 @@ impl fmt::Debug for HotPathCommand {
                 .field("submission", submission)
                 .field("watermark", watermark)
                 .finish(),
+            Self::Barrier { .. } => f.write_str("Barrier(<reply>)"),
         }
     }
 }
@@ -3614,6 +4410,16 @@ impl CoordinatorIngress {
             TrySendError::Full(_) => IngressError::Full,
             TrySendError::Disconnected(_) => IngressError::Disconnected,
         })
+    }
+
+    /// Wait until every earlier ingress item has been observed. This is intentionally blocking and may be
+    /// called only after capture/ASR is complete; the hot path above exposes `try_send` only.
+    pub(crate) fn barrier(&self) -> Result<(), IngressError> {
+        let (reply, receive) = std::sync::mpsc::channel();
+        self.sender
+            .send(HotPathCommand::Barrier { reply })
+            .map_err(|_| IngressError::Disconnected)?;
+        receive.recv().map_err(|_| IngressError::Disconnected)
     }
 }
 
@@ -3757,7 +4563,11 @@ mod tests {
             Ok(())
         }
 
-        fn prepare_final(&mut self, boundary: &FinalJournalBoundary) -> Result<(), ErrorCode> {
+        fn prepare_final(
+            &mut self,
+            boundary: &FinalJournalBoundary,
+            _output_reserve_bytes: usize,
+        ) -> Result<(), ErrorCode> {
             let mut state = self.0.lock().unwrap();
             state.trace.push("prepared");
             state
@@ -3855,7 +4665,7 @@ mod tests {
 
     impl ProviderAccess for FakeProviders {
         fn descriptor(
-            &mut self,
+            &self,
             provider: &ProviderId,
             transport: &TransportId,
         ) -> Option<ProviderDescriptor> {
@@ -3864,7 +4674,7 @@ mod tests {
         }
 
         fn credential_state(
-            &mut self,
+            &self,
             _provider: &ProviderId,
             _transport: &TransportId,
         ) -> CredentialState {
@@ -3874,7 +4684,7 @@ mod tests {
         }
 
         fn catalog(
-            &mut self,
+            &self,
             provider: &ProviderId,
             transport: &TransportId,
             scope: &ProviderScope,
@@ -3964,6 +4774,7 @@ mod tests {
             let coordinator = PostprocessCoordinator::new(
                 ProcessEpoch(77),
                 Arc::new(clock.clone()),
+                Arc::new(DigestKey::new([77; 32])),
                 Box::new(FakePersistence(persistence.clone())),
                 Box::new(FakeStore(store.clone())),
                 Box::new(FakeProviders(providers.clone())),
@@ -4007,6 +4818,31 @@ mod tests {
             self.coordinator
                 .apply_patch(ControlPatch::SetMaster(true))
                 .unwrap();
+        }
+
+        /// Most coordinator unit tests are about scheduling after provider preparation. Drive the injected
+        /// fake synchronously here; service-level tests exercise the real asynchronous worker boundary.
+        fn dispatch_next(&mut self) -> DispatchOutcome {
+            loop {
+                match self.coordinator.dispatch_next() {
+                    DispatchOutcome::Prepare(request) => {
+                        let providers = self.coordinator.provider_access();
+                        let preparation = prepare_provider(providers.as_ref(), &request.spec);
+                        let outcome = self
+                            .coordinator
+                            .complete_provider_prepare(request, preparation);
+                        if matches!(outcome, DispatchOutcome::Failed { .. }) {
+                            return outcome;
+                        }
+                    }
+                    DispatchOutcome::Waiting
+                        if self.coordinator.queue.iter().any(|queued| {
+                            queued.stage == QueueStage::Prepared
+                                && queued.eligible_at_micros <= self.clock.now()
+                        }) => {}
+                    outcome => return outcome,
+                }
+            }
         }
     }
 
@@ -4123,6 +4959,7 @@ mod tests {
                 effective_steering: "fixture steering",
                 targets: &target_rows,
                 context: &context_rows,
+                context_truncated: false,
                 question: lane.is_question().then_some("fixture question"),
             },
         );
@@ -4138,6 +4975,7 @@ mod tests {
             targets: target_rows,
             context: context_rows,
             prompt,
+            provider_cache_key: None,
             deadline: MonotonicDeadline(now.saturating_add(120_000_000)),
             cache_policy: fixture_cache_policy(),
         };
@@ -4252,7 +5090,46 @@ mod tests {
     }
 
     #[test]
-    fn final_exact_cache_is_checked_before_auth_and_recovery_committed_before_apply() {
+    fn provider_configuration_fence_does_not_cancel_unrelated_transports() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Live, KnownTransport::OpenAiDirect);
+        harness.enable_master();
+        let target = row(1, "fixture live", 0, 1_000);
+        let watermark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&target))
+            .unwrap();
+        harness
+            .coordinator
+            .submit_live(
+                submission(
+                    "provider-specific-fence",
+                    Lane::Live,
+                    KnownTransport::OpenAiDirect,
+                    harness.clock.now(),
+                    vec![target],
+                    Vec::new(),
+                ),
+                watermark,
+            )
+            .unwrap();
+        harness.clock.advance(LIVE_DEBOUNCE_MICROS);
+        let dispatched = ticket(harness.dispatch_next());
+        let anthropic = KnownTransport::AnthropicDirect.descriptor();
+        harness
+            .coordinator
+            .cancel_provider_requests(&anthropic.provider, &anthropic.transport);
+        assert!(!dispatched.cancellation().is_cancelled());
+
+        let openai = KnownTransport::OpenAiDirect.descriptor();
+        harness
+            .coordinator
+            .cancel_provider_requests(&openai.provider, &openai.transport);
+        assert!(dispatched.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn final_auth_identity_precedes_exact_cache_and_recovery_is_committed_before_apply() {
         let mut harness = Harness::new();
         harness.configure(LaneFamily::Final, KnownTransport::OpenAiDirect);
         harness.enable_master();
@@ -4284,7 +5161,7 @@ mod tests {
             )
             .unwrap();
 
-        let apply = match harness.coordinator.dispatch_next() {
+        let apply = match harness.dispatch_next() {
             DispatchOutcome::CacheApply(apply) => apply,
             other => panic!("expected cache apply, got {other:?}"),
         };
@@ -4292,9 +5169,9 @@ mod tests {
         assert!(harness.coordinator.application_is_current(&apply));
         assert_eq!(
             harness.store.lock().unwrap().trace,
-            ["prepared", "lookup", "commit"]
+            ["lookup", "prepared", "commit"]
         );
-        assert!(!harness.providers.lock().unwrap().trace.contains(&"auth"));
+        assert!(harness.providers.lock().unwrap().trace.contains(&"auth"));
         let telemetry = harness
             .store
             .lock()
@@ -4378,12 +5255,9 @@ mod tests {
             .unwrap();
 
         harness.clock.advance(LIVE_DEBOUNCE_MICROS - 1);
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Waiting
-        ));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
         harness.clock.advance(1);
-        let dispatched = ticket(harness.coordinator.dispatch_next());
+        let dispatched = ticket(harness.dispatch_next());
         assert_eq!(dispatched.request().call_id.as_str(), "live-new");
         assert!(
             !harness.coordinator.queue.iter().any(|queued| queued
@@ -4393,6 +5267,120 @@ mod tests {
                 .as_str()
                 == "live-old")
         );
+    }
+
+    #[test]
+    fn late_live_result_is_superseded_by_a_newer_transcript_revision() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Live, KnownTransport::OpenAiDirect);
+        harness.enable_master();
+        let first = row(1, "first fixture phrase", 0, 1_000);
+        let first_mark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&first))
+            .unwrap();
+        harness
+            .coordinator
+            .submit_live(
+                submission(
+                    "late-live",
+                    Lane::Live,
+                    KnownTransport::OpenAiDirect,
+                    harness.clock.now(),
+                    vec![first.clone()],
+                    Vec::new(),
+                ),
+                first_mark,
+            )
+            .unwrap();
+        harness.clock.advance(LIVE_DEBOUNCE_MICROS);
+        let dispatched = ticket(harness.dispatch_next());
+
+        let newer = row(2, "newer fixture phrase", 1_000, 2_000);
+        harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&newer))
+            .unwrap();
+        let outcome = harness.coordinator.complete(
+            dispatched,
+            Ok(terminal(
+                rewrite_output(&first, "late clean text"),
+                complete_usage(),
+            )),
+        );
+        assert!(matches!(
+            outcome,
+            CompletionOutcome::Discarded {
+                code: ErrorCode::Superseded,
+                ..
+            }
+        ));
+        assert!(harness.store.lock().unwrap().commits.is_empty());
+    }
+
+    #[test]
+    fn live_terminal_success_waits_for_atomic_application_acknowledgement() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Live, KnownTransport::OpenAiDirect);
+        harness.enable_master();
+        let target = row(1, "fixture raw", 0, 1_000);
+        let watermark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&target))
+            .unwrap();
+        harness
+            .coordinator
+            .submit_live(
+                submission(
+                    "live-apply-ack",
+                    Lane::Live,
+                    KnownTransport::OpenAiDirect,
+                    harness.clock.now(),
+                    vec![target.clone()],
+                    Vec::new(),
+                ),
+                watermark,
+            )
+            .unwrap();
+        harness.clock.advance(LIVE_DEBOUNCE_MICROS);
+        let dispatched = ticket(harness.dispatch_next());
+        let apply = match harness.coordinator.complete(
+            dispatched,
+            Ok(terminal(
+                rewrite_output(&target, "fixture clean"),
+                complete_usage(),
+            )),
+        ) {
+            CompletionOutcome::Apply(apply) => apply,
+            other => panic!("expected application boundary, got {other:?}"),
+        };
+        let before_ack = harness.coordinator.take_events();
+        assert!(!before_ack.iter().any(|event| matches!(
+            event,
+            CoordinatorEventDto::Terminal(terminal)
+                if terminal.outcome == TerminalOutcomeDto::Completed
+        )));
+
+        harness
+            .coordinator
+            .acknowledge_live_application(&apply.call_id, Err(ErrorCode::Superseded))
+            .unwrap();
+        let after_ack = harness.coordinator.take_events();
+        assert!(after_ack.iter().any(|event| matches!(
+            event,
+            CoordinatorEventDto::Terminal(terminal)
+                if terminal.outcome == TerminalOutcomeDto::Superseded
+        )));
+        assert!(!after_ack.iter().any(|event| matches!(
+            event,
+            CoordinatorEventDto::Terminal(terminal)
+                if terminal.outcome == TerminalOutcomeDto::Completed
+        )));
+        assert!(after_ack.iter().any(|event| matches!(
+            event,
+            CoordinatorEventDto::LaneState(state)
+                if state.lane == Lane::Live && state.state == LaneStateDto::UsingRaw
+        )));
     }
 
     #[test]
@@ -4437,10 +5425,10 @@ mod tests {
         assert_eq!(overflow, Err(SubmitError::AdHocQueueFull));
         assert_eq!(harness.coordinator.question_summaries().len(), 8);
 
-        let first = ticket(harness.coordinator.dispatch_next());
+        let first = ticket(harness.dispatch_next());
         assert_eq!(first.request().call_id.as_str(), "question-0");
         assert!(matches!(
-            harness.coordinator.dispatch_next(),
+            harness.dispatch_next(),
             DispatchOutcome::Backpressured | DispatchOutcome::Waiting
         ));
         let first_id = first.request().call_id.clone();
@@ -4460,7 +5448,7 @@ mod tests {
                 .answer,
             Some("fixture answer")
         );
-        let second = ticket(harness.coordinator.dispatch_next());
+        let second = ticket(harness.dispatch_next());
         assert_eq!(second.request().call_id.as_str(), "question-1");
     }
 
@@ -4491,7 +5479,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let first = ticket(harness.coordinator.dispatch_next());
+        let first = ticket(harness.dispatch_next());
         let outcome = harness
             .coordinator
             .complete(first, Err(ErrorCode::AuthRejected.into()));
@@ -4577,10 +5565,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS);
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Empty
-        ));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Empty));
 
         let threshold = row(2, "w39", 29_999, 30_000);
         let mark_40 = harness
@@ -4602,10 +5587,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS - 1);
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Empty
-        ));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Empty));
         harness.clock.advance(1);
         harness.coordinator.tick();
         assert!(
@@ -4639,7 +5621,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS);
-        let first = ticket(harness.coordinator.dispatch_next());
+        let first = ticket(harness.dispatch_next());
         assert_eq!(first.request().call_id.as_str(), "pinned-newest-pending");
         assert_eq!(harness.coordinator.pinned_run_count(), 1);
 
@@ -4675,13 +5657,82 @@ mod tests {
             )),
         );
         assert!(matches!(completed, CompletionOutcome::Apply(_)));
-        let rerun = ticket(harness.coordinator.dispatch_next());
+        let rerun = ticket(harness.dispatch_next());
         assert_eq!(rerun.request().call_id.as_str(), "pinned-rerun");
         assert_eq!(harness.coordinator.pinned_run_count(), 2);
         assert!(matches!(
-            harness.coordinator.dispatch_next(),
+            harness.dispatch_next(),
             DispatchOutcome::Waiting | DispatchOutcome::Empty | DispatchOutcome::Backpressured
         ));
+    }
+
+    #[test]
+    fn recovery_only_identical_finals_share_one_provider_egress_via_transient_fanout() {
+        let mut harness = Harness::new();
+        harness.configure(LaneFamily::Final, KnownTransport::OpenAiDirect);
+        let mut selection = harness
+            .coordinator
+            .control_snapshot()
+            .final_lane
+            .selection
+            .clone();
+        selection.cache_policy.local = LocalCacheMode::RecoveryOnly;
+        harness
+            .coordinator
+            .apply_patch(ControlPatch::SetLaneSelection {
+                lane: LaneFamily::Final,
+                selection,
+            })
+            .unwrap();
+        harness.enable_master();
+        let target = row(1, "identical final fixture", 0, 1_000);
+        let watermark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&target))
+            .unwrap();
+        for call in ["identical-final-a", "identical-final-b"] {
+            let mut request = submission(
+                call,
+                Lane::Final,
+                KnownTransport::OpenAiDirect,
+                harness.clock.now(),
+                vec![target.clone()],
+                Vec::new(),
+            );
+            request.request.cache_policy.local = LocalCacheMode::RecoveryOnly;
+            harness
+                .coordinator
+                .submit_final(request, watermark)
+                .unwrap();
+        }
+
+        let first = ticket(harness.dispatch_next());
+        assert!(matches!(
+            harness.dispatch_next(),
+            DispatchOutcome::Backpressured
+        ));
+        let cached_output = rewrite_output(&target, "shared clean fixture");
+        assert!(matches!(
+            harness
+                .coordinator
+                .complete(first, Ok(terminal(cached_output, complete_usage()))),
+            CompletionOutcome::Apply(_)
+        ));
+        assert!(matches!(
+            harness.dispatch_next(),
+            DispatchOutcome::CacheApply(_)
+        ));
+        assert_eq!(
+            harness
+                .store
+                .lock()
+                .unwrap()
+                .trace
+                .iter()
+                .filter(|entry| **entry == "dispatched")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -4730,7 +5781,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
-        let first = ticket(harness.coordinator.dispatch_next());
+        let first = ticket(harness.dispatch_next());
         assert_eq!(first.request().call_id.as_str(), "promoted-final");
     }
 
@@ -4782,12 +5833,12 @@ mod tests {
                 .unwrap();
         }
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
-        let live = ticket(harness.coordinator.dispatch_next());
+        let live = ticket(harness.dispatch_next());
         assert_eq!(live.request().call_id.as_str(), "capacity-live");
-        let first_final = ticket(harness.coordinator.dispatch_next());
+        let first_final = ticket(harness.dispatch_next());
         assert_eq!(first_final.request().call_id.as_str(), "capacity-final-0");
         assert!(matches!(
-            harness.coordinator.dispatch_next(),
+            harness.dispatch_next(),
             DispatchOutcome::Backpressured
         ));
         assert!(
@@ -4825,7 +5876,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
-        let dispatched = ticket(harness.coordinator.dispatch_next());
+        let dispatched = ticket(harness.dispatch_next());
         harness
             .coordinator
             .on_provider_event(provider_event(
@@ -4928,10 +5979,7 @@ mod tests {
             )
             .unwrap();
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Waiting
-        ));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
 
         let newest_row = row(2, "fixture newest", 500, 1_000);
         let newest_mark = harness
@@ -4990,10 +6038,7 @@ mod tests {
             .unwrap();
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
         for _ in 0..4 {
-            assert!(matches!(
-                harness.coordinator.dispatch_next(),
-                DispatchOutcome::Waiting
-            ));
+            assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
         }
         let notices: Vec<_> = harness
             .coordinator
@@ -5035,21 +6080,19 @@ mod tests {
                 == "vertex-expiring-final")
         );
         assert!(
-            harness
+            !harness
                 .store
                 .lock()
                 .unwrap()
                 .journal
                 .iter()
-                .any(|(call, state)| {
-                    call.as_str() == "vertex-expiring-final"
-                        && *state == FinalJournalState::Abandoned
-                })
+                .any(|(call, _)| call.as_str() == "vertex-expiring-final"),
+            "a credential-waiting request that expires before egress needs no recovery journal"
         );
 
-        let live = ticket(harness.coordinator.dispatch_next());
+        let live = ticket(harness.dispatch_next());
         assert_eq!(live.request().call_id.as_str(), "vertex-new");
-        let question = ticket(harness.coordinator.dispatch_next());
+        let question = ticket(harness.dispatch_next());
         assert_eq!(question.request().call_id.as_str(), "vertex-question-0");
         assert_eq!(
             harness
@@ -5108,14 +6151,8 @@ mod tests {
                 watermark,
             )
             .unwrap();
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Waiting
-        ));
-        assert!(matches!(
-            harness.coordinator.dispatch_next(),
-            DispatchOutcome::Waiting
-        ));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
+        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
         let attempt = harness.coordinator.drive_vertex().unwrap();
         harness
             .coordinator
@@ -5126,8 +6163,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let first = ticket(harness.coordinator.dispatch_next());
-        let second = ticket(harness.coordinator.dispatch_next());
+        let first = ticket(harness.dispatch_next());
+        let second = ticket(harness.dispatch_next());
         let calls = [
             first.request().call_id.as_str(),
             second.request().call_id.as_str(),
@@ -5172,7 +6209,7 @@ mod tests {
             .unwrap();
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
         assert!(matches!(
-            harness.coordinator.dispatch_next(),
+            harness.dispatch_next(),
             DispatchOutcome::Failed {
                 code: ErrorCode::Permission,
                 ..
@@ -5289,6 +6326,7 @@ mod tests {
         assert!(!format!("{request:?}").contains(sensitive_fixture));
         let apply = ApplyReady {
             call_id: CallId::new("redacted-apply").unwrap(),
+            journal_call_id: None,
             lane: Lane::Live,
             fence: dummy_fence(),
             output: ValidatedOutput::Rewrite { rows: vec![target] },

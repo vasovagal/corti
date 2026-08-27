@@ -464,6 +464,7 @@ fn hosted_request(
         targets: vec![target],
         context: Vec::new(),
         prompt,
+        provider_cache_key: None,
         deadline: MonotonicDeadline(10_000_000),
         cache_policy: CachePolicy {
             local: LocalCacheMode::MemoryOnly,
@@ -1253,6 +1254,40 @@ fn vertex_publisher_capabilities_and_cache_policy_follow_the_model_id() {
         .execute(&off, &CancellationToken::new(), &CollectingSink::default())
         .unwrap();
     assert_eq!(handle.captured().len(), 1);
+}
+
+#[test]
+fn openai_uses_the_precomputed_opaque_request_cache_key() {
+    let (handle, transport) = FakeTransportHandle::new([
+        Script::json(OPENAI_MODEL_LIST),
+        Script::sse(openai_stream()),
+    ]);
+    let (_, credential_source) = credentials();
+    let mut adapter = OpenAiResponsesAdapter::new(
+        Box::new(transport),
+        Box::new(FakeClock::new(100)),
+        credential_source,
+    );
+    adapter.catalog(&scope()).unwrap();
+    let expected = provider_cache_key();
+    let mut request = hosted_request(
+        KnownTransport::OpenAiDirect,
+        OPENAI_LUNA_MODEL_ID,
+        ProviderCacheMode::ExplicitStablePrefix,
+    );
+    request.provider_cache_key = Some(expected.clone());
+    adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap();
+    let captured = handle.captured();
+    assert_eq!(
+        captured[1].body.as_ref().unwrap()["prompt_cache_key"],
+        expected.as_str()
+    );
 }
 
 #[test]

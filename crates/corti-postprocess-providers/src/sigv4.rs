@@ -30,6 +30,19 @@ pub struct AwsCredentials {
     expires_at_unix_ms: Option<i64>,
 }
 
+// A resolver lease keeps one zeroizing copy while each signer receives a short-lived zeroizing copy. The
+// fields remain private and Debug-redacted; cloning never exposes credential bytes outside this type.
+impl Clone for AwsCredentials {
+    fn clone(&self) -> Self {
+        Self {
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
+            expires_at_unix_ms: self.expires_at_unix_ms,
+        }
+    }
+}
+
 impl AwsCredentials {
     pub fn new(
         access_key_id: impl Into<String>,
@@ -37,20 +50,28 @@ impl AwsCredentials {
         session_token: Option<String>,
         expires_at_unix_ms: Option<i64>,
     ) -> Result<Self, AwsCredentialsError> {
-        let access_key_id = access_key_id.into();
-        let secret_access_key = secret_access_key.into();
-        if access_key_id.is_empty() || secret_access_key.is_empty() {
-            return Err(AwsCredentialsError::Empty);
-        }
+        let mut access_key_id = access_key_id.into();
+        let mut secret_access_key = secret_access_key.into();
+        let mut session_token = session_token;
+        let error = if access_key_id.is_empty() || secret_access_key.is_empty() {
+            Some(AwsCredentialsError::Empty)
         // The access key id and session token are placed on the wire as header values verbatim.
-        if !access_key_id.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(AwsCredentialsError::InvalidHeaderValue);
-        }
-        if session_token
-            .as_ref()
-            .is_some_and(|token| token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()))
+        } else if !access_key_id.bytes().all(|byte| byte.is_ascii_graphic())
+            || session_token.as_ref().is_some_and(|token| {
+                token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic())
+            })
         {
-            return Err(AwsCredentialsError::InvalidHeaderValue);
+            Some(AwsCredentialsError::InvalidHeaderValue)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            access_key_id.zeroize();
+            secret_access_key.zeroize();
+            if let Some(token) = session_token.as_mut() {
+                token.zeroize();
+            }
+            return Err(error);
         }
         Ok(Self {
             access_key_id,
@@ -62,6 +83,12 @@ impl AwsCredentials {
 
     pub const fn expires_at_unix_ms(&self) -> Option<i64> {
         self.expires_at_unix_ms
+    }
+
+    /// Internal-only stable identity for the resolved lease. The access-key id is never returned; callers
+    /// receive only a fixed SHA-256 value that they bind again through Corti's keyed cache domain.
+    pub fn cache_identity(&self) -> [u8; 32] {
+        Sha256::digest(self.access_key_id.as_bytes()).into()
     }
 }
 

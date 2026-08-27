@@ -19,6 +19,9 @@ Generated Retina PNGs land in ignored `screenshots/output/`:
 
 - `live-transcript.png`
 - `live-rewriting-assistant.png`
+- `hosted-onboarding-live.png`
+- `question-policy-repair.png`
+- `pinned-waiting-guidance.png`
 - `live-assistant-drawer.png`
 - `live-diff-cost-{desktop,narrow}.png`
 - `assistant-pinned-{desktop,narrow}.png`

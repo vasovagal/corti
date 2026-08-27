@@ -25,6 +25,11 @@ use std::time::Duration;
 /// About eleven seconds / four MiB of mono 48 kHz PCM: bounded slack after the model is already loaded.
 #[cfg(feature = "local")]
 const TEST_TEE_BACKLOG: usize = 128;
+/// Match the real live final assembly's independent bound; overflow keeps Live/questions working but skips
+/// the all-or-nothing test final instead of growing with microphone-test duration.
+#[cfg(feature = "local")]
+const MAX_TEST_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MICROPHONE_TEST_RECORDING_PREFIX: &str = "microphone-test-";
 
 pub(crate) struct LiveTestManager {
     inner: Mutex<Option<TestSlot>>,
@@ -33,6 +38,7 @@ pub(crate) struct LiveTestManager {
     live: Arc<crate::live::LiveManager>,
     config: SharedConfig,
     transcript: LiveTranscriptStore,
+    hosted: Option<crate::postprocess_app::HostedHandle>,
 }
 
 #[derive(Default)]
@@ -89,11 +95,50 @@ struct TestSession {
     handle: JoinHandle<()>,
 }
 
+#[cfg(feature = "local")]
+struct TestFinalTranscript {
+    rows: Vec<corti_postprocess::TranscriptRow>,
+    bytes: usize,
+    complete: bool,
+}
+
+#[cfg(feature = "local")]
+impl TestFinalTranscript {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            bytes: 0,
+            complete: true,
+        }
+    }
+
+    fn retain(&mut self, rows: Vec<corti_postprocess::TranscriptRow>) {
+        if !self.complete {
+            return;
+        }
+        let added = rows.iter().fold(0usize, |total, row| {
+            total
+                .saturating_add(row.text.len())
+                .saturating_add(row.speaker.len())
+                .saturating_add(64)
+        });
+        if self.bytes.saturating_add(added) > MAX_TEST_FINAL_TRANSCRIPT_BYTES {
+            self.rows.clear();
+            self.bytes = 0;
+            self.complete = false;
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(added);
+        self.rows.extend(rows);
+    }
+}
+
 impl LiveTestManager {
     pub(crate) fn new(
         live: Arc<crate::live::LiveManager>,
         config: SharedConfig,
         transcript: LiveTranscriptStore,
+        hosted: Option<crate::postprocess_app::HostedHandle>,
     ) -> Self {
         Self {
             inner: Mutex::new(None),
@@ -102,6 +147,7 @@ impl LiveTestManager {
             live,
             config,
             transcript,
+            hosted,
         }
     }
 
@@ -227,7 +273,7 @@ impl LiveTestManager {
             return Ok(());
         }
 
-        let id = format!("microphone-test-{generation}");
+        let id = format!("{MICROPHONE_TEST_RECORDING_PREFIX}{generation}");
         self.transcript.begin_test(&id);
         crate::tray::set_status(app, "Loading microphone transcription test…".to_string());
 
@@ -235,7 +281,7 @@ impl LiveTestManager {
         let worker_app = app.clone();
         let worker_store = self.transcript.clone();
         let worker_live = self.live.clone();
-        let worker_id = id.clone();
+        let worker_hosted = self.hosted.clone();
         let handle = match std::thread::Builder::new()
             .name("corti-live-test".into())
             .spawn(move || {
@@ -245,7 +291,7 @@ impl LiveTestManager {
                     cfg,
                     worker_store,
                     worker_live,
-                    worker_id,
+                    worker_hosted,
                     stop_rx,
                 );
             }) {
@@ -336,7 +382,11 @@ impl LiveTestManager {
                     ..
                 }) => {
                     *stop_requested = true;
-                    (format!("microphone-test-{generation}"), *generation, false)
+                    (
+                        format!("{MICROPHONE_TEST_RECORDING_PREFIX}{generation}"),
+                        *generation,
+                        false,
+                    )
                 }
                 None => return,
             }
@@ -379,12 +429,37 @@ fn run_test_worker(
     cfg: AppConfig,
     transcript: LiveTranscriptStore,
     live: Arc<crate::live::LiveManager>,
-    id: String,
+    hosted: Option<crate::postprocess_app::HostedHandle>,
     stop_rx: Receiver<()>,
 ) {
+    let id = format!("{MICROPHONE_TEST_RECORDING_PREFIX}{generation}");
+    // The test owns a real but ephemeral hosted session so Live cleanup and both question modes exercise the
+    // same path as a call. Failure stays optional: raw microphone transcription still works independently.
+    let hosted_started = hosted
+        .as_ref()
+        .is_some_and(|handle| handle.begin_live_session(&id).is_ok());
+    let active_hosted = if hosted_started {
+        hosted.as_ref()
+    } else {
+        None
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_microphone_test(app, &cfg, &transcript, &id, &stop_rx)
+        run_microphone_test(
+            app,
+            generation,
+            &cfg,
+            &transcript,
+            active_hosted,
+            &id,
+            &stop_rx,
+        )
     }));
+    if hosted_started && let Some(handle) = hosted.as_ref() {
+        // Final already placed this fence when enabled; otherwise it ensures the finish-only tail is still
+        // visible to Live/pinned scheduling before EndSession's priority command clears the ephemeral ledger.
+        let _ = handle.flush_finalized_rows();
+        let _ = handle.end_live_session(&id);
+    }
     let status = match result {
         Ok(Ok(detail)) => {
             transcript.set_complete(&id, detail.clone());
@@ -416,13 +491,14 @@ fn run_test_worker(
 #[cfg(feature = "local")]
 fn run_microphone_test(
     app: &AppHandle,
+    _generation: u64,
     cfg: &AppConfig,
     transcript: &LiveTranscriptStore,
+    hosted: Option<&crate::postprocess_app::HostedHandle>,
     id: &str,
     stop_rx: &Receiver<()>,
 ) -> Result<String> {
     use corti_capture::{CaptureChunk, CaptureTee, MicrophoneCapture};
-    use corti_core::Speaker;
     use corti_transcribe_local::{LocalConfig, LocalTranscriber};
 
     let engine = LocalTranscriber::new(LocalConfig {
@@ -451,13 +527,22 @@ fn run_microphone_test(
         "Listening to this microphone only — say a sentence, then pause.",
     );
     crate::tray::set_status(app, "● Microphone test — listening".to_string());
+    let mut hosted_rows = TestFinalTranscript::new();
 
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(chunk) => publish_test_chunk(&mut channel, chunk, sample_rate, transcript, id),
+            Ok(chunk) => publish_test_chunk(
+                &mut channel,
+                chunk,
+                sample_rate,
+                transcript,
+                hosted,
+                id,
+                &mut hosted_rows,
+            ),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("microphone capture ended unexpectedly")
@@ -467,11 +552,21 @@ fn run_microphone_test(
 
     let quality = capture.stop().context("stopping microphone capture")?;
     while let Ok(chunk) = rx.try_recv() {
-        publish_test_chunk(&mut channel, chunk, sample_rate, transcript, id);
+        publish_test_chunk(
+            &mut channel,
+            chunk,
+            sample_rate,
+            transcript,
+            hosted,
+            id,
+            &mut hosted_rows,
+        );
     }
     let tail = channel.finish();
-    transcript.append_words(id, Speaker::Me, &tail);
+    publish_test_words(transcript, hosted, id, &tail, &mut hosted_rows);
 
+    let final_detail =
+        hosted.and_then(|handle| run_test_final(app, transcript, handle, id, &hosted_rows));
     let gaps = quality.dropped_samples > 0 || quality.tee_dropped_chunks > 0;
     tracing::info!(
         target: "corti::live_test",
@@ -482,14 +577,38 @@ fn run_microphone_test(
         dropped_chunks = quality.tee_dropped_chunks,
         "microphone transcription test finished"
     );
-    Ok(if gaps {
+    let capture_detail = if gaps {
         "Test complete, but capture dropped audio; the displayed transcript may have gaps."
             .to_string()
     } else if quality.frames == 0 {
         "Test stopped before the microphone delivered audio.".to_string()
     } else {
-        "Test complete — no audio or transcript was saved.".to_string()
-    })
+        "Test complete — no recording or note was saved.".to_string()
+    };
+    Ok(final_detail.map_or(capture_detail.clone(), |detail| {
+        format!("{capture_detail} {detail}")
+    }))
+}
+
+#[cfg(feature = "local")]
+fn publish_test_words(
+    transcript: &LiveTranscriptStore,
+    hosted: Option<&crate::postprocess_app::HostedHandle>,
+    id: &str,
+    words: &[corti_transcribe::segment::Word],
+    retained: &mut TestFinalTranscript,
+) {
+    use corti_core::Speaker;
+
+    // Match real-call ordering: raw UI first, then the bounded optional hosted handoff.
+    let rows = transcript.append_words(id, Speaker::Me, words);
+    if rows.is_empty() {
+        return;
+    }
+    if let Some(handle) = hosted {
+        let _ = handle.try_observe_finalized_rows(id, rows.clone());
+    }
+    retained.retain(rows);
 }
 
 #[cfg(feature = "local")]
@@ -498,24 +617,109 @@ fn publish_test_chunk(
     chunk: corti_capture::CaptureChunk,
     sample_rate: u32,
     transcript: &LiveTranscriptStore,
+    hosted: Option<&crate::postprocess_app::HostedHandle>,
     id: &str,
+    retained: &mut TestFinalTranscript,
 ) {
-    use corti_core::Speaker;
-
     if chunk.mic.is_empty() {
         return;
     }
     channel.push(&chunk.mic, sample_rate);
     if let Some(words) = channel.poll_words() {
-        transcript.append_words(id, Speaker::Me, &words);
+        publish_test_words(transcript, hosted, id, &words, retained);
     }
+}
+
+#[cfg(feature = "local")]
+fn run_test_final(
+    app: &AppHandle,
+    transcript: &LiveTranscriptStore,
+    hosted: &crate::postprocess_app::HostedHandle,
+    id: &str,
+    retained: &TestFinalTranscript,
+) -> Option<String> {
+    use corti_core::{DiarizedTranscript, Speaker, TranscriptSegment};
+
+    let settings = hosted.snapshot();
+    let final_lane = &settings.control.final_lane;
+    let configured = settings.control.master_enabled
+        && final_lane.enabled
+        && final_lane.selection.provider.is_some()
+        && final_lane.selection.transport.is_some()
+        && final_lane.selection.model.is_some();
+    if !configured {
+        return None;
+    }
+    if !retained.complete {
+        return Some(
+            "Final rewrite was skipped because this long test exceeded its bounded final context; raw text remains visible."
+                .to_string(),
+        );
+    }
+    let rows = &retained.rows;
+    if rows.is_empty() {
+        return None;
+    }
+
+    transcript.set_stopping(
+        id,
+        "Microphone closed — running the configured final rewrite…",
+    );
+    crate::tray::set_status(app, "Finalizing microphone rewrite test…".to_string());
+    let raw = DiarizedTranscript::new(
+        rows.iter()
+            .map(|row| TranscriptSegment {
+                speaker: if row.speaker == "Me" {
+                    Speaker::Me
+                } else {
+                    Speaker::Other(row.speaker.clone())
+                },
+                start: row.start_ms as f64 / 1_000.0,
+                end: row.end_ms as f64 / 1_000.0,
+                text: row.text.clone(),
+            })
+            .collect(),
+    );
+    let settled = hosted.finalize(id, raw, true);
+    let mut detail = settled
+        .fallback_code
+        .map(|code| format!("Final rewrite used raw fallback ({code})."))
+        .unwrap_or_else(|| "Final rewrite did not change the test transcript.".to_string());
+
+    if settled.hosted_text_applied
+        && settled.transcript.segments.len() == rows.len()
+        && hosted.mark_final_applied(&settled.call_ids).is_ok()
+    {
+        let rewritten = rows
+            .iter()
+            .zip(&settled.transcript.segments)
+            .map(|(raw, clean)| corti_postprocess::TranscriptRow {
+                text: clean.text.clone(),
+                ..raw.clone()
+            })
+            .collect::<Vec<_>>();
+        if let Some(revision) = transcript.hosted_transcript_revision(id)
+            && matches!(
+                transcript.apply_hosted_rows(id, &rewritten, revision),
+                crate::live_view::HostedRowsApplyOutcome::Applied { .. }
+            )
+        {
+            detail = "Final rewrite applied to this test view.".to_string();
+        }
+    }
+    // A microphone test has no durable filing checkpoint. Retire its final journal rather than leaving a
+    // recovery record that could be mistaken for an interrupted real recording.
+    let _ = hosted.abandon_final_result(&settled.call_ids);
+    Some(detail)
 }
 
 #[cfg(not(feature = "local"))]
 fn run_microphone_test(
     _app: &AppHandle,
+    _generation: u64,
     _cfg: &AppConfig,
     _transcript: &LiveTranscriptStore,
+    _hosted: Option<&crate::postprocess_app::HostedHandle>,
     _id: &str,
     _stop_rx: &Receiver<()>,
 ) -> Result<String> {
@@ -571,6 +775,7 @@ mod tests {
             Arc::new(crate::live::LiveManager::new()),
             Arc::new(Mutex::new(AppConfig::default())),
             LiveTranscriptStore::detached(),
+            None,
         )
     }
 
@@ -607,6 +812,22 @@ mod tests {
             "stale destruction cannot close replacement"
         );
         assert!(lifecycle.is_current(second));
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn microphone_test_final_assembly_is_bounded_and_uses_a_js_safe_epoch() {
+        let mut retained = TestFinalTranscript::new();
+        retained.bytes = MAX_TEST_FINAL_TRANSCRIPT_BYTES;
+        retained.retain(vec![corti_postprocess::TranscriptRow {
+            row_id: corti_postprocess::RowId::new("bounded-test-row").unwrap(),
+            speaker: "Me".to_string(),
+            start_ms: 0,
+            end_ms: 1,
+            text: "one more byte".to_string(),
+        }]);
+        assert!(!retained.complete);
+        assert!(retained.rows.is_empty());
     }
 
     #[test]

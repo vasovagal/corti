@@ -302,18 +302,23 @@ pub(crate) mod imp {
                 crate::console::save_console_logs,
                 crate::stats::get_stats,
                 crate::activity::get_pipeline_activity,
+                crate::tray::open_preferences_section,
+                crate::tray::take_preferences_section_request,
                 crate::live_view::get_live_transcript,
                 crate::postprocess_app::get_hosted_settings,
                 crate::postprocess_app::patch_hosted_settings,
                 crate::postprocess_app::update_hosted_steering,
                 crate::postprocess_app::replace_hosted_word_bank,
                 crate::postprocess_app::update_hosted_provider_scope,
+                crate::postprocess_app::purge_hosted_reusable_cache,
                 crate::postprocess_app::refresh_hosted_provider,
                 crate::postprocess_app::submit_hosted_question,
                 crate::postprocess_app::cancel_hosted_question,
                 crate::postprocess_app::set_hosted_pinned_question,
                 crate::postprocess_app::get_hosted_assistant,
                 crate::postprocess_app::list_aws_credential_options,
+                crate::postprocess_app::save_bedrock_setup,
+                crate::postprocess_app::clear_bedrock_setup,
                 crate::postprocess_app::set_bedrock_credential_mode,
                 crate::postprocess_app::set_hosted_vertex_models,
                 crate::postprocess_app::start_chatgpt_device_login,
@@ -368,6 +373,7 @@ pub(crate) mod imp {
 
         // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
         app.manage(AppState::new());
+        app.manage(crate::tray::PreferencesNavigation::default());
 
         // Transient, bounded timestamped transcript state. The same clone feeds call/test workers; managing
         // it exposes open-late snapshots to the singleton Live Transcript webview.
@@ -418,6 +424,7 @@ pub(crate) mod imp {
             live_manager.clone(),
             shared_cfg.clone(),
             live_transcript.clone(),
+            Some(hosted.clone()),
         ));
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned

@@ -511,6 +511,24 @@ mod tests {
     }
 
     #[test]
+    fn continuous_synthetic_speech_windowing_stays_bounded_beyond_twenty_seconds() {
+        let mut wb = WindowBuffer::default();
+        let chunk = vec![0.1; 160];
+        let chunks = TARGET_RATE as usize * 25 / chunk.len();
+        let mut max_retained = 0usize;
+        for _ in 0..chunks {
+            if wb.extend(&chunk) > 0 {
+                let released = wb.take_windows();
+                assert_eq!(released.len() % VAD_WINDOW, 0);
+            }
+            max_retained = max_retained.max(wb.buf.len());
+        }
+        assert!(max_retained < VAD_WINDOW);
+        assert!(wb.buf.capacity() <= VAD_WINDOW * 2);
+        assert!(wb.fed >= (TARGET_RATE as u64 * 25).saturating_sub(VAD_WINDOW as u64));
+    }
+
+    #[test]
     fn checkpoint_epoch_offsets_remain_call_relative() {
         let minute = TARGET_RATE as u64 * 60;
         assert_eq!(absolute_offset_sec(0, minute), 60.0);

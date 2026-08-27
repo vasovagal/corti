@@ -14,8 +14,15 @@ import {
   type HostedAssistantSnapshot,
   type HostedPatchInput,
   type HostedSettingsDto,
+  type PreferencesSection,
 } from "../lib/api";
-import { errorLabel } from "../lib/hosted";
+import {
+  errorLabel,
+  hostedErrorGuidance,
+  laneConfigurationGuidance,
+  unknownHostedErrorGuidance,
+  type HostedActionGuidance,
+} from "../lib/hosted";
 import {
   boundAssistantExchanges,
   cacheObservationLabel,
@@ -30,6 +37,7 @@ interface AssistantProps {
   snapshot: HostedAssistantSnapshot | null;
   settings: HostedSettingsDto | null;
   calls: LiveCallDetail[];
+  sessionActive: boolean;
   detailsEnabled: boolean;
   loading: boolean;
   error: string;
@@ -37,12 +45,14 @@ interface AssistantProps {
   onClose?: () => void;
   onRefresh: () => Promise<void>;
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
+  onOpenPreferences: (section: PreferencesSection) => Promise<void>;
 }
 
 export function Assistant({
   snapshot,
   settings,
   calls,
+  sessionActive,
   detailsEnabled,
   loading,
   error,
@@ -50,10 +60,11 @@ export function Assistant({
   onClose,
   onRefresh,
   onPatch,
+  onOpenPreferences,
 }: AssistantProps) {
   const [question, setQuestion] = useState("");
   const [questionBusy, setQuestionBusy] = useState("");
-  const [questionError, setQuestionError] = useState("");
+  const [questionError, setQuestionError] = useState<HostedActionGuidance | null>(null);
   const [pinnedDraft, setPinnedDraft] = useState("");
   const [pinnedDirty, setPinnedDirty] = useState(false);
   const [pinnedSaveState, setPinnedSaveState] = useState("");
@@ -86,8 +97,12 @@ export function Assistant({
       void setHostedPinnedQuestion(observedRevision, pinnedDraft)
         .then(async (result) => {
           if (pinnedSaveSequence.current !== sequence) return;
-          if (result.status === "conflict") {
-            setPinnedSaveState("Settings changed; review and try again");
+          if (result.status === "conflict" || result.status === "invalid") {
+            setPinnedSaveState(
+              result.status === "conflict"
+                ? "Settings changed; review and try again"
+                : "Template was invalid; nothing was saved",
+            );
             await onRefresh();
             return;
           }
@@ -114,8 +129,15 @@ export function Assistant({
   const pinnedAnswerIsEarlier = Boolean(
     shownPinnedAnswer && pinned && pinned.status !== "completed" && !pinned.answer,
   );
+  const questionConfiguration = settings
+    ? laneConfigurationGuidance(settings, "question")
+    : null;
+  const questionsConfigured = Boolean(settings && !questionConfiguration);
   const questionsReady = Boolean(
-    settings?.control.master_enabled && settings.control.questions.enabled,
+    sessionActive &&
+      questionsConfigured &&
+      settings?.control.master_enabled &&
+      settings.control.questions.enabled,
   );
   const templatePresent = Boolean(
     settings && (settings.control.pinned_question_revision > 0 || pinnedDraft.trim()),
@@ -126,13 +148,13 @@ export function Assistant({
     const value = question.trim();
     if (!value || questionBusy) return;
     setQuestionBusy("submit");
-    setQuestionError("");
+    setQuestionError(null);
     try {
       await submitHostedQuestion(value);
       setQuestion("");
       await onRefresh();
     } catch (reason) {
-      setQuestionError(`Question failed: ${String(reason)}`);
+      setQuestionError(unknownHostedErrorGuidance(reason));
     } finally {
       setQuestionBusy("");
     }
@@ -141,12 +163,12 @@ export function Assistant({
   async function cancelQuestion(callId: string) {
     if (questionBusy) return;
     setQuestionBusy(callId);
-    setQuestionError("");
+    setQuestionError(null);
     try {
       await cancelHostedQuestion(callId);
       await onRefresh();
     } catch (reason) {
-      setQuestionError(`Cancel failed: ${String(reason)}`);
+      setQuestionError(unknownHostedErrorGuidance(reason));
     } finally {
       setQuestionBusy("");
     }
@@ -176,7 +198,14 @@ export function Assistant({
       </p>
 
       {loading && !snapshot && <p className="live-assistant-loading">Loading assistant…</p>}
-      {error && <p className="live-assistant-error" role="alert">{error}</p>}
+      {error && (
+        <div className="live-assistant-remedy" role="alert">
+          <span>{error}</span>
+          <button className="btn-secondary" type="button" onClick={() => void onRefresh()}>
+            Try again
+          </button>
+        </div>
+      )}
 
       <section className="live-pinned-card" aria-labelledby="live-pinned-heading">
         <header>
@@ -212,6 +241,15 @@ export function Assistant({
         >
           {pinnedSaveState || "Edits save after 500 ms of quiet."}
         </p>
+        {pinnedSaveState.startsWith("Save failed") && (
+          <button
+            className="btn-quiet live-inline-repair"
+            type="button"
+            onClick={() => void onOpenPreferences("hosted-language")}
+          >
+            Edit pinned question in Preferences
+          </button>
+        )}
 
         {settings && (
           <HostedSwitch
@@ -222,7 +260,7 @@ export function Assistant({
                 : "Off · enabling requires repeated-cost acknowledgement."
             }
             checked={settings.control.pinned_auto_enabled}
-            disabled={!templatePresent || !settings.control.questions.enabled}
+            disabled={!templatePresent || !settings.control.questions.enabled || !questionsConfigured}
             onChange={(enabled) => {
               if (enabled) setConfirmAuto(true);
               else {
@@ -235,6 +273,24 @@ export function Assistant({
           />
         )}
 
+        {templatePresent && (
+          <p className="live-pinned-guidance">
+            {!sessionActive
+              ? "Start the microphone test or join a live call to run this question."
+              : questionConfiguration
+                ? questionConfiguration.message
+                : !settings?.control.questions.enabled
+                  ? "Enable Questions to run the pinned question."
+                  : !settings.control.master_enabled
+                    ? "Turn on Master to allow the pinned question to run."
+                    : !settings.control.pinned_auto_enabled
+                      ? "Turn on Automatic updates to run this question as the transcript grows."
+                      : (snapshot?.pinned_run_count ?? 0) === 0
+                        ? "Waiting for enough context: about 40 words or 30 seconds of speech, followed by a short pause. Existing context counts after setup."
+                        : "The next update runs after about 40 new words or 30 seconds of new speech and a short pause."}
+          </p>
+        )}
+
         {pinned ? (
           <QuestionResult
             exchange={pinned}
@@ -242,6 +298,7 @@ export function Assistant({
             answerIsEarlier={pinnedAnswerIsEarlier}
             call={calls.find((item) => item.call_id === pinned.call_id)}
             detailsEnabled={detailsEnabled}
+            onOpenPreferences={onOpenPreferences}
           />
         ) : (
           <p className="live-answer-placeholder">
@@ -256,7 +313,15 @@ export function Assistant({
             <h3 id="live-thread-heading">Ad-hoc thread</h3>
             <span>{exchanges.length} / 20 retained</span>
           </div>
-          {!settings?.control.questions.enabled && settings && (
+          {settings && !questionsConfigured ? (
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => void onOpenPreferences(questionConfiguration?.section ?? "hosted-routing")}
+            >
+              Configure questions
+            </button>
+          ) : settings && !settings.control.questions.enabled ? (
             <button
               className="btn-secondary"
               type="button"
@@ -269,7 +334,24 @@ export function Assistant({
             >
               Enable questions
             </button>
-          )}
+          ) : settings && !settings.control.master_enabled ? (
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => {
+                if (!settings.control.egress_acknowledged) {
+                  void onOpenPreferences("hosted");
+                } else {
+                  void onPatch(
+                    { kind: "set_master", enabled: true },
+                    "Master enabled for the next question.",
+                  );
+                }
+              }}
+            >
+              {settings.control.egress_acknowledged ? "Turn on Master" : "Review privacy"}
+            </button>
+          ) : null}
         </div>
         <form className="live-question-form" onSubmit={(event) => void submitQuestion(event)}>
           <label htmlFor="live-question">Ask about the transcript as it stands now</label>
@@ -279,7 +361,17 @@ export function Assistant({
             maxLength={32 * 1024}
             value={question}
             disabled={!questionsReady || questionBusy === "submit"}
-            placeholder={questionsReady ? "Ask one grounded question" : "Enable Master and Questions first"}
+            placeholder={
+              questionsReady
+                ? "Ask one grounded question"
+                : !sessionActive
+                  ? "Start the microphone test or join a live call first"
+                  : !questionsConfigured
+                    ? "Configure a Questions model in Preferences first"
+                    : !settings?.control.questions.enabled
+                      ? "Enable Questions first"
+                      : "Turn on Master first"
+            }
             onChange={(event) => setQuestion(event.target.value)}
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
@@ -299,7 +391,20 @@ export function Assistant({
             </button>
           </div>
         </form>
-        {questionError && <p className="live-assistant-error" role="alert">{questionError}</p>}
+        {questionError && (
+          <div className="live-assistant-remedy" role="alert">
+            <span>Question failed. {questionError.message}</span>
+            {questionError.section && questionError.actionLabel && (
+              <button
+                className="btn-secondary"
+                type="button"
+                onClick={() => void onOpenPreferences(questionError.section!)}
+              >
+                {questionError.actionLabel}
+              </button>
+            )}
+          </div>
+        )}
         {omitted > 0 && <p className="live-thread-omitted">{omitted} older exchange(s) omitted.</p>}
         {exchanges.length === 0 ? (
           <p className="live-answer-placeholder">No ad-hoc questions in this session.</p>
@@ -313,6 +418,7 @@ export function Assistant({
                   answerIsEarlier={false}
                   call={calls.find((item) => item.call_id === exchange.call_id)}
                   detailsEnabled={detailsEnabled}
+                  onOpenPreferences={onOpenPreferences}
                   onCancel={
                     ["queued", "waiting_for_credential", "running"].includes(exchange.status)
                       ? () => void cancelQuestion(exchange.call_id)
@@ -355,6 +461,7 @@ function QuestionResult({
   answerIsEarlier,
   call,
   detailsEnabled,
+  onOpenPreferences,
   onCancel,
   canceling = false,
 }: {
@@ -363,6 +470,7 @@ function QuestionResult({
   answerIsEarlier: boolean;
   call: LiveCallDetail | undefined;
   detailsEnabled: boolean;
+  onOpenPreferences: (section: PreferencesSection) => Promise<void>;
   onCancel?: () => void;
   canceling?: boolean;
 }) {
@@ -371,6 +479,7 @@ function QuestionResult({
   const tokens = usage ? tokenEntries(usage) : [];
   const cache = exchange.cache ?? call?.cache;
   const failed = exchange.status === "failed" || exchange.status === "canceled";
+  const failureGuidance = exchange.error ? hostedErrorGuidance(exchange.error) : null;
   return (
     <article className={`live-answer live-answer-${exchange.status}`}>
       <header>
@@ -390,6 +499,20 @@ function QuestionResult({
         </p>
       ) : (
         <p className="live-answer-running">{questionStatusLabel(exchange.status)}…</p>
+      )}
+      {failureGuidance && (
+        <div className="live-answer-remedy">
+          <span>{failureGuidance.message}</span>
+          {failureGuidance.section && failureGuidance.actionLabel && (
+            <button
+              className="btn-quiet"
+              type="button"
+              onClick={() => void onOpenPreferences(failureGuidance.section!)}
+            >
+              {failureGuidance.actionLabel}
+            </button>
+          )}
+        </div>
       )}
       {exchange.context_truncated && <p className="live-context-note">Earlier transcript omitted.</p>}
       <div className="live-answer-accounting">

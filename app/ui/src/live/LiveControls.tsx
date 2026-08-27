@@ -5,10 +5,12 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import type {
+  HostedLane,
   HostedLaneState,
   HostedPatchInput,
   HostedSettingsDto,
 } from "../lib/api";
+import { laneConfigurationGuidance } from "../lib/hosted";
 import { laneStateLabel } from "../lib/liveHosted";
 
 export type TranscriptView = "raw" | "clean" | "changes";
@@ -69,6 +71,7 @@ export function LiveHostedControls({
   onPatch,
   onSteering,
   onBlockedEnable,
+  onConfigurationNeeded,
 }: {
   settings: HostedSettingsDto | null;
   liveState: HostedLaneState;
@@ -79,6 +82,7 @@ export function LiveHostedControls({
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
   onSteering: (text: string, persist: boolean) => Promise<boolean>;
   onBlockedEnable: () => void;
+  onConfigurationNeeded: (lane: HostedLane) => void;
 }) {
   const [steeringOpen, setSteeringOpen] = useState(false);
   const [steering, setSteering] = useState("");
@@ -112,6 +116,8 @@ export function LiveHostedControls({
   const master = settings?.control.master_enabled ?? false;
   const live = settings?.control.live.enabled ?? false;
   const final = settings?.control.final_lane.enabled ?? false;
+  const liveNeedsSetup = settings ? laneConfigurationGuidance(settings, "live") !== null : true;
+  const finalNeedsSetup = settings ? laneConfigurationGuidance(settings, "final") !== null : true;
 
   return (
     <section className="live-hosted-controls" aria-label="Hosted session controls">
@@ -139,24 +145,32 @@ export function LiveHostedControls({
           checked={live}
           disabled={disabled}
           pending={busy === "live"}
-          onChange={(enabled) =>
+          onChange={(enabled) => {
+            if (enabled && liveNeedsSetup) {
+              onConfigurationNeeded("live");
+              return;
+            }
             void onPatch(
               { kind: "set_lane_enabled", lane: "live", enabled },
               enabled ? "Live cleanup enabled." : "Live cleanup disabled; raw stays visible.",
-            )
-          }
+            );
+          }}
         />
         <LiveSwitch
           label="Final"
           checked={final}
           disabled={disabled}
           pending={busy === "final"}
-          onChange={(enabled) =>
+          onChange={(enabled) => {
+            if (enabled && finalNeedsSetup) {
+              onConfigurationNeeded("final");
+              return;
+            }
             void onPatch(
               { kind: "set_lane_enabled", lane: "final", enabled },
               enabled ? "Final rewrite enabled." : "Final rewrite disabled; safe fallback remains.",
-            )
-          }
+            );
+          }}
         />
       </div>
 

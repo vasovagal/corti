@@ -1,4 +1,4 @@
-import { useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
 import { Models } from "./settings/Models";
 import { Paths } from "./settings/Paths";
 import { Transcription } from "./settings/Transcription";
@@ -8,7 +8,9 @@ import HostedPreferences, {
 import {
   getBackends,
   getConfig,
+  onPreferencesNavigationRequested,
   setConfig,
+  takePreferencesSectionRequest,
   type BackendInfo,
   type SettingsDto,
 } from "./lib/api";
@@ -139,12 +141,44 @@ export default function Settings() {
       .catch((error) => setStatus(`Failed to load transcription settings: ${String(error)}`));
   }, []);
 
-  function chooseSection(next: SettingsSection) {
+  const chooseSection = useCallback((next: SettingsSection) => {
     setSection(next);
     const url = new URL(window.location.href);
     url.searchParams.set("section", next);
     window.history.replaceState(null, "", url);
-  }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let stop: (() => void) | undefined;
+    const installPendingDestination = async () => {
+      try {
+        const requested = await takePreferencesSectionRequest();
+        if (
+          active &&
+          requested &&
+          ALL_SECTIONS.some((candidate) => candidate.id === requested)
+        ) {
+          chooseSection(requested as SettingsSection);
+        }
+      } catch {
+        // A newly opened window still receives the target through its query string.
+      }
+    };
+    onPreferencesNavigationRequested(() => void installPendingDestination())
+      .then((unlisten) => {
+        if (active) stop = unlisten;
+        else unlisten();
+      })
+      .catch(() => {
+        // The backend-owned mount-time read below still repairs an event-subscription failure.
+      });
+    void installPendingDestination();
+    return () => {
+      active = false;
+      stop?.();
+    };
+  }, [chooseSection]);
 
   function moveSection(event: KeyboardEvent<HTMLElement>) {
     if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {

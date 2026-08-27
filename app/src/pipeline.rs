@@ -1244,7 +1244,20 @@ pub(crate) fn transcribe_and_file(
     // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
     // transition failed (or the process died between them). Treat it as authoritative from every dispatch
     // path, including a duplicate first-attempt Process message.
-    if FilingCheckpoint::load(audio).is_ok() {
+    if let Ok(checkpoint) = FilingCheckpoint::load(audio) {
+        if checkpoint.applied_postprocess.final_outcome()
+            == Some(corti_vagus::provenance::FinalPostprocessOutcome::Applied)
+            && !checkpoint.final_attempt_call_ids.is_empty()
+        {
+            ctx.hosted
+                .mark_final_checkpointed(&checkpoint.final_attempt_call_ids)
+                .map_err(|code| {
+                    anyhow::anyhow!("acknowledging hosted Final checkpoint failed: {code}")
+                })?;
+            ctx.queue
+                .set_postprocess_state(id, Some(corti_queue::PostprocessState::Complete))
+                .context("reconciling hosted Final completion from durable checkpoint")?;
+        }
         ctx.queue
             .update(
                 id,
@@ -1400,7 +1413,11 @@ pub(crate) fn transcribe_and_file(
         return Err(error);
     }
     if final_applied {
-        let _ = ctx.hosted.mark_final_checkpointed(&settled.call_ids);
+        ctx.hosted
+            .mark_final_checkpointed(&settled.call_ids)
+            .map_err(|code| {
+                anyhow::anyhow!("acknowledging hosted Final checkpoint failed: {code}")
+            })?;
     }
     if hosted_snapshot.control.master_enabled && hosted_snapshot.control.final_lane.enabled {
         ctx.queue

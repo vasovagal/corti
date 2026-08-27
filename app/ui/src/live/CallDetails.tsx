@@ -1,4 +1,5 @@
-import { errorLabel } from "../lib/hosted";
+import type { PreferencesSection } from "../lib/api";
+import { errorLabel, hostedErrorGuidance } from "../lib/hosted";
 import {
   cacheObservationLabel,
   callLaneLabel,
@@ -8,7 +9,13 @@ import {
   type LiveCallDetail,
 } from "../lib/liveHosted";
 
-export function CallDetails({ calls }: { calls: LiveCallDetail[] }) {
+export function CallDetails({
+  calls,
+  onOpenPreferences,
+}: {
+  calls: LiveCallDetail[];
+  onOpenPreferences: (section: PreferencesSection) => Promise<void>;
+}) {
   return (
     <section className="live-call-details" aria-labelledby="live-call-details-heading">
       <div className="live-section-head">
@@ -25,6 +32,7 @@ export function CallDetails({ calls }: { calls: LiveCallDetail[] }) {
           {calls.map((call) => {
             const tokens = tokenEntries(call.usage);
             const phases = call.latency ? latencyEntries(call.latency) : [];
+            const repair = call.error ? hostedErrorGuidance(call.error) : null;
             return (
               <li className="live-call-card" key={call.call_id}>
                 <header>
@@ -45,6 +53,20 @@ export function CallDetails({ calls }: { calls: LiveCallDetail[] }) {
                   {call.outcome && <span>{call.outcome.replace(/_/gu, " ")}</span>}
                   {call.error && <span className="live-call-error">{errorLabel(call.error)}</span>}
                 </div>
+                {repair && (
+                  <div className="live-call-remedy">
+                    <span>{repair.message}</span>
+                    {repair.section && repair.actionLabel && (
+                      <button
+                        className="btn-quiet"
+                        type="button"
+                        onClick={() => void onOpenPreferences(repair.section!)}
+                      >
+                        {repair.actionLabel}
+                      </button>
+                    )}
+                  </div>
+                )}
                 <dl className="live-metric-grid" aria-label="Token usage">
                   {tokens.length === 0 ? (
                     <div>

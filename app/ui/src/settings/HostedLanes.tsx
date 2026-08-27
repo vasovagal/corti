@@ -10,6 +10,7 @@ import {
   billingDisclosure,
   emptySelection,
   findExactModel,
+  modelAdvisory,
   modelUnavailableReason,
   modelsForProvider,
   parseProviderKey,
@@ -234,7 +235,7 @@ function HostedLaneCard({
       </div>
 
       <div className="settings-field hosted-lane-field">
-        <label htmlFor={`hosted-model-${lane}`}>Exact paid model</label>
+        <label htmlFor={`hosted-model-${lane}`}>Exact model</label>
         <select
           id={`hosted-model-${lane}`}
           className="jselect"
@@ -265,6 +266,7 @@ function HostedLaneCard({
             )}
           {catalog.map((model) => {
             const reason = modelUnavailableReason(model, lane);
+            const advisory = modelAdvisory(model, lane);
             return (
               <option
                 key={`${model.exact_model_id}:${model.region ?? ""}`}
@@ -273,13 +275,16 @@ function HostedLaneCard({
               >
                 {model.exact_model_id}
                 {model.region ? ` · ${model.region}` : ""}
-                {reason ? ` · ${reason}` : ""}
+                {reason ? ` · ${reason}` : advisory ? ` · ${advisory}` : ""}
               </option>
             );
           })}
         </select>
-        {lane === "live" && catalog.length > 0 && catalog.every((model) => modelUnavailableReason(model, lane)) && (
-          <p className="hosted-field-error">This catalog has no model that passed the live benchmark gate.</p>
+        {lane === "live" && catalog.some((model) => modelUnavailableReason(model, lane) === null) && (
+          <p className="muted small hosted-field-advice">
+            Benchmark labels are guidance, not a lock. You may use any available model; if it is too slow or
+            fails, Corti keeps the raw phrase after the 5-second deadline.
+          </p>
         )}
       </div>
       </div>
@@ -464,8 +469,10 @@ function ModelTruth({
         <dt>Latency</dt>
         <dd>
           {lane === "live" && model.benchmarked_for_live
-            ? "Live benchmark gate passed; no universal latency promise."
-            : "No measured latency promise in this catalog."}
+            ? "Corti measured this model for Live; the 5-second raw fallback still applies."
+            : lane === "live"
+              ? "Live speed is not measured by Corti. You can still use it; raw text wins after the 5-second deadline."
+              : "No measured latency promise in this catalog."}
         </dd>
       </div>
       <div>

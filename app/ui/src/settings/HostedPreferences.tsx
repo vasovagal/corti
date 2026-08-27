@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   cancelChatGptDeviceLogin,
+  clearBedrockSetup,
   clearProviderSecret,
   getHostedSettings,
   listAwsCredentialOptions,
@@ -10,14 +11,13 @@ import {
   promptForProviderSecret,
   refreshHostedProvider,
   replaceHostedWordBank,
-  setBedrockCredentialMode,
+  saveBedrockSetup,
   setHostedVertexModels,
   setHostedPinnedQuestion,
   signOutChatGptSubscription,
   startChatGptDeviceLogin,
   updateHostedProviderScope,
   updateHostedSteering,
-  type AwsCredentialMode,
   type AwsCredentialOptionsDto,
   type AwsKeySlot,
   type HostedMutationResult,
@@ -27,7 +27,18 @@ import {
   type SecretSlotRequest,
 } from "../lib/api";
 import { shouldInstallHostedSettings } from "../lib/liveHosted";
-import { credentialSummary, providerPresentation } from "../lib/hosted";
+import {
+  bedrockCredentialGuidance,
+  bedrockInvalidMessage,
+  bedrockRefreshFailureGuidance,
+  credentialSummary,
+  providerPresentation,
+  type NormalizedBedrockSetup,
+} from "../lib/hosted";
+import type {
+  AwsProfileDiscoveryState,
+  BedrockActionOutcome,
+} from "./HostedBedrock";
 import { HostedDialog, HostedSwitch } from "./HostedCommon";
 import { HostedLanguagePreferences } from "./HostedLanguage";
 import { HostedLanes } from "./HostedLanes";
@@ -47,17 +58,36 @@ export default function HostedPreferences({
   const busyRef = useRef(false);
   const [busy, setBusy] = useState("");
   const [status, setStatus] = useState("");
+  const [statusAction, setStatusAction] = useState<{
+    section: HostedPreferencesSection;
+    label: string;
+  } | null>(null);
   const [loadError, setLoadError] = useState("");
   const [masterDisclosure, setMasterDisclosure] = useState(false);
   const [awsOptions, setAwsOptions] = useState<AwsCredentialOptionsDto | null>(null);
+  const [awsProfileDiscoveryState, setAwsProfileDiscoveryState] =
+    useState<AwsProfileDiscoveryState>("loading");
+  const awsOptionsRequestRef = useRef(0);
+  const [bedrockResetToken, setBedrockResetToken] = useState(0);
 
   // Profile names and secret presence are read separately from the settings document: they describe the
   // machine, not the saved preferences, and an older backend simply leaves them null.
-  const refreshAwsOptions = useCallback(async () => {
+  const refreshAwsOptions = useCallback(async (): Promise<boolean> => {
+    const request = ++awsOptionsRequestRef.current;
+    setAwsProfileDiscoveryState("loading");
     try {
-      setAwsOptions(await listAwsCredentialOptions());
+      const options = await listAwsCredentialOptions();
+      if (request === awsOptionsRequestRef.current) {
+        setAwsOptions(options);
+        setAwsProfileDiscoveryState("loaded");
+      }
+      return true;
     } catch {
-      setAwsOptions(null);
+      if (request === awsOptionsRequestRef.current) {
+        setAwsOptions(null);
+        setAwsProfileDiscoveryState("error");
+      }
+      return false;
     }
   }, []);
 
@@ -119,6 +149,9 @@ export default function HostedPreferences({
       case "conflict":
         setStatus("Hosted settings changed elsewhere. The latest state is loaded; review and try again.");
         return false;
+      case "invalid":
+        setStatus(`Nothing was saved. ${bedrockInvalidMessage(result.field, result.reason)}`);
+        return false;
       case "disabled_for_session":
         setStatus(
           `Disabled for this session, but persistence failed (${result.code.replace(/_/gu, " ")}).`,
@@ -137,6 +170,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy(label);
     setStatus("");
+    setStatusAction(null);
     try {
       return acceptMutation(await operation(current.state_revision), success);
     } catch (error) {
@@ -162,19 +196,65 @@ export default function HostedPreferences({
     );
 
   const onScope = (update: HostedProviderScopeUpdate) =>
-    runMutation("Connection update", "Connection scope saved; Master and lanes were not changed.", (revision) =>
+    runMutation("Provider setup update", "Provider setup saved. Refresh this provider to check access and load its models.", (revision) =>
       updateHostedProviderScope(revision, update),
     );
 
-  const onBedrockMode = (
-    mode: AwsCredentialMode,
-    profile: string | null,
-    roleArn: string | null,
-  ) =>
-    runMutation(
-      "Credential update",
-      "AWS credential mode saved; Master and lanes were not changed.",
-      (revision) => setBedrockCredentialMode(revision, mode, profile, roleArn),
+  async function runBedrockMutation(
+    label: string,
+    success: string,
+    operation: (observedRevision: number) => Promise<HostedMutationResult>,
+  ): Promise<BedrockActionOutcome> {
+    const current = settingsRef.current;
+    if (!current || busyRef.current) return { status: "failed" };
+    busyRef.current = true;
+    setBusy(label);
+    setStatus("");
+    setStatusAction(null);
+    try {
+      const result = await operation(current.state_revision);
+      const accepted = acceptMutation(result, success);
+      if (
+        result.status === "applied" ||
+        result.status === "unchanged" ||
+        result.status === "conflict"
+      ) {
+        setBedrockResetToken((token) => token + 1);
+      }
+      if (result.status === "invalid") {
+        return { status: "invalid", field: result.field, reason: result.reason };
+      }
+      if (result.status === "conflict") return { status: "conflict" };
+      return accepted ? { status: "accepted" } : { status: "failed" };
+    } catch (error) {
+      setStatus(`${label} failed: ${String(error)}`);
+      return { status: "failed" };
+    } finally {
+      busyRef.current = false;
+      setBusy("");
+    }
+  }
+
+  const onBedrockSetup = (setup: NormalizedBedrockSetup) =>
+    runBedrockMutation(
+      "Bedrock setup",
+      "Bedrock setup saved. Refresh models to check AWS access and load the regional catalog.",
+      (revision) =>
+        saveBedrockSetup({
+          observed_state_revision: revision,
+          mode: setup.mode,
+          profile: setup.profile,
+          role_arn: setup.roleArn,
+          region: setup.region,
+          setup_name: setup.setupName,
+        }),
+    );
+
+  const onClearBedrockSetup = () =>
+    runBedrockMutation(
+      "Clear Bedrock setup",
+      "Bedrock setup cleared. Stored AWS key values were left unchanged.",
+      (revision) => clearBedrockSetup({ observed_state_revision: revision }),
     );
 
   const onVertexModels = (models: string[]) =>
@@ -182,27 +262,18 @@ export default function HostedPreferences({
       setHostedVertexModels(revision, models),
     );
 
-  const onBedrockRegion = (region: string | null, alias: string | null) =>
-    onScope({
-      provider: "amazon",
-      transport: "bedrock_runtime",
-      alias,
-      project: null,
-      region,
-      quota_project: null,
-    });
-
   /// The sheet is native; only its outcome comes back, never the value the user typed.
   async function onPromptSecret(request: SecretSlotRequest): Promise<boolean> {
     if (busyRef.current) return false;
     busyRef.current = true;
     setBusy("Secure entry");
     setStatus("");
+    setStatusAction(null);
     try {
       const outcome = await promptForProviderSecret(request);
       setStatus(
         outcome === "stored"
-          ? "Stored in Corti's private secret store. No lane was enabled."
+          ? "Credential saved in Corti's private secret store. Refresh this provider below to check access and load its models."
           : outcome === "rejected"
             ? "That value cannot be a credential; nothing was stored."
             : "Cancelled; nothing was stored.",
@@ -212,10 +283,10 @@ export default function HostedPreferences({
       setStatus(`Secure entry failed: ${String(error)}`);
       return false;
     } finally {
-      busyRef.current = false;
-      setBusy("");
       await refreshAwsOptions();
       await reload();
+      busyRef.current = false;
+      setBusy("");
     }
   }
 
@@ -224,6 +295,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Remove credential");
     setStatus("");
+    setStatusAction(null);
     try {
       await clearProviderSecret(request);
       setStatus("Removed from Corti's private secret store.");
@@ -232,10 +304,10 @@ export default function HostedPreferences({
       setStatus(`Removal failed: ${String(error)}`);
       return false;
     } finally {
-      busyRef.current = false;
-      setBusy("");
       await refreshAwsOptions();
       await reload();
+      busyRef.current = false;
+      setBusy("");
     }
   }
 
@@ -248,6 +320,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy(label);
     setStatus("");
+    setStatusAction(null);
     try {
       await operation();
       await reload();
@@ -299,13 +372,44 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Provider refresh");
     setStatus("");
+    setStatusAction(null);
     try {
-      await refreshHostedProvider(provider, transport);
+      const refreshed = await refreshHostedProvider(provider, transport);
       await reload();
-      setStatus("Credential state and authenticated catalog refreshed. No lane was enabled.");
+      if (refreshed.credential.state === "ready" && refreshed.models.length > 0) {
+        setStatus(
+          `Provider ready — ${refreshed.models.length} exact ${refreshed.models.length === 1 ? "model" : "models"} available. Choose one for each rewrite mode you want.`,
+        );
+        setStatusAction({ section: "routing", label: "Choose rewrite models" });
+      } else if (refreshed.credential.state !== "ready") {
+        if (transport === "bedrock_runtime") {
+          const current = settingsRef.current;
+          setStatus(
+            bedrockCredentialGuidance(
+              current?.bedrock.mode ?? "default_chain",
+              refreshed.credential,
+              current?.bedrock.profile ?? null,
+            ) ?? "The saved Bedrock setup still needs attention.",
+          );
+        } else {
+          setStatus("The provider still needs attention. Review its credential and provider setup below.");
+        }
+      } else {
+        setStatus("The provider connected, but returned no usable models. Review its account, project/region, and model access, then refresh again.");
+      }
       return true;
     } catch (error) {
-      setStatus(`Provider refresh failed: ${String(error)}`);
+      if (transport === "bedrock_runtime") {
+        const current = settingsRef.current;
+        const recovery = bedrockRefreshFailureGuidance(
+          current?.bedrock.mode ?? "default_chain",
+          error,
+          current?.bedrock.profile ?? null,
+        );
+        setStatus(`Bedrock model refresh failed. ${recovery}`);
+      } else {
+        setStatus(`Provider refresh failed: ${String(error)}. Check the credential, provider setup, network, quota, and billing, then try again.`);
+      }
       await reload();
       return false;
     } finally {
@@ -319,6 +423,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Pinned question update");
     setStatus("");
+    setStatusAction(null);
     try {
       const current = settingsRef.current;
       if (!current) return false;
@@ -343,6 +448,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Master enable");
     setStatus("");
+    setStatusAction(null);
     try {
       const acknowledged = await patchHostedSettings(current.state_revision, {
         kind: "set_egress_acknowledged",
@@ -401,10 +507,12 @@ export default function HostedPreferences({
     onVertexModels,
     bedrock: {
       busy: isBusy,
-      onMode: onBedrockMode,
-      onScopeRegion: onBedrockRegion,
+      onSave: onBedrockSetup,
+      onClear: onClearBedrockSetup,
       onPromptKey: (slot: AwsKeySlot) => onPromptSecret({ provider: "aws", slot }),
       onClearKey: (slot: AwsKeySlot) => onClearSecret({ provider: "aws", slot }),
+      onReloadProfiles: refreshAwsOptions,
+      onRefresh: () => onRefreshProvider("amazon", "bedrock_runtime"),
     },
   };
 
@@ -416,7 +524,16 @@ export default function HostedPreferences({
           role={loadError ? "alert" : "status"}
           aria-live="polite"
         >
-          {loadError || (busy ? `${busy}…` : status)}
+          <span>{loadError || (busy ? `${busy}…` : status)}</span>
+          {!loadError && !busy && statusAction && (
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => onNavigate(statusAction.section)}
+            >
+              {statusAction.label}
+            </button>
+          )}
         </div>
       )}
 
@@ -505,6 +622,8 @@ export default function HostedPreferences({
           bedrock={settings.bedrock}
           vertexModels={settings.vertex_models}
           awsOptions={awsOptions}
+          awsProfileDiscoveryState={awsProfileDiscoveryState}
+          bedrockResetToken={bedrockResetToken}
           preferredSelection={settings.control.final_lane.selection}
           actions={providerActions}
         />
@@ -549,19 +668,26 @@ function HostedSetupGuide({
   onNavigate: (section: HostedPreferencesSection) => void;
 }) {
   const finalSelection = settings.control.final_lane.selection;
-  const provider = settings.providers.find(
+  const selectedProvider = settings.providers.find(
     (candidate) =>
       candidate.descriptor.provider === finalSelection.provider &&
       candidate.descriptor.transport === finalSelection.transport,
   );
+  const provider =
+    selectedProvider ??
+    settings.providers.find(
+      (candidate) => candidate.credential.state === "ready" && candidate.models.length > 0,
+    ) ??
+    settings.providers.find((candidate) => candidate.credential.state === "ready");
   const providerName = provider
     ? providerPresentation(provider.descriptor.provider, provider.descriptor.transport).shortName
     : null;
   const providerState = provider
     ? credentialSummary(provider.credential, provider.descriptor.transport).label
     : "Not chosen";
-  const providerReady = provider?.credential.state === "ready";
+  const providerReady = provider?.credential.state === "ready" && provider.models.length > 0;
   const modelName = finalSelection.model;
+  const finalReady = Boolean(modelName && settings.control.final_lane.enabled);
 
   return (
     <section className="card hosted-guide-card" aria-labelledby="hosted-guide-heading">
@@ -583,17 +709,29 @@ function HostedSetupGuide({
             <p>{providerName ? `${providerName} · ${providerState}` : "Choose the API account you already trust and bill."}</p>
           </div>
           <button className="btn-secondary" type="button" onClick={() => onNavigate("provider")}>
-            {providerReady ? "Review" : provider ? "Connect" : "Choose"}
+            {providerReady
+              ? "Review"
+              : provider?.credential.state === "ready"
+                ? "Load models"
+                : provider
+                  ? "Connect"
+                  : "Choose"}
           </button>
         </li>
-        <li className={modelName ? "is-complete" : undefined}>
+        <li className={finalReady ? "is-complete" : undefined}>
           <span className="hosted-step-number">2</span>
           <div>
             <strong>Configure Final rewrite</strong>
-            <p>{modelName ?? "Pick one exact model, then enable the final cleanup pass."}</p>
+            <p>
+              {finalReady
+                ? `${modelName} · enabled`
+                : modelName
+                  ? `${modelName} selected · enable Final rewrite next`
+                  : "Pick one exact model, then enable the final cleanup pass."}
+            </p>
           </div>
           <button className="btn-secondary" type="button" onClick={() => onNavigate("routing")}>
-            {modelName ? "Review" : "Configure"}
+            {finalReady ? "Review" : "Configure"}
           </button>
         </li>
         <li className={settings.control.master_enabled ? "is-complete" : undefined}>
@@ -683,8 +821,8 @@ function HostedTruthDisclosure({ finalDeadline }: { finalDeadline: number }) {
         <div>
           <dt>Quality</dt>
           <dd>
-            Account availability and structured output do not prove rewrite quality. Only backend-marked live
-            benchmarks unlock a model for Live.
+            Account availability and structured output do not prove rewrite quality or speed. Benchmarks are
+            guidance, not a lock: you may try any eligible model, and Live keeps raw text on delay or failure.
           </dd>
         </div>
         <div>

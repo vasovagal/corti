@@ -4,5 +4,9 @@
   "description": "Static informational Ethics & Legality guide window. No custom commands; core defaults only.",
   "platforms": ["macOS"],
   "windows": ["ethics"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:event:deny-emit",
+    "core:event:deny-emit-to"
+  ]
 }

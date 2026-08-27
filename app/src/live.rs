@@ -71,6 +71,13 @@ const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 /// Bounded in-memory canonical-row assembly used only for the optional final pass after every raw window is
 /// already synced. Exceeding it disables that pass and leaves the existing raw note path unchanged.
 const MAX_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+/// Live preview must not inherit the conservative five-second offline opening. This bounded 100 ms warm-up
+/// still gives the adaptive filter an opening window while making first audio available promptly.
+const LIVE_AEC_LOOKAHEAD_SECONDS: f32 = 0.1;
+
+fn new_live_aec(sample_rate: u32, config: corti_aec::AecConfig) -> StreamingAec {
+    StreamingAec::new_with_lookahead_seconds(sample_rate, config, LIVE_AEC_LOOKAHEAD_SECONDS)
+}
 
 /// How a live session ended, collected by the pipeline worker at `Process` time.
 #[derive(Debug)]
@@ -806,6 +813,9 @@ fn session_thread(
         )),
     }
     if let Some(hosted) = publisher.hosted.as_ref() {
+        // Final places the same FIFO fence when enabled. When it is off, flush the ASR tail here so the
+        // priority EndSession command cannot clear the ledger before the last nonblocking row arrives.
+        let _ = hosted.flush_finalized_rows();
         let _ = hosted.end_live_session(&publisher.id);
     }
     outcome
@@ -856,7 +866,7 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         // Streaming AEC on the mic, per config (skipped cleanly per-chunk when the mic side is empty).
         aec: cfg
             .aec_enabled
-            .then(|| StreamingAec::new(sample_rate, cfg.aec_config())),
+            .then(|| new_live_aec(sample_rate, cfg.aec_config())),
         window,
     })
 }
@@ -1275,7 +1285,11 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             }
             corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
             if let Some(hosted) = publisher.hosted() {
-                let _ = hosted.mark_final_checkpointed(&applied_call_ids);
+                hosted
+                    .mark_final_checkpointed(&applied_call_ids)
+                    .map_err(|code| {
+                        anyhow::anyhow!("acknowledging hosted Final note failed: {code}")
+                    })?;
             }
             info!(
                 target: "corti::live",
@@ -1646,6 +1660,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_aec_emits_opening_audio_within_two_hundred_milliseconds() {
+        let sample_rate = 48_000;
+        let config = corti_aec::AecConfig::default();
+        let expected_lookahead = corti_aec::lookahead_samples_for(
+            sample_rate,
+            config.filter_len,
+            LIVE_AEC_LOOKAHEAD_SECONDS,
+        );
+        assert!(expected_lookahead <= sample_rate as usize / 5);
+        let mut aec = new_live_aec(sample_rate, config);
+        let mic = (0..480)
+            .map(|sample| ((sample as f32) * 0.03).sin() * 0.2)
+            .collect::<Vec<_>>();
+        let far = vec![0.0; mic.len()];
+        let mut supplied = 0usize;
+        let emitted = loop {
+            supplied += mic.len();
+            let output = aec.push(&mic, &far);
+            if !output.is_empty() {
+                break output;
+            }
+            assert!(supplied <= expected_lookahead + mic.len());
+        };
+        assert!(supplied <= sample_rate as usize / 5);
+        assert!(emitted.iter().any(|sample| sample.abs() > f32::EPSILON));
+    }
+
     /// Scripted stand-in for `LiveTranscriber`: each `push` queues the next scripted word batch;
     /// `finish` returns the scripted tail.
     struct Scripted {
@@ -1688,6 +1730,18 @@ mod tests {
             words.append(&mut self.tail);
             words
         }
+    }
+
+    #[test]
+    fn injected_live_channel_can_publish_a_first_word_inside_the_audio_latency_bound() {
+        let sample_rate = 48_000;
+        let first = word(0.05, 0.09, "synthetic first word");
+        let mut channel = Scripted::new(vec![vec![first.clone()]], Vec::new());
+        let audio = vec![0.1; sample_rate as usize / 10];
+        channel.push(&audio, sample_rate);
+        let emitted = channel.poll_words().expect("scripted VAD emitted a word");
+        assert_eq!(emitted, vec![first]);
+        assert!(audio.len() <= sample_rate as usize / 5);
     }
 
     #[derive(Default)]

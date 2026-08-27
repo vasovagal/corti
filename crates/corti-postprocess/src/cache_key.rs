@@ -53,7 +53,7 @@ pub struct RequestKey([u8; 32]);
 
 impl RequestKey {
     pub fn derive(key: &DigestKey, material: &RequestKeyMaterial<'_>) -> Self {
-        let mut encoder = CanonicalCborHmac::new(key, b"corti-postprocess-key-v1\0");
+        let mut encoder = CanonicalCborHmac::new(key, b"corti-postprocess-key-v2\0");
         material.encode(&mut encoder);
         Self(encoder.finish())
     }
@@ -64,6 +64,23 @@ impl RequestKey {
 
     pub fn to_base64url(self) -> String {
         URL_SAFE_NO_PAD.encode(self.0)
+    }
+
+    pub fn from_base64url(value: &str) -> Option<Self> {
+        let decoded = URL_SAFE_NO_PAD.decode(value).ok()?;
+        Some(Self(decoded.try_into().ok()?))
+    }
+
+    /// Bind the semantic request to the credential lease that was actually resolved before exact lookup.
+    /// The identity is already opaque; a second keyed domain keeps it non-reversible in durable cache keys.
+    pub fn bind_credential(self, key: &DigestKey, credential_identity: &[u8; 32]) -> Self {
+        let mut encoder = CanonicalCborHmac::new(key, b"corti-postprocess-credential-bound-v1\0");
+        encoder.map(2);
+        encoder.key("request_key");
+        encoder.byte_string(&self.0);
+        encoder.key("credential_identity");
+        encoder.byte_string(credential_identity);
+        Self(encoder.finish())
     }
 }
 
@@ -86,6 +103,17 @@ impl ProviderCacheKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn bind_credential(&self, key: &DigestKey, credential_identity: &[u8; 32]) -> Self {
+        let mut encoder =
+            CanonicalCborHmac::new(key, b"corti-provider-cache-credential-bound-v1\0");
+        encoder.map(2);
+        encoder.key("provider_cache_key");
+        encoder.text(&self.0);
+        encoder.key("credential_identity");
+        encoder.byte_string(credential_identity);
+        Self(URL_SAFE_NO_PAD.encode(encoder.finish()))
     }
 }
 
@@ -140,13 +168,16 @@ pub struct RequestKeyMaterial<'a> {
     pub effective_steering: &'a str,
     pub targets: &'a [TranscriptRow],
     pub context: &'a [TranscriptRow],
+    /// Whether semantic context was omitted to fit the request budget. Two identical visible row slices can
+    /// carry different grounding semantics, so this bit is part of exact local identity.
+    pub context_truncated: bool,
     pub question: Option<&'a str>,
 }
 
 impl RequestKeyMaterial<'_> {
     fn encode(self, encoder: &mut CanonicalCborHmac) {
-        // Schema-defined map order is part of key-v1. Values use shortest-form CBOR integers and NFC text.
-        encoder.map(18);
+        // Schema-defined map order is part of key-v2. Values use shortest-form CBOR integers and NFC text.
+        encoder.map(19);
         encoder.key("provider_id");
         encoder.text(self.provider.as_str());
         encoder.key("transport_id");
@@ -182,6 +213,8 @@ impl RequestKeyMaterial<'_> {
         encoder.rows(self.targets);
         encoder.key("context");
         encoder.rows(self.context);
+        encoder.key("context_truncated");
+        encoder.boolean(self.context_truncated);
         encoder.key("question_if_any");
         encoder.optional_text(self.question);
     }
@@ -315,6 +348,10 @@ impl CanonicalCborHmac {
         }
     }
 
+    fn boolean(&mut self, value: bool) {
+        self.mac.update(&[if value { 0xf5 } else { 0xf4 }]);
+    }
+
     fn rows(&mut self, rows: &[TranscriptRow]) {
         self.array(rows.len());
         for row in rows {
@@ -443,6 +480,7 @@ mod tests {
             effective_steering: "synthetic policy",
             targets: target,
             context: &[],
+            context_truncated: false,
             question: None,
         }
     }
@@ -525,6 +563,9 @@ mod tests {
         let mut changed = base;
         changed.question = Some("synthetic question");
         assert_changed!(changed);
+        let mut changed = base;
+        changed.context_truncated = true;
+        assert_changed!(changed);
 
         let context = [row("synthetic context")];
         let mut changed = base;
@@ -533,6 +574,41 @@ mod tests {
         let changed_rows = [row("changed synthetic transcript")];
         let changed = material(&changed_rows);
         assert_changed!(changed);
+    }
+
+    #[test]
+    fn actual_credential_identity_fences_local_and_provider_cache_keys() {
+        let rows = [row("synthetic transcript")];
+        let material = material(&rows);
+        let key = DigestKey::new([0x31; 32]);
+        let request = RequestKey::derive(&key, &material);
+        let first = request.bind_credential(&key, &[1; 32]);
+        let second = request.bind_credential(&key, &[2; 32]);
+        assert_ne!(first, second);
+        assert_eq!(
+            RequestKey::from_base64url(&first.to_base64url()),
+            Some(first)
+        );
+
+        let provider_material = ProviderCacheKeyMaterial {
+            provider: material.provider,
+            transport: material.transport,
+            support_tier: material.support_tier,
+            connection_scope_id: material.connection_scope_id,
+            region: material.region,
+            exact_model_id: material.exact_model_id,
+            adapter_version: material.adapter_version,
+            prompt_template_version: material.prompt_template_version,
+            output_schema_version: material.output_schema_version,
+            prompt_task: PromptTask::Rewrite,
+            provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
+            word_bank_canonical_digest: material.word_bank_canonical_digest,
+        };
+        let provider = ProviderCacheKey::derive(&key, &provider_material);
+        assert_ne!(
+            provider.bind_credential(&key, &[1; 32]),
+            provider.bind_credential(&key, &[2; 32])
+        );
     }
 
     #[test]

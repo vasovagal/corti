@@ -4,5 +4,9 @@
   "description": "The Settings editor window: corti's own config commands plus core/event access (download progress events land here in a later PR).",
   "platforms": ["macOS"],
   "windows": ["settings"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:event:deny-emit",
+    "core:event:deny-emit-to"
+  ]
 }

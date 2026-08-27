@@ -248,6 +248,31 @@ export const onLiveTranscriptChanged = (
 ): Promise<UnlistenFn> =>
   listen<LiveTranscriptEvent>("live-transcript-changed", (event) => handler(event.payload));
 
+// ----- Cross-window Preferences navigation -----
+
+export type PreferencesSection =
+  | "transcription"
+  | "hosted"
+  | "hosted-provider"
+  | "hosted-routing"
+  | "hosted-language"
+  | "hosted-advanced"
+  | "storage";
+
+/** Open/focus Preferences at one backend-allowlisted repair destination. */
+export const openPreferencesSection = (section: PreferencesSection): Promise<void> =>
+  invoke<void>("open_preferences_section", { section });
+
+/** Take the backend-owned latest repair destination. Only the Settings window is allowed to call this. */
+export const takePreferencesSectionRequest = (): Promise<PreferencesSection | null> =>
+  invoke<PreferencesSection | null>("take_preferences_section_request");
+
+/** Existing Preferences singletons receive only a wake-up; the destination is fetched from Rust. */
+export const onPreferencesNavigationRequested = (
+  handler: () => void,
+): Promise<UnlistenFn> =>
+  listen("settings-navigation-requested", handler);
+
 // ----- Hosted post-processing preferences -----
 
 export type HostedSupportTier = "documented" | "experimental" | "blocked";
@@ -416,6 +441,33 @@ export interface BedrockCredentialDto {
   has_session_token: boolean;
 }
 
+/** One revision-checked, all-or-nothing Bedrock setup mutation. `setup_name` is persisted through the
+ * legacy scope alias field; the backend-owned technical identity never crosses this boundary. */
+export interface SaveBedrockSetupRequest {
+  observed_state_revision: number;
+  mode: AwsCredentialMode;
+  profile: string | null;
+  role_arn: string | null;
+  region: string;
+  setup_name: string;
+}
+
+export interface ClearBedrockSetupRequest {
+  observed_state_revision: number;
+}
+
+export type HostedMutationInvalidField =
+  | "profile"
+  | "role_arn"
+  | "region"
+  | "setup_name"
+  | "key_pair";
+export type HostedMutationInvalidReason =
+  | "required"
+  | "not_found"
+  | "invalid"
+  | "keys_missing";
+
 /** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Secret presence is not here: it comes
  * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
 export interface AwsCredentialOptionsDto {
@@ -478,6 +530,12 @@ export type HostedMutationResult =
   | { status: "applied"; settings: HostedSettingsDto }
   | { status: "unchanged"; settings: HostedSettingsDto }
   | { status: "conflict"; settings: HostedSettingsDto }
+  | {
+      status: "invalid";
+      settings: HostedSettingsDto;
+      field: HostedMutationInvalidField;
+      reason: HostedMutationInvalidReason;
+    }
   | {
       status: "disabled_for_session";
       settings: HostedSettingsDto;
@@ -719,6 +777,18 @@ export const openChatGptDeviceLogin = (): Promise<void> =>
 export const listAwsCredentialOptions = (): Promise<AwsCredentialOptionsDto> =>
   invoke<AwsCredentialOptionsDto>("list_aws_credential_options");
 
+export const saveBedrockSetup = (
+  request: SaveBedrockSetupRequest,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("save_bedrock_setup", { request });
+
+/** Clears only non-secret Bedrock setup fields. Stored key slots remain owner-managed secret actions. */
+export const clearBedrockSetup = (
+  request: ClearBedrockSetupRequest,
+): Promise<HostedMutationResult> =>
+  invoke<HostedMutationResult>("clear_bedrock_setup", { request });
+
+/** Compatibility binding for one backend release; new UI uses `saveBedrockSetup`. */
 export const setBedrockCredentialMode = (
   observedStateRevision: number,
   mode: AwsCredentialMode,

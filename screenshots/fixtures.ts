@@ -378,6 +378,87 @@ export const hostedSettings = {
   show_live_metrics_by_default: false,
 };
 
+export const syntheticUnconfiguredSettings = {
+  ...hostedSettings,
+  state_revision: 2,
+  preferences_revision: 1,
+  control: {
+    ...hostedSettings.control,
+    control_revision: 1,
+    pinned_question_revision: 0,
+    master_enabled: false,
+    egress_acknowledged: false,
+    pinned_auto_enabled: false,
+    live: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+    final_lane: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+    questions: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+  },
+  providers: hostedSettings.providers.map((provider) => ({
+    ...provider,
+    credential:
+      provider.descriptor.support_tier === "blocked"
+        ? provider.credential
+        : { state: "absent" },
+    models: [],
+    service_error: null,
+  })),
+};
+
+export const syntheticUnconfiguredLiveTranscript = {
+  protocol_version: 2,
+  process_epoch: 71,
+  session_generation: 2,
+  revision: 7,
+  session_id: "microphone-test-7",
+  mode: "test",
+  status: "listening",
+  title: "Microphone transcription test",
+  detail: "Listening to this microphone only — say a sentence, then pause.",
+  active: true,
+  evicted_lines: 0,
+  retained_from_seq: 1,
+  lines: [
+    {
+      seq: 1,
+      row_id: "microphone-test-row-1",
+      speaker: "Me",
+      start_sec: 0,
+      end_sec: 4.2,
+      text: "This raw microphone transcript works before any hosted provider is configured.",
+      clean_text: null,
+      rewrite_state: "raw",
+      commit_epoch: 0,
+    },
+  ],
+};
+
 export const syntheticVertexReadySettings = {
   ...hostedSettings,
   state_revision: 13,
@@ -451,7 +532,18 @@ export const syntheticBedrockProfileSettings = {
   },
 };
 
-/** The static key-pair mode, with both Keychain slots filled and the session token left unset. */
+/** A setup save persists routing first; credential resolution and catalog loading remain explicit. */
+export const syntheticBedrockSavedPendingSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 13,
+  providers: syntheticBedrockProfileSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? { ...provider, credential: { state: "absent" }, models: [] }
+      : provider,
+  ),
+};
+
+/** The static key-pair mode, with both private-store slots filled and the session token left unset. */
 export const syntheticBedrockKeypairSettings = {
   ...syntheticBedrockProfileSettings,
   state_revision: 15,
@@ -504,6 +596,66 @@ export const syntheticBedrockAssumedRoleSettings = {
   ),
 };
 
+/** A persisted profile removed from local AWS discovery stays visible but cannot claim readiness. */
+export const syntheticBedrockMissingProfileSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 18,
+  bedrock: {
+    ...syntheticBedrockProfileSettings.bedrock,
+    profile: "retired-screenshot-profile",
+  },
+};
+
+/** Secret presence projections used to exercise Remove followed by Add/Replace without key material. */
+export const syntheticBedrockKeyMissingSettings = {
+  ...syntheticBedrockKeypairSettings,
+  state_revision: 19,
+  bedrock: {
+    ...syntheticBedrockKeypairSettings.bedrock,
+    has_access_key_id: false,
+  },
+  providers: syntheticBedrockKeypairSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? { ...provider, credential: { state: "absent" } }
+      : provider,
+  ),
+};
+
+export const syntheticBedrockKeyRestoredSettings = {
+  ...syntheticBedrockKeypairSettings,
+  state_revision: 20,
+};
+
+/** A newer canonical snapshot returned by a revision conflict. */
+export const syntheticBedrockConflictSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 21,
+  scopes: syntheticBedrockProfileSettings.scopes.map((scope) =>
+    scope.transport === "bedrock_runtime"
+      ? { ...scope, alias: "Changed elsewhere", region: "us-west-2" }
+      : scope,
+  ),
+  bedrock: {
+    ...syntheticBedrockProfileSettings.bedrock,
+    profile: "default",
+  },
+};
+
+export const syntheticBedrockClearedSettings = {
+  ...hostedSettings,
+  state_revision: 22,
+};
+
+export const syntheticBedrockKeypairClearedSettings = {
+  ...hostedSettings,
+  state_revision: 23,
+  bedrock: {
+    ...hostedSettings.bedrock,
+    has_access_key_id: true,
+    has_secret_access_key: true,
+  },
+};
+
 /** An expired IAM Identity Center session — the case that must read as recoverable, not broken. */
 export const syntheticBedrockRejectedSsoSettings = {
   ...syntheticBedrockProfileSettings,
@@ -528,6 +680,8 @@ export const fixtures: Record<string, unknown> = {
   get_live_test_window_generation: 41,
   start_live_test: null,
   stop_live_test: null,
+  open_preferences_section: null,
+  take_preferences_section_request: null,
   list_recordings: recordings,
   retry_recording: null,
   open_note: null,
@@ -572,6 +726,8 @@ export const fixtures: Record<string, unknown> = {
   list_aws_credential_options: {
     profiles: ["default", "corti-screenshot", "corti-sso"],
   },
+  save_bedrock_setup: { status: "unchanged", settings: hostedSettings },
+  clear_bedrock_setup: { status: "unchanged", settings: hostedSettings },
   set_bedrock_credential_mode: { status: "unchanged", settings: hostedSettings },
   prompt_for_provider_secret: "stored",
   clear_provider_secret: null,
@@ -787,6 +943,34 @@ export const syntheticAssistant = {
       answer: null,
       cost_label: "Cost unavailable",
       context_truncated: true,
+      cache: "none",
+    },
+  ],
+};
+
+export const syntheticPinnedWaitingSettings = {
+  ...syntheticLiveSettings,
+  state_revision: 25,
+  control: {
+    ...syntheticLiveSettings.control,
+    pinned_auto_enabled: true,
+    pinned_question_revision: 2,
+  },
+};
+
+export const syntheticPolicyBlockedAssistant = {
+  pinned_run_count: 0,
+  pinned: null,
+  exchanges: [
+    {
+      call_id: "synthetic-policy-question",
+      as_of_revision: 42,
+      status: "failed",
+      error: "policy_blocked",
+      question: "Summarize the chat up till now",
+      answer: null,
+      cost_label: "Cost unavailable",
+      context_truncated: false,
       cache: "none",
     },
   ],

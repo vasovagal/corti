@@ -13,6 +13,7 @@ import {
   getLiveTranscript,
   onHostedStateChanged,
   onLiveTranscriptChanged,
+  openPreferencesSection,
   patchHostedSettings,
   startLiveTest,
   stopLiveTest,
@@ -29,8 +30,16 @@ import {
   type LiveTranscriptEvent,
   type LiveTranscriptLine,
   type LiveTranscriptSnapshot,
+  type PreferencesSection,
 } from "./lib/api";
-import { VERTEX_UNARMED_WARNING } from "./lib/hosted";
+import {
+  VERTEX_UNARMED_WARNING,
+  hostedErrorGuidance,
+  hostedOnboardingGuidance,
+  laneConfigurationGuidance,
+  unknownHostedErrorGuidance,
+  type HostedActionGuidance,
+} from "./lib/hosted";
 import {
   applyLiveSnapshot,
   formatLiveRange,
@@ -70,6 +79,10 @@ export default function LiveTranscript() {
   const [controlBusy, setControlBusy] = useState("");
   const mutationBusy = useRef(false);
   const [controlStatus, setControlStatus] = useState("");
+  const [controlRepair, setControlRepair] = useState<{
+    label: string;
+    section: PreferencesSection;
+  } | null>(null);
   const [detailsEnabled, setDetailsEnabled] = useState(false);
   const detailsInitialized = useRef(false);
   const [laneStates, setLaneStates] = useState<Record<"live" | "final", HostedLaneState>>({
@@ -95,11 +108,39 @@ export default function LiveTranscript() {
   const drawer = useRef<HTMLElement>(null);
   const mainSurface = useRef<HTMLDivElement>(null);
 
+  const showHostedGuidance = useCallback((guidance: HostedActionGuidance) => {
+    setControlStatus(guidance.message);
+    setControlRepair(
+      guidance.section && guidance.actionLabel
+        ? { section: guidance.section, label: guidance.actionLabel }
+        : null,
+    );
+  }, []);
+
+  const openPreferences = useCallback(async (section: PreferencesSection) => {
+    try {
+      await openPreferencesSection(section);
+    } catch {
+      setControlStatus("Could not open Preferences. Open it from the Corti menu and choose Hosted rewrite.");
+      setControlRepair(null);
+    }
+  }, []);
+
   const installSettings = useCallback((next: HostedSettingsDto) => {
-    if (!shouldInstallHostedSettings(settingsRef.current, next)) return;
+    const current = settingsRef.current;
+    if (!shouldInstallHostedSettings(current, next)) return;
+    const invalidatesGuidance = Boolean(
+      current &&
+        (current.control.process_epoch !== next.control.process_epoch ||
+          next.state_revision > current.state_revision),
+    );
     settingsRef.current = next;
     setSettings(next);
     setHostedError("");
+    if (invalidatesGuidance) {
+      setControlStatus("");
+      setControlRepair(null);
+    }
     if (!detailsInitialized.current) {
       detailsInitialized.current = true;
       setDetailsEnabled(next.show_live_metrics_by_default);
@@ -335,6 +376,18 @@ export default function LiveTranscript() {
         if (terminal.lane === "live" && terminal.outcome !== "completed") {
           setLaneStates((current) => ({ ...current, live: terminal.outcome === "failed" ? "failed" : "using_raw" }));
         }
+        if (
+          terminal.error &&
+          !["canceled", "superseded"].includes(terminal.error)
+        ) {
+          const guidance = hostedErrorGuidance(terminal.error);
+          setControlStatus(guidance.message);
+          setControlRepair(
+            guidance.section && guidance.actionLabel
+              ? { section: guidance.section, label: guidance.actionLabel }
+              : null,
+          );
+        }
         if (terminal.lane.endsWith("question")) scheduleAssistant();
         return;
       }
@@ -453,6 +506,7 @@ export default function LiveTranscript() {
   const acceptMutation = useCallback(
     (result: HostedMutationResult, success: string): boolean => {
       installSettings(result.settings);
+      setControlRepair(null);
       switch (result.status) {
         case "applied":
           setControlStatus(success);
@@ -463,8 +517,12 @@ export default function LiveTranscript() {
         case "conflict":
           setControlStatus("Controls changed elsewhere. Latest state loaded; review and try again.");
           return false;
+        case "invalid":
+          setControlStatus("That settings update was invalid. Nothing was saved; review it in Preferences.");
+          return false;
         case "disabled_for_session":
-          setControlStatus("Off for this session · could not save.");
+          setControlStatus("Off for this session because the setting could not be saved. Raw transcript behavior is unchanged.");
+          setControlRepair({ label: "Open diagnostics", section: "hosted-advanced" });
           return true;
       }
     },
@@ -484,17 +542,18 @@ export default function LiveTranscript() {
       mutationBusy.current = true;
       setControlBusy(label);
       setControlStatus("");
+      setControlRepair(null);
       try {
         return acceptMutation(await patchHostedSettings(current.state_revision, patch), success);
-      } catch {
-        setControlStatus("Control update failed. Raw transcript behavior is unchanged.");
+      } catch (error) {
+        showHostedGuidance(unknownHostedErrorGuidance(error));
         return false;
       } finally {
         mutationBusy.current = false;
         setControlBusy("");
       }
     },
-    [acceptMutation],
+    [acceptMutation, showHostedGuidance],
   );
 
   const mutateSteering = useCallback(
@@ -504,6 +563,7 @@ export default function LiveTranscript() {
       mutationBusy.current = true;
       setControlBusy("steering");
       setControlStatus("");
+      setControlRepair(null);
       try {
         return acceptMutation(
           await updateHostedSteering(current.state_revision, text, persist),
@@ -511,15 +571,15 @@ export default function LiveTranscript() {
             ? "Steering saved as default and applied to the next request."
             : "Session steering applied to the next request.",
         );
-      } catch {
-        setControlStatus("Steering update failed. In-flight and raw transcript state were not changed.");
+      } catch (error) {
+        showHostedGuidance(unknownHostedErrorGuidance(error));
         return false;
       } finally {
         mutationBusy.current = false;
         setControlBusy("");
       }
     },
-    [acceptMutation],
+    [acceptMutation, showHostedGuidance],
   );
 
   async function startTest() {
@@ -586,13 +646,16 @@ export default function LiveTranscript() {
   const canStart =
     windowGeneration != null && mode !== "call" && !snapshot?.active && status !== "stopping";
   const canStop = mode === "test" && snapshot?.active;
+  const sessionActive = Boolean(snapshot?.active && snapshot.session_id);
   const rows = snapshot?.lines ?? [];
+  const onboarding = settings ? hostedOnboardingGuidance(settings) : null;
   const assistantPanel = (
     <Assistant
       key={`${snapshot?.session_id ?? "no-session"}:${snapshot?.session_generation ?? "unknown"}`}
       snapshot={assistant}
       settings={settings}
       calls={calls}
+      sessionActive={sessionActive}
       detailsEnabled={detailsEnabled}
       loading={assistantLoading}
       error={assistantError}
@@ -600,6 +663,7 @@ export default function LiveTranscript() {
       onClose={narrow ? closeAssistant : undefined}
       onRefresh={refreshAssistant}
       onPatch={mutateControl}
+      onOpenPreferences={openPreferences}
     />
   );
 
@@ -656,14 +720,41 @@ export default function LiveTranscript() {
           onPatch={mutateControl}
           onSteering={mutateSteering}
           onBlockedEnable={() =>
-            setControlStatus("Acknowledge hosted transcript egress in Settings before enabling Master.")
+            showHostedGuidance({
+              message: "Review and acknowledge the text-only privacy boundary before enabling Master.",
+              actionLabel: "Review privacy & enable",
+              section: "hosted",
+            })
           }
+          onConfigurationNeeded={(lane) => {
+            const guidance = settings ? laneConfigurationGuidance(settings, lane) : null;
+            if (guidance) showHostedGuidance(guidance);
+          }}
         />
+
+        {onboarding && (
+          <section className="live-setup-callout" aria-label="Hosted rewrite setup">
+            <div>
+              <strong>Finish hosted rewrite setup</strong>
+              <span>{onboarding.message}</span>
+            </div>
+            {onboarding.section && onboarding.actionLabel && (
+              <button
+                className="btn-primary"
+                type="button"
+                onClick={() => void openPreferences(onboarding.section!)}
+              >
+                {onboarding.actionLabel}
+              </button>
+            )}
+          </section>
+        )}
 
         {mode === "test" && (
           <p className="callout small live-test-callout">
-            Test mode listens only to your default microphone. It does not save audio, file a note, or add a
-            recording to the queue. Automatic call detection resumes when you stop the test.
+            Test mode listens only to your default microphone. It saves no recording or note and adds nothing
+            to the queue. Enabled hosted modes may send transcript text and use their configured encrypted
+            cache; automatic call detection resumes when you stop the test.
           </p>
         )}
         {(liveError || hostedError || controlStatus || repairing) && (
@@ -672,7 +763,20 @@ export default function LiveTranscript() {
             role={liveError || hostedError ? "alert" : "status"}
             aria-live="polite"
           >
-            {liveError || hostedError || (repairing ? "Repairing a missed live update; existing raw rows remain visible." : controlStatus)}
+            <span>
+              {liveError || hostedError || (repairing ? "Repairing a missed live update; existing raw rows remain visible." : controlStatus)}
+            </span>
+            {!liveError && !repairing && (controlRepair || hostedError) && (
+              <button
+                className="btn-secondary"
+                type="button"
+                onClick={() =>
+                  void openPreferences(controlRepair?.section ?? "hosted-advanced")
+                }
+              >
+                {controlRepair?.label ?? "Open hosted diagnostics"}
+              </button>
+            )}
           </div>
         )}
 
@@ -717,7 +821,9 @@ export default function LiveTranscript() {
                 </ol>
               )}
             </div>
-            {detailsEnabled && <CallDetails calls={calls} />}
+            {detailsEnabled && (
+              <CallDetails calls={calls} onOpenPreferences={openPreferences} />
+            )}
           </main>
 
           {!narrow && <aside className="live-assistant-sidebar" aria-label="Transcript assistant">{assistantPanel}</aside>}
@@ -745,8 +851,17 @@ export default function LiveTranscript() {
       )}
 
       {toast && (
-        <div className="live-warning-toast" role="alert" aria-live="assertive" aria-atomic="true">
-          {toast.message}
+        <div className="live-warning-toast">
+          <span role="alert" aria-live="assertive" aria-atomic="true">{toast.message}</span>
+          {toast.message === VERTEX_UNARMED_WARNING && (
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => void openPreferences("hosted-provider")}
+            >
+              Fix Vertex setup
+            </button>
+          )}
         </div>
       )}
       <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">

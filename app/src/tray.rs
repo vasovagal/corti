@@ -5,6 +5,7 @@
 //! status string + recent-notes list are the source of truth) and swapped in via `TrayIcon::set_menu` —
 //! simpler and flicker-free since it's a dropdown the user only sees on click.
 
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -14,13 +15,45 @@ use tauri::image::Image;
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{
-    ActivationPolicy, AppHandle, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
+    ActivationPolicy, AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    Wry,
 };
 
 use crate::imp::{AppState, HISTORY_LIMIT, HistoryEntry};
 use crate::permissions::PRIVACY_SCREEN_CAPTURE;
 
 const TRAY_ID: &str = "corti-tray";
+pub(crate) const SETTINGS_NAVIGATION_REQUESTED_EVENT: &str = "settings-navigation-requested";
+
+/// Backend-owned latest-wins handoff. The frontend event is only a wake-up; no webview-provided payload can
+/// choose a Preferences destination, and a newly loading Settings window can take the pending value on mount.
+#[derive(Default)]
+pub(crate) struct PreferencesNavigation {
+    pending: Mutex<Option<String>>,
+}
+
+impl PreferencesNavigation {
+    fn request(&self, section: &str) {
+        *self.pending.lock().unwrap() = Some(section.to_string());
+    }
+
+    fn take(&self) -> Option<String> {
+        self.pending.lock().unwrap().take()
+    }
+}
+
+fn preferences_section(section: &str) -> Option<&'static str> {
+    match section {
+        "transcription" => Some("transcription"),
+        "hosted" => Some("hosted"),
+        "hosted-provider" => Some("hosted-provider"),
+        "hosted-routing" => Some("hosted-routing"),
+        "hosted-language" => Some("hosted-language"),
+        "hosted-advanced" => Some("hosted-advanced"),
+        "storage" => Some("storage"),
+        _ => None,
+    }
+}
 
 /// Menu-bar template icons, embedded at build time as raw RGBA (no `image-*` feature needed). Monochrome
 /// black + alpha; `icon_as_template(true)` lets macOS tint them for light/dark mode.
@@ -514,17 +547,86 @@ fn open_ethics_window(app: &AppHandle) {
     );
 }
 
-/// The Preferences editor window.
+/// The Preferences editor window. A normal tray click preserves an existing pane; targeted repair links use
+/// `open_settings_section` below to navigate deliberately.
 fn open_settings_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("settings") {
+        foreground_window(app, &win);
+        return;
+    }
     open_app_window(
         app,
         "settings",
-        "index.html?view=settings",
+        "index.html?view=settings&section=transcription",
         "Preferences",
         (1040.0, 760.0),
         (620.0, 500.0),
         None,
     );
+}
+
+/// Open Preferences at one allowlisted section. An existing singleton receives an in-app navigation event;
+/// a new window gets the same destination in its initial URL so Live can offer reliable repair links.
+fn open_settings_section(app: &AppHandle, section: &'static str) {
+    if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.emit(SETTINGS_NAVIGATION_REQUESTED_EVENT, ());
+        foreground_window(app, &win);
+        return;
+    }
+    let url = match section {
+        "transcription" => "index.html?view=settings&section=transcription",
+        "hosted" => "index.html?view=settings&section=hosted",
+        "hosted-provider" => "index.html?view=settings&section=hosted-provider",
+        "hosted-routing" => "index.html?view=settings&section=hosted-routing",
+        "hosted-language" => "index.html?view=settings&section=hosted-language",
+        "hosted-advanced" => "index.html?view=settings&section=hosted-advanced",
+        "storage" => "index.html?view=settings&section=storage",
+        _ => "index.html?view=settings&section=hosted",
+    };
+    open_app_window(
+        app,
+        "settings",
+        url,
+        "Preferences",
+        (1040.0, 760.0),
+        (620.0, 500.0),
+        None,
+    );
+}
+
+/// Bridge for actionable hosted setup/error links in Live (and same-window Settings actions). The section
+/// allowlist prevents a webview payload from turning this into arbitrary navigation, and the caller allowlist
+/// preserves every other window boundary.
+#[tauri::command]
+pub(crate) fn open_preferences_section(
+    section: String,
+    app: AppHandle,
+    navigation: tauri::State<'_, PreferencesNavigation>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    if window.label() != "live" && window.label() != "settings" {
+        return Err("preferences navigation is unavailable from this window".to_string());
+    }
+    let section =
+        preferences_section(&section).ok_or_else(|| "unknown preferences section".to_string())?;
+    navigation.request(section);
+    open_settings_section(&app, section);
+    Ok(())
+}
+
+/// Take the backend-owned repair destination after subscribing to the wake event. A spoofed frontend event
+/// can at most cause another empty read; it cannot supply or retain a destination.
+#[tauri::command]
+pub(crate) fn take_preferences_section_request(
+    navigation: tauri::State<'_, PreferencesNavigation>,
+    window: tauri::WebviewWindow,
+) -> Result<Option<String>, String> {
+    if window.label() != "settings" {
+        return Err(
+            "preferences navigation requests are available only in Preferences".to_string(),
+        );
+    }
+    Ok(navigation.take())
 }
 
 /// The timestamped live call / ephemeral microphone-test reader.
@@ -534,8 +636,8 @@ fn open_live_transcript_window(app: &AppHandle, generation: Option<u64>) {
         "live",
         "index.html?view=live",
         "Live Transcript",
-        (760.0, 620.0),
-        (520.0, 360.0),
+        (1100.0, 700.0),
+        (640.0, 420.0),
         generation,
     );
 }
@@ -699,13 +801,38 @@ fn open_url(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        NOTE_PREFIX, format_duration, history_entry_label, live_transcript_menu_state, mode_tag,
-        note_menu_id, note_path_from_id, relative_time, status_label,
+        NOTE_PREFIX, PreferencesNavigation, format_duration, history_entry_label,
+        live_transcript_menu_state, mode_tag, note_menu_id, note_path_from_id, preferences_section,
+        relative_time, status_label,
     };
     use crate::imp::HistoryEntry;
     use chrono::{DateTime, Duration, Local, TimeZone};
     use corti_core::{JobStatus, RecordingMode};
     use std::path::Path;
+
+    #[test]
+    fn preferences_navigation_is_allowlisted_backend_owned_and_latest_wins() {
+        for section in [
+            "transcription",
+            "hosted",
+            "hosted-provider",
+            "hosted-routing",
+            "hosted-language",
+            "hosted-advanced",
+            "storage",
+        ] {
+            assert_eq!(preferences_section(section), Some(section));
+        }
+        for rejected in ["", "../queue", "https://example.com", "hosted?other=true"] {
+            assert_eq!(preferences_section(rejected), None);
+        }
+
+        let navigation = PreferencesNavigation::default();
+        navigation.request("hosted-provider");
+        navigation.request("hosted-routing");
+        assert_eq!(navigation.take().as_deref(), Some("hosted-routing"));
+        assert_eq!(navigation.take(), None);
+    }
 
     #[test]
     fn live_transcript_action_tracks_call_test_and_webinar_context() {

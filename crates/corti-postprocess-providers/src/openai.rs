@@ -169,13 +169,18 @@ impl OpenAiResponsesAdapter {
 
         let cache_key = match request.cache_policy.provider {
             ProviderCacheMode::Off => None,
-            ProviderCacheMode::ExplicitStablePrefix => Some(
-                self.cache_keys
-                    .as_mut()
-                    .ok_or_else(|| ExecFailure::new(ErrorCode::Cache, false))?
-                    .key_for(request)
-                    .map_err(|_| ExecFailure::new(ErrorCode::Cache, false))?,
-            ),
+            ProviderCacheMode::ExplicitStablePrefix => {
+                Some(request.provider_cache_key.clone().map_or_else(
+                    || {
+                        self.cache_keys
+                            .as_mut()
+                            .ok_or_else(|| ExecFailure::new(ErrorCode::Cache, false))?
+                            .key_for(request)
+                            .map_err(|_| ExecFailure::new(ErrorCode::Cache, false))
+                    },
+                    Ok,
+                )?)
+            }
             ProviderCacheMode::UnavoidableImplicit | ProviderCacheMode::Unavailable => {
                 return Err(ExecFailure::new(ErrorCode::PolicyBlocked, false));
             }

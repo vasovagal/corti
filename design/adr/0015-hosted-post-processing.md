@@ -6,7 +6,8 @@
   ADR 0014 (provenance schema 2 may describe applied hosted text)
 - **References:** [design 07](../07-paid-model-post-processing.md), ADRs 0009/0012/0013,
   [#112](https://github.com/vasovagal/corti/issues/112),
-  [#130](https://github.com/vasovagal/corti/issues/130)
+  [#130](https://github.com/vasovagal/corti/issues/130),
+  [#146](https://github.com/vasovagal/corti/issues/146)
 
 ## Context
 
@@ -102,9 +103,27 @@ a null dollar amount. OpenAI Platform API keys remain a separate metered transpo
 The old `codex_app_server` descriptor is removed from the production provider catalog. No Codex process,
 `CODEX_HOME`, app-server protocol, or imported Codex/Pi/Dekopon credential participates in this path.
 
+### Amendment — benchmark state advises the owner; the microphone test exercises hosted paths (#146)
+
+An authenticated account/region model with the required text input/output and structured-output capabilities
+may be selected for Live cleanup even when Corti has not benchmarked its latency. Benchmark metadata controls
+recommendation language and defaults, not whether the owner can try a model returned by their account.
+Corti continues to disclose unmeasured speed, never silently substitutes a model, and enforces the existing
+5-second terminal deadline so raw phrase text wins when the user's choice is too slow or fails.
+
+The explicit microphone transcription test opens a recording-scoped **ephemeral** hosted session and forwards
+its finalized raw rows through the same bounded handoff as a real live call. After ASR closes, an acknowledged
+FIFO ingress barrier prevents Final or EndSession from overtaking the tail row. This makes Live cleanup and
+questions testable; an enabled Final lane runs at test stop and may update only the transient test view. The
+test creates no recording row or Vagus note, and its content-free terminal records are acknowledged without
+entering durable queue history. Any enabled provider call and configured encrypted exact cache still follow
+the ordinary egress acknowledgement/cache policy and are disclosed in the test window. Raw microphone text
+remains independent when hosted setup or dispatch fails.
+
 ## Consequences
 
-- Live cleanup latency is phrase-closure latency; Corti does not invent unstable ASR partials.
+- Live cleanup latency is phrase-closure latency; Corti does not invent unstable ASR partials. Unmeasured
+  account models remain user-selectable, with advice and hard raw fallback instead of a disabled catalog row.
 - A user can always read/file raw text when hosted work is disabled, waiting, stale, canceled, malformed,
   failed, or crash-ambiguous.
 - A literal requirement that no Vagus file exist before final processing is not met for live calls; changing

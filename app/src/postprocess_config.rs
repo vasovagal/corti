@@ -674,6 +674,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_configured_bedrock_without_a_setup_name_remains_readable() {
+        let path = test_path("bedrock-legacy-missing-name");
+        let preferences = HostedPreferences::default()
+            .revise(|values| {
+                let bedrock = &mut values.providers.bedrock;
+                bedrock.scope.connection_scope_id =
+                    Some(ConnectionScopeId::new("legacy-bedrock-scope").unwrap());
+                bedrock.scope.region = Some("us-east-1".into());
+                bedrock.scope.alias = None;
+            })
+            .unwrap();
+        preferences.save_at(&path).unwrap();
+        let loaded = HostedPreferences::load_at(&path).unwrap();
+        assert_eq!(
+            loaded
+                .values()
+                .providers
+                .bedrock
+                .scope
+                .connection_scope_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "legacy-bedrock-scope"
+        );
+        assert!(loaded.values().providers.bedrock.scope.alias.is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn bedrock_modes_require_their_own_non_secret_companion_field() {
         let base = HostedPreferences::default();
         let error = base

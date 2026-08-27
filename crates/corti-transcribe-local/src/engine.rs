@@ -34,6 +34,18 @@ pub(crate) const VAD_WINDOW: usize = 512;
 /// Cap a single speech segment so ASR stays under Parakeet's offline clip limit (~30 s).
 const MAX_SPEECH_SECONDS: f32 = 20.0;
 
+/// Sherpa may retain the maximum speech region plus the configured trailing silence and another pair of VAD
+/// windows before it closes the region. Provision that complete lifecycle instead of the exact 320,000
+/// speech samples, which forced sherpa's internal vector to grow at the normal 20-second boundary.
+fn vad_buffer_seconds(min_silence: f32) -> f32 {
+    let trailing = if min_silence.is_finite() {
+        min_silence.max(0.0)
+    } else {
+        0.25
+    };
+    MAX_SPEECH_SECONDS + trailing + (2 * VAD_WINDOW) as f32 / TARGET_RATE as f32
+}
+
 /// Resample a mono channel to 16 kHz (no-op if already there). Uses sherpa's `LinearResampler`.
 pub fn resample_to_16k(samples: &[f32], from_hz: i32) -> Result<Vec<f32>> {
     if from_hz == TARGET_RATE || samples.is_empty() {
@@ -108,9 +120,9 @@ pub fn build_vad(m: &Models, threshold: f32, min_silence: f32) -> Result<VoiceAc
         provider: Some(PROVIDER.to_string()),
         debug: false,
     };
-    // Buffer up to MAX_SPEECH_SECONDS of audio internally.
+    // Include closure slack so an ordinary maximum-length region never triggers sherpa's growth warning.
     let started = std::time::Instant::now();
-    let vad = VoiceActivityDetector::create(&config, MAX_SPEECH_SECONDS)
+    let vad = VoiceActivityDetector::create(&config, vad_buffer_seconds(min_silence))
         .context("failed to create the Silero VAD (check model file)")?;
     tracing::info!(
         target: "corti::transcribe::local",
@@ -290,6 +302,21 @@ mod tests {
 
     fn toks(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn vad_capacity_covers_maximum_speech_trailing_silence_and_window_slack() {
+        let min_silence = 0.25;
+        let seconds = vad_buffer_seconds(min_silence);
+        let samples = (seconds * TARGET_RATE as f32).floor() as usize;
+        let maximum_speech_samples = (MAX_SPEECH_SECONDS * TARGET_RATE as f32) as usize;
+        assert!(samples > maximum_speech_samples);
+        assert!(
+            samples
+                >= maximum_speech_samples
+                    + (min_silence * TARGET_RATE as f32) as usize
+                    + 2 * VAD_WINDOW
+        );
     }
 
     /// Proves sherpa-onnx loads **every** selectable English embedding model through the same diarizer —
