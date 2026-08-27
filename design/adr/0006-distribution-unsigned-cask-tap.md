@@ -61,6 +61,9 @@ which also holds vagus's formula).
 - **TCC re-prompts on every update.** Because the ad-hoc cdhash changes each release, macOS re-asks for
   Microphone + System Audio Recording after each `brew upgrade --cask corti`. Documented in the tap README;
   not a bug.
+- **The Keychain is unusable.** Login-keychain ACLs and partition lists key on the same cdhash, so every
+  build is a stranger to every item and, with no certificate to validate, macOS demands the login password
+  instead of a click. Hosted secrets therefore live in owner-only files (ADR 0015 amendment, 2026-08-26).
 - **We deliberately bypass Gatekeeper** via the postflight quarantine strip. This is a real security
   tradeoff and is only acceptable for a tap the author controls.
 - **macOS floor (latest + one back).** Per ADR 0002 the support floor is `minimumSystemVersion = 15.0`

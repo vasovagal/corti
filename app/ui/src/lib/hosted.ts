@@ -41,14 +41,14 @@ const PRESENTATION: Record<string, ProviderPresentation> = {
   openai_api: {
     name: "OpenAI direct API",
     shortName: "OpenAI API",
-    auth: "API key in macOS Keychain or workload identity",
+    auth: "API key in Corti's private secret store or workload identity",
     guidanceTitle: "For an OpenAI API account",
     guidance: "Uses separate API billing and data controls. A ChatGPT subscription does not include API usage.",
   },
   anthropic_api: {
     name: "Anthropic direct API",
     shortName: "Anthropic API",
-    auth: "API key in macOS Keychain or workload identity",
+    auth: "API key in Corti's private secret store or workload identity",
     guidanceTitle: "For an Anthropic API account",
     guidance: "Uses metered API billing. Claude Free, Pro, and Max subscriptions are separate products.",
   },
@@ -104,7 +104,7 @@ export interface CredentialSummary {
 function credentialSourceLabel(source: Extract<HostedCredentialState, { state: "ready" }>["source"]): string {
   switch (source) {
     case "keychain":
-      return "macOS Keychain";
+      return "Corti's private secret store";
     case "workload_identity":
       return "workload identity";
     case "application_default_credentials":
@@ -118,7 +118,7 @@ function credentialSourceLabel(source: Extract<HostedCredentialState, { state: "
     case "aws_profile":
       return "a named AWS profile";
     case "aws_static_keychain":
-      return "an AWS key pair in the macOS Keychain";
+      return "an AWS key pair in Corti's private secret store";
     case "aws_assumed_role":
       return "an assumed IAM role";
     case "aws_sso":
@@ -149,7 +149,7 @@ export function awsCredentialModeDescription(mode: AwsCredentialMode): string {
     case "profile":
       return "A named profile from ~/.aws/config or ~/.aws/credentials.";
     case "static_keychain":
-      return "An access key ID and secret stored in the macOS Keychain. A session token is optional.";
+      return "An access key ID and secret stored in Corti's private secret store. A session token is optional.";
     case "assume_role":
       return "Resolve a base credential, then assume this role. Corti renews the session before it lapses.";
     case "sso":
@@ -271,7 +271,7 @@ export function credentialSummary(
         label: chatgpt && credential.code === "cache" ? "Sign-in not saved" : "Credential error",
         detail:
           chatgpt && credential.code === "cache"
-            ? "OpenAI authorized Corti, but the rotating credential could not be persisted in the macOS Keychain. Sign in again after fixing Keychain access."
+            ? "OpenAI authorized Corti, but the rotating credential could not be persisted in Corti's private secret store. Sign in again after fixing its permissions."
             : errorLabel(credential.code),
         tone: "error",
       };

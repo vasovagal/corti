@@ -416,7 +416,7 @@ export interface BedrockCredentialDto {
   has_session_token: boolean;
 }
 
-/** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Keychain presence is not here: it comes
+/** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Secret presence is not here: it comes
  * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
 export interface AwsCredentialOptionsDto {
   profiles: string[];
@@ -744,7 +744,7 @@ export const setHostedVertexModels = (
     request: { observed_state_revision: observedStateRevision, models },
   });
 
-/** Opens the native secure-entry sheet. The typed value goes straight to the Keychain; this call only
+/** Opens the native secure-entry sheet. The typed value goes straight to the private secret store; this call only
  * ever learns whether it was stored, cancelled, or rejected. */
 export const promptForProviderSecret = (request: SecretSlotRequest): Promise<SecretEntryResult> =>
   invoke<SecretEntryResult>("prompt_for_provider_secret", { request });

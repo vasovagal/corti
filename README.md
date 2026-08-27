@@ -45,7 +45,7 @@ signals. Exactly what this app does: audio → notes.
   Closing that test window closes the microphone and resumes automatic call detection.
 - **Optional hosted text cleanup and questions.** Raw ASR remains immediate and durable; separately enabled
   modes can rewrite finalized text or answer transcript questions through direct APIs, Vertex, Bedrock, or a
-  ChatGPT subscription. ChatGPT sign-in uses a Corti-owned device credential in the macOS Keychain and calls
+  ChatGPT subscription. ChatGPT sign-in uses a Corti-owned device credential in its private secret store and calls
   OpenAI's fixed Responses endpoint directly—there is no Codex server and no OpenAI API-key charge for that
   transport.
 - **Crash-safe live inbox filing.** With the local backend, the app transcribes continuously and

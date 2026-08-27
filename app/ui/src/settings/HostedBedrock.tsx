@@ -191,7 +191,8 @@ export function HostedBedrockCredentials({
       {mode === "static_keychain" && (
         <div className="hosted-native-auth">
           <p className="muted small">
-            Values are typed into a native macOS sheet and written straight to the Keychain. This window
+            Values are typed into a native macOS sheet and written straight to Corti's private secret store
+            (owner-only files under ~/.local/share/corti/hosted-secrets). This window
             never receives them, and no browser field accepts a key.
           </p>
           <ul className="hosted-key-slots">
