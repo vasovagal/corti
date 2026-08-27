@@ -2035,13 +2035,13 @@ fn vertex_adapter(
     Some(Box::new(adapter))
 }
 
-/// The curated Gemini models plus whatever exact ids the operator typed in Settings. Vertex exposes no
+/// The curated models plus whatever exact ids the operator typed in Settings. Vertex exposes no
 /// per-project listing of the models a caller may invoke — the publisher list is the whole Model Garden and
 /// needs a quota project the caller may not hold — so typing the id is the only discovery Corti can offer.
-/// Typed entries inherit the Gemini 2.5 limits: the adapter only uses them to refuse an output budget larger
-/// than the model allows, and Vertex rejects a genuinely wrong id on the first call with its own error.
+/// Limits come from the id: the adapter only uses them to refuse an output budget larger than the model
+/// allows, and Vertex rejects a genuinely wrong id on the first call with its own error.
 fn vertex_direct_models(typed: &[String]) -> Vec<VertexModel> {
-    const CURATED: [&str; 2] = ["gemini-2.5-flash", "gemini-2.5-pro"];
+    const CURATED: [&str; 3] = ["gemini-2.5-flash", "gemini-2.5-pro", "claude-sonnet-4-5"];
     let mut seen = HashSet::new();
     CURATED
         .into_iter()
@@ -2050,7 +2050,7 @@ fn vertex_direct_models(typed: &[String]) -> Vec<VertexModel> {
         // The adapter rejects the whole catalog on a duplicate, so a typed id that repeats a curated one
         // must collapse rather than disarm every model.
         .filter(|id| seen.insert(id.clone()))
-        .filter_map(|id| VertexModel::new(ModelId::new(id).ok()?, 1_000_000, 65_536).ok())
+        .filter_map(|id| VertexModel::inferred(ModelId::new(id).ok()?).ok())
         .collect()
 }
 
@@ -5114,7 +5114,7 @@ mod tests {
         RewriteOutput,
     };
     use corti_postprocess_providers::{
-        HttpRequest, HttpResponse, HttpResponseBody, TransportError,
+        HttpRequest, HttpResponse, HttpResponseBody, TransportError, VertexPublisher,
     };
 
     use super::*;
@@ -6881,7 +6881,7 @@ mod tests {
 
         assert_eq!(
             ids(&vertex_direct_models(&[])),
-            ["gemini-2.5-flash", "gemini-2.5-pro"]
+            ["gemini-2.5-flash", "gemini-2.5-pro", "claude-sonnet-4-5"]
         );
         // A repeat of a curated id would make `VertexRestAdapter::new` reject the whole catalog.
         assert_eq!(
@@ -6892,9 +6892,16 @@ mod tests {
             [
                 "gemini-2.5-flash",
                 "gemini-2.5-pro",
+                "claude-sonnet-4-5",
                 "gemini-2.5-flash-lite"
             ]
         );
+
+        let claude = vertex_direct_models(&["claude-opus-4-5@20251101".to_owned()])
+            .into_iter()
+            .find(|model| model.exact_model_id().as_str() == "claude-opus-4-5@20251101")
+            .unwrap();
+        assert_eq!(claude.publisher(), VertexPublisher::Anthropic);
     }
 
     #[test]
@@ -6946,13 +6953,14 @@ mod tests {
             catalog("global"),
             Ok(vec![
                 "gemini-2.5-flash".to_owned(),
-                "gemini-2.5-pro".to_owned()
+                "gemini-2.5-pro".to_owned(),
+                "claude-sonnet-4-5".to_owned()
             ])
         );
 
         // An adapter built for the old region rejects the new one outright.
         revise(|values| values.providers.vertex.region = Some("us-east5".to_owned()));
-        assert_eq!(catalog("us-east5").map(|models| models.len()), Ok(2));
+        assert_eq!(catalog("us-east5").map(|models| models.len()), Ok(3));
 
         revise(|values| {
             values.providers.vertex_models = vec!["gemini-2.5-flash-lite".to_owned()];
@@ -6962,6 +6970,7 @@ mod tests {
             Ok(vec![
                 "gemini-2.5-flash".to_owned(),
                 "gemini-2.5-pro".to_owned(),
+                "claude-sonnet-4-5".to_owned(),
                 "gemini-2.5-flash-lite".to_owned(),
             ])
         );

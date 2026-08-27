@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod anthropic;
+mod anthropic_wire;
 mod bedrock;
 mod blocked;
 mod chatgpt;
@@ -48,8 +49,8 @@ pub use transport::{
     TransportErrorKind, UreqTransport, WallClock,
 };
 pub use vertex::{
-    AdcAccessToken, AdcAccessTokenSource, VERTEX_PUBLISHER, VERTEX_REST_ADAPTER_VERSION,
-    VertexConfigurationError, VertexModel, VertexProjectMetadata, VertexRestAdapter,
+    AdcAccessToken, AdcAccessTokenSource, VERTEX_REST_ADAPTER_VERSION, VertexConfigurationError,
+    VertexModel, VertexProjectMetadata, VertexPublisher, VertexRestAdapter,
 };
 pub use vertex_auth::{
     VERTEX_CREDENTIAL_POLL_INTERVAL_MICROS, VertexAutoPending, VertexCredentialResolver,

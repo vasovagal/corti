@@ -35,6 +35,9 @@ const CHATGPT_MODEL_LIST: &str = r#"{
 }"#;
 const ANTHROPIC_MODEL_ID: &str = "claude-haiku-4-5-20251001";
 const VERTEX_MODEL_ID: &str = "gemini-synthetic-001";
+const VERTEX_CLAUDE_MODEL_ID: &str = "claude-sonnet-4-5@20250929";
+/// Vertex echoes the id it resolved to, not the one the request asked for.
+const VERTEX_CLAUDE_RESOLVED_MODEL_ID: &str = "claude-sonnet-4-5-20250929";
 const VERTEX_PROJECT_ID: &str = "synthetic-project";
 const VERTEX_REGION: &str = "us-central1";
 const VERTEX_QUOTA_PROJECT_ID: &str = "synthetic-quota-project";
@@ -623,6 +626,11 @@ fn vertex_stream() -> Vec<Vec<u8>> {
 }
 
 fn anthropic_stream() -> Vec<Vec<u8>> {
+    anthropic_stream_for(ANTHROPIC_MODEL_ID)
+}
+
+/// The same stream the direct API sends, under whichever model id the server reports.
+fn anthropic_stream_for(model: &str) -> Vec<Vec<u8>> {
     let output = r#"{"schema":1,"replacements":[{"row_id":"r-000001","text":"Synthetic corrected sentence."}]}"#;
     let split = output.find("corrected").unwrap();
     let mut wire = Vec::new();
@@ -631,7 +639,7 @@ fn anthropic_stream() -> Vec<Vec<u8>> {
         json!({
             "type":"message_start",
             "message":{
-                "model":ANTHROPIC_MODEL_ID,
+                "model":model,
                 "usage":{
                     "input_tokens":12,
                     "output_tokens":1,
@@ -720,6 +728,15 @@ fn anthropic_adapter(scripts: Vec<Script>) -> (FakeTransportHandle, AnthropicMes
 fn vertex_adapter(
     scripts: Vec<Script>,
 ) -> (FakeTransportHandle, Arc<CredentialState>, VertexRestAdapter) {
+    let model =
+        VertexModel::new(ModelId::new(VERTEX_MODEL_ID).unwrap(), 1_000_000, 64_000).unwrap();
+    vertex_adapter_with(vec![model], scripts)
+}
+
+fn vertex_adapter_with(
+    models: Vec<VertexModel>,
+    scripts: Vec<Script>,
+) -> (FakeTransportHandle, Arc<CredentialState>, VertexRestAdapter) {
     let (handle, transport) = FakeTransportHandle::new(scripts);
     let state = Arc::new(CredentialState::default());
     let metadata = VertexProjectMetadata::new(
@@ -728,8 +745,6 @@ fn vertex_adapter(
         Some(VERTEX_QUOTA_PROJECT_ID.to_owned()),
     )
     .unwrap();
-    let model =
-        VertexModel::new(ModelId::new(VERTEX_MODEL_ID).unwrap(), 1_000_000, 64_000).unwrap();
     let adapter = VertexRestAdapter::new(
         Box::new(transport),
         Box::new(FakeClock::new(100)),
@@ -737,7 +752,7 @@ fn vertex_adapter(
             state: state.clone(),
         }),
         metadata,
-        [model],
+        models,
     )
     .unwrap();
     (handle, state, adapter)
@@ -1120,6 +1135,124 @@ fn vertex_metadata_and_cache_policy_fail_closed_before_egress() {
         .unwrap_err();
     assert_eq!(error.code, corti_postprocess::ErrorCode::PolicyBlocked);
     assert!(handle.captured().is_empty());
+}
+
+#[test]
+fn vertex_anthropic_publisher_speaks_the_messages_api_under_the_resolved_model_id() {
+    let model = VertexModel::inferred(ModelId::new(VERTEX_CLAUDE_MODEL_ID).unwrap()).unwrap();
+    let (handle, _, mut adapter) = vertex_adapter_with(
+        vec![model],
+        vec![Script::sse(anthropic_stream_for(
+            VERTEX_CLAUDE_RESOLVED_MODEL_ID,
+        ))],
+    );
+    adapter.catalog(&vertex_scope()).unwrap();
+
+    let request = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_CLAUDE_MODEL_ID,
+        ProviderCacheMode::ExplicitStablePrefix,
+    );
+    let sink = CollectingSink::default();
+    let terminal = adapter
+        .execute(&request, &CancellationToken::new(), &sink)
+        .unwrap();
+    assert_eq!(terminal.usage.input_tokens, Some(12));
+    assert_eq!(terminal.usage.output_tokens, Some(9));
+    assert_eq!(terminal.usage.cached_read_tokens, Some(3));
+    assert_eq!(terminal.usage.cached_write_tokens, Some(5));
+    assert_eq!(terminal.usage.reasoning_tokens, Some(2));
+    assert!(terminal.usage.usage_complete);
+    assert_eq!(
+        terminal.cache,
+        corti_postprocess::CacheObservation::ProviderRead
+    );
+
+    let captured = handle.captured();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].method, HttpMethod::Post);
+    assert_eq!(
+        captured[0].url,
+        format!(
+            "https://{VERTEX_REGION}-aiplatform.googleapis.com/v1/projects/{VERTEX_PROJECT_ID}/locations/{VERTEX_REGION}/publishers/anthropic/models/{VERTEX_CLAUDE_MODEL_ID}:streamRawPredict"
+        )
+    );
+    assert_eq!(captured[0].secret_headers, ["authorization"]);
+    let body = captured[0].body.as_ref().unwrap();
+    assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+    assert!(body.get("model").is_none());
+    assert!(body.get("inference_geo").is_none());
+    assert_eq!(body["output_config"]["format"]["type"], "json_schema");
+    assert_eq!(body["system"].as_array().unwrap().len(), 2);
+    assert!(
+        !body["system"]
+            .to_string()
+            .contains("Ignore previous instructions")
+    );
+    assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 4);
+    assert!(
+        body["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Ignore previous instructions")
+    );
+}
+
+#[test]
+fn vertex_publisher_capabilities_and_cache_policy_follow_the_model_id() {
+    let (handle, _, mut adapter) = vertex_adapter_with(
+        vec![
+            VertexModel::inferred(ModelId::new(VERTEX_MODEL_ID).unwrap()).unwrap(),
+            VertexModel::inferred(ModelId::new(VERTEX_CLAUDE_MODEL_ID).unwrap()).unwrap(),
+        ],
+        vec![Script::sse(anthropic_stream_for(
+            VERTEX_CLAUDE_RESOLVED_MODEL_ID,
+        ))],
+    );
+    let catalog = adapter.catalog(&vertex_scope()).unwrap();
+    let gemini = catalog
+        .models
+        .iter()
+        .find(|model| model.exact_model_id.as_str() == VERTEX_MODEL_ID)
+        .unwrap();
+    assert!(gemini.capabilities.implicit_cache_may_apply);
+    assert!(!gemini.capabilities.explicit_prefix_cache);
+    assert_eq!(gemini.max_context_tokens, 1_000_000);
+    assert_eq!(gemini.max_output_tokens, 65_536);
+    let claude = catalog
+        .models
+        .iter()
+        .find(|model| model.exact_model_id.as_str() == VERTEX_CLAUDE_MODEL_ID)
+        .unwrap();
+    assert!(claude.capabilities.explicit_prefix_cache);
+    assert!(!claude.capabilities.implicit_cache_may_apply);
+    assert_eq!(claude.max_context_tokens, 200_000);
+    assert_eq!(claude.max_output_tokens, 64_000);
+
+    let implicit = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_CLAUDE_MODEL_ID,
+        ProviderCacheMode::UnavoidableImplicit,
+    );
+    let error = adapter
+        .execute(
+            &implicit,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::PolicyBlocked);
+    assert!(handle.captured().is_empty());
+
+    let off = hosted_request(
+        KnownTransport::VertexDirect,
+        VERTEX_CLAUDE_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    adapter
+        .execute(&off, &CancellationToken::new(), &CollectingSink::default())
+        .unwrap();
+    assert_eq!(handle.captured().len(), 1);
 }
 
 #[test]

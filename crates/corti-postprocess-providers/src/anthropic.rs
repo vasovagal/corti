@@ -4,22 +4,20 @@ use corti_postprocess::{
     AdapterCapabilities, BillingBasis, CancellationToken, ErrorCode, HostedRequest, KnownTransport,
     ModelCatalog, ModelDescriptor, ModelId, NormalizedUsage, PostprocessError, ProviderAdapter,
     ProviderCacheMode, ProviderDescriptor, ProviderEventKind, ProviderEventSink, ProviderScope,
-    ProviderTerminal, RawUsage, SupportTier,
+    ProviderTerminal, SupportTier,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
 use url::Url;
 
 use crate::{
+    anthropic_wire::{AnthropicStreamState, AnthropicWire, WireFailure},
     common::{
-        DISCARD_EVENT_SINK, DirectAdapterOptions, MAX_CATALOG_BODY_BYTES, SendFailure,
-        TextCollector, Timing, boundary_code, credential_code, emit, http_status_code, json_bytes,
-        parse_output, read_body_limited, request_timeout, send_with_retry,
-        terminal_cache_observation, usage_cache_observations, validate_event_stream_response,
-        validate_prompt_layout,
+        DISCARD_EVENT_SINK, DirectAdapterOptions, MAX_CATALOG_BODY_BYTES, SendFailure, Timing,
+        boundary_code, credential_code, emit, http_status_code, parse_output, read_body_limited,
+        request_timeout, send_with_retry, terminal_cache_observation, usage_cache_observations,
+        validate_event_stream_response, validate_prompt_layout,
     },
-    schema::output_schema,
-    sse::{SseDecoder, SseEvent},
+    sse::SseDecoder,
     transport::{ApiKeySource, Clock, HttpMethod, HttpRequest, HttpTransport},
 };
 
@@ -216,10 +214,12 @@ impl AnthropicMessagesAdapter {
             return Err(ExecFailure::new(code, false));
         }
 
-        let body = anthropic_request_body(
+        let body = crate::anthropic_wire::request_body(
             request,
             self.options.max_output_tokens,
-            self.active_region.as_deref(),
+            AnthropicWire::Direct {
+                region: self.active_region.as_deref(),
+            },
         )
         .map_err(ExecFailure::from_error)?;
         let now = self.clock.monotonic_micros();
@@ -257,7 +257,8 @@ impl AnthropicMessagesAdapter {
             .map_err(|error| ExecFailure::new(error.code, true))?;
 
         let mut decoder = SseDecoder::new(self.options.max_stream_bytes);
-        let mut state = AnthropicStreamState::new(self.options.max_stream_bytes);
+        let mut state =
+            AnthropicStreamState::new(self.options.max_stream_bytes, Some(request.model.as_str()));
         loop {
             if let Some(code) =
                 boundary_code(cancel, request.deadline, self.clock.monotonic_micros())
@@ -299,7 +300,7 @@ impl AnthropicMessagesAdapter {
                 };
                 state
                     .process(event, request, event_sink, &*self.clock)
-                    .map_err(|failure| failure.with_dispatched())?;
+                    .map_err(|failure| ExecFailure::from(failure).with_dispatched())?;
                 if buffered_boundary.is_none() {
                     buffered_boundary =
                         boundary_code(cancel, request.deadline, self.clock.monotonic_micros());
@@ -323,11 +324,11 @@ impl AnthropicMessagesAdapter {
         })? {
             state
                 .process(event, request, sink, &*self.clock)
-                .map_err(|failure| failure.with_dispatched())?;
+                .map_err(|failure| ExecFailure::from(failure).with_dispatched())?;
         }
         state
             .finish()
-            .map_err(|failure| failure.with_dispatched())?;
+            .map_err(|failure| ExecFailure::from(failure).with_dispatched())?;
         timing.first_text_at = state.text.first_text_at();
         timing.terminal_at = state.terminal_at;
 
@@ -455,297 +456,21 @@ fn validate_anthropic_request(
     Ok(())
 }
 
-fn anthropic_request_body(
-    request: &HostedRequest,
-    max_output_tokens: u64,
-    region: Option<&str>,
-) -> Result<Vec<u8>, PostprocessError> {
-    let cache_enabled = request.cache_policy.provider == ProviderCacheMode::ExplicitStablePrefix;
-    let prompt = request.prompt.messages();
-    let system = prompt[..2]
-        .iter()
-        .map(|message| json!({"type": "text", "text": message.content()}))
-        .collect::<Vec<_>>();
-    let dynamic = prompt[2..]
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let mut block = json!({"type": "text", "text": message.content()});
-            if cache_enabled && index == 0 {
-                block["cache_control"] = json!({"type": "ephemeral", "ttl": "5m"});
-            }
-            block
-        })
-        .collect::<Vec<_>>();
-    let mut body = json!({
-        "model": request.model.as_str(),
-        "max_tokens": max_output_tokens,
-        "stream": true,
-        "system": system,
-        "messages": [{"role": "user", "content": dynamic}],
-        "output_config": {
-            "format": {
-                "type": "json_schema",
-                "schema": output_schema(request.prompt.task())
-            }
-        }
-    });
-    if let Some(region) = region {
-        body["inference_geo"] = Value::String(region.to_owned());
-    }
-    json_bytes(&body)
-}
-
-struct AnthropicStreamState {
-    text: TextCollector,
-    started: bool,
-    stopped: bool,
-    text_block_seen: bool,
-    open_text_index: Option<u64>,
-    stop_reason: Option<String>,
-    usage: AnthropicUsageValues,
-    terminal_usage: Option<NormalizedUsage>,
-    terminal_at: Option<u64>,
-}
-
-impl AnthropicStreamState {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            text: TextCollector::new(max_bytes),
-            started: false,
-            stopped: false,
-            text_block_seen: false,
-            open_text_index: None,
-            stop_reason: None,
-            usage: AnthropicUsageValues::default(),
-            terminal_usage: None,
-            terminal_at: None,
-        }
-    }
-
-    fn process(
-        &mut self,
-        event: SseEvent,
-        request: &HostedRequest,
-        sink: &dyn ProviderEventSink,
-        clock: &dyn Clock,
-    ) -> Result<(), ExecFailure> {
-        let envelope: AnthropicEnvelope = serde_json::from_str(&event.data)
-            .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-        if event
-            .event
-            .as_deref()
-            .is_some_and(|name| name != envelope.kind)
-        {
-            return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-        }
-        if self.stopped && envelope.kind != "ping" {
-            return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-        }
-        match envelope.kind.as_str() {
-            "message_start" => {
-                if self.started {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                let payload: AnthropicMessageStart = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if payload.message.model != request.model.as_str() {
-                    return Err(ExecFailure::new(ErrorCode::ModelUnavailable, true));
-                }
-                self.usage
-                    .reconcile(payload.message.usage)
-                    .map_err(|code| ExecFailure::new(code, true))?;
-                self.started = true;
-                emit(
-                    sink,
-                    request,
-                    ProviderEventKind::UsageProvisional(
-                        self.usage
-                            .normalized(false)
-                            .map_err(|code| ExecFailure::new(code, true))?,
-                    ),
-                );
-            }
-            "content_block_start" => {
-                if !self.started || self.open_text_index.is_some() || self.text_block_seen {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                let payload: AnthropicBlockStart = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if payload.content_block.kind != "text" {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                self.open_text_index = Some(payload.index);
-                self.text_block_seen = true;
-                self.text
-                    .push(&payload.content_block.text, request, sink, clock)
-                    .map_err(|error| ExecFailure::new(error.code, true))?;
-            }
-            "content_block_delta" => {
-                let payload: AnthropicBlockDelta = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if self.open_text_index != Some(payload.index) || payload.delta.kind != "text_delta"
-                {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                self.text
-                    .push(&payload.delta.text, request, sink, clock)
-                    .map_err(|error| ExecFailure::new(error.code, true))?;
-            }
-            "content_block_stop" => {
-                let payload: AnthropicBlockStop = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if self.open_text_index != Some(payload.index) {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                self.open_text_index = None;
-            }
-            "message_delta" => {
-                if !self.started || self.open_text_index.is_some() {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                let payload: AnthropicMessageDelta = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if let Some(reason) = payload.delta.stop_reason {
-                    if self
-                        .stop_reason
-                        .as_ref()
-                        .is_some_and(|existing| existing != &reason)
-                    {
-                        return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                    }
-                    self.stop_reason = Some(reason);
-                }
-                self.usage
-                    .reconcile(payload.usage)
-                    .map_err(|code| ExecFailure::new(code, true))?;
-                emit(
-                    sink,
-                    request,
-                    ProviderEventKind::UsageProvisional(
-                        self.usage
-                            .normalized(false)
-                            .map_err(|code| ExecFailure::new(code, true))?,
-                    ),
-                );
-            }
-            "message_stop" => {
-                if !self.started
-                    || self.stopped
-                    || self.open_text_index.is_some()
-                    || !self.text_block_seen
-                {
-                    return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                }
-                match self.stop_reason.as_deref() {
-                    Some("end_turn") => {}
-                    Some("max_tokens" | "model_context_window_exceeded") | None => {
-                        return Err(ExecFailure::new(ErrorCode::MalformedOutput, true));
-                    }
-                    Some(_) => return Err(ExecFailure::new(ErrorCode::Provider, true)),
-                }
-                let usage = self
-                    .usage
-                    .normalized(true)
-                    .map_err(|code| ExecFailure::new(code, true))?;
-                self.terminal_usage = Some(usage);
-                self.terminal_at = Some(clock.monotonic_micros());
-                self.stopped = true;
-            }
-            "error" => {
-                let payload: AnthropicErrorEvent = serde_json::from_str(&event.data)
-                    .map_err(|_| ExecFailure::new(ErrorCode::Provider, true))?;
-                return Err(ExecFailure {
-                    code: anthropic_error_code(&payload.error.kind),
-                    usage: self.usage.normalized(false).ok(),
-                    dispatched: true,
-                });
-            }
-            "ping" => {}
-            // Anthropic documents that new event types may be added. Unknown events are ignored.
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn finish(&self) -> Result<(), ExecFailure> {
-        if !self.stopped || self.text.text().is_empty() {
-            return Err(ExecFailure {
-                code: ErrorCode::MalformedOutput,
-                usage: self.terminal_usage,
-                dispatched: true,
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct AnthropicUsageValues {
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    cached_read_tokens: Option<i64>,
-    cached_write_tokens: Option<i64>,
-    reasoning_tokens: Option<i64>,
-}
-
-impl AnthropicUsageValues {
-    fn reconcile(&mut self, update: AnthropicUsage) -> Result<(), ErrorCode> {
-        reconcile_field(&mut self.input_tokens, update.input_tokens)?;
-        reconcile_field(&mut self.output_tokens, update.output_tokens)?;
-        reconcile_field(&mut self.cached_read_tokens, update.cache_read_input_tokens)?;
-        reconcile_field(
-            &mut self.cached_write_tokens,
-            update.cache_creation_input_tokens,
-        )?;
-        reconcile_field(
-            &mut self.reasoning_tokens,
-            update.output_tokens_details.thinking_tokens,
-        )?;
-        Ok(())
-    }
-
-    fn normalized(self, terminal: bool) -> Result<NormalizedUsage, ErrorCode> {
-        let complete = terminal && self.input_tokens.is_some() && self.output_tokens.is_some();
-        NormalizedUsage::try_from(RawUsage {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
-            cached_read_tokens: self.cached_read_tokens,
-            cached_write_tokens: self.cached_write_tokens,
-            reasoning_tokens: self.reasoning_tokens,
-            usage_complete: complete,
-        })
-        .map_err(|_| ErrorCode::MalformedOutput)
-    }
-}
-
-fn reconcile_field(current: &mut Option<i64>, update: Option<i64>) -> Result<(), ErrorCode> {
-    let Some(update) = update else {
-        return Ok(());
-    };
-    if update < 0 || current.is_some_and(|current| update < current) {
-        return Err(ErrorCode::MalformedOutput);
-    }
-    *current = Some(update);
-    Ok(())
-}
-
-fn anthropic_error_code(kind: &str) -> ErrorCode {
-    match kind {
-        "authentication_error" => ErrorCode::AuthRejected,
-        "permission_error" => ErrorCode::Permission,
-        "rate_limit_error" => ErrorCode::RateLimited,
-        "not_found_error" => ErrorCode::ModelUnavailable,
-        "overloaded_error" => ErrorCode::Provider,
-        _ => ErrorCode::Provider,
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ExecFailure {
     code: ErrorCode,
     usage: Option<NormalizedUsage>,
     dispatched: bool,
+}
+
+impl From<WireFailure> for ExecFailure {
+    fn from(failure: WireFailure) -> Self {
+        Self {
+            code: failure.code,
+            usage: failure.usage,
+            dispatched: failure.dispatched,
+        }
+    }
 }
 
 impl ExecFailure {
@@ -801,99 +526,6 @@ struct AnthropicModelCapabilities {
 #[derive(Deserialize)]
 struct AnthropicCapability {
     supported: bool,
-}
-
-#[derive(Deserialize)]
-struct AnthropicEnvelope {
-    #[serde(rename = "type")]
-    kind: String,
-}
-
-#[derive(Deserialize)]
-struct AnthropicMessageStart {
-    message: AnthropicStartMessage,
-}
-
-#[derive(Deserialize)]
-struct AnthropicStartMessage {
-    model: String,
-    usage: AnthropicUsage,
-}
-
-#[derive(Deserialize)]
-struct AnthropicBlockStart {
-    index: u64,
-    content_block: AnthropicTextBlock,
-}
-
-#[derive(Deserialize)]
-struct AnthropicTextBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct AnthropicBlockDelta {
-    index: u64,
-    delta: AnthropicTextDelta,
-}
-
-#[derive(Deserialize)]
-struct AnthropicTextDelta {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct AnthropicBlockStop {
-    index: u64,
-}
-
-#[derive(Deserialize)]
-struct AnthropicMessageDelta {
-    delta: AnthropicTopLevelDelta,
-    usage: AnthropicUsage,
-}
-
-#[derive(Deserialize)]
-struct AnthropicTopLevelDelta {
-    #[serde(default)]
-    stop_reason: Option<String>,
-}
-
-#[derive(Clone, Copy, Default, Deserialize)]
-struct AnthropicUsage {
-    #[serde(default)]
-    input_tokens: Option<i64>,
-    #[serde(default)]
-    output_tokens: Option<i64>,
-    #[serde(default)]
-    cache_creation_input_tokens: Option<i64>,
-    #[serde(default)]
-    cache_read_input_tokens: Option<i64>,
-    #[serde(default)]
-    output_tokens_details: AnthropicOutputTokenDetails,
-}
-
-#[derive(Clone, Copy, Default, Deserialize)]
-struct AnthropicOutputTokenDetails {
-    #[serde(default)]
-    thinking_tokens: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct AnthropicErrorEvent {
-    error: AnthropicStreamError,
-}
-
-#[derive(Deserialize)]
-struct AnthropicStreamError {
-    #[serde(rename = "type")]
-    kind: String,
 }
 
 fn parse_url(value: &str) -> Result<Url, PostprocessError> {

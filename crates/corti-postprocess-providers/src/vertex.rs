@@ -12,11 +12,12 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
+    anthropic_wire::{AnthropicStreamState, AnthropicWire, WireFailure},
     common::{
         DISCARD_EVENT_SINK, DirectAdapterOptions, SendFailure, TextCollector, Timing,
         boundary_code, credential_code, emit, http_status_code, json_bytes, parse_output,
-        read_body_limited, request_timeout, send_with_retry, usage_cache_observations,
-        validate_event_stream_response, validate_prompt_layout,
+        read_body_limited, request_timeout, send_with_retry, terminal_cache_observation,
+        usage_cache_observations, validate_event_stream_response, validate_prompt_layout,
     },
     schema::output_schema,
     sse::{SseDecoder, SseEvent},
@@ -24,9 +25,41 @@ use crate::{
 };
 
 pub const VERTEX_REST_ADAPTER_VERSION: u32 = 1;
-pub const VERTEX_PUBLISHER: &str = "google";
 
 const MAX_VERTEX_ERROR_BODY_BYTES: usize = 256 * 1024;
+
+/// Gemini limits, used for a model whose id carries no other signal.
+const GEMINI_MAX_CONTEXT_TOKENS: u64 = 1_000_000;
+const GEMINI_MAX_OUTPUT_TOKENS: u64 = 65_536;
+const CLAUDE_MAX_CONTEXT_TOKENS: u64 = 200_000;
+const CLAUDE_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
+/// The Model Garden publisher a model is served under. Vertex fronts each publisher's own API rather than a
+/// common one, so this picks the request body, the URL verb, and the stream codec together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VertexPublisher {
+    Google,
+    Anthropic,
+}
+
+impl VertexPublisher {
+    /// Derived from the id, not configured alongside it: `validate_model_id` rejects `/`, so a
+    /// `publishers/anthropic/...` prefix is not expressible, and a bare id is what operators type.
+    pub fn for_model_id(id: &str) -> Self {
+        if id.starts_with("claude-") {
+            Self::Anthropic
+        } else {
+            Self::Google
+        }
+    }
+
+    const fn path_segment(self) -> &'static str {
+        match self {
+            Self::Google => "google",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
 
 /// One memory-only ADC access-token lease. Refresh credentials and ADC file paths cannot be represented.
 pub struct AdcAccessToken {
@@ -126,6 +159,7 @@ impl fmt::Debug for VertexProjectMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VertexModel {
     exact_model_id: ModelId,
+    publisher: VertexPublisher,
     max_context_tokens: u64,
     max_output_tokens: u64,
     implicit_cache_may_apply: bool,
@@ -145,17 +179,34 @@ impl VertexModel {
         if max_context_tokens == 0 || max_output_tokens == 0 {
             return Err(VertexConfigurationError::InvalidModelLimits);
         }
+        let publisher = VertexPublisher::for_model_id(exact_model_id.as_str());
         Ok(Self {
             exact_model_id,
+            publisher,
             max_context_tokens,
             max_output_tokens,
             // Vertex Gemini models can apply implicit caching without a request cache resource. Callers must
-            // explicitly classify a verified model otherwise before selecting ProviderCacheMode::Off.
-            implicit_cache_may_apply: true,
+            // explicitly classify a verified model otherwise before selecting ProviderCacheMode::Off. Claude
+            // on Vertex caches only against an explicit prefix marker, as it does on the direct API.
+            implicit_cache_may_apply: publisher == VertexPublisher::Google,
             deprecated: false,
             benchmarked_for_live: false,
             tariff_version: None,
         })
+    }
+
+    /// Publisher and documented limits from the id alone, for a model an operator typed rather than one the
+    /// caller has a capability snapshot for.
+    pub fn inferred(exact_model_id: ModelId) -> Result<Self, VertexConfigurationError> {
+        let (context, output) = match VertexPublisher::for_model_id(exact_model_id.as_str()) {
+            VertexPublisher::Google => (GEMINI_MAX_CONTEXT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS),
+            VertexPublisher::Anthropic => (CLAUDE_MAX_CONTEXT_TOKENS, CLAUDE_MAX_OUTPUT_TOKENS),
+        };
+        Self::new(exact_model_id, context, output)
+    }
+
+    pub const fn publisher(&self) -> VertexPublisher {
+        self.publisher
     }
 
     pub const fn with_implicit_cache_may_apply(mut self, value: bool) -> Self {
@@ -274,7 +325,7 @@ impl VertexRestAdapter {
                     text_output: true,
                     streaming: true,
                     structured_output: true,
-                    explicit_prefix_cache: false,
+                    explicit_prefix_cache: model.publisher == VertexPublisher::Anthropic,
                     implicit_cache_may_apply: model.implicit_cache_may_apply,
                 },
                 billing_basis: BillingBasis::MeteredEstimate,
@@ -319,12 +370,20 @@ impl VertexRestAdapter {
             return Err(ExecFailure::new(code, false));
         }
 
-        let body = vertex_request_body(request, self.options.max_output_tokens)
-            .map_err(ExecFailure::from_error)?;
+        let publisher = VertexPublisher::for_model_id(request.model.as_str());
+        let body = match publisher {
+            VertexPublisher::Google => vertex_request_body(request, self.options.max_output_tokens),
+            VertexPublisher::Anthropic => crate::anthropic_wire::request_body(
+                request,
+                self.options.max_output_tokens,
+                AnthropicWire::Vertex,
+            ),
+        }
+        .map_err(ExecFailure::from_error)?;
         let now = self.clock.monotonic_micros();
         let mut wire = HttpRequest::new(
             HttpMethod::Post,
-            vertex_stream_url(&self.metadata, request.model.as_str())
+            vertex_stream_url(&self.metadata, publisher, request.model.as_str())
                 .map_err(ExecFailure::from_error)?,
         )
         .map_err(|_| ExecFailure::new(ErrorCode::Internal, false))?
@@ -370,7 +429,7 @@ impl VertexRestAdapter {
             .map_err(|error| ExecFailure::new(error.code, true))?;
 
         let mut decoder = SseDecoder::new(self.options.max_stream_bytes);
-        let mut state = VertexStreamState::new(self.options.max_stream_bytes);
+        let mut state = VertexStream::new(publisher, self.options.max_stream_bytes);
         loop {
             if let Some(code) =
                 boundary_code(cancel, request.deadline, self.clock.monotonic_micros())
@@ -439,8 +498,8 @@ impl VertexRestAdapter {
         state
             .finish()
             .map_err(|failure| failure.with_dispatched())?;
-        timing.first_text_at = state.text.first_text_at();
-        timing.terminal_at = state.terminal_at;
+        timing.first_text_at = state.text().first_text_at();
+        timing.terminal_at = state.terminal_at();
 
         if let Some(code) = boundary_code(cancel, request.deadline, self.clock.monotonic_micros()) {
             return Err(ExecFailure {
@@ -450,7 +509,7 @@ impl VertexRestAdapter {
             });
         }
         let parse_start = self.clock.monotonic_micros();
-        let output = parse_output(request.prompt.task(), state.text.text()).map_err(|error| {
+        let output = parse_output(request.prompt.task(), state.text().text()).map_err(|error| {
             ExecFailure {
                 code: error.code,
                 usage: state.latest_usage(),
@@ -462,12 +521,17 @@ impl VertexRestAdapter {
         let usage = state
             .latest_usage()
             .unwrap_or_else(NormalizedUsage::unknown);
-        let cache = if model.capabilities.implicit_cache_may_apply
-            && usage.cached_read_tokens.is_some_and(|tokens| tokens > 0)
-        {
-            CacheObservation::ProviderImplicit
-        } else {
-            CacheObservation::None
+        let cache = match publisher {
+            VertexPublisher::Google => {
+                if model.capabilities.implicit_cache_may_apply
+                    && usage.cached_read_tokens.is_some_and(|tokens| tokens > 0)
+                {
+                    CacheObservation::ProviderImplicit
+                } else {
+                    CacheObservation::None
+                }
+            }
+            VertexPublisher::Anthropic => terminal_cache_observation(usage),
         };
         Ok(ProviderTerminal {
             output,
@@ -576,13 +640,17 @@ fn validate_vertex_request<'a>(
         || !model.capabilities.text_output
         || !model.capabilities.streaming
         || !model.capabilities.structured_output
-        || model.capabilities.explicit_prefix_cache
         || configured_max_output > model.max_output_tokens
     {
         return Err(ErrorCode::ModelUnavailable.into());
     }
     let cache_policy_matches = if model.capabilities.implicit_cache_may_apply {
         request.cache_policy.provider == ProviderCacheMode::UnavoidableImplicit
+    } else if model.capabilities.explicit_prefix_cache {
+        matches!(
+            request.cache_policy.provider,
+            ProviderCacheMode::Off | ProviderCacheMode::ExplicitStablePrefix
+        )
     } else {
         request.cache_policy.provider == ProviderCacheMode::Off
     };
@@ -624,6 +692,7 @@ fn vertex_request_body(
 
 fn vertex_stream_url(
     metadata: &VertexProjectMetadata,
+    publisher: VertexPublisher,
     model: &str,
 ) -> Result<Url, PostprocessError> {
     validate_model_id(model).map_err(|_| PostprocessError::from(ErrorCode::ModelUnavailable))?;
@@ -632,9 +701,16 @@ fn vertex_stream_url(
     } else {
         format!("{}-aiplatform.googleapis.com", metadata.region)
     };
+    // rawPredict streams SSE from the body's `"stream": true`; only generateContent needs `?alt=sse`.
+    let verb = match publisher {
+        VertexPublisher::Google => "streamGenerateContent?alt=sse",
+        VertexPublisher::Anthropic => "streamRawPredict",
+    };
     Url::parse(&format!(
-        "https://{host}/v1/projects/{}/locations/{}/publishers/{VERTEX_PUBLISHER}/models/{model}:streamGenerateContent?alt=sse",
-        metadata.project_id, metadata.region
+        "https://{host}/v1/projects/{}/locations/{}/publishers/{}/models/{model}:{verb}",
+        metadata.project_id,
+        metadata.region,
+        publisher.path_segment()
     ))
     .map_err(|_| ErrorCode::Internal.into())
 }
@@ -798,6 +874,68 @@ impl VertexStreamState {
     }
 }
 
+/// Vertex fronts each publisher's own streaming API, so the loop is shared but the codec is not.
+enum VertexStream {
+    Gemini(VertexStreamState),
+    Anthropic(AnthropicStreamState),
+}
+
+impl VertexStream {
+    fn new(publisher: VertexPublisher, max_bytes: usize) -> Self {
+        match publisher {
+            VertexPublisher::Google => Self::Gemini(VertexStreamState::new(max_bytes)),
+            // No expected model id: the URL path pins routing, and Vertex echoes the id it resolved to
+            // (`claude-sonnet-4-5@20250929` comes back as `claude-sonnet-4-5-20250929`).
+            VertexPublisher::Anthropic => {
+                Self::Anthropic(AnthropicStreamState::new(max_bytes, None))
+            }
+        }
+    }
+
+    fn process(
+        &mut self,
+        event: SseEvent,
+        request: &HostedRequest,
+        sink: &dyn ProviderEventSink,
+        clock: &dyn Clock,
+    ) -> Result<(), ExecFailure> {
+        match self {
+            Self::Gemini(state) => state.process(event, request, sink, clock),
+            Self::Anthropic(state) => state
+                .process(event, request, sink, clock)
+                .map_err(ExecFailure::from),
+        }
+    }
+
+    fn finish(&self) -> Result<(), ExecFailure> {
+        match self {
+            Self::Gemini(state) => state.finish(),
+            Self::Anthropic(state) => state.finish().map_err(ExecFailure::from),
+        }
+    }
+
+    const fn latest_usage(&self) -> Option<NormalizedUsage> {
+        match self {
+            Self::Gemini(state) => state.latest_usage(),
+            Self::Anthropic(state) => state.terminal_usage,
+        }
+    }
+
+    const fn text(&self) -> &TextCollector {
+        match self {
+            Self::Gemini(state) => &state.text,
+            Self::Anthropic(state) => &state.text,
+        }
+    }
+
+    const fn terminal_at(&self) -> Option<u64> {
+        match self {
+            Self::Gemini(state) => state.terminal_at,
+            Self::Anthropic(state) => state.terminal_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct VertexUsageValues {
     input_tokens: Option<i64>,
@@ -848,6 +986,16 @@ struct ExecFailure {
     code: ErrorCode,
     usage: Option<NormalizedUsage>,
     dispatched: bool,
+}
+
+impl From<WireFailure> for ExecFailure {
+    fn from(failure: WireFailure) -> Self {
+        Self {
+            code: failure.code,
+            usage: failure.usage,
+            dispatched: failure.dispatched,
+        }
+    }
 }
 
 impl ExecFailure {
