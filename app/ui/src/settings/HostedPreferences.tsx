@@ -47,6 +47,10 @@ export default function HostedPreferences({
   const busyRef = useRef(false);
   const [busy, setBusy] = useState("");
   const [status, setStatus] = useState("");
+  const [statusAction, setStatusAction] = useState<{
+    section: HostedPreferencesSection;
+    label: string;
+  } | null>(null);
   const [loadError, setLoadError] = useState("");
   const [masterDisclosure, setMasterDisclosure] = useState(false);
   const [awsOptions, setAwsOptions] = useState<AwsCredentialOptionsDto | null>(null);
@@ -137,6 +141,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy(label);
     setStatus("");
+    setStatusAction(null);
     try {
       return acceptMutation(await operation(current.state_revision), success);
     } catch (error) {
@@ -162,7 +167,7 @@ export default function HostedPreferences({
     );
 
   const onScope = (update: HostedProviderScopeUpdate) =>
-    runMutation("Connection update", "Connection scope saved; Master and lanes were not changed.", (revision) =>
+    runMutation("Connection update", "Connection scope saved. Refresh this provider to check access and load its models.", (revision) =>
       updateHostedProviderScope(revision, update),
     );
 
@@ -173,7 +178,7 @@ export default function HostedPreferences({
   ) =>
     runMutation(
       "Credential update",
-      "AWS credential mode saved; Master and lanes were not changed.",
+      "AWS credential mode saved. Refresh Bedrock to check access and load its regional models.",
       (revision) => setBedrockCredentialMode(revision, mode, profile, roleArn),
     );
 
@@ -198,11 +203,12 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Secure entry");
     setStatus("");
+    setStatusAction(null);
     try {
       const outcome = await promptForProviderSecret(request);
       setStatus(
         outcome === "stored"
-          ? "Stored in Corti's private secret store. No lane was enabled."
+          ? "Credential saved in Corti's private secret store. Refresh this provider below to check access and load its models."
           : outcome === "rejected"
             ? "That value cannot be a credential; nothing was stored."
             : "Cancelled; nothing was stored.",
@@ -224,6 +230,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Remove credential");
     setStatus("");
+    setStatusAction(null);
     try {
       await clearProviderSecret(request);
       setStatus("Removed from Corti's private secret store.");
@@ -248,6 +255,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy(label);
     setStatus("");
+    setStatusAction(null);
     try {
       await operation();
       await reload();
@@ -299,13 +307,23 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Provider refresh");
     setStatus("");
+    setStatusAction(null);
     try {
-      await refreshHostedProvider(provider, transport);
+      const refreshed = await refreshHostedProvider(provider, transport);
       await reload();
-      setStatus("Credential state and authenticated catalog refreshed. No lane was enabled.");
+      if (refreshed.credential.state === "ready" && refreshed.models.length > 0) {
+        setStatus(
+          `Provider ready — ${refreshed.models.length} exact ${refreshed.models.length === 1 ? "model" : "models"} available. Choose one for each rewrite mode you want.`,
+        );
+        setStatusAction({ section: "routing", label: "Choose rewrite models" });
+      } else if (refreshed.credential.state !== "ready") {
+        setStatus("The provider still needs attention. Review its credential and connection scope below.");
+      } else {
+        setStatus("The provider connected, but returned no usable models. Review its account, project/region, and model access, then refresh again.");
+      }
       return true;
     } catch (error) {
-      setStatus(`Provider refresh failed: ${String(error)}`);
+      setStatus(`Provider refresh failed: ${String(error)}. Check the credential, connection scope, network, quota, and billing, then try again.`);
       await reload();
       return false;
     } finally {
@@ -319,6 +337,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Pinned question update");
     setStatus("");
+    setStatusAction(null);
     try {
       const current = settingsRef.current;
       if (!current) return false;
@@ -343,6 +362,7 @@ export default function HostedPreferences({
     busyRef.current = true;
     setBusy("Master enable");
     setStatus("");
+    setStatusAction(null);
     try {
       const acknowledged = await patchHostedSettings(current.state_revision, {
         kind: "set_egress_acknowledged",
@@ -416,7 +436,16 @@ export default function HostedPreferences({
           role={loadError ? "alert" : "status"}
           aria-live="polite"
         >
-          {loadError || (busy ? `${busy}…` : status)}
+          <span>{loadError || (busy ? `${busy}…` : status)}</span>
+          {!loadError && !busy && statusAction && (
+            <button
+              className="btn-secondary"
+              type="button"
+              onClick={() => onNavigate(statusAction.section)}
+            >
+              {statusAction.label}
+            </button>
+          )}
         </div>
       )}
 
@@ -549,19 +578,26 @@ function HostedSetupGuide({
   onNavigate: (section: HostedPreferencesSection) => void;
 }) {
   const finalSelection = settings.control.final_lane.selection;
-  const provider = settings.providers.find(
+  const selectedProvider = settings.providers.find(
     (candidate) =>
       candidate.descriptor.provider === finalSelection.provider &&
       candidate.descriptor.transport === finalSelection.transport,
   );
+  const provider =
+    selectedProvider ??
+    settings.providers.find(
+      (candidate) => candidate.credential.state === "ready" && candidate.models.length > 0,
+    ) ??
+    settings.providers.find((candidate) => candidate.credential.state === "ready");
   const providerName = provider
     ? providerPresentation(provider.descriptor.provider, provider.descriptor.transport).shortName
     : null;
   const providerState = provider
     ? credentialSummary(provider.credential, provider.descriptor.transport).label
     : "Not chosen";
-  const providerReady = provider?.credential.state === "ready";
+  const providerReady = provider?.credential.state === "ready" && provider.models.length > 0;
   const modelName = finalSelection.model;
+  const finalReady = Boolean(modelName && settings.control.final_lane.enabled);
 
   return (
     <section className="card hosted-guide-card" aria-labelledby="hosted-guide-heading">
@@ -583,17 +619,29 @@ function HostedSetupGuide({
             <p>{providerName ? `${providerName} · ${providerState}` : "Choose the API account you already trust and bill."}</p>
           </div>
           <button className="btn-secondary" type="button" onClick={() => onNavigate("provider")}>
-            {providerReady ? "Review" : provider ? "Connect" : "Choose"}
+            {providerReady
+              ? "Review"
+              : provider?.credential.state === "ready"
+                ? "Load models"
+                : provider
+                  ? "Connect"
+                  : "Choose"}
           </button>
         </li>
-        <li className={modelName ? "is-complete" : undefined}>
+        <li className={finalReady ? "is-complete" : undefined}>
           <span className="hosted-step-number">2</span>
           <div>
             <strong>Configure Final rewrite</strong>
-            <p>{modelName ?? "Pick one exact model, then enable the final cleanup pass."}</p>
+            <p>
+              {finalReady
+                ? `${modelName} · enabled`
+                : modelName
+                  ? `${modelName} selected · enable Final rewrite next`
+                  : "Pick one exact model, then enable the final cleanup pass."}
+            </p>
           </div>
           <button className="btn-secondary" type="button" onClick={() => onNavigate("routing")}>
-            {modelName ? "Review" : "Configure"}
+            {finalReady ? "Review" : "Configure"}
           </button>
         </li>
         <li className={settings.control.master_enabled ? "is-complete" : undefined}>
@@ -683,8 +731,8 @@ function HostedTruthDisclosure({ finalDeadline }: { finalDeadline: number }) {
         <div>
           <dt>Quality</dt>
           <dd>
-            Account availability and structured output do not prove rewrite quality. Only backend-marked live
-            benchmarks unlock a model for Live.
+            Account availability and structured output do not prove rewrite quality or speed. Benchmarks are
+            guidance, not a lock: you may try any eligible model, and Live keeps raw text on delay or failure.
           </dd>
         </div>
         <div>

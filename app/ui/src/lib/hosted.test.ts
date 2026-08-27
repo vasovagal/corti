@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { HostedModelDescriptor, HostedProviderState } from "./api";
+import type { HostedModelDescriptor, HostedProviderState, HostedSettingsDto } from "./api";
 import { AWS_REGIONS, BEDROCK_REGIONS, regionOptions } from "./awsRegions";
 import {
   VERTEX_UNARMED_WARNING,
@@ -9,8 +9,13 @@ import {
   billingDisclosure,
   credentialSummary,
   defaultProviderCache,
+  errorLabel,
   filterWordEntries,
   findExactModel,
+  hostedErrorGuidance,
+  hostedOnboardingGuidance,
+  laneConfigurationGuidance,
+  modelAdvisory,
   modelUnavailableReason,
   parseProviderKey,
   providerKey,
@@ -64,6 +69,49 @@ function provider(models: HostedModelDescriptor[]): HostedProviderState {
   };
 }
 
+function settings(): HostedSettingsDto {
+  const selection = {
+    provider: null,
+    transport: null,
+    model: null,
+    cache_policy: { local: "reusable" as const, provider: "off" as const },
+  };
+  return {
+    state_revision: 1,
+    preferences_revision: 1,
+    control: {
+      process_epoch: 1,
+      session_generation: 1,
+      control_revision: 1,
+      steering_revision: 1,
+      bank_revision: 1,
+      pinned_question_revision: 0,
+      master_enabled: false,
+      egress_acknowledged: false,
+      pinned_auto_enabled: false,
+      live: { enabled: false, revision: 1, selection: { ...selection } },
+      final_lane: { enabled: false, revision: 1, selection: { ...selection } },
+      questions: { enabled: false, revision: 1, selection: { ...selection } },
+    },
+    providers: [provider([model()])],
+    scopes: [],
+    bedrock: {
+      mode: "default_chain",
+      profile: null,
+      role_arn: null,
+      has_access_key_id: false,
+      has_secret_access_key: false,
+      has_session_token: false,
+    },
+    vertex_models: [],
+    default_steering: "",
+    word_bank: { revision: 1, entries: [] },
+    final_deadline_seconds: 90,
+    show_history_diagnostics: false,
+    show_live_metrics_by_default: false,
+  };
+}
+
 describe("hosted provider and catalog truth", () => {
   it("uses backend tiers verbatim and preserves the exact Vertex warning", () => {
     expect(supportTierLabel("documented")).toBe("Documented");
@@ -103,17 +151,58 @@ describe("hosted provider and catalog truth", () => {
     ).toBe("unavailable");
   });
 
-  it("never invents a model and applies the live benchmark gate", () => {
-    const finalOnly = model();
-    const liveReady = model({ exact_model_id: "catalog-fixture-live", benchmarked_for_live: true });
-    const states = [provider([finalOnly, liveReady])];
+  it("never invents a model and treats live benchmarks as advice rather than a gate", () => {
+    const unmeasured = model();
+    const measured = model({ exact_model_id: "catalog-fixture-live", benchmarked_for_live: true });
+    const states = [provider([unmeasured, measured])];
 
-    expect(modelUnavailableReason(finalOnly, "live")).toBe("not benchmarked for live latency");
-    expect(modelUnavailableReason(finalOnly, "final")).toBeNull();
+    expect(modelUnavailableReason(unmeasured, "live")).toBeNull();
+    expect(modelAdvisory(unmeasured, "live")).toContain("raw text wins");
+    expect(modelAdvisory(measured, "live")).toBeNull();
     expect(findExactModel(states, "fixture-provider", "fixture-api", "catalog-fixture-live")).toBe(
-      liveReady,
+      measured,
     );
     expect(findExactModel(states, "fixture-provider", "fixture-api", "not-in-catalog")).toBeNull();
+  });
+
+  it("routes each incomplete onboarding state to an actionable Preferences section", () => {
+    const noProvider = settings();
+    noProvider.providers = [{ ...noProvider.providers[0], credential: { state: "absent" }, models: [] }];
+    expect(hostedOnboardingGuidance(noProvider)).toMatchObject({ section: "hosted-provider" });
+
+    const noLane = settings();
+    expect(hostedOnboardingGuidance(noLane)).toMatchObject({ section: "hosted-routing" });
+    expect(laneConfigurationGuidance(noLane, "question")).toMatchObject({
+      section: "hosted-routing",
+    });
+
+    const ready = settings();
+    ready.control.final_lane = {
+      enabled: true,
+      revision: 2,
+      selection: {
+        provider: "fixture-provider",
+        transport: "fixture-api",
+        model: "catalog-fixture-v1",
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    };
+    expect(hostedOnboardingGuidance(ready)).toMatchObject({ section: "hosted" });
+    ready.control.egress_acknowledged = true;
+    ready.control.master_enabled = true;
+    expect(hostedOnboardingGuidance(ready)).toBeNull();
+  });
+
+  it("turns typed hosted failures into safe repair advice", () => {
+    expect(hostedErrorGuidance("policy_blocked")).toMatchObject({
+      section: "hosted-routing",
+    });
+    expect(hostedErrorGuidance("auth_rejected")).toMatchObject({
+      section: "hosted-provider",
+    });
+    expect(hostedErrorGuidance("malformed_output").message).toContain("raw transcript");
+    expect(errorLabel("policy_blocked")).toContain("setup");
+    expect(errorLabel("policy_blocked")).not.toBe("policy blocked");
   });
 
   it("derives selections only from an exact catalog descriptor and discloses cache behavior", () => {

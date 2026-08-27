@@ -4,5 +4,9 @@
   "description": "Timestamped live call transcript and ephemeral microphone/transcription test window.",
   "platforms": ["macOS"],
   "windows": ["live"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:event:deny-emit",
+    "core:event:deny-emit-to"
+  ]
 }

@@ -1,8 +1,8 @@
 # 07 — Paid hosted-model post-processing
 
-- **Status:** Implemented in v0.14, amended by native ChatGPT subscription transport (#130)
+- **Status:** Implemented in v0.14, amended by native ChatGPT subscription transport (#130) and actionable owner-driven onboarding (#146)
 - **Decision ADR:** [ADR 0015](adr/0015-hosted-post-processing.md)
-- **Tracking issues:** [#112 — hosted post-processing](https://github.com/vasovagal/corti/issues/112), [#130 — native ChatGPT subscription device auth](https://github.com/vasovagal/corti/issues/130)
+- **Tracking issues:** [#112 — hosted post-processing](https://github.com/vasovagal/corti/issues/112), [#130 — native ChatGPT subscription device auth](https://github.com/vasovagal/corti/issues/130), [#146 — actionable hosted onboarding](https://github.com/vasovagal/corti/issues/146)
 - **Code baseline reviewed:** `cc6f75ae42aa3e5640efced4366f97e54d0432dc` (`v0.13.0`)
 - **Architecture recon fan-out before this writer:** 2,404,707 tokens
 - **Last provider-truth check:** 2026-08-21; links are in [Provider sources](#provider-sources)
@@ -130,18 +130,21 @@ separate actions.
    availability probe);
 2. adapter capabilities: text input/output, streaming, structured row output, context size, cache modes;
 3. the selected billing/retention policy; and
-4. a versioned Corti benchmark manifest for lane suitability.
+4. optional versioned Corti benchmark metadata used for recommendations and latency advice, never to take an
+   otherwise eligible account model away from its user.
 
 A `ModelDescriptor` contains provider, transport, support tier, exact model/snapshot id, account-scoped
 availability, region, context/output limits, streaming/structured-output/cache capabilities, billing basis,
 tariff provenance, deprecation, and optional measured Corti profiles. Rust revalidates every selection at
 request time. There is no silent provider/model substitution.
 
-Auto-live eligibility requires a representative Corti benchmark with p95 time-to-first-text ≤1.5 s, p95
-complete cleanup ≤4.0 s, valid structured output, and no cleanup-quality regression on the frozen corpus.
+A **Corti-recommended** Live model requires a representative benchmark with p95 time-to-first-text ≤1.5 s,
+p95 complete cleanup ≤4.0 s, valid structured output, and no cleanup-quality regression on the frozen corpus.
 Question recommendations use the same interactive profile. Final recommendations select the best measured
-quality that fits the final deadline and context/chunk policy. Unbenchmarked models can be shown with
-`Unbenchmarked for Corti`; they are disabled for automatic live use and are never defaulted.
+quality that fits the final deadline and context/chunk policy. Unbenchmarked models are shown as
+`Live speed not measured`; they remain selectable when the authenticated catalog and hard capability checks
+permit them, but are never silently defaulted. The user's own 5-second raw fallback—not a catalog lock—bounds
+a slow Live choice.
 
 OpenAI's current model page verifies exact id `gpt-5.6-luna`, text output, streaming, structured outputs,
 prompt caching, a large context, and cost-sensitive/high-volume positioning. It does **not** verify Corti
@@ -1005,15 +1008,19 @@ Hosted controls use immediate patch commands, not the existing bottom-of-form Sa
   user code. It explains included quota, private endpoint limits, and that no Codex server/API key is used.
 - Claude subscription card says `Blocked — use Anthropic API billing` and has no credential-import button.
 - Live and Final cards have independent provider/model selectors, tariff basis, enable switch, and cache
-  disclosure. Unavailable/benchmark reasons remain visible.
+  disclosure. Hard unavailability reasons remain visible; benchmark state is visible latency advice, not a
+  disabled option.
 - Word-bank editor supports chips, bulk paste, search, edit/remove, `Clear…`, count/revision, and
   `Remember spelling`; never auto-learns.
 - Separate persistent switches: `Show history diagnostics` and `Show live metrics by default`.
 
 ### 14.3 Live window
 
-Default size becomes 1,100×700; minimum 640×420. At ≥820 px it is a resizable transcript/assistant split
-(initially 65/35). Below 820 px, Assistant is a focus-trapped drawer with unread badge, Escape/backdrop close,
+Default size becomes 1,100×700; minimum 640×420. The microphone test opens the same ephemeral hosted session
+and row handoff as a real live call, so Live cleanup, Final rewrite at stop, pinned questions, and ad-hoc
+questions can be verified without creating a recording, queue row, or Vagus note. Hosted egress/cache behavior
+still follows the explicitly enabled controls and is disclosed in the test window. At ≥820 px it is a
+resizable transcript/assistant split (initially 65/35). Below 820 px, Assistant is a focus-trapped drawer with unread badge, Escape/backdrop close,
 and focus restoration. Drawer/rewrite updates preserve transcript scroll; auto-follow only when within 80 px
 of the bottom.
 
@@ -1059,9 +1066,11 @@ patterns; concise state changes are announced without rereading transcript rows.
    complete privacy/retention review, tariff provenance, provider fixtures, and model benchmarks.
 3. **Final lane canary:** opt-in final only, cache mandatory, small user cohort. Verify crash ambiguity,
    Vagus same-note publication, costs, and purge.
-4. **Live cleanup + protocol/sidebar:** enable per user after p95/quality gates; then pinned questions behind a
-   separate repeated-cost acknowledgement.
-5. **General availability:** only documented transports/models that meet measured gates. Remote kill switch
+4. **Live cleanup + protocol/sidebar:** publish measured recommendations after p95/quality gates while allowing
+   the owner to try any otherwise eligible account model behind the hard raw fallback; then pinned questions
+   behind a separate repeated-cost acknowledgement.
+5. **General availability:** documented transports remain the release default, and only measured models earn
+   recommendations/defaults. An account-returned capable model remains owner-selectable. A remote kill switch
    may disable a provider/model descriptor but must never silently substitute another.
 6. **ChatGPT subscription:** ship the direct fixed-endpoint transport visibly experimental, with a provider
    kill switch and no inference fallback/substitution if OpenAI changes its private contract.
@@ -1098,8 +1107,9 @@ property.
 - [ ] ChatGPT device auth is Corti-owned, secret-store-backed, bounded, fixed-host, refresh-token rotating, and
       never exposes tokens/account ids over IPC, logs, debug, or preferences; no Codex server/tools exist.
 - [ ] Claude subscription has no adapter/import/setup command absent written permission.
-- [ ] Model choices come from provider/account/region catalogs plus capability/benchmark gates; no silent
-      substitution and no local model catalog contamination.
+- [ ] Model choices come from provider/account/region catalogs plus hard capability gates; benchmark state is
+      honest recommendation/advice rather than an ownership gate, with no silent substitution or local model
+      catalog contamination.
 - [ ] `gpt-5.6-luna` appears only as the exact direct-OpenAI catalog id, with unbenchmarked latency until
       measured and no inferred ChatGPT-subscription availability/default.
 
@@ -1115,8 +1125,9 @@ property.
 - [ ] Cache-committed final recovery never repeats a provider call; crash-ambiguous dispatch never auto-retries
       and requires explicit confirmed retry.
 - [ ] Filing checkpoint v2 stores exact applied text/provenance, so filing retries never call a paid provider.
-- [ ] Exactly one pinned template exists; 500 ms edit debounce, meaningful-progress policy, one coalesced rerun,
-      and repeated-cost acknowledgement work in Rust.
+- [ ] Exactly one pinned template exists; 500 ms edit debounce, meaningful-progress policy (including enough
+      transcript already present when setup is completed), one coalesced rerun, and repeated-cost
+      acknowledgement work in Rust.
 - [ ] Ad-hoc questions are bounded, visible, cancelable, as-of-revision, and never silently coalesced.
 
 ### Cache, privacy, telemetry, and cost

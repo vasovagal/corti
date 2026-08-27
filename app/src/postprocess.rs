@@ -19,7 +19,7 @@ use std::{
     fmt,
     sync::{
         Arc,
-        mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+        mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError, sync_channel},
     },
 };
 
@@ -1553,7 +1553,14 @@ impl PostprocessCoordinator {
         self.control
             .commit_pinned_question_revision()
             .map_err(|_| SubmitError::GenerationOverflow)?;
-        self.pinned.request_watermark = self.watermark;
+        // A newly saved question should be able to answer the substantial transcript already on screen.
+        // Starting its progress baseline at "now" made late setup look broken until another 40 words arrived.
+        // Subsequent accepted runs still advance the baseline normally, preserving bounded coalesced updates.
+        self.pinned.request_watermark = if self.pinned_template.is_some() {
+            TranscriptWatermark::initial(self.watermark.session_generation)
+        } else {
+            self.watermark
+        };
         self.pinned.quiet_due_at_micros = None;
         self.pinned.dirty_while_running = false;
         self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
@@ -3432,7 +3439,6 @@ fn validate_exact_model(queued: &QueuedCall, catalog: &ModelCatalog) -> Result<(
         || !model.capabilities.text_input
         || !model.capabilities.text_output
         || !model.capabilities.structured_output
-        || (request.lane == Lane::Live && !model.benchmarked_for_live)
     {
         return Err(ErrorCode::PolicyBlocked);
     }
@@ -3546,8 +3552,8 @@ fn cancellation_outcome(reason: CancellationReason) -> (TerminalOutcomeDto, Erro
     }
 }
 
-/// Bounded hot-path handoff. Only `try_send` is exposed, so capture/live-ASR code cannot accidentally wait
-/// behind cache, auth, provider, or store work.
+/// Bounded hot-path handoff. Capture/live-ASR uses only `try_send`; the separate blocking barrier is reserved
+/// for the already-finished ASR/final boundary and cannot enter a capture callback.
 pub(crate) struct CoordinatorIngress {
     sender: SyncSender<HotPathCommand>,
 }
@@ -3569,6 +3575,8 @@ pub(crate) enum HotPathCommand {
         submission: Box<RequestSubmission>,
         watermark: TranscriptWatermark,
     },
+    /// Off-hot-path FIFO fence used after ASR is complete, before a final request snapshots the ledger.
+    Barrier { reply: Sender<()> },
 }
 
 impl fmt::Debug for HotPathCommand {
@@ -3587,6 +3595,7 @@ impl fmt::Debug for HotPathCommand {
                 .field("submission", submission)
                 .field("watermark", watermark)
                 .finish(),
+            Self::Barrier { .. } => f.write_str("Barrier(<reply>)"),
         }
     }
 }
@@ -3614,6 +3623,16 @@ impl CoordinatorIngress {
             TrySendError::Full(_) => IngressError::Full,
             TrySendError::Disconnected(_) => IngressError::Disconnected,
         })
+    }
+
+    /// Wait until every earlier ingress item has been observed. This is intentionally blocking and may be
+    /// called only after capture/ASR is complete; the hot path above exposes `try_send` only.
+    pub(crate) fn barrier(&self) -> Result<(), IngressError> {
+        let (reply, receive) = std::sync::mpsc::channel();
+        self.sender
+            .send(HotPathCommand::Barrier { reply })
+            .map_err(|_| IngressError::Disconnected)?;
+        receive.recv().map_err(|_| IngressError::Disconnected)
     }
 }
 

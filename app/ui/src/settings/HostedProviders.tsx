@@ -423,7 +423,7 @@ function HostedProviderCard({
                 <code>{model.exact_model_id}</code>
                 <span>
                   {model.region ? `${model.region} · ` : ""}
-                  {model.benchmarked_for_live ? "live benchmark passed" : "live latency unbenchmarked"}
+                  {model.benchmarked_for_live ? "live speed measured" : "live speed not measured · still selectable"}
                   {model.deprecated ? " · deprecated" : ""}
                 </span>
               </li>

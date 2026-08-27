@@ -7,7 +7,12 @@ import {
   syntheticGapEvent,
   syntheticGapSnapshot,
   syntheticLiveOverrides,
+  syntheticLiveSettings,
   syntheticLiveTerminal,
+  syntheticPinnedWaitingSettings,
+  syntheticPolicyBlockedAssistant,
+  syntheticUnconfiguredLiveTranscript,
+  syntheticUnconfiguredSettings,
   syntheticVertexNotice,
   syntheticVertexReadySettings,
 } from "./fixtures.js";
@@ -22,6 +27,8 @@ test.beforeEach(async ({ page }, testInfo) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
   const liveExperience = [
     "live rewrite changes and assistant",
+    "policy-blocked question explains the repair path",
+    "pinned question explains its first automatic run",
     "live diff and cost narrow",
     "desktop sidebar and pinned answer",
     "reduced motion live rewrite desktop",
@@ -30,10 +37,33 @@ test.beforeEach(async ({ page }, testInfo) => {
     "narrow assistant drawer restores focus",
     "accepted rewrite wash is one shot",
     "live controls and pinned debounce use narrow commands",
+    "equal revision refresh keeps actionable repair",
     "forced colors keeps changed tokens visible",
   ].includes(testInfo.title);
+  const onboarding = testInfo.title === "unconfigured microphone test links to hosted setup";
+  const overrides = onboarding
+    ? {
+        get_live_transcript: syntheticUnconfiguredLiveTranscript,
+        get_hosted_settings: syntheticUnconfiguredSettings,
+        patch_hosted_settings: { status: "unchanged", settings: syntheticUnconfiguredSettings },
+        get_hosted_assistant: { pinned_run_count: 0, pinned: null, exchanges: [] },
+      }
+    : testInfo.title === "policy-blocked question explains the repair path"
+      ? {
+          ...syntheticLiveOverrides,
+          get_hosted_assistant: syntheticPolicyBlockedAssistant,
+        }
+      : testInfo.title === "pinned question explains its first automatic run"
+        ? {
+            ...syntheticLiveOverrides,
+            get_hosted_settings: syntheticPinnedWaitingSettings,
+            get_hosted_assistant: { pinned_run_count: 0, pinned: null, exchanges: [] },
+          }
+        : liveExperience
+        ? syntheticLiveOverrides
+        : undefined;
   await page.addInitScript({
-    content: buildInitScript(liveExperience ? syntheticLiveOverrides : undefined),
+    content: buildInitScript(overrides),
   });
   // Product captures are fixture-only. Even if the machine has ambient provider
   // credentials, the browser may talk only to the loopback Vite server.
@@ -72,6 +102,46 @@ test("live transcript", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Zoom · live transcript" })).toBeVisible();
   await expect(page.getByText("The inbox note is already open", { exact: false })).toBeVisible();
   await capture(page, "live-transcript.png");
+});
+
+test("unconfigured microphone test links to hosted setup", async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await page.goto(`${BASE_URL}/?view=live`);
+  await expect(page.getByRole("heading", { name: "Microphone transcription test" })).toBeVisible();
+  await expect(page.getByText("You don't have a ready hosted provider catalog yet", { exact: false })).toBeVisible();
+  await expect(page.getByRole("complementary", { name: "Transcript assistant" })).toBeVisible();
+  await capture(page, "hosted-onboarding-live.png");
+
+  await page.getByRole("button", { name: "Configure a provider" }).click();
+  expect(await lastInvocation(page, "open_preferences_section")).toMatchObject({
+    args: { section: "hosted-provider" },
+  });
+
+  await page.getByRole("switch", { name: "Live" }).click();
+  await expect(page.getByText("Live cleanup needs an exact provider model", { exact: false })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Configure Live cleanup" })).toBeVisible();
+  expect(await invocationCount(page, "patch_hosted_settings")).toBe(0);
+});
+
+test("policy-blocked question explains the repair path", async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await page.goto(`${BASE_URL}/?view=live`);
+  await expect(page.getByText("Summarize the chat up till now", { exact: true })).toBeVisible();
+  await expect(page.getByText("saved model or rewrite mode is not currently usable", { exact: false })).toBeVisible();
+  await captureElement(page.locator(".live-answer-failed"), "question-policy-repair.png");
+  await page.getByRole("button", { name: "Review rewrite modes" }).click();
+  expect(await lastInvocation(page, "open_preferences_section")).toMatchObject({
+    args: { section: "hosted-routing" },
+  });
+});
+
+test("pinned question explains its first automatic run", async ({ page }) => {
+  await page.setViewportSize({ width: 1100, height: 700 });
+  await page.goto(`${BASE_URL}/?view=live`);
+  const pinned = page.locator(".live-pinned-card");
+  await expect(pinned.getByText("Waiting for enough context", { exact: false })).toBeVisible();
+  await expect(pinned.getByText("Existing context counts after setup", { exact: false })).toBeVisible();
+  await captureElement(pinned, "pinned-waiting-guidance.png");
 });
 
 test("live rewrite changes and assistant", async ({ page }) => {
@@ -292,6 +362,20 @@ test("live controls and pinned debounce use narrow commands", async ({ page }) =
   });
 });
 
+test("equal revision refresh keeps actionable repair", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=live`);
+  await setFixture(page, "patch_hosted_settings", {
+    status: "disabled_for_session",
+    settings: syntheticLiveSettings,
+    code: "cache",
+  });
+  await page.getByRole("switch", { name: "Live" }).click();
+  await expect(page.getByRole("button", { name: "Open diagnostics" })).toBeVisible();
+  await emitFixture(page, "hosted-state-changed", { event: "control_changed" });
+  await page.waitForTimeout(150);
+  await expect(page.getByRole("button", { name: "Open diagnostics" })).toBeVisible();
+});
+
 test("forced colors keeps changed tokens visible", async ({ page }) => {
   await page.emulateMedia({ reducedMotion: "reduce", forcedColors: "active" });
   await page.goto(`${BASE_URL}/?view=live`);
@@ -421,6 +505,18 @@ async function setFixture(page: Page, command: string, value: unknown) {
   );
 }
 
+test("repair links retarget an existing Preferences window", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=transcription`);
+  await expect(page.getByRole("heading", { name: "Transcription", exact: true })).toBeVisible();
+  await emitFixture(page, "settings-navigation-requested", "hosted-provider");
+  await page.waitForTimeout(50);
+  await expect(page.getByRole("heading", { name: "Transcription", exact: true })).toBeVisible();
+  await setFixture(page, "take_preferences_section_request", "hosted-routing");
+  await emitFixture(page, "settings-navigation-requested", null);
+  await expect(page.getByRole("heading", { name: "Rewrite modes", exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/section=hosted-routing/u);
+});
+
 test("hosted rewrite preferences", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${BASE_URL}/?view=settings&section=hosted`);
@@ -439,6 +535,31 @@ test("hosted rewrite preferences", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "ChatGPT subscription" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign in with ChatGPT…" })).toBeVisible();
   await expect(page.getByText("does not launch a Codex server", { exact: false })).toBeVisible();
+});
+
+test("unmeasured live model remains selectable with fallback advice", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 900 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-routing`);
+  const liveCard = page.locator(".hosted-lane-card").filter({
+    has: page.getByRole("heading", { name: "Live cleanup" }),
+  });
+  await liveCard.locator(".hosted-lane-head").click();
+  await liveCard.locator("#hosted-provider-live").selectOption({ index: 1 });
+  const model = liveCard.locator("#hosted-model-live");
+  await expect(model.locator("option[value='gpt-5.6-luna']")).toBeEnabled();
+  await model.selectOption("gpt-5.6-luna");
+  await expect(page.getByText("Benchmark labels are guidance, not a lock", { exact: false })).toBeVisible();
+  expect(await lastInvocation(page, "patch_hosted_settings")).toMatchObject({
+    args: {
+      request: {
+        patch: {
+          kind: "set_lane_selection",
+          lane: "live",
+          selection: { model: "gpt-5.6-luna" },
+        },
+      },
+    },
+  });
 });
 
 test("hosted rewrite preferences narrow", async ({ page }) => {
@@ -469,6 +590,8 @@ test("Vertex warning and recovery", async ({ page }) => {
   await vertexCard.getByRole("button", { name: "Refresh status & catalog" }).click();
   await expect(vertexCard.getByText("Armed · token only", { exact: true })).toBeVisible();
   await expect(vertexCard.getByRole("alert")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Choose rewrite models" })).toBeVisible();
+  await expect(page.getByText("No lane was enabled", { exact: false })).toHaveCount(0);
   await captureElement(vertexCard, "vertex-recovery-narrow.png");
 
   await page.setViewportSize({ width: 1200, height: 1000 });

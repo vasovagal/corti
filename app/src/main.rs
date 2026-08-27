@@ -302,6 +302,8 @@ pub(crate) mod imp {
                 crate::console::save_console_logs,
                 crate::stats::get_stats,
                 crate::activity::get_pipeline_activity,
+                crate::tray::open_preferences_section,
+                crate::tray::take_preferences_section_request,
                 crate::live_view::get_live_transcript,
                 crate::postprocess_app::get_hosted_settings,
                 crate::postprocess_app::patch_hosted_settings,
@@ -368,6 +370,7 @@ pub(crate) mod imp {
 
         // Managed state must exist before the tray (build_menu reads it) and before any worker touches it.
         app.manage(AppState::new());
+        app.manage(crate::tray::PreferencesNavigation::default());
 
         // Transient, bounded timestamped transcript state. The same clone feeds call/test workers; managing
         // it exposes open-late snapshots to the singleton Live Transcript webview.
@@ -418,6 +421,7 @@ pub(crate) mod imp {
             live_manager.clone(),
             shared_cfg.clone(),
             live_transcript.clone(),
+            Some(hosted.clone()),
         ));
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned

@@ -1206,6 +1206,10 @@ summary:focus-visible,
   position: sticky;
   top: 12px;
   z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
   border-radius: 8px;
   background: var(--bg-card);
@@ -2486,10 +2490,42 @@ summary:focus-visible,
   cursor: pointer;
 }
 .live-test-callout,
-.live-status-banner {
+.live-status-banner,
+.live-setup-callout {
+  flex: 0 0 auto;
+}
+.live-setup-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-card));
+  padding: 9px 10px;
+}
+.live-setup-callout > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+.live-setup-callout strong {
+  font-size: 12px;
+}
+.live-setup-callout span {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.live-setup-callout button {
   flex: 0 0 auto;
 }
 .live-status-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin: 8px 0 0;
   border-left: 3px solid var(--accent);
   border-radius: 7px;
@@ -2783,6 +2819,33 @@ summary:focus-visible,
 .live-assistant-error {
   color: var(--warn-fg);
 }
+.live-assistant-remedy,
+.live-answer-remedy,
+.live-call-remedy {
+  display: grid;
+  gap: 6px;
+  margin: 7px 0;
+  border-left: 2px solid var(--warn-fg);
+  padding-left: 8px;
+  color: var(--warn-fg);
+  font-size: 10px;
+}
+.live-assistant-remedy button,
+.live-answer-remedy button,
+.live-call-remedy button {
+  justify-self: start;
+}
+.live-inline-repair {
+  margin: -5px 0 7px;
+}
+.live-pinned-guidance {
+  margin: 7px 0;
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
 .live-pinned-card,
 .live-thread {
   border: 1px solid var(--border);
@@ -2924,7 +2987,10 @@ summary:focus-visible,
   z-index: 120;
   right: 18px;
   bottom: 18px;
-  max-width: min(380px, calc(100vw - 36px));
+  max-width: min(420px, calc(100vw - 36px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
   border: 1px solid var(--caution-fg);
   border-radius: 9px;
   background: var(--caution-bg);
@@ -2935,7 +3001,7 @@ summary:focus-visible,
   font-weight: 700;
 }
 
-@media (max-width: 980px) {
+@media (max-width: 1180px) {
   .live-hosted-controls {
     flex-wrap: wrap;
   }
@@ -2988,6 +3054,11 @@ summary:focus-visible,
   }
   .live-hosted-controls {
     align-items: flex-start;
+  }
+  .live-setup-callout,
+  .live-status-banner {
+    align-items: flex-start;
+    flex-direction: column;
   }
   .live-switches {
     width: 100%;

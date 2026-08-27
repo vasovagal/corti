@@ -378,6 +378,87 @@ export const hostedSettings = {
   show_live_metrics_by_default: false,
 };
 
+export const syntheticUnconfiguredSettings = {
+  ...hostedSettings,
+  state_revision: 2,
+  preferences_revision: 1,
+  control: {
+    ...hostedSettings.control,
+    control_revision: 1,
+    pinned_question_revision: 0,
+    master_enabled: false,
+    egress_acknowledged: false,
+    pinned_auto_enabled: false,
+    live: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+    final_lane: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+    questions: {
+      enabled: false,
+      revision: 1,
+      selection: {
+        provider: null,
+        transport: null,
+        model: null,
+        cache_policy: { local: "reusable", provider: "off" },
+      },
+    },
+  },
+  providers: hostedSettings.providers.map((provider) => ({
+    ...provider,
+    credential:
+      provider.descriptor.support_tier === "blocked"
+        ? provider.credential
+        : { state: "absent" },
+    models: [],
+    service_error: null,
+  })),
+};
+
+export const syntheticUnconfiguredLiveTranscript = {
+  protocol_version: 2,
+  process_epoch: 71,
+  session_generation: 2,
+  revision: 7,
+  session_id: "microphone-test-7",
+  mode: "test",
+  status: "listening",
+  title: "Microphone transcription test",
+  detail: "Listening to this microphone only — say a sentence, then pause.",
+  active: true,
+  evicted_lines: 0,
+  retained_from_seq: 1,
+  lines: [
+    {
+      seq: 1,
+      row_id: "microphone-test-row-1",
+      speaker: "Me",
+      start_sec: 0,
+      end_sec: 4.2,
+      text: "This raw microphone transcript works before any hosted provider is configured.",
+      clean_text: null,
+      rewrite_state: "raw",
+      commit_epoch: 0,
+    },
+  ],
+};
+
 export const syntheticVertexReadySettings = {
   ...hostedSettings,
   state_revision: 13,
@@ -528,6 +609,8 @@ export const fixtures: Record<string, unknown> = {
   get_live_test_window_generation: 41,
   start_live_test: null,
   stop_live_test: null,
+  open_preferences_section: null,
+  take_preferences_section_request: null,
   list_recordings: recordings,
   retry_recording: null,
   open_note: null,
@@ -787,6 +870,34 @@ export const syntheticAssistant = {
       answer: null,
       cost_label: "Cost unavailable",
       context_truncated: true,
+      cache: "none",
+    },
+  ],
+};
+
+export const syntheticPinnedWaitingSettings = {
+  ...syntheticLiveSettings,
+  state_revision: 25,
+  control: {
+    ...syntheticLiveSettings.control,
+    pinned_auto_enabled: true,
+    pinned_question_revision: 2,
+  },
+};
+
+export const syntheticPolicyBlockedAssistant = {
+  pinned_run_count: 0,
+  pinned: null,
+  exchanges: [
+    {
+      call_id: "synthetic-policy-question",
+      as_of_revision: 42,
+      status: "failed",
+      error: "policy_blocked",
+      question: "Summarize the chat up till now",
+      answer: null,
+      cost_label: "Cost unavailable",
+      context_truncated: false,
       cache: "none",
     },
   ],

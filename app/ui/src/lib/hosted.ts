@@ -9,7 +9,9 @@ import type {
   HostedProviderCacheMode,
   HostedProviderState,
   HostedSelectionInput,
+  HostedSettingsDto,
   HostedSupportTier,
+  PreferencesSection,
 } from "./api";
 
 /** The backend contract requires this warning to remain undecorated and exact. */
@@ -92,7 +94,42 @@ export function supportTierLabel(tier: HostedSupportTier): string {
 }
 
 export function errorLabel(code: HostedErrorCode): string {
-  return code.replace(/_/gu, " ");
+  switch (code) {
+    case "auth_unarmed":
+      return "provider sign-in is not ready";
+    case "auth_rejected":
+      return "provider sign-in was rejected";
+    case "permission":
+      return "provider permission was denied";
+    case "quota":
+      return "provider quota is exhausted";
+    case "rate_limited":
+      return "provider rate limit reached";
+    case "model_unavailable":
+      return "selected model is unavailable";
+    case "network":
+      return "network request failed";
+    case "timeout":
+      return "request deadline was exceeded";
+    case "canceled":
+      return "request was canceled";
+    case "superseded":
+      return "request was replaced by newer work";
+    case "policy_blocked":
+      return "setup or provider policy prevented the request";
+    case "cache":
+      return "protected cache is unavailable";
+    case "malformed_output":
+      return "model response could not be safely applied";
+    case "provider":
+      return "provider request failed";
+    case "broker_exited":
+      return "provider helper exited";
+    case "ambiguous_dispatch":
+      return "paid dispatch outcome is unknown";
+    case "internal":
+      return "internal hosted processing error";
+  }
 }
 
 export interface CredentialSummary {
@@ -298,7 +335,7 @@ export function parseProviderKey(value: string): { provider: string; transport: 
   return null;
 }
 
-export function modelUnavailableReason(model: HostedModelDescriptor, lane: HostedLane): string | null {
+export function modelUnavailableReason(model: HostedModelDescriptor, _lane: HostedLane): string | null {
   if (model.support_tier === "blocked") return "blocked by provider policy";
   if (!model.account_scoped_available) return "not available to this account or region";
   if (model.deprecated) return "deprecated";
@@ -306,8 +343,229 @@ export function modelUnavailableReason(model: HostedModelDescriptor, lane: Hoste
     return "text input/output capability is missing";
   }
   if (!model.capabilities.structured_output) return "structured output is not supported";
-  if (lane === "live" && !model.benchmarked_for_live) return "not benchmarked for live latency";
   return null;
+}
+
+/** Benchmark state is advice, never an ownership gate: the user's exact catalog model may still run. */
+export function modelAdvisory(model: HostedModelDescriptor, lane: HostedLane): string | null {
+  if (lane === "live" && !model.benchmarked_for_live) {
+    return "live speed not measured; raw text wins if the deadline is missed";
+  }
+  return null;
+}
+
+export interface HostedActionGuidance {
+  message: string;
+  actionLabel: string | null;
+  section: PreferencesSection | null;
+}
+
+function controlForLane(settings: HostedSettingsDto, lane: HostedLane) {
+  switch (lane) {
+    case "live":
+      return settings.control.live;
+    case "final":
+      return settings.control.final_lane;
+    case "question":
+      return settings.control.questions;
+  }
+}
+
+function laneTitle(lane: HostedLane): string {
+  switch (lane) {
+    case "live":
+      return "Live cleanup";
+    case "final":
+      return "Final rewrite";
+    case "question":
+      return "Questions";
+  }
+}
+
+/** Explain the first configuration fact that prevents this lane from dispatching. */
+export function laneConfigurationGuidance(
+  settings: HostedSettingsDto,
+  lane: HostedLane,
+): HostedActionGuidance | null {
+  const title = laneTitle(lane);
+  const selection = controlForLane(settings, lane).selection;
+  if (!selection.provider || !selection.transport || !selection.model) {
+    return {
+      message: `${title} needs an exact provider model before it can run.`,
+      actionLabel: `Configure ${title}`,
+      section: "hosted-routing",
+    };
+  }
+  const provider = settings.providers.find(
+    (candidate) =>
+      candidate.descriptor.provider === selection.provider &&
+      candidate.descriptor.transport === selection.transport,
+  );
+  if (!provider || provider.descriptor.support_tier === "blocked" || !provider.descriptor.adapter_available) {
+    return {
+      message: `${title}'s saved provider is unavailable. Choose a supported provider and refresh its catalog.`,
+      actionLabel: "Review provider",
+      section: "hosted-provider",
+    };
+  }
+  if (provider.credential.state !== "ready") {
+    return {
+      message: `${title}'s provider is not connected. Sign in or fix its credential, then refresh the catalog.`,
+      actionLabel: "Fix provider connection",
+      section: "hosted-provider",
+    };
+  }
+  const model = findExactModel(
+    settings.providers,
+    selection.provider,
+    selection.transport,
+    selection.model,
+  );
+  if (!model) {
+    return {
+      message: `${title}'s saved model is no longer in the current catalog. Refresh the provider or choose another model.`,
+      actionLabel: "Choose another model",
+      section: "hosted-routing",
+    };
+  }
+  const unavailable = modelUnavailableReason(model, lane);
+  if (unavailable) {
+    return {
+      message: `${title}'s model is ${unavailable}. Choose another exact catalog model.`,
+      actionLabel: "Choose another model",
+      section: "hosted-routing",
+    };
+  }
+  return null;
+}
+
+/** One next step for the Live window instead of exposing controls that fail with policy jargon. */
+export function hostedOnboardingGuidance(
+  settings: HostedSettingsDto,
+): HostedActionGuidance | null {
+  const readyCatalog = settings.providers.some(
+    (provider) =>
+      provider.descriptor.support_tier !== "blocked" &&
+      provider.descriptor.adapter_available &&
+      provider.credential.state === "ready" &&
+      provider.models.some((model) => modelUnavailableReason(model, "final") === null),
+  );
+  if (!readyCatalog) {
+    return {
+      message: "You don't have a ready hosted provider catalog yet. Connect one provider and refresh its models.",
+      actionLabel: "Configure a provider",
+      section: "hosted-provider",
+    };
+  }
+  const lanes: HostedLane[] = ["final", "live", "question"];
+  const configured = lanes.filter((lane) => laneConfigurationGuidance(settings, lane) === null);
+  if (configured.length === 0) {
+    return {
+      message: "Your provider is ready. Choose an exact model for at least one rewrite mode next.",
+      actionLabel: "Choose rewrite models",
+      section: "hosted-routing",
+    };
+  }
+  if (!configured.some((lane) => controlForLane(settings, lane).enabled)) {
+    return {
+      message: "Models are selected, but every rewrite mode is off. Enable the mode you want to try.",
+      actionLabel: "Enable a rewrite mode",
+      section: "hosted-routing",
+    };
+  }
+  if (!settings.control.egress_acknowledged) {
+    return {
+      message: "Your provider and model are ready. Review the text-only privacy boundary before the first hosted request.",
+      actionLabel: "Review privacy & enable",
+      section: "hosted",
+    };
+  }
+  if (!settings.control.master_enabled) {
+    return {
+      message: "Hosted rewrite is configured but paused. Turn on Master above when you're ready to send transcript text.",
+      actionLabel: "Review Master",
+      section: "hosted",
+    };
+  }
+  return null;
+}
+
+/** User-facing recovery copy for typed terminal errors. */
+export function hostedErrorGuidance(code: HostedErrorCode): HostedActionGuidance {
+  switch (code) {
+    case "auth_unarmed":
+    case "auth_rejected":
+    case "permission":
+      return {
+        message: "The provider could not authorize this request. Check its sign-in, account access, and connection scope, then refresh.",
+        actionLabel: "Fix provider connection",
+        section: "hosted-provider",
+      };
+    case "quota":
+    case "rate_limited":
+      return {
+        message: "The provider refused more work right now. Check quota or billing, or wait and try again.",
+        actionLabel: "Review provider",
+        section: "hosted-provider",
+      };
+    case "model_unavailable":
+    case "policy_blocked":
+      return {
+        message: "The saved model or rewrite mode is not currently usable. Review the exact model and lane setup.",
+        actionLabel: "Review rewrite modes",
+        section: "hosted-routing",
+      };
+    case "malformed_output":
+      return {
+        message: "The model returned text Corti could not safely apply. Try another exact model; raw transcript text was kept.",
+        actionLabel: "Choose another model",
+        section: "hosted-routing",
+      };
+    case "cache":
+      return {
+        message: "Corti could not use its protected hosted state or cache. Review diagnostics; raw transcript text was kept.",
+        actionLabel: "Open diagnostics",
+        section: "hosted-advanced",
+      };
+    case "network":
+    case "timeout":
+    case "provider":
+    case "broker_exited":
+    case "ambiguous_dispatch":
+      return {
+        message: "The provider call did not finish safely. Check the connection and try again; Corti kept raw text and will not blindly repeat a paid call.",
+        actionLabel: "Review provider",
+        section: "hosted-provider",
+      };
+    case "canceled":
+    case "superseded":
+      return {
+        message: "This request was replaced or canceled. The current transcript remains available.",
+        actionLabel: null,
+        section: null,
+      };
+    case "internal":
+      return {
+        message: "Hosted processing hit an internal error. Raw transcript text was kept; diagnostics can help identify the cause.",
+        actionLabel: "Open diagnostics",
+        section: "hosted-advanced",
+      };
+  }
+}
+
+export function unknownHostedErrorGuidance(error: unknown): HostedActionGuidance {
+  const text = String(error).toLocaleLowerCase();
+  if (text.includes("auth") || text.includes("credential") || text.includes("permission")) {
+    return hostedErrorGuidance("auth_rejected");
+  }
+  if (text.includes("quota")) return hostedErrorGuidance("quota");
+  if (text.includes("rate")) return hostedErrorGuidance("rate_limited");
+  if (text.includes("network")) return hostedErrorGuidance("network");
+  if (text.includes("timeout") || text.includes("deadline")) return hostedErrorGuidance("timeout");
+  if (text.includes("cache")) return hostedErrorGuidance("cache");
+  if (text.includes("model")) return hostedErrorGuidance("model_unavailable");
+  if (text.includes("policy") || text.includes("disabled")) return hostedErrorGuidance("policy_blocked");
+  return hostedErrorGuidance("internal");
 }
 
 export function modelsForProvider(

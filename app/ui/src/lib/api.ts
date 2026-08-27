@@ -248,6 +248,31 @@ export const onLiveTranscriptChanged = (
 ): Promise<UnlistenFn> =>
   listen<LiveTranscriptEvent>("live-transcript-changed", (event) => handler(event.payload));
 
+// ----- Cross-window Preferences navigation -----
+
+export type PreferencesSection =
+  | "transcription"
+  | "hosted"
+  | "hosted-provider"
+  | "hosted-routing"
+  | "hosted-language"
+  | "hosted-advanced"
+  | "storage";
+
+/** Open/focus Preferences at one backend-allowlisted repair destination. */
+export const openPreferencesSection = (section: PreferencesSection): Promise<void> =>
+  invoke<void>("open_preferences_section", { section });
+
+/** Take the backend-owned latest repair destination. Only the Settings window is allowed to call this. */
+export const takePreferencesSectionRequest = (): Promise<PreferencesSection | null> =>
+  invoke<PreferencesSection | null>("take_preferences_section_request");
+
+/** Existing Preferences singletons receive only a wake-up; the destination is fetched from Rust. */
+export const onPreferencesNavigationRequested = (
+  handler: () => void,
+): Promise<UnlistenFn> =>
+  listen("settings-navigation-requested", handler);
+
 // ----- Hosted post-processing preferences -----
 
 export type HostedSupportTier = "documented" | "experimental" | "blocked";

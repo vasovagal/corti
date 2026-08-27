@@ -208,6 +208,12 @@ impl HostedHandle {
         }
     }
 
+    /// Off-hot-path FIFO fence for the ASR tail. Real calls and microphone tests use it only after capture
+    /// has closed, so the final row cannot be overtaken by Final or EndSession.
+    pub(crate) fn flush_finalized_rows(&self) -> Result<(), IngressError> {
+        self.ingress.barrier()
+    }
+
     /// Run the stronger all-or-nothing final pass. This is called only after ASR and may wait up to the
     /// configured final deadline. Every error returns the immutable raw transcript with typed no-apply
     /// provenance; it never turns a hosted failure into a pipeline failure.
@@ -218,6 +224,12 @@ impl HostedHandle {
         live_session: bool,
     ) -> SettledFinalTranscript {
         let raw = transcript.clone();
+        // Live/test rows use a nonblocking channel. Once ASR has finished it is safe—and necessary—to wait
+        // for a FIFO barrier so Final cannot overtake the tail row and observe it twice or fence an old ledger.
+        if live_session && self.flush_finalized_rows().is_err() {
+            self.ingress_incomplete.store(true, Ordering::Release);
+            return fallback_final(raw, ErrorCode::Internal, Vec::new(), None);
+        }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         if self
             .send(ServiceCommand::Finalize {
@@ -2605,6 +2617,15 @@ fn default_store_path() -> Result<PathBuf> {
 fn import_outbox(queue: &Queue, outbox: &TelemetryOutbox) -> Result<usize> {
     let mut imported = HashSet::new();
     for telemetry in outbox.pending() {
+        // The microphone test deliberately has no queue row. Its content-free terminal event remains visible
+        // in the current Live window, then is acknowledged here instead of clogging the durable outbox.
+        if telemetry
+            .recording_id
+            .starts_with(crate::live_test::MICROPHONE_TEST_RECORDING_PREFIX)
+        {
+            imported.insert(telemetry.call_id);
+            continue;
+        }
         // Live calls can settle before LiveNoteCreated/enqueue publishes the recording row. Keep those
         // entries pending; every later pipeline wake retries idempotently.
         if queue.get(&telemetry.recording_id)?.is_none() {
@@ -3156,6 +3177,10 @@ impl Service {
             .map_err(control_error_code)?;
         if !matches!(outcome, PatchOutcome::Unchanged(_)) {
             self.bump_state();
+            // A user may save the template, enable Questions, acknowledge Master, and enable automatic
+            // updates in any order. Reconsider the transcript already present after every effective control
+            // change so that sequence never requires another 40 words merely to start the first answer.
+            self.schedule_pinned_from_current();
         }
         self.refresh_snapshot();
         Ok(match outcome {
@@ -3446,7 +3471,7 @@ impl Service {
 
     fn validate_settings_selection(
         &self,
-        family: LaneFamily,
+        _family: LaneFamily,
         selection: &LaneSelectionDto,
     ) -> Result<(), ErrorCode> {
         let fields = (
@@ -3485,7 +3510,6 @@ impl Service {
             || !candidate.capabilities.text_input
             || !candidate.capabilities.text_output
             || !candidate.capabilities.structured_output
-            || (family == LaneFamily::Live && !candidate.benchmarked_for_live)
         {
             return Err(ErrorCode::PolicyBlocked);
         }
@@ -3606,6 +3630,9 @@ impl Service {
                 }) => {
                     let _ = self.coordinator.submit_live(*submission, watermark);
                 }
+                Ok(HotPathCommand::Barrier { reply }) => {
+                    let _ = reply.send(());
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
@@ -3709,6 +3736,10 @@ impl Service {
             return;
         }
         self.observed_pinned_revision = revision;
+        self.schedule_pinned_from_current();
+    }
+
+    fn schedule_pinned_from_current(&mut self) {
         let Some(recording_id) = self.current_recording.clone() else {
             return;
         };
@@ -5156,7 +5187,7 @@ mod tests {
                     billing_basis: descriptor.billing_basis,
                     tariff_version: None,
                     deprecated: false,
-                    benchmarked_for_live: true,
+                    benchmarked_for_live: false,
                 },
                 descriptor,
             }
@@ -6415,6 +6446,55 @@ mod tests {
     }
 
     #[test]
+    fn live_final_waits_for_finish_only_row_ingress_before_fencing() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (handle, _pipeline_rx, path) =
+            start_fixture("live-final-barrier", Arc::new(RewriteExecutor), events);
+        handle.begin_live_session("recording").unwrap();
+        handle
+            .try_observe_finalized_rows(
+                "recording",
+                vec![TranscriptRow {
+                    row_id: RowId::new("finish-only-row").unwrap(),
+                    speaker: "Me".into(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    text: "fixture finish-only context".into(),
+                }],
+            )
+            .unwrap();
+
+        // No sleep: Final must place a FIFO barrier behind the row before its normal service command can
+        // overtake ingress. Without the barrier, start_final observes the supplied transcript and the queued
+        // row arrives later, advancing the watermark twice.
+        let settled = handle.finalize("recording", raw_transcript(), true);
+        assert!(settled.hosted_text_applied);
+
+        let (reply, receive) = std::sync::mpsc::channel();
+        handle
+            .send(ServiceCommand::SubmitAdHoc {
+                question: "fixture barrier question".into(),
+                reply,
+            })
+            .unwrap();
+        let call_id = receive.recv().unwrap().unwrap();
+        let snapshot = assistant(&handle);
+        let exchange = snapshot
+            .exchanges
+            .iter()
+            .find(|exchange| exchange.call_id == call_id)
+            .unwrap();
+        assert_eq!(
+            exchange.as_of_revision, 1,
+            "the finish-only row must be observed exactly once"
+        );
+
+        handle.abandon_final_result(&settled.call_ids).unwrap();
+        handle.end_live_session("recording").unwrap();
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
     fn live_oversized_first_row_is_not_silently_dropped_or_byte_truncated() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let executor = Arc::new(RecordingExecutor::new());
@@ -6622,16 +6702,24 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let (handle, _pipeline_rx, path) =
             start_fixture("assistant", Arc::new(RewriteExecutor), events);
-        handle.begin_live_session("recording").unwrap();
+        let recording_id = format!(
+            "{}fixture",
+            crate::live_test::MICROPHONE_TEST_RECORDING_PREFIX
+        );
+        handle.begin_live_session(&recording_id).unwrap();
+        let forty_words = (0..40)
+            .map(|index| format!("word{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         handle
             .try_observe_finalized_rows(
-                "recording",
+                &recording_id,
                 vec![TranscriptRow {
                     row_id: RowId::new("assistant-row-1").unwrap(),
                     speaker: "Me".into(),
                     start_ms: 0,
-                    end_ms: 1_000,
-                    text: "fixture context for a grounded answer".into(),
+                    end_ms: 31_000,
+                    text: forty_words,
                 }],
             )
             .unwrap();
@@ -6677,6 +6765,9 @@ mod tests {
             receive.recv().unwrap().unwrap(),
             HostedMutationResult::Applied { .. }
         ));
+        // Let the revision observer see the saved template while auto-run is still off. Enabling auto later
+        // must reconsider existing context rather than relying on a lucky same-tick ordering.
+        std::thread::sleep(Duration::from_millis(30));
         let settings = handle.snapshot();
         handle
             .patch_for_test(HostedPatchRequest {
@@ -6687,22 +6778,8 @@ mod tests {
                 },
             })
             .unwrap();
-        let forty_words = (0..40)
-            .map(|index| format!("word{index}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        handle
-            .try_observe_finalized_rows(
-                "recording",
-                vec![TranscriptRow {
-                    row_id: RowId::new("assistant-row-2").unwrap(),
-                    speaker: "Me".into(),
-                    start_ms: 1_000,
-                    end_ms: 32_000,
-                    text: forty_words,
-                }],
-            )
-            .unwrap();
+        // Saving the template after substantial speech should schedule its initial answer from the transcript
+        // already present; requiring another threshold made late onboarding appear to do nothing.
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let snapshot = assistant(&handle);
@@ -6716,7 +6793,15 @@ mod tests {
             assert!(Instant::now() < deadline, "pinned answer did not settle");
             std::thread::sleep(Duration::from_millis(10));
         }
-        handle.end_live_session("recording").unwrap();
+        handle.end_live_session(&recording_id).unwrap();
+        let queue = Queue::open_at(path.join("queue.db")).unwrap();
+        assert_eq!(
+            handle.import_outbox(&queue).unwrap(),
+            2,
+            "ephemeral question calls should be acknowledged without a recording row"
+        );
+        assert_eq!(handle.import_outbox(&queue).unwrap(), 0);
+        assert!(queue.get(&recording_id).unwrap().is_none());
         std::fs::remove_dir_all(path).ok();
     }
 

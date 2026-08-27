@@ -806,6 +806,9 @@ fn session_thread(
         )),
     }
     if let Some(hosted) = publisher.hosted.as_ref() {
+        // Final places the same FIFO fence when enabled. When it is off, flush the ASR tail here so the
+        // priority EndSession command cannot clear the ledger before the last nonblocking row arrives.
+        let _ = hosted.flush_finalized_rows();
         let _ = hosted.end_live_session(&publisher.id);
     }
     outcome
