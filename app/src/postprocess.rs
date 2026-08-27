@@ -611,14 +611,16 @@ pub(crate) struct FinalRecoveryRecord {
     pub(crate) state: FinalJournalState,
 }
 
+pub(crate) struct FinalRecoveryHit {
+    pub(crate) boundary: FinalJournalBoundary,
+    pub(crate) state: FinalJournalState,
+    pub(crate) output: ProviderOutput,
+    pub(crate) terminal: Option<TerminalTelemetryDto>,
+}
+
 pub(crate) enum FinalRecoveryLookup {
     None,
-    Hit {
-        boundary: FinalJournalBoundary,
-        state: FinalJournalState,
-        output: ProviderOutput,
-        terminal: Option<TerminalTelemetryDto>,
-    },
+    Hit(Box<FinalRecoveryHit>),
     /// A recoverable group exists for this recording, but the current credential-bound request key is not
     /// one of its chunks. Repeating provider egress would no longer be crash recovery.
     Mismatch,
@@ -629,12 +631,10 @@ impl fmt::Debug for FinalRecoveryLookup {
         match self {
             Self::None => f.write_str("FinalRecoveryLookup::None"),
             Self::Mismatch => f.write_str("FinalRecoveryLookup::Mismatch"),
-            Self::Hit {
-                boundary, state, ..
-            } => f
+            Self::Hit(hit) => f
                 .debug_struct("FinalRecoveryLookup::Hit")
-                .field("boundary", boundary)
-                .field("state", state)
+                .field("boundary", &hit.boundary)
+                .field("state", &hit.state)
                 .finish_non_exhaustive(),
         }
     }
@@ -2424,13 +2424,13 @@ impl PostprocessCoordinator {
                     &queued.submission.recording_id,
                     queued.submission.request_key,
                 ) {
-                    Ok(FinalRecoveryLookup::Hit {
-                        boundary,
-                        output,
-                        terminal,
-                        ..
-                    }) => {
-                        return self.finish_recovery_hit(queued, boundary, output, terminal);
+                    Ok(FinalRecoveryLookup::Hit(hit)) => {
+                        return self.finish_recovery_hit(
+                            queued,
+                            hit.boundary,
+                            hit.output,
+                            hit.terminal,
+                        );
                     }
                     Ok(FinalRecoveryLookup::Mismatch) | Err(_) => {
                         self.finish_queued_failure(&queued, ErrorCode::Cache);

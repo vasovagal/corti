@@ -3250,12 +3250,14 @@ impl EncryptedPostprocessStore for RuntimeStore {
             .clone()
             .ok_or(ErrorCode::Cache)?
             .into_output();
-        Ok(crate::postprocess::FinalRecoveryLookup::Hit {
-            boundary: journal.boundary()?,
-            state: journal.state,
-            output,
-            terminal: journal.terminal.clone(),
-        })
+        Ok(crate::postprocess::FinalRecoveryLookup::Hit(Box::new(
+            crate::postprocess::FinalRecoveryHit {
+                boundary: journal.boundary()?,
+                state: journal.state,
+                output,
+                terminal: journal.terminal.clone(),
+            },
+        )))
     }
 
     fn recover_final_boundaries(
