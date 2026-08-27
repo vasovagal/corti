@@ -517,6 +517,9 @@ export default function LiveTranscript() {
         case "conflict":
           setControlStatus("Controls changed elsewhere. Latest state loaded; review and try again.");
           return false;
+        case "invalid":
+          setControlStatus("That settings update was invalid. Nothing was saved; review it in Preferences.");
+          return false;
         case "disabled_for_session":
           setControlStatus("Off for this session because the setting could not be saved. Raw transcript behavior is unchanged.");
           setControlRepair({ label: "Open diagnostics", section: "hosted-advanced" });

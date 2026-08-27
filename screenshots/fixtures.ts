@@ -532,7 +532,18 @@ export const syntheticBedrockProfileSettings = {
   },
 };
 
-/** The static key-pair mode, with both Keychain slots filled and the session token left unset. */
+/** A setup save persists routing first; credential resolution and catalog loading remain explicit. */
+export const syntheticBedrockSavedPendingSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 13,
+  providers: syntheticBedrockProfileSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? { ...provider, credential: { state: "absent" }, models: [] }
+      : provider,
+  ),
+};
+
+/** The static key-pair mode, with both private-store slots filled and the session token left unset. */
 export const syntheticBedrockKeypairSettings = {
   ...syntheticBedrockProfileSettings,
   state_revision: 15,
@@ -583,6 +594,66 @@ export const syntheticBedrockAssumedRoleSettings = {
         }
       : provider,
   ),
+};
+
+/** A persisted profile removed from local AWS discovery stays visible but cannot claim readiness. */
+export const syntheticBedrockMissingProfileSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 18,
+  bedrock: {
+    ...syntheticBedrockProfileSettings.bedrock,
+    profile: "retired-screenshot-profile",
+  },
+};
+
+/** Secret presence projections used to exercise Remove followed by Add/Replace without key material. */
+export const syntheticBedrockKeyMissingSettings = {
+  ...syntheticBedrockKeypairSettings,
+  state_revision: 19,
+  bedrock: {
+    ...syntheticBedrockKeypairSettings.bedrock,
+    has_access_key_id: false,
+  },
+  providers: syntheticBedrockKeypairSettings.providers.map((provider) =>
+    provider.descriptor.transport === "bedrock_runtime"
+      ? { ...provider, credential: { state: "absent" } }
+      : provider,
+  ),
+};
+
+export const syntheticBedrockKeyRestoredSettings = {
+  ...syntheticBedrockKeypairSettings,
+  state_revision: 20,
+};
+
+/** A newer canonical snapshot returned by a revision conflict. */
+export const syntheticBedrockConflictSettings = {
+  ...syntheticBedrockProfileSettings,
+  state_revision: 21,
+  scopes: syntheticBedrockProfileSettings.scopes.map((scope) =>
+    scope.transport === "bedrock_runtime"
+      ? { ...scope, alias: "Changed elsewhere", region: "us-west-2" }
+      : scope,
+  ),
+  bedrock: {
+    ...syntheticBedrockProfileSettings.bedrock,
+    profile: "default",
+  },
+};
+
+export const syntheticBedrockClearedSettings = {
+  ...hostedSettings,
+  state_revision: 22,
+};
+
+export const syntheticBedrockKeypairClearedSettings = {
+  ...hostedSettings,
+  state_revision: 23,
+  bedrock: {
+    ...hostedSettings.bedrock,
+    has_access_key_id: true,
+    has_secret_access_key: true,
+  },
 };
 
 /** An expired IAM Identity Center session — the case that must read as recoverable, not broken. */
@@ -655,6 +726,8 @@ export const fixtures: Record<string, unknown> = {
   list_aws_credential_options: {
     profiles: ["default", "corti-screenshot", "corti-sso"],
   },
+  save_bedrock_setup: { status: "unchanged", settings: hostedSettings },
+  clear_bedrock_setup: { status: "unchanged", settings: hostedSettings },
   set_bedrock_credential_mode: { status: "unchanged", settings: hostedSettings },
   prompt_for_provider_secret: "stored",
   clear_provider_secret: null,

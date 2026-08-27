@@ -55,6 +55,12 @@ pub(crate) enum HostedRewriteState {
     Clean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostedRowsApplyOutcome {
+    Applied { row_count: usize },
+    Stale,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct LiveTranscriptLine {
     /// Process-monotonic row id. It does not reset between sessions, so stale events are unambiguous.
@@ -125,6 +131,9 @@ struct Inner {
     process_epoch: u64,
     session_generation: u64,
     revision: u64,
+    /// Hosted coordinator watermark mirrored once per non-empty raw-row publication. Status/clean UI
+    /// revisions are deliberately separate so a late rewrite cannot pass merely because UI state changed.
+    transcript_revision: u64,
     next_seq: u64,
     session_id: Option<String>,
     mode: LiveTranscriptMode,
@@ -143,6 +152,7 @@ impl Default for Inner {
             process_epoch: new_process_epoch(),
             session_generation: 0,
             revision: 0,
+            transcript_revision: 0,
             next_seq: 1,
             session_id: None,
             mode: LiveTranscriptMode::Idle,
@@ -235,6 +245,12 @@ impl LiveTranscriptStore {
     }
 
     #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    pub(crate) fn hosted_transcript_revision(&self, id: &str) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        (inner.session_id.as_deref() == Some(id)).then_some(inner.transcript_revision)
+    }
+
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
     pub(crate) fn begin_call(&self, id: &str, title: &str) {
         self.begin(
             id,
@@ -307,6 +323,7 @@ impl LiveTranscriptStore {
                 LiveTranscriptStatus::Loading | LiveTranscriptStatus::Listening
             );
             inner.lines.clear();
+            inner.transcript_revision = 0;
             inner.retained_bytes = 0;
             inner.evicted_lines = 0;
             inner.event(from_revision, true, None)
@@ -442,6 +459,9 @@ impl LiveTranscriptStore {
                 inner.revision = inner.revision.saturating_add(1);
                 events.push(inner.event(from_revision, false, Some(line)));
             }
+            if !hosted_rows.is_empty() {
+                inner.transcript_revision = inner.transcript_revision.saturating_add(1);
+            }
             (events, hosted_rows)
         };
         for event in events {
@@ -450,35 +470,42 @@ impl LiveTranscriptStore {
         hosted_rows
     }
 
-    /// Apply a validated, currently-fenced cleanup to retained transient rows. Missing/evicted rows are a
-    /// safe no-op; immutable raw text is never replaced or deleted.
-    pub(crate) fn apply_hosted_rows(&self, id: &str, rows: &[TranscriptRow], commit_epoch: u64) {
+    /// Apply a validated cleanup only when session and transcript revision still match. Validation and all
+    /// row mutations happen under one lock, so an evicted/mismatched target rejects the whole application;
+    /// immutable raw text is never replaced or deleted.
+    pub(crate) fn apply_hosted_rows(
+        &self,
+        id: &str,
+        rows: &[TranscriptRow],
+        commit_epoch: u64,
+    ) -> HostedRowsApplyOutcome {
         if rows.is_empty() {
-            return;
+            return HostedRowsApplyOutcome::Applied { row_count: 0 };
         }
         let _publish = self.publish.lock().unwrap();
         let events = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.session_id.as_deref() != Some(id) {
-                return;
+            if inner.session_id.as_deref() != Some(id) || inner.transcript_revision != commit_epoch
+            {
+                return HostedRowsApplyOutcome::Stale;
             }
-            let mut events = Vec::new();
+            let mut indices = Vec::with_capacity(rows.len());
             for row in rows {
-                let Some(index) = inner
-                    .lines
-                    .iter()
-                    .position(|line| line.row_id == row.row_id)
-                else {
-                    continue;
+                let Some(index) = inner.lines.iter().position(|line| {
+                    line.row_id == row.row_id
+                        && line.speaker == row.speaker
+                        && seconds_to_millis(line.start_sec) == row.start_ms
+                        && seconds_to_millis(line.end_sec) == row.end_ms
+                }) else {
+                    return HostedRowsApplyOutcome::Stale;
                 };
+                indices.push(index);
+            }
+
+            let mut changed_lines = Vec::with_capacity(rows.len());
+            for (row, index) in rows.iter().zip(indices) {
                 let old_cost = line_cost(&inner.lines[index]);
                 let line = &mut inner.lines[index];
-                if line.speaker != row.speaker
-                    || seconds_to_millis(line.start_sec) != row.start_ms
-                    || seconds_to_millis(line.end_sec) != row.end_ms
-                {
-                    continue;
-                }
                 line.clean_text = Some(row.text.clone());
                 line.rewrite_state = HostedRewriteState::Clean;
                 line.commit_epoch = commit_epoch;
@@ -487,15 +514,19 @@ impl LiveTranscriptStore {
                     .retained_bytes
                     .saturating_sub(old_cost)
                     .saturating_add(line_cost(&line));
-                while inner.lines.len() > MAX_RETAINED_LINES
-                    || inner.retained_bytes > MAX_RETAINED_BYTES
-                {
-                    let Some(evicted) = inner.lines.pop_front() else {
-                        break;
-                    };
-                    inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
-                    inner.evicted_lines = inner.evicted_lines.saturating_add(1);
-                }
+                changed_lines.push(line);
+            }
+            while inner.lines.len() > MAX_RETAINED_LINES
+                || inner.retained_bytes > MAX_RETAINED_BYTES
+            {
+                let Some(evicted) = inner.lines.pop_front() else {
+                    break;
+                };
+                inner.retained_bytes = inner.retained_bytes.saturating_sub(line_cost(&evicted));
+                inner.evicted_lines = inner.evicted_lines.saturating_add(1);
+            }
+            let mut events = Vec::with_capacity(changed_lines.len());
+            for line in changed_lines {
                 let from_revision = inner.revision;
                 inner.revision = inner.revision.saturating_add(1);
                 events.push(inner.event(from_revision, false, Some(line)));
@@ -504,6 +535,9 @@ impl LiveTranscriptStore {
         };
         for event in events {
             (self.notify)(event);
+        }
+        HostedRowsApplyOutcome::Applied {
+            row_count: rows.len(),
         }
     }
 }
@@ -650,14 +684,40 @@ mod tests {
 
         let mut clean = rows[0].clone();
         clean.text = "clean fixture words".into();
-        store.apply_hosted_rows("call", &[clean], 7);
+        assert_eq!(
+            store.apply_hosted_rows("call", &[clean], 1),
+            HostedRowsApplyOutcome::Applied { row_count: 1 }
+        );
         let snapshot = store.snapshot();
         assert_eq!(snapshot.lines[0].text, "raw fixture words");
         assert_eq!(
             snapshot.lines[0].clean_text.as_deref(),
             Some("clean fixture words")
         );
-        assert_eq!(snapshot.lines[0].commit_epoch, 7);
+        assert_eq!(snapshot.lines[0].commit_epoch, 1);
+    }
+
+    #[test]
+    fn hosted_rows_reject_a_late_transcript_revision_atomically() {
+        let store = LiveTranscriptStore::detached();
+        store.begin_call("call", "Fixture");
+        let first = store.append_words("call", Speaker::Me, &[word(1.0, 2.0, "first raw")]);
+        let mut clean = first[0].clone();
+        clean.text = "first clean".into();
+        store.append_words("call", Speaker::Me, &[word(3.0, 4.0, "newer raw")]);
+
+        assert_eq!(
+            store.apply_hosted_rows("call", &[clean], 1),
+            HostedRowsApplyOutcome::Stale
+        );
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot
+                .lines
+                .iter()
+                .all(|line| line.clean_text.is_none()
+                    && line.rewrite_state == HostedRewriteState::Raw)
+        );
     }
 
     #[test]

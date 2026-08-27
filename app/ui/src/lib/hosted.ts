@@ -6,6 +6,8 @@ import type {
   HostedLane,
   HostedLocalCacheMode,
   HostedModelDescriptor,
+  HostedMutationInvalidField,
+  HostedMutationInvalidReason,
   HostedProviderCacheMode,
   HostedProviderState,
   HostedSelectionInput,
@@ -77,7 +79,7 @@ export function providerPresentation(provider: string, transport: string): Provi
       shortName: provider,
       auth: "Backend-managed credential",
       guidanceTitle: "Backend-managed provider",
-      guidance: "Review the authenticated connection scope and catalog before selecting an exact model.",
+      guidance: "Review the authenticated provider setup and catalog before selecting an exact model.",
     }
   );
 }
@@ -194,27 +196,321 @@ export function awsCredentialModeDescription(mode: AwsCredentialMode): string {
   }
 }
 
-/** What still has to be filled in before this Bedrock mode can be saved. Empty means the mode is ready. */
+export interface BedrockSetupDraft {
+  mode: AwsCredentialMode;
+  profile: string;
+  roleArn: string;
+  region: string;
+  setupName: string;
+}
+
+export interface BedrockKeyPresence {
+  hasAccessKeyId: boolean;
+  hasSecretAccessKey: boolean;
+}
+
+export interface NormalizedBedrockSetup {
+  mode: AwsCredentialMode;
+  profile: string | null;
+  roleArn: string | null;
+  region: string;
+  setupName: string;
+}
+
+export interface BedrockSetupIssue {
+  field: HostedMutationInvalidField;
+  reason: HostedMutationInvalidReason;
+  message: string;
+}
+
+export type BedrockSetupStatus = "unsaved_changes" | "saved_not_ready" | "ready";
+
+const AWS_ROLE_ARN = /^arn:aws(?:-us-gov|-cn|-iso|-iso-b)?:iam::\d{12}:role\/[A-Za-z0-9+=,.@_\/-]{1,512}$/u;
+const AWS_REGION = /^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$/u;
+
+/** Trim the one atomic setup payload and drop fields that do not belong to the selected method. */
+export function normalizeBedrockSetup(draft: BedrockSetupDraft): NormalizedBedrockSetup {
+  const usesProfile = draft.mode === "profile" || draft.mode === "sso" || draft.mode === "assume_role";
+  return {
+    mode: draft.mode,
+    profile: usesProfile ? draft.profile.trim() || null : null,
+    roleArn: draft.mode === "assume_role" ? draft.roleArn.trim() || null : null,
+    region: draft.region.trim(),
+    setupName: draft.setupName.trim(),
+  };
+}
+
+/** Canonical draft comparison prevents whitespace or hidden fields from enabling a misleading Save. */
+export function bedrockSetupChanged(
+  draft: BedrockSetupDraft,
+  saved: BedrockSetupDraft,
+): boolean {
+  const left = normalizeBedrockSetup(draft);
+  const right = normalizeBedrockSetup(saved);
+  return (
+    left.mode !== right.mode ||
+    left.profile !== right.profile ||
+    left.roleArn !== right.roleArn ||
+    left.region !== right.region ||
+    left.setupName !== right.setupName
+  );
+}
+
+/** Validate every visible prerequisite for the one atomic Bedrock setup save. */
 export function bedrockModeRequirements(
+  draft: BedrockSetupDraft,
+  discoveredProfiles: readonly string[] | null,
+  keys: BedrockKeyPresence,
+): BedrockSetupIssue[] {
+  const normalized = normalizeBedrockSetup(draft);
+  const issues: BedrockSetupIssue[] = [];
+  const profileRequired = draft.mode === "profile" || draft.mode === "sso";
+
+  if (profileRequired && !normalized.profile) {
+    issues.push({ field: "profile", reason: "required", message: "Select an AWS profile." });
+  } else if (
+    normalized.profile &&
+    (draft.mode === "profile" || draft.mode === "sso" || draft.mode === "assume_role") &&
+    discoveredProfiles !== null &&
+    !discoveredProfiles.includes(normalized.profile)
+  ) {
+    issues.push({
+      field: "profile",
+      reason: "not_found",
+      message: "Select a profile currently available on this Mac.",
+    });
+  }
+
+  if (draft.mode === "assume_role") {
+    if (!normalized.roleArn) {
+      issues.push({ field: "role_arn", reason: "required", message: "Enter the role ARN to assume." });
+    } else if (!AWS_ROLE_ARN.test(normalized.roleArn) || normalized.roleArn.length > 1024) {
+      issues.push({
+        field: "role_arn",
+        reason: "invalid",
+        message: "Enter a valid IAM role ARN with a 12-digit AWS account ID.",
+      });
+    }
+  }
+
+  if (draft.mode === "static_keychain" && (!keys.hasAccessKeyId || !keys.hasSecretAccessKey)) {
+    issues.push({
+      field: "key_pair",
+      reason: "keys_missing",
+      message: "Add both an access key ID and secret access key before saving.",
+    });
+  }
+
+  if (!normalized.region) {
+    issues.push({ field: "region", reason: "required", message: "Select an AWS region." });
+  } else if (!AWS_REGION.test(normalized.region)) {
+    issues.push({ field: "region", reason: "invalid", message: "Select a valid AWS region." });
+  }
+
+  if (!normalized.setupName) {
+    issues.push({ field: "setup_name", reason: "required", message: "Enter a setup name." });
+  } else if (normalized.setupName.length > 1024) {
+    issues.push({
+      field: "setup_name",
+      reason: "invalid",
+      message: "Setup name must be 1,024 characters or fewer.",
+    });
+  }
+
+  return issues;
+}
+
+/** Truthful form state: visible draft validity and persisted credential readiness are separate facts. */
+export const BEDROCK_CREDENTIAL_EXPIRY_SKEW_MS = 60_000;
+
+/** A temporary lease inside the renewal window is not truthful readiness for a new request. */
+export function bedrockCredentialReady(
+  credential: HostedCredentialState,
+  nowUnixMs: number,
+): boolean {
+  return (
+    credential.state === "ready" &&
+    (credential.expires_at_unix_ms == null ||
+      credential.expires_at_unix_ms - BEDROCK_CREDENTIAL_EXPIRY_SKEW_MS > nowUnixMs)
+  );
+}
+
+export function deriveBedrockSetupStatus({
+  changed,
+  issues,
+  scopeConfigured,
+  credential,
+  nowUnixMs = Date.now(),
+}: {
+  changed: boolean;
+  issues: readonly BedrockSetupIssue[];
+  scopeConfigured: boolean;
+  credential: HostedCredentialState;
+  nowUnixMs?: number;
+}): BedrockSetupStatus {
+  if (changed) return "unsaved_changes";
+  if (
+    issues.length > 0 ||
+    !scopeConfigured ||
+    !bedrockCredentialReady(credential, nowUnixMs)
+  ) {
+    return "saved_not_ready";
+  }
+  return "ready";
+}
+
+export function bedrockSetupStatusLabel(status: BedrockSetupStatus): string {
+  switch (status) {
+    case "unsaved_changes":
+      return "Unsaved changes";
+    case "saved_not_ready":
+      return "Saved—not ready";
+    case "ready":
+      return "Ready";
+  }
+}
+
+/** Turn backend validation into field-local copy without suggesting that anything was persisted. */
+export function bedrockInvalidMessage(
+  field: HostedMutationInvalidField,
+  reason: HostedMutationInvalidReason,
+): string {
+  if (field === "key_pair" || reason === "keys_missing") {
+    return "Add both an access key ID and secret access key before saving.";
+  }
+  if (field === "profile") {
+    return reason === "not_found"
+      ? "Select a profile currently available on this Mac."
+      : "Select an AWS profile.";
+  }
+  if (field === "role_arn") {
+    return reason === "required"
+      ? "Enter the role ARN to assume."
+      : "Enter a valid IAM role ARN with a 12-digit AWS account ID.";
+  }
+  if (field === "region") {
+    return reason === "required" ? "Select an AWS region." : "Select a valid AWS region.";
+  }
+  return reason === "required" ? "Enter a setup name." : "Enter a valid setup name.";
+}
+
+function bedrockAuthenticationGuidance(
   mode: AwsCredentialMode,
-  draft: { profile: string; roleArn: string; region: string },
-  keys: { hasAccessKeyId: boolean; hasSecretAccessKey: boolean },
-): string[] {
-  const missing: string[] = [];
-  if (!draft.region.trim()) missing.push("a Bedrock region");
-  if ((mode === "profile" || mode === "sso") && !draft.profile.trim()) {
-    missing.push("a profile name");
+  profile: string | null,
+): string {
+  switch (mode) {
+    case "default_chain":
+      return "AWS rejected the default credential chain. Check its environment, profile, or workload-role access, then refresh models.";
+    case "profile":
+      return "AWS rejected the selected profile. Update that profile's credentials and Bedrock permissions, then refresh models.";
+    case "static_keychain":
+      return "AWS rejected the stored key pair. Replace the key values or fix their Bedrock permissions, then refresh models.";
+    case "assume_role":
+      return "AWS could not use the base credential or assume this role. Check the role trust and Bedrock permissions, then refresh models.";
+    case "sso": {
+      const selected = profile?.trim() || "your-profile";
+      return `The cached SSO session is unavailable. Run aws sso login --profile ${selected}, then refresh models.`;
+    }
   }
-  if (mode === "assume_role") {
-    const arn = draft.roleArn.trim();
-    if (!arn) missing.push("a role ARN");
-    else if (!arn.startsWith("arn:") || !arn.includes(":role/")) missing.push("a valid IAM role ARN");
+}
+
+function bedrockOperationalGuidance(code: HostedErrorCode): string {
+  switch (code) {
+    case "network":
+      return "Corti could not reach AWS. Check the network connection, then refresh models without replacing credentials.";
+    case "timeout":
+      return "The AWS check timed out. Try Refresh models again; the saved credentials were not rejected.";
+    case "quota":
+      return "AWS reported exhausted quota. Review Bedrock quotas for this account and region, then refresh models.";
+    case "rate_limited":
+      return "AWS rate-limited the catalog check. Wait briefly, then refresh models.";
+    case "model_unavailable":
+      return "The saved AWS region returned no usable Bedrock model catalog. Review regional model access, then refresh models.";
+    case "cache":
+      return "Corti could not update its protected provider cache. Repair local storage access, then refresh models.";
+    case "policy_blocked":
+      return "This Bedrock setup is unavailable in the current build or policy configuration.";
+    case "canceled":
+    case "superseded":
+      return "The AWS check was replaced or canceled. Refresh models when the current setup is stable.";
+    case "permission":
+    case "auth_rejected":
+    case "auth_unarmed":
+      // These are handled with method-specific copy by the caller.
+      return "AWS authentication needs attention before models can be loaded.";
+    case "provider":
+    case "broker_exited":
+    case "ambiguous_dispatch":
+    case "malformed_output":
+    case "internal":
+      return `The Bedrock check failed because ${errorLabel(code)}. The saved credential was not classified as rejected; try again or review diagnostics.`;
   }
-  if (mode === "static_keychain") {
-    if (!keys.hasAccessKeyId) missing.push("an access key ID");
-    if (!keys.hasSecretAccessKey) missing.push("a secret access key");
+}
+
+/** Mode-specific AWS recovery guidance. Only an authentication failure in SSO mentions `aws sso login`. */
+export function bedrockCredentialGuidance(
+  mode: AwsCredentialMode,
+  credential: HostedCredentialState,
+  profile: string | null,
+): string | null {
+  if (credential.state === "ready") return null;
+  if (credential.state === "resolving") return "Corti is checking this AWS authentication method.";
+  if (credential.state === "refreshing") return "Corti is renewing the AWS session before the next request.";
+  if (credential.state === "rejected") return bedrockAuthenticationGuidance(mode, profile);
+  if (credential.state === "error") {
+    return credential.code === "auth_rejected" ||
+      credential.code === "auth_unarmed" ||
+      credential.code === "permission"
+      ? bedrockAuthenticationGuidance(mode, profile)
+      : bedrockOperationalGuidance(credential.code);
   }
-  return missing;
+  if (credential.state === "unsupported") return bedrockOperationalGuidance(credential.code);
+
+  switch (mode) {
+    case "default_chain":
+      return "Refresh models to resolve the default AWS credential chain on demand.";
+    case "profile":
+      return "Refresh models to check the selected AWS profile and Bedrock permissions.";
+    case "static_keychain":
+      return "Refresh models to check the stored key pair and Bedrock permissions.";
+    case "assume_role":
+      return "Refresh models to resolve the base credential and assume this role.";
+    case "sso":
+      return "Refresh models to check the selected IAM Identity Center session.";
+  }
+}
+
+const HOSTED_ERROR_CODES: readonly HostedErrorCode[] = [
+  "auth_unarmed", "auth_rejected", "permission", "quota", "rate_limited",
+  "model_unavailable", "network", "timeout", "canceled", "superseded",
+  "policy_blocked", "cache", "malformed_output", "provider", "broker_exited",
+  "ambiguous_dispatch", "internal",
+];
+
+/** Tauri rejects operational failures as one sanitized ErrorCode string. */
+export function hostedErrorCodeFrom(error: unknown): HostedErrorCode | null {
+  const value = typeof error === "string"
+    ? error
+    : error instanceof Error
+      ? error.message
+      : "";
+  return HOSTED_ERROR_CODES.includes(value as HostedErrorCode)
+    ? value as HostedErrorCode
+    : null;
+}
+
+export function bedrockRefreshFailureGuidance(
+  mode: AwsCredentialMode,
+  error: unknown,
+  profile: string | null,
+): string {
+  const code = hostedErrorCodeFrom(error);
+  if (code === "auth_rejected" || code === "auth_unarmed" || code === "permission") {
+    return bedrockAuthenticationGuidance(mode, profile);
+  }
+  return code
+    ? bedrockOperationalGuidance(code)
+    : "The Bedrock model refresh failed without an authentication classification. Review diagnostics and try again; do not replace credentials unless AWS rejects them.";
 }
 
 /** Countdown wording for an assumed-role or SSO session. Returns null when there is no expiry. */
@@ -293,7 +589,7 @@ export function credentialSummary(
       return {
         label: "Rejected",
         detail: bedrock
-          ? "AWS refused the credential. An expired SSO session is the usual cause."
+          ? "AWS rejected the selected authentication method. Review its method-specific guidance."
           : "Authentication was rejected. Service readiness is checked separately.",
         tone: "error",
       };
@@ -497,7 +793,7 @@ export function hostedErrorGuidance(code: HostedErrorCode): HostedActionGuidance
     case "auth_rejected":
     case "permission":
       return {
-        message: "The provider could not authorize this request. Check its sign-in, account access, and connection scope, then refresh.",
+        message: "The provider could not authorize this request. Check its sign-in, account access, and provider setup, then refresh.",
         actionLabel: "Fix provider connection",
         section: "hosted-provider",
       };

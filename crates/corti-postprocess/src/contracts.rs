@@ -221,6 +221,9 @@ pub struct HostedRequest {
     pub targets: Vec<RewriteTarget>,
     pub context: Vec<ContextRow>,
     pub prompt: CanonicalPrompt,
+    /// Precomputed opaque provider prefix identity. It is present only when the selected provider cache
+    /// policy requires one and cannot expose account, prompt, or transcript text.
+    pub provider_cache_key: Option<crate::ProviderCacheKey>,
     pub deadline: MonotonicDeadline,
     pub cache_policy: CachePolicy,
 }
@@ -239,6 +242,7 @@ impl fmt::Debug for HostedRequest {
             .field("target_count", &self.targets.len())
             .field("context_count", &self.context.len())
             .field("prompt", &self.prompt)
+            .field("provider_cache_key", &self.provider_cache_key)
             .field("deadline", &self.deadline)
             .field("cache_policy", &self.cache_policy)
             .finish()

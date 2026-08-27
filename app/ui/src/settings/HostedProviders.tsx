@@ -16,7 +16,11 @@ import {
   providerPresentation,
   supportTierLabel,
 } from "../lib/hosted";
-import { HostedBedrockCredentials, type BedrockActions } from "./HostedBedrock";
+import {
+  HostedBedrockCredentials,
+  type AwsProfileDiscoveryState,
+  type BedrockActions,
+} from "./HostedBedrock";
 
 interface ProviderActions {
   busy: boolean;
@@ -50,6 +54,8 @@ export function HostedProviders({
   bedrock,
   vertexModels,
   awsOptions,
+  awsProfileDiscoveryState,
+  bedrockResetToken,
   preferredSelection,
   actions,
 }: {
@@ -58,6 +64,8 @@ export function HostedProviders({
   bedrock: BedrockCredentialDto;
   vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
+  awsProfileDiscoveryState: AwsProfileDiscoveryState;
+  bedrockResetToken: number;
   preferredSelection: PreferredProvider;
   actions: ProviderActions;
 }) {
@@ -107,13 +115,6 @@ export function HostedProviders({
     (provider) =>
       providerKey(provider.descriptor.provider, provider.descriptor.transport) === selectedKey,
   );
-  const selectedScope = selected
-    ? scopes.find(
-        (candidate) =>
-          candidate.provider === selected.descriptor.provider &&
-          candidate.transport === selected.descriptor.transport,
-      )
-    : undefined;
   const guidance = selected
     ? providerPresentation(selected.descriptor.provider, selected.descriptor.transport)
     : null;
@@ -149,7 +150,9 @@ export function HostedProviders({
               );
               return (
                 <option key={key} value={key}>
-                  {presentation.shortName} — {auth.label}
+                  {provider.descriptor.transport === "bedrock_runtime"
+                    ? `${presentation.shortName} — Setup status below`
+                    : `${presentation.shortName} — ${auth.label}`}
                 </option>
               );
             })}
@@ -169,19 +172,30 @@ export function HostedProviders({
         <li><span>3</span> Select an exact model under Rewrite modes; nothing is enabled automatically.</li>
       </ol>
 
-      {selected && (
-        <div className="hosted-provider-grid">
-          <HostedProviderCard
-            key={`${selected.descriptor.provider}:${selected.descriptor.transport}`}
-            state={selected}
-            scope={selectedScope}
-            bedrock={bedrock}
-            vertexModels={vertexModels}
-            awsOptions={awsOptions}
-            actions={actions}
-          />
-        </div>
-      )}
+      <div className="hosted-provider-grid">
+        {orderedProviders.map((provider) => {
+          const key = providerKey(provider.descriptor.provider, provider.descriptor.transport);
+          const providerScope = scopes.find(
+            (candidate) =>
+              candidate.provider === provider.descriptor.provider &&
+              candidate.transport === provider.descriptor.transport,
+          );
+          return (
+            <div key={key} hidden={key !== selectedKey}>
+              <HostedProviderCard
+                state={provider}
+                scope={providerScope}
+                bedrock={bedrock}
+                vertexModels={vertexModels}
+                awsOptions={awsOptions}
+                awsProfileDiscoveryState={awsProfileDiscoveryState}
+                bedrockResetToken={bedrockResetToken}
+                actions={actions}
+              />
+            </div>
+          );
+        })}
+      </div>
     </section>
   );
 }
@@ -192,6 +206,8 @@ function HostedProviderCard({
   bedrock,
   vertexModels,
   awsOptions,
+  awsProfileDiscoveryState,
+  bedrockResetToken,
   actions,
 }: {
   state: HostedProviderState;
@@ -199,6 +215,8 @@ function HostedProviderCard({
   bedrock: BedrockCredentialDto;
   vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
+  awsProfileDiscoveryState: AwsProfileDiscoveryState;
+  bedrockResetToken: number;
   actions: ProviderActions;
 }) {
   const { descriptor, credential } = state;
@@ -238,7 +256,7 @@ function HostedProviderCard({
         </div>
       )}
 
-      {!isClaudeSubscription && (
+      {!isClaudeSubscription && !isBedrock && (
         <div className={`hosted-auth-state hosted-tone-${auth.tone}`}>
           <span aria-hidden="true" />
           <div>
@@ -382,17 +400,21 @@ function HostedProviderCard({
           scope={scope}
           credential={credential}
           options={awsOptions}
+          profileDiscoveryState={awsProfileDiscoveryState}
+          resetToken={bedrockResetToken}
+          adapterAvailable={descriptor.adapter_available}
+          models={state.models}
           actions={actions.bedrock}
         />
       )}
 
-      {scope && descriptor.support_tier === "documented" && !isChatGpt && (
+      {scope && descriptor.support_tier === "documented" && !isChatGpt && !isBedrock && (
         <ProviderScopeEditor scope={scope} transport={descriptor.transport} actions={actions} />
       )}
 
       {isVertex && <VertexModelEditor models={vertexModels} actions={actions} />}
 
-      {!isClaudeSubscription && (
+      {!isClaudeSubscription && !isBedrock && (
         <div className="hosted-provider-actions">
           <button
             className="btn-secondary"
@@ -404,7 +426,7 @@ function HostedProviderCard({
           </button>
           <span className="muted small">
             {scope && !scope.configured
-              ? "Save a connection scope first."
+              ? "Save a complete provider setup first."
               : state.models.length === 0
                 ? isVertex
                   ? "No models yet — add one above."
@@ -414,7 +436,7 @@ function HostedProviderCard({
         </div>
       )}
 
-      {state.models.length > 0 && (
+      {state.models.length > 0 && !isBedrock && (
         <details className="hosted-catalog">
           <summary>Authenticated model catalog</summary>
           <ul>
@@ -574,18 +596,18 @@ function ProviderScopeEditor({
   return (
     <form className="hosted-scope" onSubmit={save}>
       <div className="hosted-scope-head">
-        <strong>Connection scope</strong>
+        <strong>Provider setup</strong>
         <span className={scope.configured ? "hosted-configured" : "muted"}>
-          {scope.configured ? "Configured" : "Not configured"}
+          {scope.configured ? "Saved" : "Not saved"}
         </span>
       </div>
       <label>
-        <span>Connection label</span>
+        <span>Setup name</span>
         <input
           type="text"
           value={alias}
           maxLength={1024}
-          placeholder={vertex ? "Optional local label" : "Required local label"}
+          placeholder={vertex ? "Optional setup name" : "Required setup name"}
           onChange={(event) => setAlias(event.target.value)}
         />
       </label>
@@ -631,11 +653,11 @@ function ProviderScopeEditor({
       )}
       {!valid && (
         <p className="hosted-field-error">
-          {vertex ? "Project and region are required together." : "Add a local connection label."}
+          {vertex ? "Project and region are required together." : "Add a setup name."}
         </p>
       )}
       <button className="btn-secondary" type="submit" disabled={!changed || !valid || actions.busy}>
-        {allEmpty && scope.configured ? "Clear scope" : "Save scope"}
+        {allEmpty && scope.configured ? "Clear setup" : "Save setup"}
       </button>
     </form>
   );

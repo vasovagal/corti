@@ -1,9 +1,17 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import {
+  hostedSettings,
   syntheticBedrockAssumedRoleSettings,
+  syntheticBedrockClearedSettings,
+  syntheticBedrockConflictSettings,
+  syntheticBedrockKeyMissingSettings,
+  syntheticBedrockKeyRestoredSettings,
+  syntheticBedrockKeypairClearedSettings,
   syntheticBedrockKeypairSettings,
+  syntheticBedrockMissingProfileSettings,
   syntheticBedrockProfileSettings,
   syntheticBedrockRejectedSsoSettings,
+  syntheticBedrockSavedPendingSettings,
   syntheticGapEvent,
   syntheticGapSnapshot,
   syntheticLiveOverrides,
@@ -95,6 +103,10 @@ async function captureElement(locator: Locator, filename: string) {
     animations: "disabled",
     caret: "hide",
   });
+}
+
+async function expectNoHorizontalOverflow(locator: Locator) {
+  expect(await locator.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
 }
 
 test("live transcript", async ({ page }) => {
@@ -505,6 +517,37 @@ async function setFixture(page: Page, command: string, value: unknown) {
   );
 }
 
+async function holdFixtureCommand(page: Page, command: string) {
+  await page.evaluate((name) => {
+    const bridge = window as unknown as { __cortiHoldCommand: (command: string) => void };
+    bridge.__cortiHoldCommand(name);
+  }, command);
+}
+
+async function resolveFixtureCommand(page: Page, command: string, value: unknown) {
+  await page.evaluate(
+    ({ name, result }) => {
+      const bridge = window as unknown as {
+        __cortiResolveCommand: (command: string, value: unknown) => void;
+      };
+      bridge.__cortiResolveCommand(name, result);
+    },
+    { name: command, result: value },
+  );
+}
+
+async function rejectFixtureCommand(page: Page, command: string, reason: string) {
+  await page.evaluate(
+    ({ name, error }) => {
+      const bridge = window as unknown as {
+        __cortiRejectCommand: (command: string, reason: string) => void;
+      };
+      bridge.__cortiRejectCommand(name, error);
+    },
+    { name: command, error: reason },
+  );
+}
+
 test("repair links retarget an existing Preferences window", async ({ page }) => {
   await page.goto(`${BASE_URL}/?view=settings&section=transcription`);
   await expect(page.getByRole("heading", { name: "Transcription", exact: true })).toBeVisible();
@@ -600,7 +643,7 @@ test("Vertex warning and recovery", async ({ page }) => {
 
 /** Select Bedrock's one-at-a-time provider card and unpin status chrome for element captures. */
 async function bedrockCard(page: Page) {
-  await page.locator("#hosted-provider-picker").selectOption({ label: "Bedrock — No credential" });
+  await page.locator("#hosted-provider-picker").selectOption({ label: "Bedrock — Setup status below" });
   await page.addStyleTag({
     content: ".hosted-status-banner { position: static !important; }",
   });
@@ -618,6 +661,247 @@ async function applySettings(page: Page, settings: unknown) {
   await emitFixture(page, "hosted-state-changed", { event: "provider_state" });
 }
 
+async function chooseBedrockMode(card: Locator, label: string) {
+  const method = card.getByRole("radio", { name: label });
+  await method.focus();
+  await method.press("Space");
+}
+
+async function completeBedrockProfileDraft(card: Locator, setupName = "Screenshot Bedrock") {
+  await chooseBedrockMode(card, "Named profile");
+  await card.locator("#bedrock-profile").selectOption("corti-screenshot");
+  await card.locator("#bedrock-region").selectOption("us-east-1");
+  await card.locator("#bedrock-setup-name").fill(setupName);
+}
+
+test("Bedrock setup is one atomic, revision-checked form", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  const card = await bedrockCard(page);
+  const save = card.getByRole("button", { name: "Save Bedrock setup", exact: true });
+  const refresh = card.getByRole("button", { name: "Refresh models", exact: true });
+
+  await expect(card.getByRole("heading", { name: "Bedrock setup" })).toBeVisible();
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(save).toBeDisabled();
+  await expect(card.locator("#bedrock-region-error")).toHaveText("Select an AWS region.");
+  await expect(card.getByText("It is not Ollama, a local model, or an OpenAI-compatible endpoint", { exact: false })).toBeVisible();
+
+  await completeBedrockProfileDraft(card);
+  await expect(card.getByText("Unsaved changes", { exact: true })).toBeVisible();
+  await expect(save).toBeEnabled();
+  await expect(refresh).toBeDisabled();
+  await expect(card.getByText("Save these setup changes before refreshing models.", { exact: true })).toBeVisible();
+
+  await holdFixtureCommand(page, "save_bedrock_setup");
+  await save.click();
+  await expect.poll(() => invocationCount(page, "save_bedrock_setup")).toBe(1);
+  await expect(card.getByText("Ready", { exact: true })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: "Saving Bedrock setup…" })).toBeDisabled();
+  expect(await lastInvocation(page, "save_bedrock_setup")).toEqual({
+    command: "save_bedrock_setup",
+    args: {
+      request: {
+        observed_state_revision: 12,
+        mode: "profile",
+        profile: "corti-screenshot",
+        role_arn: null,
+        region: "us-east-1",
+        setup_name: "Screenshot Bedrock",
+      },
+    },
+  });
+
+  await resolveFixtureCommand(page, "save_bedrock_setup", {
+    status: "applied",
+    settings: syntheticBedrockSavedPendingSettings,
+  });
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(card.getByText("Ready", { exact: true })).toHaveCount(0);
+  await expect(card.getByText("No models loaded yet", { exact: false })).toBeVisible();
+  await expect(refresh).toBeEnabled();
+
+  const readyBedrock = syntheticBedrockProfileSettings.providers.find(
+    (provider) => provider.descriptor.transport === "bedrock_runtime",
+  );
+  await setFixture(page, "get_hosted_settings", syntheticBedrockProfileSettings);
+  await setFixture(page, "refresh_hosted_provider", readyBedrock);
+  await refresh.click();
+  await expect(card.getByText("Ready", { exact: true })).toBeVisible();
+  await expect(card.locator("button").filter({ hasText: /^Save/u })).toHaveCount(1);
+});
+
+test("Bedrock draft survives provider switching and unrelated conflicts reset it", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  let card = await bedrockCard(page);
+  await completeBedrockProfileDraft(card, "Unsaved provider switch");
+
+  const picker = page.locator("#hosted-provider-picker");
+  const openAiValue = await picker.locator("option").filter({ hasText: "OpenAI API" }).getAttribute("value");
+  await picker.selectOption(openAiValue ?? "");
+  await picker.selectOption({ label: "Bedrock — Setup status below" });
+  card = page.locator(".hosted-provider-card").filter({
+    has: page.getByRole("heading", { name: "Amazon Bedrock" }),
+  });
+  await expect(card.locator("#bedrock-setup-name")).toHaveValue("Unsaved provider switch");
+  await expect(card.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+  await setFixture(page, "save_bedrock_setup", {
+    status: "conflict",
+    settings: { ...hostedSettings, state_revision: 99 },
+  });
+  await card.getByRole("button", { name: "Save Bedrock setup", exact: true }).click();
+  await expect(card.getByRole("radio", { name: "Default chain" })).toBeChecked();
+  await expect(card.locator("#bedrock-region")).toHaveValue("");
+  await expect(card.locator("#bedrock-setup-name")).toHaveValue("");
+  await expect(card.getByText("Unsaved changes", { exact: true })).toHaveCount(0);
+});
+
+test("Bedrock profile discovery distinguishes failure and reloads repaired profiles", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  const card = await bedrockCard(page);
+  await chooseBedrockMode(card, "Named profile");
+  const reload = card.getByRole("button", { name: "Reload AWS profiles", exact: true });
+
+  await holdFixtureCommand(page, "list_aws_credential_options");
+  await reload.click();
+  await rejectFixtureCommand(page, "list_aws_credential_options", "synthetic discovery failure");
+  await expect(card.getByText("has not classified this selection as missing", { exact: false })).toBeVisible();
+
+  await setFixture(page, "list_aws_credential_options", {
+    profiles: ["default", "corti-screenshot", "newly-repaired"],
+  });
+  await reload.click();
+  await expect(card.locator("#bedrock-profile option").filter({ hasText: "newly-repaired" })).toHaveCount(1);
+  await expect(card.getByText("3 AWS profiles loaded.", { exact: true })).toBeVisible();
+});
+
+test("every Bedrock authentication method submits one complete atomic payload", async ({ page }) => {
+  const cases = [
+    {
+      mode: "default_chain",
+      label: "Default chain",
+      profile: null,
+      role_arn: null,
+    },
+    {
+      mode: "profile",
+      label: "Named profile",
+      profile: "corti-screenshot",
+      role_arn: null,
+    },
+    {
+      mode: "static_keychain",
+      label: "Key pair",
+      profile: null,
+      role_arn: null,
+    },
+    {
+      mode: "assume_role",
+      label: "Assume role",
+      profile: null,
+      role_arn: "arn:aws:iam::123456789012:role/corti",
+    },
+    {
+      mode: "sso",
+      label: "SSO",
+      profile: "corti-screenshot",
+      role_arn: null,
+    },
+  ] as const;
+
+  for (const candidate of cases) {
+    await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+    const card = await bedrockCard(page);
+    let revision = 12;
+    if (candidate.mode === "static_keychain") {
+      revision = 30;
+      await applySettings(page, {
+        ...hostedSettings,
+        state_revision: revision,
+        bedrock: {
+          ...hostedSettings.bedrock,
+          has_access_key_id: true,
+          has_secret_access_key: true,
+        },
+      });
+    }
+    await chooseBedrockMode(card, candidate.label);
+    if (candidate.profile) await card.locator("#bedrock-profile").selectOption(candidate.profile);
+    if (candidate.role_arn) await card.locator("#bedrock-role-arn").fill(candidate.role_arn);
+    await card.locator("#bedrock-region").selectOption("us-east-1");
+    await card.locator("#bedrock-setup-name").fill(`Atomic ${candidate.label}`);
+    const before = await invocationCount(page, "save_bedrock_setup");
+    await holdFixtureCommand(page, "save_bedrock_setup");
+    await card.getByRole("button", { name: "Save Bedrock setup", exact: true }).click();
+    await expect.poll(() => invocationCount(page, "save_bedrock_setup")).toBe(before + 1);
+    expect(await lastInvocation(page, "save_bedrock_setup")).toEqual({
+      command: "save_bedrock_setup",
+      args: {
+        request: {
+          observed_state_revision: revision,
+          mode: candidate.mode,
+          profile: candidate.profile,
+          role_arn: candidate.role_arn,
+          region: "us-east-1",
+          setup_name: `Atomic ${candidate.label}`,
+        },
+      },
+    });
+    await rejectFixtureCommand(page, "save_bedrock_setup", "synthetic bounded rejection");
+  }
+});
+
+test("Bedrock invalid, conflict, error, and clear states never claim a partial save", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  const card = await bedrockCard(page);
+  const save = card.getByRole("button", { name: "Save Bedrock setup", exact: true });
+  await completeBedrockProfileDraft(card);
+
+  await setFixture(page, "save_bedrock_setup", {
+    status: "invalid",
+    settings: hostedSettings,
+    field: "profile",
+    reason: "not_found",
+  });
+  await save.click();
+  await expect(page.getByText("Nothing was saved. Select a profile currently available", { exact: false })).toBeVisible();
+  await expect.poll(() => invocationCount(page, "list_aws_credential_options")).toBeGreaterThan(1);
+  await expect(card.locator("#bedrock-profile")).not.toHaveAttribute("aria-invalid", "true");
+  await expect(card.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+  await card.locator("#bedrock-profile").selectOption("default");
+  await setFixture(page, "save_bedrock_setup", {
+    status: "conflict",
+    settings: syntheticBedrockConflictSettings,
+  });
+  await save.click();
+  await expect(page.getByText("Hosted settings changed elsewhere", { exact: false })).toBeVisible();
+  await expect(card.locator("#bedrock-profile")).toHaveValue("default");
+  await expect(card.locator("#bedrock-region")).toHaveValue("us-west-2");
+  await expect(card.locator("#bedrock-setup-name")).toHaveValue("Changed elsewhere");
+
+  await card.locator("#bedrock-setup-name").fill("Retry after conflict");
+  await holdFixtureCommand(page, "save_bedrock_setup");
+  await save.click();
+  await expect.poll(() => invocationCount(page, "save_bedrock_setup")).toBe(3);
+  await rejectFixtureCommand(page, "save_bedrock_setup", "synthetic provider error");
+  await expect(page.getByText("Bedrock setup failed: synthetic provider error", { exact: true })).toBeVisible();
+  await expect(card.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+  await setFixture(page, "clear_bedrock_setup", {
+    status: "applied",
+    settings: syntheticBedrockClearedSettings,
+  });
+  await card.getByRole("button", { name: "Clear Bedrock setup", exact: true }).click();
+  expect(await lastInvocation(page, "clear_bedrock_setup")).toMatchObject({
+    args: { request: { observed_state_revision: 21 } },
+  });
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(card.locator("#bedrock-region")).toHaveValue("");
+  await expect(card.locator("#bedrock-setup-name")).toHaveValue("");
+});
+
 test("Bedrock credential modes", async ({ page }) => {
   await page.setViewportSize({ width: 1200, height: 1000 });
   await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
@@ -625,16 +909,27 @@ test("Bedrock credential modes", async ({ page }) => {
 
   // Default chain: the pane is legible before any AWS setup exists.
   await expect(card.getByRole("radio", { name: "Default chain" })).toBeChecked();
-  await expect(card.getByText("No credential", { exact: true })).toBeVisible();
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(card.getByText("No credential", { exact: true })).toHaveCount(0);
 
   await applySettings(page, syntheticBedrockProfileSettings);
   await expect(card.getByRole("radio", { name: "Named profile" })).toBeChecked();
   await expect(card.getByText("Ready", { exact: true })).toBeVisible();
-  await expect(card.getByText("a named AWS profile", { exact: false })).toBeVisible();
+  await expect(card.getByText("A named profile from", { exact: false })).toBeVisible();
   await expect(card.locator("select").first()).toHaveValue("corti-screenshot");
+  await expectNoHorizontalOverflow(card);
+  await expect(card).toHaveScreenshot("bedrock-profile-desktop.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
   await captureElement(card, "bedrock-profile-desktop.png");
 
   await page.setViewportSize({ width: 430, height: 900 });
+  await expectNoHorizontalOverflow(card);
+  await expect(card).toHaveScreenshot("bedrock-profile-narrow.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
   await captureElement(card, "bedrock-profile-narrow.png");
 });
 
@@ -658,11 +953,30 @@ test("Bedrock key pair and assumed role", async ({ page }) => {
   await applySettings(page, syntheticBedrockAssumedRoleSettings);
   await expect(card.getByRole("radio", { name: "Assume role" })).toBeChecked();
   await expect(card.getByText("Session renews in 47 min", { exact: true })).toBeVisible();
-  await expect(card.getByText("an assumed IAM role", { exact: false })).toBeVisible();
+  await expect(card.getByText("then assume this role", { exact: false })).toBeVisible();
   await captureElement(card, "bedrock-assumed-role-desktop.png");
 
   await page.setViewportSize({ width: 430, height: 900 });
   await captureElement(card, "bedrock-assumed-role-narrow.png");
+});
+
+test("Bedrock missing profile remains visible and not ready", async ({ page }) => {
+  await page.setViewportSize({ width: 1200, height: 1000 });
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  const card = await bedrockCard(page);
+
+  await applySettings(page, syntheticBedrockMissingProfileSettings);
+  await expect(card.locator("#bedrock-profile")).toHaveValue("retired-screenshot-profile");
+  await expect(card.locator("#bedrock-profile option:checked")).toHaveText(
+    "Previously selected — not found",
+  );
+  await expect(card.locator("#bedrock-profile")).toHaveAttribute("aria-invalid", "true");
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(card.getByRole("button", { name: "Refresh models", exact: true })).toBeDisabled();
+  await captureElement(card, "bedrock-missing-profile-desktop.png");
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await captureElement(card, "bedrock-missing-profile-narrow.png");
 });
 
 test("Bedrock expired SSO reads as recoverable", async ({ page }) => {
@@ -672,12 +986,56 @@ test("Bedrock expired SSO reads as recoverable", async ({ page }) => {
 
   await applySettings(page, syntheticBedrockRejectedSsoSettings);
   await expect(card.getByRole("radio", { name: "SSO" })).toBeChecked();
-  await expect(card.getByText("Rejected", { exact: true })).toBeVisible();
-  await expect(card.getByText("aws sso login --profile corti-sso", { exact: true })).toBeVisible();
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+  await expect(card.getByText("aws sso login --profile corti-sso", { exact: false })).toBeVisible();
   await captureElement(card, "bedrock-sso-rejected-desktop.png");
 
   await page.setViewportSize({ width: 430, height: 900 });
   await captureElement(card, "bedrock-sso-rejected-narrow.png");
+});
+
+test("Bedrock secret Add, Replace, and Remove refresh presence-only projection", async ({ page }) => {
+  await page.goto(`${BASE_URL}/?view=settings&section=hosted-provider`);
+  const card = await bedrockCard(page);
+  await applySettings(page, syntheticBedrockKeypairSettings);
+  const accessKey = card.locator(".hosted-key-slots li").filter({ hasText: "Access key ID" });
+
+  await setFixture(page, "get_hosted_settings", syntheticBedrockKeyMissingSettings);
+  await accessKey.getByRole("button", { name: "Remove", exact: true }).click();
+  expect(await lastInvocation(page, "clear_provider_secret")).toMatchObject({
+    args: { request: { provider: "aws", slot: "access_key_id" } },
+  });
+  await expect(accessKey.getByText("Not set", { exact: true })).toBeVisible();
+  await expect(accessKey.getByRole("button", { name: "Add…", exact: true })).toBeVisible();
+  await expect(card.getByText("Saved—not ready", { exact: true })).toBeVisible();
+
+  await setFixture(page, "get_hosted_settings", syntheticBedrockKeyRestoredSettings);
+  await accessKey.getByRole("button", { name: "Add…", exact: true }).click();
+  await expect(accessKey.getByText("Stored", { exact: true })).toBeVisible();
+  await expect(accessKey.getByRole("button", { name: "Replace…", exact: true })).toBeVisible();
+  expect(await lastInvocation(page, "prompt_for_provider_secret")).toMatchObject({
+    args: { request: { provider: "aws", slot: "access_key_id" } },
+  });
+
+  await accessKey.getByRole("button", { name: "Replace…", exact: true }).click();
+  await expect.poll(() => invocationCount(page, "prompt_for_provider_secret")).toBe(2);
+  await expect(page.locator("input[type='password']")).toHaveCount(0);
+
+  await setFixture(page, "clear_bedrock_setup", {
+    status: "applied",
+    settings: syntheticBedrockKeypairClearedSettings,
+  });
+  await card.getByRole("button", { name: "Clear Bedrock setup", exact: true }).click();
+  await expect(card.getByRole("radio", { name: "Default chain" })).toBeChecked();
+  await expect(page.getByText("Stored AWS key values were left unchanged", { exact: false })).toBeVisible();
+  // Retained values remain directly manageable even though Default chain is selected.
+  await expect(card.getByText("Stored", { exact: true })).toHaveCount(2);
+  await expect(card.getByText("not used by the selected authentication method", { exact: false })).toBeVisible();
+  await expect(card.getByRole("button", { name: "Remove", exact: true })).toHaveCount(2);
+  expect(syntheticBedrockKeypairClearedSettings.bedrock).toMatchObject({
+    has_access_key_id: true,
+    has_secret_access_key: true,
+  });
 });
 
 test("provider key entry uses the native sheet, never a browser field", async ({ page }) => {

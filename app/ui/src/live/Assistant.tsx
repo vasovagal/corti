@@ -97,8 +97,12 @@ export function Assistant({
       void setHostedPinnedQuestion(observedRevision, pinnedDraft)
         .then(async (result) => {
           if (pinnedSaveSequence.current !== sequence) return;
-          if (result.status === "conflict") {
-            setPinnedSaveState("Settings changed; review and try again");
+          if (result.status === "conflict" || result.status === "invalid") {
+            setPinnedSaveState(
+              result.status === "conflict"
+                ? "Settings changed; review and try again"
+                : "Template was invalid; nothing was saved",
+            );
             await onRefresh();
             return;
           }

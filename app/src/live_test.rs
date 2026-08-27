@@ -29,10 +29,6 @@ const TEST_TEE_BACKLOG: usize = 128;
 /// the all-or-nothing test final instead of growing with microphone-test duration.
 #[cfg(feature = "local")]
 const MAX_TEST_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(feature = "local")]
-const TEST_FINAL_COMMIT_EPOCH_BASE: u64 = 1_000_000_000_000;
-#[cfg(feature = "local")]
-const _: () = assert!(TEST_FINAL_COMMIT_EPOCH_BASE < (1_u64 << 53));
 pub(crate) const MICROPHONE_TEST_RECORDING_PREFIX: &str = "microphone-test-";
 
 pub(crate) struct LiveTestManager {
@@ -495,7 +491,7 @@ fn run_test_worker(
 #[cfg(feature = "local")]
 fn run_microphone_test(
     app: &AppHandle,
-    generation: u64,
+    _generation: u64,
     cfg: &AppConfig,
     transcript: &LiveTranscriptStore,
     hosted: Option<&crate::postprocess_app::HostedHandle>,
@@ -569,8 +565,8 @@ fn run_microphone_test(
     let tail = channel.finish();
     publish_test_words(transcript, hosted, id, &tail, &mut hosted_rows);
 
-    let final_detail = hosted
-        .and_then(|handle| run_test_final(app, generation, transcript, handle, id, &hosted_rows));
+    let final_detail =
+        hosted.and_then(|handle| run_test_final(app, transcript, handle, id, &hosted_rows));
     let gaps = quality.dropped_samples > 0 || quality.tee_dropped_chunks > 0;
     tracing::info!(
         target: "corti::live_test",
@@ -637,7 +633,6 @@ fn publish_test_chunk(
 #[cfg(feature = "local")]
 fn run_test_final(
     app: &AppHandle,
-    generation: u64,
     transcript: &LiveTranscriptStore,
     hosted: &crate::postprocess_app::HostedHandle,
     id: &str,
@@ -703,14 +698,14 @@ fn run_test_final(
                 ..raw.clone()
             })
             .collect::<Vec<_>>();
-        // Keep this presentation-only epoch distinct from ordinary revisions while remaining an exact
-        // JavaScript integer across the Tauri boundary.
-        transcript.apply_hosted_rows(
-            id,
-            &rewritten,
-            TEST_FINAL_COMMIT_EPOCH_BASE.saturating_add(generation.max(1)),
-        );
-        detail = "Final rewrite applied to this test view.".to_string();
+        if let Some(revision) = transcript.hosted_transcript_revision(id)
+            && matches!(
+                transcript.apply_hosted_rows(id, &rewritten, revision),
+                crate::live_view::HostedRowsApplyOutcome::Applied { .. }
+            )
+        {
+            detail = "Final rewrite applied to this test view.".to_string();
+        }
     }
     // A microphone test has no durable filing checkpoint. Retire its final journal rather than leaving a
     // recovery record that could be mistaken for an interrupted real recording.

@@ -10,10 +10,14 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: bridge.listen }));
 
 import {
   cancelHostedQuestion,
+  clearBedrockSetup,
+  clearProviderSecret,
   getHostedAssistant,
   patchHostedSettings,
+  promptForProviderSecret,
   refreshHostedProvider,
   replaceHostedWordBank,
+  saveBedrockSetup,
   setHostedPinnedQuestion,
   submitHostedQuestion,
   updateHostedProviderScope,
@@ -84,6 +88,44 @@ describe("hosted Tauri command bindings", () => {
         observed_state_revision: 9,
         template: "Synthetic pinned question",
       },
+    });
+  });
+
+  it("sends one revision-checked atomic Bedrock setup payload including region and setup name", async () => {
+    await saveBedrockSetup({
+      observed_state_revision: 21,
+      mode: "assume_role",
+      profile: "base-profile",
+      role_arn: "arn:aws:iam::123456789012:role/corti",
+      region: "us-west-2",
+      setup_name: "Clinical Bedrock",
+    });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("save_bedrock_setup", {
+      request: {
+        observed_state_revision: 21,
+        mode: "assume_role",
+        profile: "base-profile",
+        role_arn: "arn:aws:iam::123456789012:role/corti",
+        region: "us-west-2",
+        setup_name: "Clinical Bedrock",
+      },
+    });
+
+    await clearBedrockSetup({ observed_state_revision: 22 });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("clear_bedrock_setup", {
+      request: { observed_state_revision: 22 },
+    });
+  });
+
+  it("keeps Bedrock key add, replace, and remove operations on secret-only commands", async () => {
+    await promptForProviderSecret({ provider: "aws", slot: "access_key_id" });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("prompt_for_provider_secret", {
+      request: { provider: "aws", slot: "access_key_id" },
+    });
+
+    await clearProviderSecret({ provider: "aws", slot: "secret_access_key" });
+    expect(bridge.invoke).toHaveBeenLastCalledWith("clear_provider_secret", {
+      request: { provider: "aws", slot: "secret_access_key" },
     });
   });
 

@@ -1482,24 +1482,77 @@ summary:focus-visible,
   padding: 6px 8px;
 }
 .hosted-bedrock {
-  border-top: 1px solid var(--border);
-  margin-top: 12px;
-  padding-top: 12px;
   display: grid;
-  gap: 12px;
+  gap: 16px;
+  margin-top: 14px;
+}
+.hosted-bedrock-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 13px 16px;
+}
+.hosted-bedrock-full {
+  grid-column: 1 / -1;
+}
+.hosted-bedrock-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.hosted-bedrock-heading h4,
+.hosted-bedrock-models h4 {
+  margin: 0;
+  font-size: 15px;
+}
+.hosted-bedrock-heading > div:first-child > p,
+.hosted-bedrock-models > div > p {
+  margin: 3px 0 0;
+}
+.hosted-bedrock-status {
+  min-width: min(310px, 46%);
+  display: grid;
+  justify-items: end;
+  gap: 2px;
+  text-align: right;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.hosted-bedrock-status strong {
+  display: inline-flex;
+  border-radius: 999px;
+  background: var(--bg-soft);
+  padding: 3px 8px;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.hosted-bedrock-status-unsaved_changes strong {
+  background: var(--caution-bg);
+  color: var(--caution-fg);
+}
+.hosted-bedrock-status-ready strong {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
 }
 .hosted-bedrock-modes {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
   border: 0;
   margin: 0;
   padding: 0;
-  display: grid;
-  gap: 7px;
 }
-.hosted-bedrock-modes legend {
+.hosted-bedrock-modes legend,
+.hosted-bedrock-field > span:first-child,
+.hosted-bedrock-field > label:first-child {
   padding: 0;
   color: var(--fg-muted);
   font-size: 11px;
   font-weight: 650;
+}
+.hosted-bedrock-modes > p {
+  margin: 0;
 }
 .hosted-segmented {
   display: flex;
@@ -1511,7 +1564,8 @@ summary:focus-visible,
   padding: 3px;
 }
 .hosted-segmented label {
-  flex: 1 1 auto;
+  min-width: 0;
+  flex: 1 1 112px;
   border-radius: 6px;
   padding: 6px 9px;
   text-align: center;
@@ -1519,7 +1573,7 @@ summary:focus-visible,
   color: var(--fg-muted);
   font-size: 12px;
   font-weight: 650;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .hosted-segmented label.is-selected {
   background: var(--bg-card);
@@ -1541,30 +1595,14 @@ summary:focus-visible,
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.hosted-bedrock-fields,
-.hosted-bedrock-region {
-  display: grid;
-  gap: 9px;
-  align-items: end;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.hosted-bedrock-fields > p,
-.hosted-bedrock-region > p {
-  grid-column: 1 / -1;
-  margin: 0;
-}
-.hosted-bedrock-fields label,
-.hosted-bedrock-region label {
-  display: grid;
-  gap: 4px;
+.hosted-bedrock-field {
   min-width: 0;
-  color: var(--fg-muted);
-  font-size: 11px;
-  font-weight: 650;
+  display: grid;
+  align-content: start;
+  gap: 4px;
 }
-.hosted-bedrock-fields input,
-.hosted-bedrock-fields select,
-.hosted-bedrock-region select {
+.hosted-bedrock-field input,
+.hosted-bedrock-field select {
   width: 100%;
   min-width: 0;
   border: 1px solid var(--border);
@@ -1575,16 +1613,79 @@ summary:focus-visible,
   font: inherit;
   font-size: 13px;
 }
-.hosted-bedrock-fields button,
-.hosted-bedrock-region button {
-  justify-self: start;
+.hosted-bedrock-field [aria-invalid="true"] {
+  border-color: var(--warn-fg);
 }
-.hosted-bedrock-region {
-  border-top: 1px solid var(--border);
-  padding-top: 12px;
+.hosted-bedrock-field .small,
+.hosted-bedrock-field .hosted-field-error {
+  font-weight: 400;
 }
-.hosted-bedrock-expiry {
+.hosted-bedrock-help,
+.hosted-bedrock-expiry,
+.hosted-bedrock-secrets > p,
+.hosted-bedrock-actions > p,
+.hosted-bedrock-models p {
   margin: 0;
+}
+.hosted-bedrock-secrets {
+  min-width: 0;
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 10px;
+}
+.hosted-bedrock-secrets > strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.hosted-profile-discovery {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+.hosted-profile-discovery > span {
+  min-width: 0;
+  flex: 1 1 220px;
+}
+.hosted-profile-discovery button {
+  max-width: 100%;
+  white-space: normal;
+}
+.hosted-bedrock-actions {
+  display: grid;
+  gap: 5px;
+}
+.hosted-bedrock-actions > .other-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.hosted-bedrock-actions button,
+.hosted-bedrock-models button,
+.hosted-key-slots button {
+  max-width: 100%;
+  white-space: normal;
+}
+.hosted-bedrock-models {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px 14px;
+  border-radius: 8px;
+  background: var(--bg-soft);
+  padding: 12px;
+}
+.hosted-bedrock-models > p,
+.hosted-bedrock-models > details {
+  grid-column: 1 / -1;
+}
+.hosted-bedrock-models > .hosted-catalog {
+  margin-top: 7px;
+  border-top: 0;
+  padding-top: 0;
 }
 .hosted-key-slots {
   display: grid;
@@ -1594,6 +1695,7 @@ summary:focus-visible,
   list-style: none;
 }
 .hosted-key-slots li {
+  min-width: 0;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1601,18 +1703,20 @@ summary:focus-visible,
   gap: 8px;
   border: 1px solid var(--border);
   border-radius: 8px;
+  background: var(--bg-card);
   padding: 8px 10px;
 }
 .hosted-key-slots li > div:first-child {
-  display: grid;
-  gap: 3px;
-  /* The pill is inline-flex, so it would otherwise stretch to the whole grid column. */
-  justify-items: start;
   min-width: 0;
+  display: grid;
+  justify-items: start;
+  gap: 3px;
   font-size: 12px;
 }
 .hosted-key-slots .other-row {
+  min-width: 0;
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
 }
 .hosted-catalog {
@@ -2187,9 +2291,30 @@ summary:focus-visible,
     gap: 8px;
   }
   .hosted-scope,
-  .hosted-bedrock-fields,
-  .hosted-bedrock-region {
+  .hosted-bedrock-form,
+  .hosted-bedrock-models {
     grid-template-columns: 1fr;
+  }
+  .hosted-bedrock-full,
+  .hosted-bedrock-models > p,
+  .hosted-bedrock-models > details {
+    grid-column: auto;
+  }
+  .hosted-bedrock-heading,
+  .hosted-bedrock-models {
+    align-items: flex-start;
+  }
+  .hosted-bedrock-heading {
+    flex-direction: column;
+  }
+  .hosted-bedrock-status {
+    min-width: 0;
+    width: 100%;
+    justify-items: start;
+    text-align: left;
+  }
+  .hosted-bedrock-models button {
+    justify-self: start;
   }
   .hosted-segmented {
     display: grid;
@@ -2202,6 +2327,10 @@ summary:focus-visible,
   .hosted-key-slots li {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .hosted-key-slots .other-row,
+  .hosted-bedrock-actions > .other-row {
+    width: 100%;
   }
   .hosted-scope-head {
     grid-column: auto;
@@ -2238,6 +2367,7 @@ summary:focus-visible,
   .hosted-state-on,
   .hosted-state-off,
   .hosted-configured,
+  .hosted-bedrock-status strong,
   .hosted-lane-state,
   .hosted-segmented label.is-selected,
   .hosted-vertex-warning {

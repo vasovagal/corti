@@ -5,10 +5,17 @@ import {
   VERTEX_UNARMED_WARNING,
   awsCredentialModeDescription,
   awsCredentialModeLabel,
+  bedrockCredentialGuidance,
+  bedrockCredentialReady,
+  bedrockInvalidMessage,
   bedrockModeRequirements,
+  bedrockSetupChanged,
+  bedrockRefreshFailureGuidance,
+  bedrockSetupStatusLabel,
   billingDisclosure,
   credentialSummary,
   defaultProviderCache,
+  deriveBedrockSetupStatus,
   errorLabel,
   filterWordEntries,
   findExactModel,
@@ -17,6 +24,7 @@ import {
   laneConfigurationGuidance,
   modelAdvisory,
   modelUnavailableReason,
+  normalizeBedrockSetup,
   parseProviderKey,
   providerKey,
   providerPresentation,
@@ -284,12 +292,38 @@ describe("bedrock credential helpers", () => {
     }
   });
 
-  it("explains a Bedrock rejection as an expired session rather than a generic failure", () => {
-    expect(credentialSummary({ state: "rejected" }, "bedrock_runtime").detail).toContain("SSO");
+  it("uses method-specific Bedrock rejection guidance and mentions SSO login only for SSO", () => {
+    const modes = ["default_chain", "profile", "static_keychain", "assume_role", "sso"] as const;
+    for (const mode of modes) {
+      const guidance = bedrockCredentialGuidance(mode, { state: "rejected" }, "work");
+      expect(guidance).not.toBeNull();
+      if (mode === "sso") expect(guidance).toContain("aws sso login --profile work");
+      else expect(guidance).not.toContain("sso login");
+    }
+    expect(credentialSummary({ state: "rejected" }, "bedrock_runtime").detail).toContain(
+      "method-specific",
+    );
     expect(credentialSummary({ state: "refreshing" }, "bedrock_runtime").detail).toContain("renewed");
     expect(credentialSummary({ state: "absent" }, "bedrock_runtime").detail).toContain("mode");
-    // Other transports keep their existing wording.
-    expect(credentialSummary({ state: "rejected" }, "openai_api").detail).not.toContain("SSO");
+
+    expect(
+      bedrockCredentialGuidance(
+        "sso",
+        { state: "error", code: "network" },
+        "work",
+      ),
+    ).toContain("network");
+    expect(
+      bedrockCredentialGuidance(
+        "sso",
+        { state: "error", code: "network" },
+        "work",
+      ),
+    ).not.toContain("sso login");
+    expect(bedrockRefreshFailureGuidance("profile", "timeout", "work")).toContain("timed out");
+    expect(bedrockRefreshFailureGuidance("sso", "auth_rejected", "work")).toContain(
+      "aws sso login --profile work",
+    );
   });
 
   it("labels and describes each credential mode", () => {
@@ -300,37 +334,132 @@ describe("bedrock credential helpers", () => {
     expect(awsCredentialModeLabel("assume_role")).toBe("Assume role");
   });
 
-  it("requires each mode's own companion field before it can be saved", () => {
-    const ready = { profile: "work", roleArn: "arn:aws:iam::1:role/x", region: "us-east-1" };
+  it("validates the complete atomic draft for every credential mode", () => {
+    const ready = {
+      mode: "default_chain" as const,
+      profile: "work",
+      roleArn: "arn:aws:iam::123456789012:role/corti",
+      region: "us-east-1",
+      setupName: "Clinical Bedrock",
+    };
+    const profiles = ["work"];
     const keys = { hasAccessKeyId: true, hasSecretAccessKey: true };
 
-    expect(bedrockModeRequirements("default_chain", ready, keys)).toEqual([]);
-    expect(bedrockModeRequirements("profile", ready, keys)).toEqual([]);
-    expect(bedrockModeRequirements("assume_role", ready, keys)).toEqual([]);
-    expect(bedrockModeRequirements("static_keychain", ready, keys)).toEqual([]);
+    for (const mode of ["default_chain", "profile", "static_keychain", "assume_role", "sso"] as const) {
+      expect(bedrockModeRequirements({ ...ready, mode }, profiles, keys)).toEqual([]);
+    }
 
-    expect(bedrockModeRequirements("profile", { ...ready, profile: "  " }, keys)).toContain(
-      "a profile name",
-    );
-    expect(bedrockModeRequirements("sso", { ...ready, profile: "" }, keys)).toContain(
-      "a profile name",
-    );
-    expect(bedrockModeRequirements("assume_role", { ...ready, roleArn: "" }, keys)).toContain(
-      "a role ARN",
-    );
     expect(
-      bedrockModeRequirements("assume_role", { ...ready, roleArn: "arn:aws:iam::1:user/x" }, keys),
-    ).toContain("a valid IAM role ARN");
+      bedrockModeRequirements({ ...ready, mode: "profile", profile: "" }, profiles, keys),
+    ).toContainEqual(expect.objectContaining({ field: "profile", reason: "required" }));
     expect(
-      bedrockModeRequirements("static_keychain", ready, {
-        hasAccessKeyId: false,
-        hasSecretAccessKey: false,
-      }),
-    ).toEqual(["an access key ID", "a secret access key"]);
-    // The connection is regional in every mode.
-    expect(bedrockModeRequirements("default_chain", { ...ready, region: "" }, keys)).toEqual([
-      "a Bedrock region",
+      bedrockModeRequirements({ ...ready, mode: "sso", profile: "retired" }, profiles, keys),
+    ).toContainEqual(expect.objectContaining({ field: "profile", reason: "not_found" }));
+    expect(
+      bedrockModeRequirements({ ...ready, mode: "sso", profile: "retired" }, null, keys),
+    ).not.toContainEqual(expect.objectContaining({ field: "profile", reason: "not_found" }));
+    expect(
+      bedrockModeRequirements({ ...ready, mode: "assume_role", roleArn: "" }, profiles, keys),
+    ).toContainEqual(expect.objectContaining({ field: "role_arn", reason: "required" }));
+    expect(
+      bedrockModeRequirements(
+        { ...ready, mode: "assume_role", roleArn: "arn:aws:iam::123456789012:user/x" },
+        profiles,
+        keys,
+      ),
+    ).toContainEqual(expect.objectContaining({ field: "role_arn", reason: "invalid" }));
+    expect(
+      bedrockModeRequirements(
+        { ...ready, mode: "static_keychain" },
+        profiles,
+        { hasAccessKeyId: false, hasSecretAccessKey: false },
+      ),
+    ).toContainEqual(expect.objectContaining({ field: "key_pair", reason: "keys_missing" }));
+    expect(
+      bedrockModeRequirements({ ...ready, region: "", setupName: "" }, profiles, keys),
+    ).toEqual([
+      expect.objectContaining({ field: "region", reason: "required" }),
+      expect.objectContaining({ field: "setup_name", reason: "required" }),
     ]);
+  });
+
+  it("normalizes one payload and derives pristine, dirty, saved-not-ready, and ready states", () => {
+    const saved = {
+      mode: "profile" as const,
+      profile: "work",
+      roleArn: "hidden and ignored",
+      region: "us-east-1",
+      setupName: "Clinical Bedrock",
+    };
+    expect(normalizeBedrockSetup({ ...saved, setupName: "  Clinical Bedrock  " })).toEqual({
+      mode: "profile",
+      profile: "work",
+      roleArn: null,
+      region: "us-east-1",
+      setupName: "Clinical Bedrock",
+    });
+    expect(bedrockSetupChanged({ ...saved, setupName: " Clinical Bedrock " }, saved)).toBe(false);
+    expect(bedrockSetupChanged({ ...saved, region: "us-west-2" }, saved)).toBe(true);
+
+    const readyCredential = {
+      state: "ready" as const,
+      expires_at_unix_ms: null,
+      source: "aws_profile" as const,
+    };
+    expect(
+      deriveBedrockSetupStatus({
+        changed: true,
+        issues: [],
+        scopeConfigured: true,
+        credential: readyCredential,
+      }),
+    ).toBe("unsaved_changes");
+    expect(
+      deriveBedrockSetupStatus({
+        changed: false,
+        issues: [{ field: "setup_name", reason: "required", message: "Enter a setup name." }],
+        scopeConfigured: true,
+        credential: readyCredential,
+      }),
+    ).toBe("saved_not_ready");
+    expect(
+      deriveBedrockSetupStatus({
+        changed: false,
+        issues: [],
+        scopeConfigured: true,
+        credential: { state: "rejected" },
+      }),
+    ).toBe("saved_not_ready");
+    expect(
+      deriveBedrockSetupStatus({
+        changed: false,
+        issues: [],
+        scopeConfigured: true,
+        credential: readyCredential,
+        nowUnixMs: 1_000,
+      }),
+    ).toBe("ready");
+    const expiringCredential = {
+      ...readyCredential,
+      expires_at_unix_ms: 60_000,
+    };
+    expect(bedrockCredentialReady(expiringCredential, 1)).toBe(false);
+    expect(
+      deriveBedrockSetupStatus({
+        changed: false,
+        issues: [],
+        scopeConfigured: true,
+        credential: expiringCredential,
+        nowUnixMs: 1,
+      }),
+    ).toBe("saved_not_ready");
+    expect(bedrockSetupStatusLabel("saved_not_ready")).toBe("Saved—not ready");
+  });
+
+  it("maps backend validation to field-local copy", () => {
+    expect(bedrockInvalidMessage("profile", "not_found")).toContain("currently available");
+    expect(bedrockInvalidMessage("key_pair", "keys_missing")).toContain("both");
+    expect(bedrockInvalidMessage("setup_name", "required")).toBe("Enter a setup name.");
   });
 
   it("counts down an assumed-role session and reports a lapsed one", () => {
