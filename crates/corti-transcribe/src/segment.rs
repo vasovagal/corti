@@ -184,6 +184,11 @@ fn turn_distance(t: f64, turn: &SpeakerTurn) -> f64 {
 // local backend exposes none). Filler words and stutters are deliberately out of scope: they belong to the
 // decoder, not to segmentation.
 
+/// Version of the [`cleanup`] rule set, recorded in a note's `corti.configuration.segment_cleanup`
+/// provenance. Bump it whenever a pass's behavior changes, so an old note is never read as if it had
+/// today's rules; the individual thresholds are recorded alongside it and are not part of this number.
+pub const CLEANUP_RULES_VERSION: u32 = 1;
+
 /// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
 /// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
 #[derive(Debug, Clone, PartialEq)]
@@ -451,6 +456,8 @@ fn drop_echoes(
         }
     }
 
+    // `retain` visits every element once, in order, so draining the decision list alongside it filters in
+    // place without a second allocation.
     let mut kept = kept.into_iter();
     let mut out = segments;
     out.retain(|_| kept.next().unwrap_or(true));

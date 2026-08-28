@@ -734,6 +734,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every `CORTI_CLEANUP_*` knob reaches `cleanup_config`, and an out-of-range value is ignored rather
+    /// than shipped to the rules.
+    #[test]
+    fn cleanup_env_overrides_apply_and_reject_nonsense() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("corti-cfg-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: process-global env is serialized by ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_DATA_DIR", &dir) };
+        clear_config_env();
+
+        AppConfig::default().save().unwrap();
+        assert_eq!(AppConfig::load().cleanup_config(), CleanupConfig::default());
+
+        for (key, value) in [
+            ("CORTI_CLEANUP_ECHO_DROP", "off"),
+            ("CORTI_CLEANUP_ECHO_WINDOW_SECONDS", "9.5"),
+            ("CORTI_CLEANUP_ECHO_CONTAINMENT", "0.85"),
+            ("CORTI_CLEANUP_MERGE_GAP_SECONDS", "0"),
+            ("CORTI_CLEANUP_DROP_BACKCHANNELS", "0"),
+        ] {
+            // SAFETY: still under ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+        }
+        let cfg = AppConfig::load().cleanup_config();
+        assert_eq!(
+            cfg,
+            CleanupConfig {
+                echo_drop: false,
+                echo_window_seconds: 9.5,
+                echo_containment: 0.85,
+                merge_gap_seconds: 0.0,
+                drop_backchannels: false,
+            }
+        );
+        assert!(cfg.is_noop(), "every pass off ⇒ the whole stage is off");
+
+        // Out of range: the persisted/default value survives.
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_CLEANUP_ECHO_CONTAINMENT", "4") };
+        assert_eq!(
+            AppConfig::load().cleanup_config().echo_containment,
+            CleanupConfig::default().echo_containment
+        );
+
+        clear_config_env();
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::remove_var("CORTI_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn env_overrides_file_and_file_wins_when_unset() {
         let _g = ENV_LOCK.lock().unwrap();
