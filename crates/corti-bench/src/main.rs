@@ -3,6 +3,8 @@
 //! One Mac, one experiment at a time (see [`lock`]). Three primitives the optimizer composes.
 //! `process`: optional offline AEC then local Parakeet/ONNX transcription → `DiarizedTranscript` JSON +
 //! timing (wrap in `/usr/bin/time -l` for peak RSS; a no-flags run reproduces today's pipeline byte-for-byte).
+//! `clean`: the same deterministic segment cleanup applied to an existing transcript JSON, so a metric
+//! sweep over the rules costs no ASR (#149).
 //! `aec`: offline `corti_aec::cancel` with all FDAF knobs as flags → cleaned WAV + optional per-signal dumps
 //! for the python ERLE scorer. `capture`: serial, tray-guarded 2-track capture (needs the audio-capture grant).
 //!
@@ -18,6 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use corti_core::{OwningApp, RecordingMeta};
 use corti_transcribe::Transcriber;
+use corti_transcribe::segment::{CleanupConfig, CleanupStats, cleanup};
 use corti_transcribe_local::{LocalConfig, LocalTranscriber};
 
 #[derive(Parser)]
@@ -35,9 +38,14 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// Clap parses this once into a local and immediately destructures it; boxing a variant is not an
+// option anyway (clap's `Subcommand` derive needs the plain `Args` type).
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// (Optional AEC →) local transcription of a WAV → DiarizedTranscript JSON + timing.
     Process(ProcessArgs),
+    /// Apply the shipping segment cleanup to an existing DiarizedTranscript JSON (no audio, no ASR).
+    Clean(CleanArgs),
     /// Offline AEC of a 2-track WAV with tunable FDAF knobs → cleaned WAV + timing.
     Aec(AecArgs),
     /// Record a 2-track (mic+tap) WAV for N seconds (macOS, needs the audio-capture TCC grant).
@@ -106,9 +114,82 @@ struct ProcessArgs {
     #[command(flatten)]
     aec_knobs: AecKnobs,
 
+    // --- segment cleanup knobs (#149) ---
+    #[command(flatten)]
+    cleanup_knobs: CleanupKnobs,
+
     /// Also write the transcript JSON to this file (always printed to stdout regardless).
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct CleanArgs {
+    /// Input DiarizedTranscript JSON (bare, as written by `process --out`).
+    #[arg(long)]
+    input: PathBuf,
+    /// Write the cleaned DiarizedTranscript here (always printed to stdout regardless).
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[command(flatten)]
+    knobs: CleanupKnobs,
+}
+
+/// `--cleanup` / `--no-cleanup` plus the four thresholds, so a sweep can attribute a metric change to one
+/// pass. The default is the app default: cleanup ON, shipping thresholds.
+#[derive(Args, Clone)]
+struct CleanupKnobs {
+    /// Run the deterministic segment cleanup (the default; the flag exists to be explicit in a sweep).
+    #[arg(long, overrides_with = "no_cleanup")]
+    cleanup: bool,
+    /// Emit the raw `merge_by_time` timeline with no cleanup at all.
+    #[arg(long, overrides_with = "cleanup")]
+    no_cleanup: bool,
+    /// Skip the cross-channel echo pass.
+    #[arg(long)]
+    no_echo_drop: bool,
+    /// Skip the backchannel pass.
+    #[arg(long)]
+    no_drop_backchannels: bool,
+    #[arg(long)]
+    echo_window_seconds: Option<f64>,
+    #[arg(long)]
+    echo_containment: Option<f64>,
+    /// Non-positive disables the fragment-merge pass.
+    #[arg(long)]
+    merge_gap_seconds: Option<f64>,
+}
+
+impl CleanupKnobs {
+    /// `None` ⇒ the pass is off entirely (`--no-cleanup`).
+    fn config(&self) -> Option<CleanupConfig> {
+        if self.no_cleanup {
+            return None;
+        }
+        let d = CleanupConfig::default();
+        Some(CleanupConfig {
+            echo_drop: !self.no_echo_drop,
+            drop_backchannels: !self.no_drop_backchannels,
+            echo_window_seconds: self.echo_window_seconds.unwrap_or(d.echo_window_seconds),
+            echo_containment: self.echo_containment.unwrap_or(d.echo_containment),
+            merge_gap_seconds: self.merge_gap_seconds.unwrap_or(d.merge_gap_seconds),
+        })
+    }
+}
+
+/// The effective cleanup config + what it removed, for the stdout envelope. `null` when `--no-cleanup`.
+fn cleanup_json(cfg: &CleanupConfig, stats: &CleanupStats) -> serde_json::Value {
+    serde_json::json!({
+        "echo_drop": cfg.echo_drop,
+        "echo_window_seconds": cfg.echo_window_seconds,
+        "echo_containment": cfg.echo_containment,
+        "merge_gap_seconds": cfg.merge_gap_seconds,
+        "drop_backchannels": cfg.drop_backchannels,
+        "echo_dropped_me": stats.echo_dropped_me,
+        "echo_dropped_them": stats.echo_dropped_them,
+        "merged": stats.merged,
+        "backchannels_dropped": stats.backchannels_dropped,
+    })
 }
 
 #[derive(Args, Clone)]
@@ -166,6 +247,7 @@ fn main() -> Result<()> {
     let _guard = lock::acquire(!cli.no_lock)?;
     match cli.cmd {
         Cmd::Process(a) => run_process(a),
+        Cmd::Clean(a) => run_clean(a),
         Cmd::Aec(a) => run_aec(a),
         Cmd::Capture(a) => run_capture(a),
     }
@@ -235,10 +317,19 @@ fn run_process(a: ProcessArgs) -> Result<()> {
         audio_path: asr_input.clone(),
     };
     let asr_t = Instant::now();
-    let transcript = LocalTranscriber::new(cfg.clone())
+    let mut transcript = LocalTranscriber::new(cfg.clone())
         .transcribe(&asr_input, &meta)
         .with_context(|| format!("transcribing {}", asr_input.display()))?;
     let asr_ms = asr_t.elapsed().as_millis();
+
+    // Same call, same order as `app/src/transcribe.rs`: cleanup runs on the merged timeline the backend
+    // returned, before anything reads the transcript.
+    let cleanup_report = a.cleanup_knobs.config().map(|cleanup_cfg| {
+        let (segments, stats) =
+            cleanup(std::mem::take(&mut transcript.segments), &cleanup_cfg, &[]);
+        transcript.segments = segments;
+        cleanup_json(&cleanup_cfg, &stats)
+    });
 
     if let Some(p) = clean_to_delete {
         let _ = std::fs::remove_file(p);
@@ -255,6 +346,7 @@ fn run_process(a: ProcessArgs) -> Result<()> {
         "backend": "local",
         "aec_applied": aec_applied,
         "aec": if a.aec { Some(aec_json(&aec_cfg)) } else { None },
+        "cleanup": cleanup_report,
         "aec_stats": aec_stats.as_ref().map(|p| p.display().to_string()),
         "config": local_config_json(&cfg),
         "n_segments": transcript.segments.len(),
@@ -263,6 +355,42 @@ fn run_process(a: ProcessArgs) -> Result<()> {
         "transcript": transcript,
     });
     println!("{}", serde_json::to_string(&out)?);
+    Ok(())
+}
+
+// ---- clean ---------------------------------------------------------------------------------------------
+
+/// Re-run the deterministic cleanup over a transcript that already exists. ASR is the expensive part of
+/// `process`, and the cleanup rules are pure functions of text and timings, so a threshold sweep — or a
+/// before/after score of a note replayed by `bench/scoring/cleanup.py` — never has to decode audio twice.
+fn run_clean(a: CleanArgs) -> Result<()> {
+    let raw = std::fs::read_to_string(&a.input)
+        .with_context(|| format!("reading {}", a.input.display()))?;
+    let transcript: corti_core::DiarizedTranscript = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing a DiarizedTranscript from {}", a.input.display()))?;
+    let before = transcript.segments.len();
+
+    let cfg = a
+        .knobs
+        .config()
+        .context("`clean --no-cleanup` would be a no-op; drop the flag")?;
+    let (segments, stats) = cleanup(transcript.segments, &cfg, &[]);
+    let cleaned = corti_core::DiarizedTranscript::new(segments);
+
+    if let Some(path) = &a.out {
+        std::fs::write(path, serde_json::to_string(&cleaned)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "input": a.input.display().to_string(),
+            "cleanup": cleanup_json(&cfg, &stats),
+            "n_segments_before": before,
+            "n_segments": cleaned.segments.len(),
+            "transcript": cleaned,
+        }))?
+    );
     Ok(())
 }
 
