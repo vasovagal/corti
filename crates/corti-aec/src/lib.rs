@@ -23,7 +23,10 @@
 pub mod score;
 pub mod streaming;
 
-pub use streaming::{StreamingAec, configured_lookahead_seconds, lookahead_samples_for};
+pub use streaming::{
+    BlockStats, FinishOutput, MAX_BLOCK_STATS, SpanStats, StreamingAec,
+    configured_lookahead_seconds, lookahead_samples_for, span_stats,
+};
 
 use rustfft::num_complex::Complex;
 
@@ -256,7 +259,7 @@ mod tests {
     use super::*;
 
     /// Deterministic white-ish noise in `[-amp, amp]` (LCG; no `rand` dep, reproducible across runs).
-    fn noise(n: usize, amp: f32, seed: u64) -> Vec<f32> {
+    pub(crate) fn noise(n: usize, amp: f32, seed: u64) -> Vec<f32> {
         let mut s = seed | 1;
         (0..n)
             .map(|_| {
@@ -270,7 +273,7 @@ mod tests {
     }
 
     /// Causal FIR convolution: `y[n] = Σ_k h[k]·x[n-k]` — a synthetic room/echo path.
-    fn convolve(x: &[f32], h: &[f32]) -> Vec<f32> {
+    pub(crate) fn convolve(x: &[f32], h: &[f32]) -> Vec<f32> {
         let mut y = vec![0.0f32; x.len()];
         for n in 0..x.len() {
             let mut acc = 0.0f32;
@@ -670,7 +673,7 @@ mod tests {
     /// Build the same synthetic echo fixture `cancels_synthetic_echo` uses: 3 s @ 48 kHz, far-end noise,
     /// a ~1 ms-delayed decaying room impulse, and a loud 440 Hz near-end tone active only in [1s, 2s).
     /// Returns `(mic, far, near, sr, n)`.
-    fn synthetic_echo_fixture() -> (Vec<f32>, Vec<f32>, Vec<f32>, u32, usize) {
+    pub(crate) fn synthetic_echo_fixture() -> (Vec<f32>, Vec<f32>, Vec<f32>, u32, usize) {
         let sr = 48_000u32;
         let secs = 3usize;
         let n = sr as usize * secs;

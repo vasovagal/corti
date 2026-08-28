@@ -1,6 +1,7 @@
 # Audio pipeline — the data plane
 
-> Verified against v0.8.0 + feat/pipeline-docs-and-streaming.
+> Verified against v0.8.0 + feat/pipeline-docs-and-streaming, plus per-block AEC statistics
+> (`feat/aec-block-stats`, #149 phase 3) re-verified on v0.16.1.
 
 The audio data plane runs mic-in-use → capture → clean, entirely on OS threads with one lock-free
 ring. CoreAudio HAL threads push (an event when the mic starts/stops, PCM frames while recording);
@@ -147,6 +148,62 @@ AEC from later Settings.
 **The live tee is unrelated to this.** `run_writer` still tees the **raw** downmix to `corti-live`,
 which runs its own `StreamingAec` for the in-call transcript (#78/#87). Leaving it alone was a
 deliberate scope choice: the two cancellers are independent and each bounded.
+
+### Per-block echo statistics — instrumentation, not a gate change (#149 phase 3)
+
+`StreamingAec` records one `BlockStats` per **emitted** block into a bounded ring:
+`{ t_start_secs, mic_energy, far_energy, echo_estimate_energy, error_energy, double_talk,
+suppressed }`. Nothing here is new DSP — these are the quantities the adaptation gate
+(`streaming.rs`, `Σd² > double_talk_ratio · Σx²`) and the residual suppressor already compute, captured
+instead of discarded. Energies are sums of squares over the block on the raw `f32` sample scale, so a
+ratio of two of them is directly an ERLE-style figure. Emitted audio is unchanged, sample for sample,
+whether or not anyone reads the ring (`recording_stats_does_not_change_the_audio`, and the existing
+`in_flight_filter_matches_post_capture_pass` parity test still holds).
+
+**The timeline contract is the load-bearing part.** `t_start_secs` is call-relative on the **emitted
+(cleaned)** timeline: the offset of the block's first cleaned sample from the first cleaned sample of the
+call. Because the filter emits exactly one sample per pushed mic sample, that is also the mic-input
+offset — the timestamp the transcriber will put on this audio. **The lookahead is already subtracted.**
+The warm-up convergence sub-pass discards its output and records nothing; the opening re-emit starts the
+clock at `0.0`. Block *k* covers cleaned samples `[k·filter_len, (k+1)·filter_len)` — of `-clean.wav`,
+or of the `push` return stream — with no offset to correct for. A consumer can compare a `BlockStats`
+time to a `TranscriptSegment` time directly.
+
+`block_stats(&mut self) -> Vec<BlockStats>` **drains** the ring; `stats_dropped() -> u64` is the lifetime
+count of blocks evicted because a consumer drained too slowly. The ring holds `MAX_BLOCK_STATS` = 4096
+blocks (≈11.6 min at the default 8192-tap hop / 48 kHz, ≈128 KiB), so a consumer that never drains costs
+a fixed amount rather than growing with call length — and the hole is always at the *old* end, counted,
+never silent. `finish` consumes the filter, so `finish_with_stats() -> FinishOutput` is how a caller
+reaches the blocks the flush itself records (for a call shorter than the lookahead, that is every block)
+plus the locked delay.
+
+`span_stats(&[BlockStats], start, end) -> Option<SpanStats>` folds the blocks overlapping a span into
+`{ blocks, mean_mic_db, mean_echo_estimate_db, mean_error_db, double_talk_fraction, suppressed_fraction }`.
+Means are taken over *energies* and converted to dB once, so one silent block cannot dominate. A span
+shorter than one hop collapses to the block containing its start. This is the accessor the deterministic
+segment-cleanup pass (#149 phase 1) will consume to ask "was this mic segment mostly echo?"; nothing
+calls it yet.
+
+**`double_talk` and `suppressed` are recorded separately on purpose.** Today the suppressor's bypass test
+is the *same* `Σd² > ratio · Σx²` comparison as the adaptation gate, so `suppressed == !double_talk`
+whenever `suppress_residual > 0` — which is exactly #107 root cause #1 (a hot mic freezes adaptation *and*
+disengages suppression during far-end-only speech). Keeping both fields means the record stays meaningful
+the day those gates diverge, and `gate_flags_agree_with_the_double_talk_regions` fails loudly if they do.
+This PR changed no gate math and no default.
+
+**The locked delay is logged once per call**, at `info!(target: "corti::aec", …)` from the delay lock:
+`delay_samples`, `delay_ms`, the `max_lag_samples` / `max_lag_ms` search window, the warm-up span, and the
+filter length. The delay is estimated once at the end of warm-up and never re-estimated (ADR 0007
+Decision 2), so a lock pinned at the edge of a 10 ms window — or at 0 — is visible in one line. This is
+#107's cheapest diagnostic.
+
+**Batch/bench sidecar.** `write_clean_wav_with_options(raw, cfg, lookahead, AecStatsSidecar::Write)`
+writes `<stem>-aec-stats.json` beside the `-clean.wav`: schema version, source, sample rate, frames,
+lookahead, the exact `AecConfig`, the locked delay, the block hop, the drop count, and every block. It
+drains per push, so a call longer than the ring loses nothing. Opt-in — `write_clean_wav` and
+`write_clean_wav_with_lookahead` pass `Off`, and the cleaned WAV is byte-identical either way.
+`corti-bench process --aec` turns it on by default (`--no-aec-stats` to suppress), surfaces the path in
+its JSON envelope as `aec_stats`, and keeps the sidecar even when the `-clean.wav` is deleted.
 
 ## corti-tap shares the engine, not the app's filter policy
 
