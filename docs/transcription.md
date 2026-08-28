@@ -1,6 +1,7 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#85, #87, #93, #103).
+> Verified against main + transcribe.cpp integration PR #92, crash-safe rolling live commits (#85, #87,
+> #93, #103), and segment cleanup (#149).
 
 Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
 interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
@@ -30,9 +31,9 @@ pub trait Transcriber {
 - The 2-track layout **is** the diarization prior: ch0 → `Speaker::Me`, ch1 → `Speaker::Other`.
 
 Shared post-processing lives in `corti_transcribe::segment` (`segment.rs`): `Word{start,end,text}`
-(`:16`), `SpeakerTurn` (`:24`), `words_to_segments` (`:38`), `merge_by_time` (`:73`),
-`diarize_words` (`:83`), and `SEGMENT_GAP = 1.5s` (`:33`). Both backends emit timestamped `Word`s
-and reuse these to shape the final transcript.
+(`:23`), `SpeakerTurn` (`:31`), `words_to_segments` (`:45`), `merge_by_time` (`:80`),
+`diarize_words` (`:90`), `SEGMENT_GAP = 1.5s` (`:40`), and `cleanup` (`:268`) — see §Segment cleanup.
+Both backends emit timestamped `Word`s and reuse these to shape the final transcript.
 
 ## Backend dispatch
 
@@ -45,6 +46,60 @@ for foreign audio (`corti --input`), marker-less pre-upgrade rows, and a writer 
 before emitting any clean frame. Ordinary recordings carry a versioned `CaptureProcessing` record
 in `queue.db`, so retries skip the file pass only when capture positively identifies the WAV as
 processed/disabled. The request includes the original lookahead rather than re-reading environment.
+
+## Segment cleanup — echo, fragments, backchannels (#149)
+
+`merge_by_time` is the first and only point where the two capture channels see each other, so it is the
+only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:268`) runs
+there, on **both** paths — batch (`app/src/transcribe.rs:366`, right after `Backend::transcribe`, so it
+covers local, AWS and `corti --input`) and live (`app/src/live.rs`, inside `flush_window` before the
+append) — and always **before** the LLM tier, which is contractually forbidden from dropping or reordering
+rows (`crates/corti-postprocess/src/prompt.rs`, `validation.rs`). It is pure text/timing arithmetic: no
+audio, no model, and no confidence score (the local backend exposes none). Filler words and stutters are
+deliberately out of scope — those belong to the decoder.
+
+Three passes, in this order:
+
+1. **Echo** (`drop_echoes`, `:399`). Residual speaker bleed the AEC could not remove is decoded as a short
+   `Me` utterance 1–6 s after the far end said the same words (issue #107, whose AEC root causes stay open).
+   For each segment S, every **earlier, still-kept** other-channel segment O with
+   `O.start ≤ S.start ≤ O.end + echo_window_seconds` is a candidate source; S is dropped when it has three
+   or more content tokens and `|tok(S) ∩ tok(O)| / |tok(S)| ≥ echo_containment`, or when it has one or two
+   content tokens, the match is total, **and** `[S.start, S.end] ⊂ [O.start, O.end]` — the `Me: Gateway`
+   phantom sitting inside a far-end monologue. Content tokens are lowercase alphabetic tokens minus fillers,
+   stopwords and backchannels, as a set, so a stutter cannot inflate a score. Only kept segments are
+   sources, so echoes never chain; one source may kill several copies; the rule is symmetric and the two
+   directions are counted separately.
+2. **Merge** (`merge_fragments`, `:469`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
+   so every fragment visible in a note has a measured gap above that. Consecutive same-speaker segments
+   within `merge_gap_seconds` are joined — **unless the other channel started a turn in between**. That
+   clause is why this is not a VAD tuning problem: `vad_min_silence` can be raised, but it cannot know that
+   the far end took the floor, and raising it also delays live rows and pushes regions toward the 20 s cap.
+3. **Backchannel** (`drop_backchannel_turns`, `:513`). A segment of fewer than four words whose whole
+   normalized text is backchannel ("Yeah.", "Okay yeah.", "Makes sense.") and which overlaps other-channel
+   speech is dropped — **unless** the nearest earlier other-channel segment ends in `?`, which makes it an
+   answer, not listening.
+
+`CleanupConfig` (`:195`) carries the five knobs; defaults are `echo_drop = true`,
+`echo_window_seconds = 6.0`, `echo_containment = 0.7`, `merge_gap_seconds = 2.5` (non-positive disables the
+pass), `drop_backchannels = true`. The app persists them as the `[cleanup]` table in `config.toml`
+(`app/src/config.rs:169`, effective values via `AppConfig::cleanup_config`, `:235`) with
+`CORTI_CLEANUP_ECHO_DROP`, `CORTI_CLEANUP_ECHO_WINDOW_SECONDS`, `CORTI_CLEANUP_ECHO_CONTAINMENT`,
+`CORTI_CLEANUP_MERGE_GAP_SECONDS` and `CORTI_CLEANUP_DROP_BACKCHANNELS` overriding it. Hand-edited
+nonsense is clamped the same way `aec_config` clamps a non-finite AEC knob. `CleanupStats` (`:239`) is
+logged per run under `corti::transcribe` / `corti::live`, per echo direction.
+
+Every note records the rules it was produced under: `corti.configuration.segment_cleanup`
+(`app/src/provenance.rs:321`, mirrored for `corti-tap --inbox`) is either `"off"` or
+`{"rules": 1, "echo_drop": …, "echo_window_seconds": …, "echo_containment": …, "merge_gap_seconds": …,
+"drop_backchannels": …}`. `rules` is `CLEANUP_RULES_VERSION` (`segment.rs:190`) — bump it when a pass's
+behavior changes so an old note is never read as if it had today's rules.
+
+Offline, `corti-bench process --cleanup/--no-cleanup` runs the same function after ASR, and
+`corti-bench clean --input <DiarizedTranscript.json>` re-runs just the cleanup over a transcript that
+already exists, so a threshold sweep costs no decode. `bench/scoring/cleanup.py` scores what is left
+(`echo_pairs_remaining`, `turns_le3`, `backchannel_turns`, `content_retention`, and `orphan_drops`, which
+must be zero) over that JSON or over a replayed corti note.
 
 ## Local backend — Parakeet via sherpa or transcribe.cpp
 
