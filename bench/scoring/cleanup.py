@@ -30,6 +30,9 @@ and, when both ``--before`` and ``--after`` are given::
     dropped                turns present in before and gone from after
     orphan_drops           dropped turns whose content is NOT >= 70 % present in a kept neighbour
                            within 6 s — i.e. speech the cleanup actually lost. MUST be 0.
+    backchannel_orphans    the same test for turns that are wholly a backchannel phrase ("I see.").
+                           Not a loss — it is what the backchannel pass removes, and its words are
+                           deliberately not stopwords — but reported so a wrong phrase list is visible.
 
 The echo detector is deliberately **looser than the cleanup rule** (containment >= 0.5 vs. the shipping
 0.7): a metric that used the rule's own threshold could only ever report zero. A turn counts once, no
@@ -231,24 +234,33 @@ def compare(before, after):
     kept = {(s["channel"], round(s["start"], 3)) for s in after}
     dropped = [s for s in before if (s["channel"], round(s["start"], 3)) not in kept]
 
-    orphans = []
+    orphans, backchannel_orphans = [], 0
     for d in dropped:
         d_tok = content(d["text"])
         if not d_tok:
-            continue  # nothing to lose: a pure backchannel or filler row
+            continue  # nothing to lose: a filler or single-word backchannel row
         best = 0.0
         for k in after:
             if k["start"] > d["end"] + WINDOW_S or k["end"] < d["start"] - WINDOW_S:
                 continue
             best = max(best, containment(d_tok, content(k["text"])))
-        if best < ORPHAN_CONTAINMENT:
-            orphans.append({"start": d["start"], "channel": d["channel"], "best_containment": round(best, 3)})
+        if best >= ORPHAN_CONTAINMENT:
+            continue
+        # A whole-phrase backchannel ("I see.", "Of course.", "Sounds good.") is not lost content — it is
+        # what the backchannel pass exists to remove, and `backchannel_turns` already counts it. Its words
+        # are not in the stopword set (they carry meaning elsewhere), so it would otherwise look orphaned.
+        # Counted separately rather than hidden, because a spike here would mean the phrase list is wrong.
+        if is_backchannel(d["text"]):
+            backchannel_orphans += 1
+            continue
+        orphans.append({"start": d["start"], "channel": d["channel"], "best_containment": round(best, 3)})
 
     before_tokens = sum(content_count(s["text"]) for s in before)
     after_tokens = sum(content_count(s["text"]) for s in after)
     return {
         "dropped": len(dropped),
         "orphan_drops": len(orphans),
+        "backchannel_orphans": backchannel_orphans,
         "orphans": orphans[:20],
         "content_retention": round(after_tokens / before_tokens, 4) if before_tokens else 1.0,
     }
@@ -266,6 +278,7 @@ def table(report):
         d = report["delta"]
         print(
             f"\ndropped={d['dropped']}  orphan_drops={d['orphan_drops']}  "
+            f"backchannel_orphans={d['backchannel_orphans']}  "
             f"content_retention={d['content_retention']}",
             file=sys.stderr,
         )
