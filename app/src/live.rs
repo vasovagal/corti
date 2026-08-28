@@ -76,6 +76,7 @@ const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 /// `echo_window_seconds` is enormous. 8192 blocks is ≈23 minutes and ≈256 KiB; the oldest go first, exactly
 /// like the canceller's own ring.
 const MAX_WINDOW_AEC_BLOCKS: usize = 8192;
+
 /// Bounded in-memory canonical-row assembly used only for the optional final pass after every raw window is
 /// already synced. Exceeding it disables that pass and leaves the existing raw note path unchanged.
 const MAX_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;

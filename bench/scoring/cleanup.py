@@ -38,6 +38,15 @@ The echo detector is deliberately **looser than the cleanup rule** (containment 
 0.7): a metric that used the rule's own threshold could only ever report zero. A turn counts once, no
 matter how many sources it echoes.
 
+**`orphan_drops` reads differently for the audio rule (#149 phase 3b).** This scorer only sees two
+transcripts, so it judges a drop by whether the words turn up in a kept neighbour. That is the right test
+for the text rules — they drop a row *because* it repeats one. It is the wrong test for a drop made on the
+AEC's per-block evidence: those rows are exactly the ones whose garbled text matches nothing, which is why
+text could not catch them, so a working audio rule *raises* `orphan_drops` by construction. Attribute it by
+running the same transcript through `corti-bench clean` with and without `--aec-stats` and diffing the
+orphan list; the run's own `echo_dropped_audio` and `audio_evidence` counters are in the `corti-bench`
+JSON envelope, not here.
+
 The stopword / filler / backchannel vocabularies are mirrored from
 ``crates/corti-transcribe/src/segment.rs``; keep the two in lock-step. Python stdlib only.
 

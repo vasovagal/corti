@@ -162,12 +162,12 @@ struct CleanupKnobs {
     #[arg(long)]
     echo_containment: Option<f64>,
     /// Non-positive disables the fragment-merge pass.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     merge_gap_seconds: Option<f64>,
     /// dB a mic span may exceed the AEC's own echo estimate and still be dropped as echo. Only bites when
     /// per-block AEC statistics are available; a large negative value (e.g. -1000) switches the audio rule
     /// off while leaving the text rules alone.
-    #[arg(long)]
+    #[arg(long, allow_negative_numbers = true)]
     echo_audio_margin_db: Option<f32>,
 }
 
