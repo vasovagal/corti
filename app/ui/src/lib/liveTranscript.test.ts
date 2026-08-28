@@ -127,6 +127,37 @@ describe("live transcript race/retention reducer", () => {
     expect(next.lines.map((line) => line.text)).toEqual(["earlier", "later"]);
   });
 
+  it("keeps a late early-dropped mic row in call order behind the rows that released it", () => {
+    // #149 phase 2 withholds a short mic region until the far end closes a region, so it is published
+    // *after* a row with a later timestamp. The reader must still read it back in call order.
+    let current = applyLiveEvent(
+      null,
+      event({
+        revision: 4,
+        line: { seq: 4, speaker: "Them", start_sec: 0, end_sec: 1, text: "which region?" },
+      }),
+    );
+    current = applyLiveEvent(
+      current,
+      event({
+        revision: 5,
+        line: { seq: 5, speaker: "Them", start_sec: 4, end_sec: 4.6, text: "got it" },
+      }),
+    );
+    const late = applyLiveEvent(
+      current,
+      event({
+        revision: 6,
+        line: { seq: 6, speaker: "Me", start_sec: 1.4, end_sec: 1.9, text: "Frankfurt." },
+      }),
+    );
+    expect(late.lines.map((line) => line.text)).toEqual([
+      "which region?",
+      "Frankfurt.",
+      "got it",
+    ]);
+  });
+
   it("retains raw rows and requests repair on revision gaps or process changes", () => {
     const current = snapshot({
       process_epoch: 10,

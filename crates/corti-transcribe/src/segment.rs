@@ -39,6 +39,33 @@ pub struct SpeakerTurn {
 /// historical 1.5 s split.)
 pub const SEGMENT_GAP: f64 = 1.5;
 
+/// Whether `word` continues a region that ended at `prev_end` rather than opening a new one. The single
+/// definition of the pause split, shared by [`words_to_segments`] and [`split_regions`]. A non-comparable
+/// timestamp continues nothing, so it breaks the region rather than silently extending it.
+fn continues_region(prev_end: f64, word: &Word, gap: f64) -> bool {
+    word.start - prev_end <= gap
+}
+
+/// Split one speaker's time-ordered `words` into the groups [`words_to_segments`] would render as one
+/// segment each — the same pause rule, without committing to a speaker or to rendered text. The live path
+/// needs the words themselves: it decides region by region whether to publish or withhold, and a withheld
+/// region is published later with its original words and timestamps.
+pub fn split_regions(words: &[Word], gap: f64) -> Vec<Vec<Word>> {
+    let mut out: Vec<Vec<Word>> = Vec::new();
+    for w in words.iter().filter(|w| !w.text.is_empty()) {
+        match out.last_mut() {
+            Some(region) if continues_region(region_end(region), w, gap) => region.push(w.clone()),
+            _ => out.push(vec![w.clone()]),
+        }
+    }
+    out
+}
+
+/// The end timestamp of a non-empty region (its last word's end).
+fn region_end(region: &[Word]) -> f64 {
+    region.last().map_or(f64::NAN, |w| w.end)
+}
+
 /// Group one speaker's time-ordered `words` into [`TranscriptSegment`]s, starting a new segment on a pause
 /// longer than `gap`. Words are joined with single spaces (punctuation should already be glued onto the
 /// word by the caller). Empty words are skipped; empty input yields no segments.
@@ -51,7 +78,7 @@ pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<Tran
             continue;
         }
         match cur.as_mut() {
-            Some(seg) if w.start - seg.end <= gap => {
+            Some(seg) if continues_region(seg.end, w, gap) => {
                 seg.text.push(' ');
                 seg.text.push_str(&w.text);
                 seg.end = w.end;
@@ -390,62 +417,104 @@ fn is_me(segment: &TranscriptSegment) -> bool {
     matches!(segment.speaker, Speaker::Me)
 }
 
-/// Drop each segment that repeats what the other channel already said, inside the echo window.
+/// One side of the echo comparison: a closed region's channel, span, and content-token set, computed once.
 ///
-/// A segment with three or more content tokens is an echo when `echo_containment` of them appear in the
-/// source. One or two content tokens are only enough when the match is total **and** the segment's whole
-/// span sits inside the source's — that is the #107 phantom (`Me: Gateway` in the middle of a far-end
-/// monologue), and requiring containment of the span is what keeps a genuine one-word interjection.
+/// The live early-drop path (#149 phase 2) asks the same question of one mic region against a rolling ring
+/// of far-end regions **before** the region is published, so both paths ask it through this one type
+/// instead of through two copies of the thresholds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EchoCandidate {
+    /// Near-end mic channel. Echo is only ever judged *across* this boundary.
+    me: bool,
+    start: f64,
+    end: f64,
+    tokens: BTreeSet<String>,
+}
+
+impl EchoCandidate {
+    /// A candidate from a rendered segment — the batch and window rule.
+    pub fn from_segment(segment: &TranscriptSegment) -> Self {
+        Self {
+            me: is_me(segment),
+            start: segment.start,
+            end: segment.end,
+            tokens: content_tokens(&segment.text),
+        }
+    }
+
+    /// A candidate from one closed region's words, before anything has rendered them as a segment — the
+    /// live rule. An empty region carries no tokens, so it is never an echo of anything.
+    pub fn from_words(me: bool, words: &[Word]) -> Self {
+        let text = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self {
+            me,
+            start: words.first().map_or(0.0, |w| w.start),
+            end: words.last().map_or(0.0, |w| w.end),
+            tokens: content_tokens(&text),
+        }
+    }
+
+    /// Seconds from call start at which this region begins.
+    pub fn start(&self) -> f64 {
+        self.start
+    }
+
+    /// Seconds from call start at which this region ends.
+    pub fn end(&self) -> f64 {
+        self.end
+    }
+
+    /// How many distinct content tokens the region carries — the unit "short" is measured in.
+    pub fn content_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// True when this region repeats what `source` said on the **other** channel, inside the echo window.
+    ///
+    /// Three or more content tokens are an echo when `echo_containment` of them appear in the source. One
+    /// or two are only enough when the match is total **and** this region's whole span sits inside the
+    /// source's — that is the #107 phantom (`Me: Gateway` in the middle of a far-end monologue), and
+    /// requiring containment of the span is what keeps a genuine one-word interjection.
+    pub fn is_echo_of(&self, source: &Self, cfg: &CleanupConfig) -> bool {
+        if source.me == self.me || self.tokens.is_empty() {
+            return false;
+        }
+        // The source must have started first and still be inside the echo window.
+        let in_window =
+            source.start <= self.start && self.start <= source.end + cfg.echo_window_seconds;
+        if !in_window {
+            return false;
+        }
+        let c = containment(&self.tokens, &source.tokens);
+        if self.tokens.len() >= 3 {
+            c >= cfg.echo_containment
+        } else {
+            c >= 1.0 && self.start >= source.start && self.end <= source.end
+        }
+    }
+}
+
+/// Drop each segment that repeats what the other channel already said, inside the echo window.
 fn drop_echoes(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
     carry: &[TranscriptSegment],
     stats: &mut CleanupStats,
 ) -> Vec<TranscriptSegment> {
-    /// One candidate echo source, with its content tokens computed once.
-    struct Source {
-        is_me: bool,
-        start: f64,
-        end: f64,
-        tokens: BTreeSet<String>,
-    }
-    let source_of = |s: &TranscriptSegment| Source {
-        is_me: is_me(s),
-        start: s.start,
-        end: s.end,
-        tokens: content_tokens(&s.text),
-    };
-
-    let carry_sources: Vec<Source> = carry.iter().map(&source_of).collect();
-    let current: Vec<Source> = segments.iter().map(&source_of).collect();
+    let carry_sources: Vec<EchoCandidate> = carry.iter().map(EchoCandidate::from_segment).collect();
+    let current: Vec<EchoCandidate> = segments.iter().map(EchoCandidate::from_segment).collect();
     let mut kept = vec![true; segments.len()];
 
     for (i, segment) in segments.iter().enumerate() {
         let subject = &current[i];
-        if subject.tokens.is_empty() {
-            continue;
-        }
-        let echoes = |source: &Source| -> bool {
-            if source.is_me == subject.is_me {
-                return false;
-            }
-            // The source must have started first and still be inside the echo window.
-            let in_window = source.start <= subject.start
-                && subject.start <= source.end + cfg.echo_window_seconds;
-            if !in_window {
-                return false;
-            }
-            let c = containment(&subject.tokens, &source.tokens);
-            if subject.tokens.len() >= 3 {
-                c >= cfg.echo_containment
-            } else {
-                c >= 1.0 && subject.start >= source.start && subject.end <= source.end
-            }
-        };
         // Sources are the previous window's kept segments plus every earlier segment this pass has kept —
         // an already-dropped copy is never allowed to kill the utterance it copied.
-        let dropped =
-            carry_sources.iter().any(&echoes) || (0..i).any(|j| kept[j] && echoes(&current[j]));
+        let dropped = carry_sources.iter().any(|o| subject.is_echo_of(o, cfg))
+            || (0..i).any(|j| kept[j] && subject.is_echo_of(&current[j], cfg));
         if dropped {
             kept[i] = false;
             if is_me(segment) {
@@ -1029,5 +1098,71 @@ mod tests {
         ] {
             assert!(!is_backchannel(text), "{text} carries content");
         }
+    }
+
+    /// `split_regions` splits exactly where `words_to_segments` does, and keeps the words themselves so a
+    /// withheld region can be published later unchanged.
+    #[test]
+    fn regions_split_on_the_same_pause_segments_do() {
+        let words = [
+            word(0.0, 0.4, "Morning"),
+            word(0.4, 0.8, "team."),
+            word(6.0, 6.5, "Thanks"),
+        ];
+        let regions = split_regions(&words, SEGMENT_GAP);
+        let segments = words_to_segments(&words, Speaker::Me, SEGMENT_GAP);
+        assert_eq!(regions.len(), segments.len());
+        assert_eq!(regions[0], words[0..2]);
+        assert_eq!(regions[1], words[2..3]);
+        assert!(split_regions(&[], SEGMENT_GAP).is_empty());
+        assert!(split_regions(&[word(0.0, 0.1, "")], SEGMENT_GAP).is_empty());
+    }
+
+    /// The candidate built from a region's words asks the same question as the one built from the rendered
+    /// segment, so the live path and the window path cannot drift apart.
+    #[test]
+    fn echo_candidate_from_words_matches_the_rendered_segment() {
+        let cfg = CleanupConfig::default();
+        let them = TranscriptSegment {
+            speaker: Speaker::Other("Them".into()),
+            start: 10.0,
+            end: 18.0,
+            text: "the invoice reconciliation moves to the settlement gateway".into(),
+        };
+        let ghost = [word(13.0, 13.4, "settlement"), word(13.4, 13.9, "gateway.")];
+
+        let source = EchoCandidate::from_segment(&them);
+        let subject = EchoCandidate::from_words(true, &ghost);
+        assert_eq!(subject.start(), 13.0);
+        assert_eq!(subject.end(), 13.9);
+        assert_eq!(subject.content_tokens(), 2);
+        assert!(subject.is_echo_of(&source, &cfg));
+        // Same verdict through the rendered segment.
+        assert!(
+            EchoCandidate::from_segment(&TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 13.0,
+                end: 13.9,
+                text: "settlement gateway.".into(),
+            })
+            .is_echo_of(&source, &cfg)
+        );
+        // Same channel is never an echo, and an empty region has nothing to match.
+        assert!(!subject.is_echo_of(&subject, &cfg));
+        assert!(!EchoCandidate::from_words(true, &[]).is_echo_of(&source, &cfg));
+    }
+
+    /// A short genuine answer is not an echo: it shares no content with the far-end region it follows.
+    #[test]
+    fn echo_candidate_keeps_a_short_answer_that_shares_no_content() {
+        let cfg = CleanupConfig::default();
+        let source = EchoCandidate::from_segment(&TranscriptSegment {
+            speaker: Speaker::Other("Them".into()),
+            start: 10.0,
+            end: 12.0,
+            text: "which region is the replica in?".into(),
+        });
+        let answer = EchoCandidate::from_words(true, &[word(12.4, 13.0, "Frankfurt.")]);
+        assert!(!answer.is_echo_of(&source, &cfg));
     }
 }
