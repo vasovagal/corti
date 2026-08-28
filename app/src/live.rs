@@ -46,7 +46,8 @@ use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
 use corti_transcribe::segment::{
-    SEGMENT_GAP, SpeakerTurn, Word, diarize_words, merge_by_time, words_to_segments,
+    CleanupConfig, CleanupStats, SEGMENT_GAP, SpeakerTurn, Word, cleanup, diarize_words,
+    merge_by_time, words_to_segments,
 };
 use tracing::{info, warn};
 
@@ -857,6 +858,7 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         sample_rate,
         cfg.live_buffer_minutes,
         engine.diarizes_far_end(),
+        cfg.cleanup_config(),
     )
     .context("reserving the bounded live transcript window")?;
     Ok(SessionParts {
@@ -952,10 +954,22 @@ struct TranscriptWindow {
     tap_audio: Vec<f32>,
     buffered_text_bytes: usize,
     diarize_far_end: bool,
+    /// Deterministic segment cleanup applied to each window before its one append (#149).
+    cleanup: CleanupConfig,
+    /// The tail of the **previous** window's appended segments — every one whose end is still inside
+    /// `echo_window_seconds` of this window's start. They are read-only echo sources: an echo whose source
+    /// landed just before the one-minute boundary is still caught. Never appended (they are already in the
+    /// note) and never mutated. Bounded by one window's segment count, so the memory contract is unchanged.
+    carry: Vec<TranscriptSegment>,
 }
 
 impl TranscriptWindow {
-    fn new(sample_rate: u32, minutes: u32, diarize_far_end: bool) -> Result<Self> {
+    fn new(
+        sample_rate: u32,
+        minutes: u32,
+        diarize_far_end: bool,
+        cleanup: CleanupConfig,
+    ) -> Result<Self> {
         let sample_rate = sample_rate.max(1);
         let configured = u64::from(sample_rate)
             .saturating_mul(u64::from(minutes.max(1)))
@@ -986,7 +1000,23 @@ impl TranscriptWindow {
             tap_audio,
             buffered_text_bytes: 0,
             diarize_far_end,
+            cleanup,
+            carry: Vec::new(),
         })
+    }
+
+    /// Seconds from call start at which the *next* window begins.
+    fn next_start_sec(&self) -> f64 {
+        self.start_frame.saturating_add(self.frames) as f64 / f64::from(self.sample_rate)
+    }
+
+    /// Retain the appended segments that are still inside the echo window as sources for the next flush.
+    /// Called after every successful append (including an empty one, which correctly clears a stale carry).
+    fn remember_carry(&mut self, appended: &[TranscriptSegment]) {
+        let horizon = self.next_start_sec() - self.cleanup.echo_window_seconds;
+        self.carry.clear();
+        self.carry
+            .extend(appended.iter().filter(|s| s.end >= horizon).cloned());
     }
 
     fn remaining_frames(&self) -> usize {
@@ -1206,6 +1236,14 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
         }
     }
     let segments = merge_by_time(segments);
+    // Cleanup runs on the merged window, with the previous window's tail as echo sources, before anything
+    // is written. Fragment merges cannot cross the append boundary (a committed row is never rewritten);
+    // echo lookback can, through `carry`.
+    let (segments, stats) = if window.cleanup.is_noop() {
+        (segments, CleanupStats::default())
+    } else {
+        cleanup(segments, &window.cleanup, &window.carry)
+    };
     if !segments.is_empty() {
         writer.append_segments(&segments)?;
         info!(
@@ -1213,10 +1251,15 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
             start_sec = window.start_sec(),
             duration_sec = window.frames as f64 / f64::from(window.sample_rate),
             segments = segments.len(),
+            echo_dropped_me = stats.echo_dropped_me,
+            echo_dropped_them = stats.echo_dropped_them,
+            merged = stats.merged,
+            backchannels_dropped = stats.backchannels_dropped,
             buffered_audio_bytes = window.tap_audio.len() * std::mem::size_of::<f32>(),
             "durable live transcript chunk synced"
         );
     }
+    window.remember_carry(&segments);
     window.clear_after_flush();
     Ok(())
 }
@@ -1939,7 +1982,8 @@ mod tests {
     #[test]
     fn rolling_window_memory_is_invariant_over_three_hours() {
         let sample_rate = 100u32;
-        let mut window = TranscriptWindow::new(sample_rate, 1, true).unwrap();
+        let mut window =
+            TranscriptWindow::new(sample_rate, 1, true, CleanupConfig::default()).unwrap();
         let source = vec![0.0f32; 137];
         let mut remaining = u64::from(sample_rate) * 3 * 60 * 60;
         let mut flushes = 0usize;
@@ -1965,7 +2009,7 @@ mod tests {
         assert!(max_retained <= sample_rate as usize * 60 * std::mem::size_of::<f32>());
         assert_eq!(window.start_frame, u64::from(sample_rate) * 3 * 60 * 60);
 
-        let high_rate = TranscriptWindow::new(192_000, 10, true).unwrap();
+        let high_rate = TranscriptWindow::new(192_000, 10, true, CleanupConfig::default()).unwrap();
         assert_eq!(
             high_rate.frame_limit as usize * std::mem::size_of::<f32>(),
             MAX_DIARIZATION_AUDIO_BYTES,
@@ -1986,7 +2030,7 @@ mod tests {
             }],
             calls: RefCell::new(Vec::new()),
         };
-        let mut window = TranscriptWindow::new(10, 1, true).unwrap();
+        let mut window = TranscriptWindow::new(10, 1, true, CleanupConfig::default()).unwrap();
         window.start_frame = 600; // second minute: proves the absolute offset is supplied
         window.push_audio(&vec![0.0; 100], 100);
         window.push_them_words(vec![word(62.0, 62.5, "owned action item")]);
@@ -2022,7 +2066,7 @@ mod tests {
             &mut mic,
             &mut them,
             &NoDiarizer,
-            &mut TranscriptWindow::new(1, 1, false).unwrap(),
+            &mut TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap(),
             &mut writer,
             &publisher,
         )
@@ -2064,7 +2108,7 @@ mod tests {
         drop(tx);
 
         let mut aec = None;
-        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
         consume_chunks(
             &rx,
             1,
@@ -2111,6 +2155,128 @@ mod tests {
         assert!(!final_content.contains("State: transcribing"));
     }
 
+    /// The live path applies the same cleanup the batch path does, before the append: an echo of far-end
+    /// speech, a backchannel over it, and two fragments of one mic sentence all resolve inside one window,
+    /// and an echo whose source landed in the *previous* window is still caught through `carry`.
+    ///
+    /// Synthetic script — this repo is public, so the shapes are reproduced with invented words.
+    #[test]
+    fn live_windows_drop_echoes_and_backchannels_and_merge_fragments() {
+        let filer = TempFiler::new("cleanup");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+
+        let mut them = Scripted::new(
+            vec![
+                vec![word(
+                    2.0,
+                    6.0,
+                    "We should rotate the widget calibration before Friday.",
+                )],
+                vec![word(
+                    57.0,
+                    59.5,
+                    "The gateway timeout hits the queue depth.",
+                )],
+            ],
+            Vec::new(),
+        );
+        let mut mic = Scripted::new(
+            vec![
+                vec![
+                    // A backchannel over the far end, and an echo of what it just said.
+                    word(4.0, 4.3, "Yeah."),
+                    word(8.0, 9.9, "Rotate the widget calibration."),
+                ],
+                vec![
+                    // One sentence the VAD split at a breath (2.0 s > SEGMENT_GAP).
+                    word(40.0, 41.0, "I will send the summary"),
+                    word(43.0, 44.0, "after this call."),
+                ],
+                // Second window: an echo of the far-end turn that closed the first one.
+                vec![
+                    word(62.0, 63.0, "Gateway timeout queue depth."),
+                    word(70.0, 71.0, "Sending the notes now."),
+                ],
+            ],
+            Vec::new(),
+        );
+
+        // Four 30-frame chunks at 1 Hz ⇒ two full one-minute windows.
+        let (tx, rx) = sync_channel::<CaptureChunk>(8);
+        for _ in 0..4 {
+            tx.send(CaptureChunk {
+                mic: vec![0.0; 30],
+                tap: vec![0.0; 30],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+
+        let content = read(&note);
+        assert!(
+            content.ends_with(
+                "**[00:02] Them:** We should rotate the widget calibration before Friday.\n\n\
+                 **[00:40] Me:** I will send the summary after this call.\n\n\
+                 **[00:57] Them:** The gateway timeout hits the queue depth.\n\n\
+                 **[01:10] Me:** Sending the notes now.\n\n"
+            ),
+            "unexpected note body:\n{content}"
+        );
+        assert!(!content.contains("Me:** Yeah."), "backchannel survived");
+        assert!(
+            !content.contains("Me:** Rotate the widget calibration."),
+            "in-window echo survived"
+        );
+        assert!(
+            !content.contains("Me:** Gateway timeout queue depth."),
+            "cross-window echo survived — carry did not reach the next window"
+        );
+    }
+
+    /// `carry` holds only the previous window's tail, and only as echo sources: it is never appended a
+    /// second time, and it is dropped once it falls outside the echo window.
+    #[test]
+    fn carry_holds_the_previous_windows_tail_and_nothing_else() {
+        let filer = TempFiler::new("carry");
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+
+        window.push_them_words(vec![
+            word(1.0, 2.0, "An early turn nobody echoes."),
+            word(57.0, 59.0, "The gateway timeout hits the queue depth."),
+        ]);
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        // 60 s window, 6 s echo window ⇒ only segments ending at or after 54 s are carried.
+        assert_eq!(window.carry.len(), 1);
+        assert_eq!(window.carry[0].start, 57.0);
+
+        // The carried segment is an echo source, not content: it is not re-appended by the next flush.
+        window.push_mic_words(vec![word(62.0, 63.0, "Gateway timeout queue depth.")]);
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(
+            window.carry.is_empty(),
+            "nothing survived the second window"
+        );
+    }
+
     /// A failed checkpoint degrades the session instead of ending it: the window is dropped, the note is
     /// marked for the batch rewrite, the reader is told once, and the next checkpoint recovers.
     #[test]
@@ -2139,7 +2305,7 @@ mod tests {
         drop(tx);
 
         let publisher = StatusPublisher::default();
-        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
         consume_chunks(
             &rx,
             1,
@@ -2233,7 +2399,7 @@ mod tests {
             mic,
             them,
             NoDiarizer,
-            TranscriptWindow::new(48_000, 1, false).unwrap(),
+            TranscriptWindow::new(48_000, 1, false, CleanupConfig::default()).unwrap(),
             FinishQuality { dropped_chunks: 3 },
             &mut writer,
             &NoopPublisher,
@@ -2270,7 +2436,7 @@ mod tests {
         .unwrap();
         drop(tx);
         let mut aec = None;
-        let mut window = TranscriptWindow::new(1, 1, false).unwrap();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
         consume_chunks(
             &rx,
             1,
