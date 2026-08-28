@@ -13,7 +13,8 @@ use anyhow::Result;
 use corti_core::{DiarizedTranscript, RecordingMeta};
 
 /// Shared reconciliation helpers (word grouping, speaker merge, diarization attribution) used by the
-/// concrete backends to shape timestamped words into a [`DiarizedTranscript`].
+/// concrete backends to shape timestamped words into a [`DiarizedTranscript`], plus the deterministic
+/// [`segment::cleanup`] pass every path runs over the merged timeline.
 pub mod segment;
 
 /// Turns a recording into a diarized, timestamped transcript.

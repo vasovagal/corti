@@ -7,8 +7,14 @@
 //! - and, for the local backend, attribute far-end words to diarization turns and segment them in one pass
 //!   ([`diarize_words`](crate::segment::diarize_words)).
 //!
+//! [`cleanup`](crate::segment::cleanup) then runs on that merged timeline: the one place in corti where the
+//! two capture channels can see each other, so cross-channel echo, fragmentation and backchannels are
+//! removed before anything downstream (note, LLM tier) sees a row.
+//!
 //! The AWS backend feeds channel-identified words (ch0 = me, ch1 = them); the local backend feeds Parakeet
 //! words (ch0 = me) plus ch1 words attributed to pyannote speaker turns.
+
+use std::collections::BTreeSet;
 
 use corti_core::{Speaker, TranscriptSegment};
 
@@ -160,6 +166,394 @@ fn turn_distance(t: f64, turn: &SpeakerTurn) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Deterministic segment cleanup (#149; #107 mitigation #5)
+// ---------------------------------------------------------------------------------------------------
+//
+// Two defects survive ASR and cannot be fixed downstream: the LLM post-processing tier is contractually
+// forbidden from dropping or reordering rows (`corti-postprocess`), and the two capture channels never see
+// each other before [`merge_by_time`]. So the fix belongs here, on the merged timeline:
+//
+// 1. **Cross-channel echo.** Residual speaker bleed the AEC could not remove is decoded as a short "Me"
+//    utterance sitting inside far-end speech, 1–6 s after the far end said the same words (issue #107).
+// 2. **Fragmentation and backchannels.** `words_to_segments` only joins word gaps ≤ [`SEGMENT_GAP`], so an
+//    utterance with a longer breath break becomes several one- and two-word rows, and pure "Yeah." rows
+//    over the other side's speech add nothing to a transcript.
+//
+// Everything here is deterministic text/timing arithmetic — no audio, no model, no confidence score (the
+// local backend exposes none). Filler words and stutters are deliberately out of scope: they belong to the
+// decoder, not to segmentation.
+
+/// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
+/// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleanupConfig {
+    /// Run the cross-channel echo pass.
+    pub echo_drop: bool,
+    /// How long after a far-end utterance *starts* its echo may still be decoded on the other channel.
+    pub echo_window_seconds: f64,
+    /// Fraction of a segment's content tokens that must also appear in the candidate source before the
+    /// segment is judged an echo of it (segments of three or more content tokens).
+    pub echo_containment: f64,
+    /// Largest silence (seconds) between two consecutive same-speaker segments that is still merged into
+    /// one utterance. Non-positive disables the merge pass.
+    pub merge_gap_seconds: f64,
+    /// Run the backchannel pass ("Yeah." over the other side's speech).
+    pub drop_backchannels: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            echo_drop: true,
+            // Measured echo lag on real captures is 1–6 s (#107); the window is the outer bound, not a
+            // typical value, because containment still has to hold.
+            echo_window_seconds: 6.0,
+            echo_containment: 0.7,
+            // Longer than SEGMENT_GAP (1.5 s) — every fragment visible in a note already has a gap above
+            // it — but short enough that a genuine new utterance after a real pause stays its own row.
+            merge_gap_seconds: 2.5,
+            drop_backchannels: true,
+        }
+    }
+}
+
+impl CleanupConfig {
+    /// True when no pass would run, so callers can skip [`cleanup`] entirely and record `"off"` in
+    /// provenance rather than a set of inert knobs.
+    pub fn is_noop(&self) -> bool {
+        let merge_off = self.merge_gap_seconds <= 0.0 || self.merge_gap_seconds.is_nan();
+        !self.echo_drop && !self.drop_backchannels && merge_off
+    }
+}
+
+/// What [`cleanup`] changed. Logged per run so a surprising transcript can be explained without rerunning
+/// ASR; the echo count is split per direction because the two directions have different causes (mic bleed
+/// vs. the far end re-decoding our own voice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CleanupStats {
+    /// `Me` segments dropped as echoes of far-end speech (the #107 phantom class).
+    pub echo_dropped_me: usize,
+    /// Far-end segments dropped as echoes of `Me` speech.
+    pub echo_dropped_them: usize,
+    /// Segments absorbed into the preceding same-speaker segment.
+    pub merged: usize,
+    /// Backchannel segments dropped over the other side's speech.
+    pub backchannels_dropped: usize,
+}
+
+impl CleanupStats {
+    /// Total segments removed or absorbed — zero means the transcript came through untouched.
+    pub fn changed(&self) -> usize {
+        self.echo_dropped_me + self.echo_dropped_them + self.merged + self.backchannels_dropped
+    }
+}
+
+/// Clean one **time-sorted** timeline (the output of [`merge_by_time`]) in three passes, in this order:
+/// echo → merge → backchannel. The order matters: dropping an echo first stops it from being merged into a
+/// real turn, and merging before the backchannel pass protects a "Yeah." that is really the opening of a
+/// longer sentence.
+///
+/// `carry` is a read-only set of segments from the previous live window. They are only ever consulted as
+/// echo *sources*, never mutated, and never appear in the output — that is how the live path catches an
+/// echo whose source landed just before the one-minute append boundary.
+///
+/// Only earlier, still-kept segments act as echo sources, so echoes never chain: a dropped copy cannot go
+/// on to kill the real utterance that follows it.
+pub fn cleanup(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+) -> (Vec<TranscriptSegment>, CleanupStats) {
+    let mut stats = CleanupStats::default();
+    let mut segments = segments;
+    if cfg.echo_drop {
+        segments = drop_echoes(segments, cfg, carry, &mut stats);
+    }
+    if cfg.merge_gap_seconds > 0.0 {
+        segments = merge_fragments(segments, cfg, &mut stats);
+    }
+    if cfg.drop_backchannels {
+        segments = drop_backchannel_turns(segments, &mut stats);
+    }
+    (segments, stats)
+}
+
+/// Filler noises. Stripped before any comparison so "Um, the gateway" and "the gateway" are the same
+/// utterance to the echo detector.
+const FILLERS: &[&str] = &[
+    "um", "umm", "uh", "uhh", "ah", "aah", "er", "erm", "hm", "hmm", "mm", "mmm", "mhm", "huh",
+];
+
+/// Single-word backchannels. They are both excluded from content tokens (they carry no information, so
+/// they must not prop up a containment score) and used to recognize a whole backchannel turn.
+const BACKCHANNELS: &[&str] = &[
+    "yeah",
+    "yep",
+    "yup",
+    "yes",
+    "okay",
+    "ok",
+    "sure",
+    "right",
+    "uh-huh",
+    "mm-hmm",
+    "uhhuh",
+    "cool",
+    "alright",
+    "exactly",
+    "absolutely",
+    "totally",
+    "definitely",
+    "gotcha",
+];
+
+/// Multi-word backchannel turns, matched on the whole normalized text.
+const BACKCHANNEL_PHRASES: &[&str] = &[
+    "all right",
+    "there we go",
+    "go ahead",
+    "got it",
+    "makes sense",
+    "that makes sense",
+    "i see",
+    "sounds good",
+    "for sure",
+    "of course",
+    "no worries",
+];
+
+/// Closed-class words that appear in nearly every utterance. Excluded from content tokens so containment
+/// measures shared *content*, not shared grammar.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from", "had", "has",
+    "have", "he", "her", "his", "i", "if", "in", "is", "it", "its", "just", "like", "me", "my",
+    "no", "not", "of", "oh", "on", "or", "our", "out", "she", "so", "that", "the", "their", "them",
+    "then", "there", "these", "they", "this", "to", "up", "was", "we", "well", "were", "with",
+    "you", "your", "i'm", "it's", "that's", "we're", "you're", "don't", "we've", "i've",
+];
+
+/// Lowercase one raw token, keeping only letters plus word-internal `-`/`'` (so `uh-huh` and `don't`
+/// survive) and dropping the punctuation glued on by the decoder. Returns an empty string for a token with
+/// no letters at all (a bare number, an ellipsis).
+fn normalize_token(raw: &str) -> String {
+    let kept: String = raw
+        .chars()
+        .filter(|c| c.is_alphabetic() || *c == '-' || *c == '\'')
+        .flat_map(char::to_lowercase)
+        .collect();
+    let trimmed = kept.trim_matches(|c| c == '-' || c == '\'');
+    if trimmed.chars().any(char::is_alphabetic) {
+        trimmed.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The segment's text as normalized tokens, punctuation stripped, in order.
+fn normalized_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(normalize_token)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// The **set** of content tokens: normalized tokens minus fillers, stopwords and backchannels. A set (not a
+/// bag) so a stutter-repeated word cannot inflate a containment score.
+fn content_tokens(text: &str) -> BTreeSet<String> {
+    normalized_tokens(text)
+        .into_iter()
+        .filter(|t| {
+            let t = t.as_str();
+            !FILLERS.contains(&t) && !STOPWORDS.contains(&t) && !BACKCHANNELS.contains(&t)
+        })
+        .collect()
+}
+
+/// Fraction of `subject`'s content tokens that also appear in `source`. Empty subject ⇒ 0.
+fn containment(subject: &BTreeSet<String>, source: &BTreeSet<String>) -> f64 {
+    if subject.is_empty() {
+        return 0.0;
+    }
+    let shared = subject.iter().filter(|t| source.contains(*t)).count();
+    shared as f64 / subject.len() as f64
+}
+
+/// The near-end mic track is one channel; every [`Speaker::Other`] label is the far-end channel. Echo and
+/// backchannel rules only ever compare *across* that boundary.
+fn is_me(segment: &TranscriptSegment) -> bool {
+    matches!(segment.speaker, Speaker::Me)
+}
+
+/// Drop each segment that repeats what the other channel already said, inside the echo window.
+///
+/// A segment with three or more content tokens is an echo when `echo_containment` of them appear in the
+/// source. One or two content tokens are only enough when the match is total **and** the segment's whole
+/// span sits inside the source's — that is the #107 phantom (`Me: Gateway` in the middle of a far-end
+/// monologue), and requiring containment of the span is what keeps a genuine one-word interjection.
+fn drop_echoes(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    stats: &mut CleanupStats,
+) -> Vec<TranscriptSegment> {
+    /// One candidate echo source, with its content tokens computed once.
+    struct Source {
+        is_me: bool,
+        start: f64,
+        end: f64,
+        tokens: BTreeSet<String>,
+    }
+    let source_of = |s: &TranscriptSegment| Source {
+        is_me: is_me(s),
+        start: s.start,
+        end: s.end,
+        tokens: content_tokens(&s.text),
+    };
+
+    let carry_sources: Vec<Source> = carry.iter().map(&source_of).collect();
+    let current: Vec<Source> = segments.iter().map(&source_of).collect();
+    let mut kept = vec![true; segments.len()];
+
+    for (i, segment) in segments.iter().enumerate() {
+        let subject = &current[i];
+        if subject.tokens.is_empty() {
+            continue;
+        }
+        let echoes = |source: &Source| -> bool {
+            if source.is_me == subject.is_me {
+                return false;
+            }
+            // The source must have started first and still be inside the echo window.
+            let in_window = source.start <= subject.start
+                && subject.start <= source.end + cfg.echo_window_seconds;
+            if !in_window {
+                return false;
+            }
+            let c = containment(&subject.tokens, &source.tokens);
+            if subject.tokens.len() >= 3 {
+                c >= cfg.echo_containment
+            } else {
+                c >= 1.0 && subject.start >= source.start && subject.end <= source.end
+            }
+        };
+        // Sources are the previous window's kept segments plus every earlier segment this pass has kept —
+        // an already-dropped copy is never allowed to kill the utterance it copied.
+        let dropped =
+            carry_sources.iter().any(&echoes) || (0..i).any(|j| kept[j] && echoes(&current[j]));
+        if dropped {
+            kept[i] = false;
+            if is_me(segment) {
+                stats.echo_dropped_me += 1;
+            } else {
+                stats.echo_dropped_them += 1;
+            }
+        }
+    }
+
+    let mut kept = kept.into_iter();
+    let mut out = segments;
+    out.retain(|_| kept.next().unwrap_or(true));
+    out
+}
+
+/// Join consecutive same-speaker segments separated by at most `merge_gap_seconds` **when the other channel
+/// did not start a turn in between**. That last clause is the whole point: VAD tuning can lengthen the
+/// silence it tolerates, but it cannot know that the far end took the floor, and merging across a real
+/// exchange would rewrite who said what to whom.
+fn merge_fragments(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    stats: &mut CleanupStats,
+) -> Vec<TranscriptSegment> {
+    let me_starts: Vec<f64> = segments
+        .iter()
+        .filter(|s| is_me(s))
+        .map(|s| s.start)
+        .collect();
+    let them_starts: Vec<f64> = segments
+        .iter()
+        .filter(|s| !is_me(s))
+        .map(|s| s.start)
+        .collect();
+
+    let mut out: Vec<TranscriptSegment> = Vec::with_capacity(segments.len());
+    for b in segments {
+        let mergeable = match out.last() {
+            Some(a) => {
+                let interrupted = if is_me(&b) { &them_starts } else { &me_starts };
+                a.speaker == b.speaker
+                    && b.start - a.end <= cfg.merge_gap_seconds
+                    && !interrupted
+                        .iter()
+                        .any(|start| a.start <= *start && *start < b.start)
+            }
+            None => false,
+        };
+        match out.last_mut() {
+            Some(a) if mergeable => {
+                a.text = format!("{} {}", a.text.trim_end(), b.text.trim_start());
+                a.end = b.end;
+                stats.merged += 1;
+            }
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+/// Drop pure backchannels spoken over the other channel — "Yeah." while the far end is mid-sentence is
+/// listening, not content. A backchannel that answers a question is kept: if the nearest earlier
+/// other-channel segment ends in `?`, this row is the answer to it.
+fn drop_backchannel_turns(
+    segments: Vec<TranscriptSegment>,
+    stats: &mut CleanupStats,
+) -> Vec<TranscriptSegment> {
+    let mut kept = vec![true; segments.len()];
+    for (i, s) in segments.iter().enumerate() {
+        if s.text.split_whitespace().count() >= 4 || !is_backchannel(&s.text) {
+            continue;
+        }
+        let over_other_speech = segments
+            .iter()
+            .enumerate()
+            .any(|(j, o)| j != i && is_me(o) != is_me(s) && s.start < o.end && o.start < s.end);
+        if !over_other_speech {
+            continue;
+        }
+        // Time-sorted input ⇒ the last other-channel segment at or before this start is the nearest one.
+        let answers_a_question = segments
+            .iter()
+            .rfind(|o| is_me(o) != is_me(s) && o.start <= s.start)
+            .is_some_and(|o| o.text.trim_end().ends_with('?'));
+        if answers_a_question {
+            continue;
+        }
+        kept[i] = false;
+        stats.backchannels_dropped += 1;
+    }
+
+    let mut kept = kept.into_iter();
+    let mut out = segments;
+    out.retain(|_| kept.next().unwrap_or(true));
+    out
+}
+
+/// Whether the whole utterance is backchannel: a listed phrase, or nothing but backchannel words and
+/// fillers ("Yeah yeah.", "Um, okay.").
+fn is_backchannel(text: &str) -> bool {
+    let tokens = normalized_tokens(text);
+    if tokens.is_empty() {
+        return false;
+    }
+    if BACKCHANNEL_PHRASES.contains(&tokens.join(" ").as_str()) {
+        return true;
+    }
+    tokens
+        .iter()
+        .all(|t| BACKCHANNELS.contains(&t.as_str()) || FILLERS.contains(&t.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +653,374 @@ mod tests {
         let segs = diarize_words(&words, &turns, SEGMENT_GAP, "Them");
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].speaker, Speaker::Other("Them 1".into()));
+    }
+
+    // ---- cleanup (#149) ----------------------------------------------------------------------------
+    //
+    // Fixtures are synthetic. This repository is public and the transcripts that motivated the rules are
+    // private meetings, so the shapes are reproduced (an echo 1–5 s late, a fragment split by a breath, a
+    // backchannel over the far end) with invented words.
+
+    fn seg(speaker: Speaker, start: f64, end: f64, text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            speaker,
+            start,
+            end,
+            text: text.to_string(),
+        }
+    }
+
+    fn me(start: f64, end: f64, text: &str) -> TranscriptSegment {
+        seg(Speaker::Me, start, end, text)
+    }
+
+    fn them(start: f64, end: f64, text: &str) -> TranscriptSegment {
+        seg(Speaker::Other("Them".into()), start, end, text)
+    }
+
+    fn texts(segments: &[TranscriptSegment]) -> Vec<&str> {
+        segments.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    /// Only the echo pass, so a fixture's fragments/backchannels don't confuse what is being asserted.
+    fn echo_only() -> CleanupConfig {
+        CleanupConfig {
+            merge_gap_seconds: 0.0,
+            drop_backchannels: false,
+            ..CleanupConfig::default()
+        }
+    }
+
+    /// Only the merge pass.
+    fn merge_only() -> CleanupConfig {
+        CleanupConfig {
+            echo_drop: false,
+            drop_backchannels: false,
+            ..CleanupConfig::default()
+        }
+    }
+
+    #[test]
+    fn later_copy_of_a_far_end_utterance_is_dropped() {
+        let segments = vec![
+            them(
+                10.0,
+                14.0,
+                "We should rotate the widget calibration before Friday.",
+            ),
+            me(15.0, 16.5, "Rotate the widget calibration."),
+        ];
+        let (out, stats) = cleanup(segments, &echo_only(), &[]);
+        assert_eq!(
+            texts(&out),
+            vec!["We should rotate the widget calibration before Friday."]
+        );
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(stats.echo_dropped_them, 0);
+    }
+
+    #[test]
+    fn one_source_kills_every_copy_inside_its_window() {
+        let segments = vec![
+            them(
+                10.0,
+                14.0,
+                "We should rotate the widget calibration before Friday.",
+            ),
+            me(15.0, 16.5, "Rotate the widget calibration."),
+            me(18.0, 19.0, "Widget calibration rotate."),
+        ];
+        let (out, stats) = cleanup(segments, &echo_only(), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.echo_dropped_me, 2);
+    }
+
+    /// Two of three content tokens shared is 0.67 — below the 0.7 threshold, so a genuinely different
+    /// sentence that happens to reuse the topic's nouns survives.
+    fn near_miss_fixture() -> Vec<TranscriptSegment> {
+        vec![
+            them(
+                10.0,
+                14.0,
+                "We should rotate the widget calibration before Friday.",
+            ),
+            me(15.0, 16.5, "Rotate the widget schedule."),
+        ]
+    }
+
+    #[test]
+    fn near_miss_below_the_containment_threshold_is_kept() {
+        let (out, stats) = cleanup(near_miss_fixture(), &echo_only(), &[]);
+        assert_eq!(out.len(), 2, "0.67 containment must not be an echo");
+        assert_eq!(stats.echo_dropped_me, 0);
+
+        // …and it is genuinely a threshold, not an accident of the fixture.
+        let loose = CleanupConfig {
+            echo_containment: 0.6,
+            ..echo_only()
+        };
+        let (out, _) = cleanup(near_miss_fixture(), &loose, &[]);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn one_word_phantom_inside_a_far_end_span_is_dropped_but_a_later_one_is_kept() {
+        let segments = vec![
+            them(
+                20.0,
+                30.0,
+                "The gateway is what times out when the queue backs up.",
+            ),
+            me(22.0, 22.4, "Gateway."),
+            me(31.0, 31.5, "Gateway."),
+        ];
+        let (out, stats) = cleanup(segments, &echo_only(), &[]);
+        assert_eq!(stats.echo_dropped_me, 1, "only the contained span is echo");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].start, 31.0);
+    }
+
+    #[test]
+    fn backchannel_over_far_end_speech_is_dropped_but_an_answer_to_a_question_survives() {
+        let segments = vec![
+            them(
+                40.0,
+                50.0,
+                "So the plan is to rebuild the index overnight and swap it in.",
+            ),
+            me(42.0, 42.4, "Yeah."),
+            them(60.0, 64.0, "Do you want me to go first?"),
+            me(63.0, 63.6, "Sure."),
+        ];
+        let cfg = CleanupConfig {
+            echo_drop: false,
+            merge_gap_seconds: 0.0,
+            ..CleanupConfig::default()
+        };
+        let (out, stats) = cleanup(segments, &cfg, &[]);
+        assert_eq!(stats.backchannels_dropped, 1);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "So the plan is to rebuild the index overnight and swap it in.",
+                "Do you want me to go first?",
+                "Sure.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backchannel_with_nobody_else_speaking_is_kept() {
+        let segments = vec![them(40.0, 41.0, "Right."), me(50.0, 50.4, "Yeah.")];
+        let cfg = CleanupConfig {
+            echo_drop: false,
+            merge_gap_seconds: 0.0,
+            ..CleanupConfig::default()
+        };
+        let (out, stats) = cleanup(segments, &cfg, &[]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.backchannels_dropped, 0);
+    }
+
+    #[test]
+    fn fragments_merge_only_within_the_gap() {
+        let close = vec![
+            me(0.0, 1.0, "The migration finished"),
+            me(3.0, 4.0, "about an hour ago."),
+        ];
+        let (out, stats) = cleanup(close, &merge_only(), &[]);
+        assert_eq!(
+            texts(&out),
+            vec!["The migration finished about an hour ago."]
+        );
+        assert_eq!(out[0].start, 0.0);
+        assert_eq!(out[0].end, 4.0);
+        assert_eq!(stats.merged, 1);
+
+        let far = vec![
+            me(0.0, 1.0, "The migration finished"),
+            me(4.0, 5.0, "about an hour ago."),
+        ];
+        let (out, stats) = cleanup(far, &merge_only(), &[]);
+        assert_eq!(out.len(), 2, "a 3.0 s gap is a new utterance");
+        assert_eq!(stats.merged, 0);
+    }
+
+    #[test]
+    fn an_intervening_far_end_turn_blocks_the_merge() {
+        let segments = vec![
+            me(0.0, 1.0, "The migration finished"),
+            them(1.2, 1.6, "Which migration?"),
+            me(2.0, 3.0, "about an hour ago."),
+        ];
+        let (out, stats) = cleanup(segments, &merge_only(), &[]);
+        assert_eq!(out.len(), 3, "the far end took the floor in between");
+        assert_eq!(stats.merged, 0);
+    }
+
+    #[test]
+    fn separate_far_end_speakers_do_not_merge_into_each_other() {
+        let segments = vec![
+            seg(Speaker::Other("Them 1".into()), 0.0, 1.0, "I can take that"),
+            seg(Speaker::Other("Them 2".into()), 1.5, 2.5, "or I can."),
+        ];
+        let (out, stats) = cleanup(segments, &merge_only(), &[]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.merged, 0);
+    }
+
+    #[test]
+    fn carry_segments_are_echo_sources_and_never_output() {
+        let carry = vec![them(
+            10.0,
+            14.0,
+            "We should rotate the widget calibration before Friday.",
+        )];
+        let segments = vec![
+            me(15.0, 16.5, "Rotate the widget calibration."),
+            me(
+                18.0,
+                19.0,
+                "The dashboard still renders yesterday's totals.",
+            ),
+        ];
+        let (out, stats) = cleanup(segments, &echo_only(), &carry);
+        assert_eq!(
+            texts(&out),
+            vec!["The dashboard still renders yesterday's totals."],
+            "the carried source must not be re-emitted"
+        );
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(carry.len(), 1, "carry is read-only");
+    }
+
+    /// A dropped copy must not become a source: the far end repeating itself right after our echo is real
+    /// speech and has to survive.
+    #[test]
+    fn echoes_do_not_chain_through_a_dropped_copy() {
+        let segments = vec![
+            them(10.0, 12.0, "Rotate the widget calibration."),
+            me(13.0, 14.0, "Rotate the widget calibration."),
+            them(15.0, 17.0, "Rotate the widget calibration, yes."),
+        ];
+        let (out, stats) = cleanup(segments, &echo_only(), &[]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(stats.echo_dropped_them, 0);
+        assert!(!is_me(&out[1]));
+    }
+
+    #[test]
+    fn stats_count_every_pass_and_both_echo_directions() {
+        let segments = vec![
+            // Me first, so this pair counts as a far-end echo of us.
+            me(0.0, 3.0, "The retention sweep runs hourly now."),
+            them(4.0, 5.5, "Retention sweep hourly."),
+            // A far-end utterance echoed back onto the mic.
+            them(
+                20.0,
+                30.0,
+                "The gateway is what times out when the queue backs up.",
+            ),
+            me(22.0, 22.4, "Gateway."),
+            // A pure backchannel over that same far-end turn.
+            me(26.0, 26.3, "Yeah."),
+            // Two mic fragments with nobody else speaking in between.
+            me(40.0, 41.0, "I will send the summary"),
+            me(42.5, 43.5, "after this call."),
+        ];
+        let (out, stats) = cleanup(segments, &CleanupConfig::default(), &[]);
+        assert_eq!(
+            stats,
+            CleanupStats {
+                echo_dropped_me: 1,
+                echo_dropped_them: 1,
+                merged: 1,
+                backchannels_dropped: 1,
+            }
+        );
+        assert_eq!(
+            texts(&out),
+            vec![
+                "The retention sweep runs hourly now.",
+                "The gateway is what times out when the queue backs up.",
+                "I will send the summary after this call.",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_pass_is_individually_switchable_and_a_dead_config_is_a_noop() {
+        let off = CleanupConfig {
+            echo_drop: false,
+            merge_gap_seconds: 0.0,
+            drop_backchannels: false,
+            ..CleanupConfig::default()
+        };
+        assert!(off.is_noop());
+        assert!(!CleanupConfig::default().is_noop());
+
+        let segments = vec![
+            them(
+                20.0,
+                30.0,
+                "The gateway is what times out when the queue backs up.",
+            ),
+            me(22.0, 22.4, "Gateway."),
+            me(26.0, 26.3, "Yeah."),
+        ];
+        let (out, stats) = cleanup(segments.clone(), &off, &[]);
+        assert_eq!(out, segments);
+        assert_eq!(stats.changed(), 0);
+    }
+
+    /// Timing arithmetic must stay panic-free on a NaN a decoder should never produce but might.
+    #[test]
+    fn nan_timings_are_passed_through_rather_than_panicking() {
+        let segments = vec![
+            them(f64::NAN, f64::NAN, "The gateway is what times out."),
+            me(f64::NAN, f64::NAN, "Gateway."),
+            me(0.0, 1.0, "Gateway."),
+        ];
+        let (out, stats) = cleanup(segments, &CleanupConfig::default(), &[]);
+        assert_eq!(out.len(), 3, "no comparison against NaN can succeed");
+        assert_eq!(stats.changed(), 0);
+    }
+
+    #[test]
+    fn content_tokens_ignore_fillers_stopwords_and_punctuation() {
+        assert_eq!(
+            content_tokens("Um, so the WIDGET calibration — widget! — drifted."),
+            ["calibration", "drifted", "widget"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(content_tokens("Yeah, yeah. Okay.").is_empty());
+    }
+
+    #[test]
+    fn backchannel_recognition_covers_phrases_and_combinations() {
+        for text in [
+            "Yeah.",
+            "Yeah, yeah.",
+            "Okay yeah.",
+            "Uh-huh.",
+            "There we go.",
+            "Go ahead.",
+            "Got it.",
+            "Makes sense.",
+            "All right.",
+            "Um, sure.",
+        ] {
+            assert!(is_backchannel(text), "{text} should read as backchannel");
+        }
+        for text in [
+            "Yeah, the migration finished.",
+            "Right after the standup.",
+            "Sure thing, I will send it.",
+        ] {
+            assert!(!is_backchannel(text), "{text} carries content");
+        }
     }
 }
