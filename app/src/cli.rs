@@ -312,7 +312,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
 
     let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
+    let (transcript, used, aec_outcome, audio_evidence) = crate::transcribe::transcribe_recording(
         &backend,
         offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&resolved.id),
@@ -342,6 +342,7 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         &provenance_cfg,
         corti_vagus::provenance::GenerationMode::Batch,
         aec_execution,
+        audio_evidence,
     );
     let vagus = Vagus::discover()
         .context("vagus not available (needed to file the note; pass --print to skip filing)")?;
@@ -464,7 +465,7 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
     let offline_aec = aec_enabled.then(|| crate::transcribe::OfflineAec::current(aec_cfg));
     let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (transcript, used, aec_outcome) = crate::transcribe::transcribe_recording(
+    let (transcript, used, aec_outcome, audio_evidence) = crate::transcribe::transcribe_recording(
         &backend,
         offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&job_id),
@@ -494,6 +495,7 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         &provenance_cfg,
         corti_vagus::provenance::GenerationMode::Batch,
         aec_execution,
+        audio_evidence,
     );
     let title = args.title.unwrap_or_else(|| meta.note_title());
     let source = args.source.unwrap_or_else(|| meta.source());

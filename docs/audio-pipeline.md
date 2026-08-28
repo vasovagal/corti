@@ -180,9 +180,15 @@ plus the locked delay.
 `span_stats(&[BlockStats], start, end) -> Option<SpanStats>` folds the blocks overlapping a span into
 `{ blocks, mean_mic_db, mean_echo_estimate_db, mean_error_db, double_talk_fraction, suppressed_fraction }`.
 Means are taken over *energies* and converted to dB once, so one silent block cannot dominate. A span
-shorter than one hop collapses to the block containing its start. This is the accessor the deterministic
-segment-cleanup pass (#149 phase 1) will consume to ask "was this mic segment mostly echo?"; nothing
-calls it yet.
+shorter than one hop collapses to the block containing its start.
+
+**The consumer is the deterministic segment cleanup** (#149 phase 3b; see
+[`transcription.md`](./transcription.md) § Audio evidence). `corti_transcribe::segment::cleanup_with_evidence`
+takes an `Fn(f64, f64) -> Option<SpanEvidence>` over the transcript timeline; `corti-transcribe` does not
+depend on this crate, so `app/src/transcribe.rs::span_evidence` folds `SpanStats` into that four-field
+shape. A `Me` row overlapping far-end speech whose span shows `mean_mic_db − mean_echo_estimate_db ≤ 3 dB`,
+with `double_talk_fraction < 0.5`, is dropped as echo whatever its wording. The timeline contract above is
+what makes that comparison legal: a block time and a `TranscriptSegment` time are the same clock.
 
 **`double_talk` and `suppressed` are recorded separately on purpose.** Today the suppressor's bypass test
 is the *same* `Σd² > ratio · Σx²` comparison as the adaptation gate, so `suppressed == !double_talk`
@@ -203,7 +209,22 @@ lookahead, the exact `AecConfig`, the locked delay, the block hop, the drop coun
 drains per push, so a call longer than the ring loses nothing. Opt-in — `write_clean_wav` and
 `write_clean_wav_with_lookahead` pass `Off`, and the cleaned WAV is byte-identical either way.
 `corti-bench process --aec` turns it on by default (`--no-aec-stats` to suppress), surfaces the path in
-its JSON envelope as `aec_stats`, and keeps the sidecar even when the `-clean.wav` is deleted.
+its JSON envelope as `aec_stats`, keeps the sidecar even when the `-clean.wav` is deleted, and feeds it
+straight back into its own `--cleanup` pass. The app's offline fallback
+(`transcribe_recording`'s `OfflineAec` request) asks for it too.
+
+**In-flight sidecar.** The ordinary app recording never runs that pass — the mic is cleaned in the capture
+writer — so the filter produces the same file through its own seam. `StreamingAecFilter` drains
+`block_stats()` after every push into a shared, bounded `AecStatsCollector`
+(`MAX_CAPTURE_BLOCK_STATS` = 32 768 blocks ≈ 93 min ≈ 1 MiB, oldest evicted and counted), and hands over
+its trailing blocks plus the locked delay at `finish`. **`Recorder::stop_capture` writes the file, not the
+writer thread**: the trait returns only audio, the writer thread should not do file I/O it can avoid, and —
+the load-bearing reason — only the stopping thread knows the `CaptureFilterDisposition`. The sidecar is
+written **only for `Applied`**. A `RawFallback` recording is re-cleaned by the offline pass, which writes
+its own; a `Degraded` recording is a cleaned prefix plus a raw remainder, so the record would describe
+audio the WAV does not contain, and no record is better than a wrong one. Writing it is best-effort and
+logged: a diagnostic sidecar never costs a finished recording. `write_clean_wav`'s cleaned WAV and the
+capture writer's retained WAV are both byte-identical whether or not anyone collects.
 
 ## corti-tap shares the engine, not the app's filter policy
 

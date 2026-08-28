@@ -386,6 +386,9 @@ fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
     let mut paths = vec![
         audio.to_path_buf(),
         corti_capture::clean_wav_path(audio),
+        // The per-block echo record belongs to the recording, not to one pipeline run: it survives
+        // completion so a `--redo` still has audio evidence, and goes when the recording does (#149).
+        corti_capture::aec_stats_path(audio),
         crate::checkpoint::path_for(audio),
         crate::checkpoint::aws_staging_path_for(audio),
     ];

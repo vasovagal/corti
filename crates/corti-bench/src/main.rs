@@ -20,7 +20,9 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use corti_core::{OwningApp, RecordingMeta};
 use corti_transcribe::Transcriber;
-use corti_transcribe::segment::{CleanupConfig, CleanupStats, cleanup};
+use corti_transcribe::segment::{
+    CleanupConfig, CleanupStats, SpanEvidence, cleanup, cleanup_with_evidence,
+};
 use corti_transcribe_local::{LocalConfig, LocalTranscriber};
 
 #[derive(Parser)]
@@ -131,6 +133,10 @@ struct CleanArgs {
     /// Write the cleaned DiarizedTranscript here (always printed to stdout regardless).
     #[arg(long)]
     out: Option<PathBuf>,
+    /// The `<stem>-aec-stats.json` sidecar for the recording this transcript came from, so the echo pass
+    /// can use audio evidence as well as text (#149 phase 3b). Without it the run is text-only.
+    #[arg(long)]
+    aec_stats: Option<PathBuf>,
     #[command(flatten)]
     knobs: CleanupKnobs,
 }
@@ -158,6 +164,11 @@ struct CleanupKnobs {
     /// Non-positive disables the fragment-merge pass.
     #[arg(long)]
     merge_gap_seconds: Option<f64>,
+    /// dB a mic span may exceed the AEC's own echo estimate and still be dropped as echo. Only bites when
+    /// per-block AEC statistics are available; a large negative value (e.g. -1000) switches the audio rule
+    /// off while leaving the text rules alone.
+    #[arg(long)]
+    echo_audio_margin_db: Option<f32>,
 }
 
 impl CleanupKnobs {
@@ -173,22 +184,60 @@ impl CleanupKnobs {
             echo_window_seconds: self.echo_window_seconds.unwrap_or(d.echo_window_seconds),
             echo_containment: self.echo_containment.unwrap_or(d.echo_containment),
             merge_gap_seconds: self.merge_gap_seconds.unwrap_or(d.merge_gap_seconds),
+            echo_audio_margin_db: self.echo_audio_margin_db.unwrap_or(d.echo_audio_margin_db),
         })
     }
 }
 
 /// The effective cleanup config + what it removed, for the stdout envelope. `null` when `--no-cleanup`.
-fn cleanup_json(cfg: &CleanupConfig, stats: &CleanupStats) -> serde_json::Value {
+/// `audio_evidence` says whether the echo pass actually had the canceller's per-block record to work from,
+/// so a sweep can tell "the audio rule found nothing" from "there was nothing to look at".
+fn cleanup_json(
+    cfg: &CleanupConfig,
+    stats: &CleanupStats,
+    audio_evidence: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "echo_drop": cfg.echo_drop,
         "echo_window_seconds": cfg.echo_window_seconds,
         "echo_containment": cfg.echo_containment,
         "merge_gap_seconds": cfg.merge_gap_seconds,
         "drop_backchannels": cfg.drop_backchannels,
+        "echo_audio_margin_db": cfg.echo_audio_margin_db,
+        "audio_evidence": audio_evidence,
         "echo_dropped_me": stats.echo_dropped_me,
         "echo_dropped_them": stats.echo_dropped_them,
+        "echo_dropped_audio": stats.echo_dropped_audio,
         "merged": stats.merged,
         "backchannels_dropped": stats.backchannels_dropped,
+    })
+}
+
+/// Read a `-aec-stats.json` sidecar into the block record the echo pass consumes. A schema mismatch is an
+/// error here, not a shrug: the harness was told explicitly where to look.
+fn load_aec_blocks(path: &std::path::Path) -> Result<Vec<corti_aec::BlockStats>> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let record: corti_capture::AecStatsFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing AEC statistics from {}", path.display()))?;
+    anyhow::ensure!(
+        record.schema_version == corti_capture::AEC_STATS_SCHEMA_VERSION,
+        "{} was written by AEC statistics schema {} (this build reads {})",
+        path.display(),
+        record.schema_version,
+        corti_capture::AEC_STATS_SCHEMA_VERSION
+    );
+    Ok(record.blocks)
+}
+
+/// `corti_aec::SpanStats` in the four-field shape `corti-transcribe` asks for (it does not depend on the
+/// DSP crate). Mirrors `app/src/transcribe.rs::span_evidence`.
+fn span_evidence(blocks: &[corti_aec::BlockStats], start: f64, end: f64) -> Option<SpanEvidence> {
+    let s = corti_aec::span_stats(blocks, start, end)?;
+    Some(SpanEvidence {
+        mic_db: s.mean_mic_db,
+        echo_estimate_db: s.mean_echo_estimate_db,
+        double_talk_fraction: s.double_talk_fraction,
+        blocks: s.blocks,
     })
 }
 
@@ -324,11 +373,23 @@ fn run_process(a: ProcessArgs) -> Result<()> {
 
     // Same call, same order as `app/src/transcribe.rs`: cleanup runs on the merged timeline the backend
     // returned, before anything reads the transcript.
+    // The `--aec` run just wrote the sidecar; feed it straight back in as the echo pass's audio evidence
+    // so `process --cleanup --aec` matches what the app does with a recording it cleaned (#149 phase 3b).
+    let evidence_blocks = match aec_stats.as_deref() {
+        Some(path) => Some(load_aec_blocks(path)?),
+        None => None,
+    };
     let cleanup_report = a.cleanup_knobs.config().map(|cleanup_cfg| {
-        let (segments, stats) =
-            cleanup(std::mem::take(&mut transcript.segments), &cleanup_cfg, &[]);
+        let taken = std::mem::take(&mut transcript.segments);
+        let (segments, stats) = match evidence_blocks.as_deref() {
+            Some(blocks) => {
+                let evidence = |start: f64, end: f64| span_evidence(blocks, start, end);
+                cleanup_with_evidence(taken, &cleanup_cfg, &[], Some(&evidence))
+            }
+            None => cleanup(taken, &cleanup_cfg, &[]),
+        };
         transcript.segments = segments;
-        cleanup_json(&cleanup_cfg, &stats)
+        cleanup_json(&cleanup_cfg, &stats, evidence_blocks.is_some())
     });
 
     if let Some(p) = clean_to_delete {
@@ -374,7 +435,17 @@ fn run_clean(a: CleanArgs) -> Result<()> {
         .knobs
         .config()
         .context("`clean --no-cleanup` would be a no-op; drop the flag")?;
-    let (segments, stats) = cleanup(transcript.segments, &cfg, &[]);
+    let blocks = match a.aec_stats.as_deref() {
+        Some(path) => Some(load_aec_blocks(path)?),
+        None => None,
+    };
+    let (segments, stats) = match blocks.as_deref() {
+        Some(blocks) => {
+            let evidence = |start: f64, end: f64| span_evidence(blocks, start, end);
+            cleanup_with_evidence(transcript.segments, &cfg, &[], Some(&evidence))
+        }
+        None => cleanup(transcript.segments, &cfg, &[]),
+    };
     let cleaned = corti_core::DiarizedTranscript::new(segments);
 
     if let Some(path) = &a.out {
@@ -385,7 +456,8 @@ fn run_clean(a: CleanArgs) -> Result<()> {
         "{}",
         serde_json::to_string(&serde_json::json!({
             "input": a.input.display().to_string(),
-            "cleanup": cleanup_json(&cfg, &stats),
+            "aec_stats": a.aec_stats.as_ref().map(|p| p.display().to_string()),
+            "cleanup": cleanup_json(&cfg, &stats, blocks.is_some()),
             "n_segments_before": before,
             "n_segments": cleaned.segments.len(),
             "transcript": cleaned,

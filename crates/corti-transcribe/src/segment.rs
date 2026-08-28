@@ -214,7 +214,7 @@ fn turn_distance(t: f64, turn: &SpeakerTurn) -> f64 {
 /// Version of the [`cleanup`] rule set, recorded in a note's `corti.configuration.segment_cleanup`
 /// provenance. Bump it whenever a pass's behavior changes, so an old note is never read as if it had
 /// today's rules; the individual thresholds are recorded alongside it and are not part of this number.
-pub const CLEANUP_RULES_VERSION: u32 = 1;
+pub const CLEANUP_RULES_VERSION: u32 = 2;
 
 /// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
 /// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
@@ -232,6 +232,11 @@ pub struct CleanupConfig {
     pub merge_gap_seconds: f64,
     /// Run the backchannel pass ("Yeah." over the other side's speech).
     pub drop_backchannels: bool,
+    /// How far (dB) a mic span's energy may exceed the AEC's echo estimate for that same span and still be
+    /// judged "this was mostly echo". Only consulted when [`cleanup_with_evidence`] is given an
+    /// [`AudioEvidence`] accessor; a very negative value switches the audio rule off without disturbing the
+    /// text rules.
+    pub echo_audio_margin_db: f32,
 }
 
 impl Default for CleanupConfig {
@@ -246,6 +251,10 @@ impl Default for CleanupConfig {
             // it — but short enough that a genuine new utterance after a real pause stays its own row.
             merge_gap_seconds: 2.5,
             drop_backchannels: true,
+            // Real captures top out around 10.6 dB ERLE (#107), so a mic block that is genuinely nothing
+            // but residual echo sits *below* the echo estimate, not above it. +3 dB leaves room for the
+            // estimate being one block stale without admitting a span that carries real near-end speech.
+            echo_audio_margin_db: 3.0,
         }
     }
 }
@@ -272,14 +281,55 @@ pub struct CleanupStats {
     pub merged: usize,
     /// Backchannel segments dropped over the other side's speech.
     pub backchannels_dropped: usize,
+    /// `Me` segments dropped by the **audio** echo rule — the AEC said the mic block was mostly echo — of
+    /// which the text rules would have kept some. A subset of nothing else: these are counted here and not
+    /// in [`echo_dropped_me`](Self::echo_dropped_me), so the two signals stay separable in a sweep.
+    pub echo_dropped_audio: usize,
 }
 
 impl CleanupStats {
     /// Total segments removed or absorbed — zero means the transcript came through untouched.
     pub fn changed(&self) -> usize {
-        self.echo_dropped_me + self.echo_dropped_them + self.merged + self.backchannels_dropped
+        self.echo_dropped_me
+            + self.echo_dropped_them
+            + self.merged
+            + self.backchannels_dropped
+            + self.echo_dropped_audio
     }
 }
+
+/// What the acoustic echo canceller measured over one span of the **cleaned** mic timeline — the same
+/// timeline a [`TranscriptSegment`]'s `start`/`end` are on.
+///
+/// This crate deliberately does **not** depend on `corti-aec`: transcription must not pull in a DSP crate,
+/// and the AWS backend has no canceller at all. The caller (the app's live loop, or the batch path reading
+/// a `-aec-stats.json` sidecar) folds `corti_aec::SpanStats` into this four-field summary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanEvidence {
+    /// Mean block mic energy over the span, in dB.
+    pub mic_db: f32,
+    /// Mean block energy of the echo estimate the canceller subtracted over the span, in dB.
+    pub echo_estimate_db: f32,
+    /// Fraction of the span's blocks in which the adaptation gate fired (the canceller judged the near end
+    /// to dominate and froze its filter update).
+    pub double_talk_fraction: f32,
+    /// How many canceller blocks the span covers. Zero means "no measurement", which is not the same as
+    /// "measured silence" — see [`cleanup_with_evidence`].
+    pub blocks: usize,
+}
+
+/// Accessor handed to [`cleanup_with_evidence`]: given `(start, end)` in seconds on the transcript
+/// timeline, the canceller's summary for that span, or `None` where nothing was recorded.
+pub type AudioEvidence<'a> = &'a dyn Fn(f64, f64) -> Option<SpanEvidence>;
+
+/// A span whose adaptation gate fired in at least this fraction of its blocks is not evidence of anything:
+/// the canceller froze its filter update because it judged the near end to dominate, so its echo estimate
+/// is stale for most of the span, and the comparison the audio rule makes is against a number that stopped
+/// tracking the room. Such a span falls through to the text rules.
+///
+/// This is not merely a numerical scruple: "the gate fired" is the canceller's own statement that it heard
+/// near-end speech, which is precisely the case in which a `Me` segment must be kept.
+const AUDIO_DOUBLE_TALK_LIMIT: f32 = 0.5;
 
 /// Clean one **time-sorted** timeline (the output of [`merge_by_time`]) in three passes, in this order:
 /// echo → merge → backchannel. The order matters: dropping an echo first stops it from being merged into a
@@ -297,10 +347,38 @@ pub fn cleanup(
     cfg: &CleanupConfig,
     carry: &[TranscriptSegment],
 ) -> (Vec<TranscriptSegment>, CleanupStats) {
+    cleanup_with_evidence(segments, cfg, carry, None)
+}
+
+/// [`cleanup`] with the acoustic canceller's per-block record available to the echo pass.
+///
+/// Text alone cannot separate two populations that look identical: a `Me` row that is residual speaker
+/// bleed, and a `Me` row where both people genuinely used the same nouns. `evidence` answers the question
+/// text cannot — *was this mic span mostly echo?* — so the echo pass can drop a ghost whose wording is
+/// nowhere near the containment threshold.
+///
+/// The audio rule runs **inside the echo pass, before the text rules**, and only on `Me` segments. A
+/// segment is dropped when all of these hold:
+///
+/// 1. it overlaps a far-end segment (`S.start < O.end && O.start < S.end`) — the far end had the floor;
+/// 2. `evidence(S.start, S.end)` returns a span covering at least one block;
+/// 3. that span's adaptation gate fired in fewer than [`AUDIO_DOUBLE_TALK_LIMIT`] of its blocks;
+/// 4. `mic_db − echo_estimate_db ≤ echo_audio_margin_db` — the mic carried little more than what the
+///    canceller was already subtracting as echo.
+///
+/// A span with **no blocks** falls through to the text rules unchanged. That is the AWS backend (no
+/// canceller), a sidecar that does not cover this recording, and a stats ring that overflowed: in all
+/// three, absence of evidence is not evidence of speech.
+pub fn cleanup_with_evidence(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+) -> (Vec<TranscriptSegment>, CleanupStats) {
     let mut stats = CleanupStats::default();
     let mut segments = segments;
     if cfg.echo_drop {
-        segments = drop_echoes(segments, cfg, carry, &mut stats);
+        segments = drop_echoes(segments, cfg, carry, evidence, &mut stats);
     }
     if cfg.merge_gap_seconds > 0.0 {
         segments = merge_fragments(segments, cfg, &mut stats);
@@ -498,11 +576,17 @@ impl EchoCandidate {
     }
 }
 
-/// Drop each segment that repeats what the other channel already said, inside the echo window.
+/// Drop each segment that repeats what the other channel already said, inside the echo window. The text
+/// rule itself lives on [`EchoCandidate::is_echo_of`], shared with the live early-drop path (#149 phase 2).
+///
+/// When `evidence` is available the **audio** rule is tried first, on `Me` segments only: a mic span the
+/// canceller measured as carrying no more than `echo_audio_margin_db` above its own echo estimate is a
+/// ghost whatever its wording. See [`cleanup_with_evidence`] for the full predicate.
 fn drop_echoes(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
     carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
     stats: &mut CleanupStats,
 ) -> Vec<TranscriptSegment> {
     let carry_sources: Vec<EchoCandidate> = carry.iter().map(EchoCandidate::from_segment).collect();
@@ -511,6 +595,17 @@ fn drop_echoes(
 
     for (i, segment) in segments.iter().enumerate() {
         let subject = &current[i];
+        // The audio rule needs no tokens at all — a ghost is often one garbled word — so it runs before
+        // the text rules, which have nothing to say about a region whose wording matches nothing.
+        if let Some(evidence) = evidence
+            && subject.me
+            && overlaps_far_end(subject.start, subject.end, &current, &carry_sources)
+            && is_mostly_echo(evidence(subject.start, subject.end), cfg)
+        {
+            kept[i] = false;
+            stats.echo_dropped_audio += 1;
+            continue;
+        }
         // Sources are the previous window's kept segments plus every earlier segment this pass has kept —
         // an already-dropped copy is never allowed to kill the utterance it copied.
         let dropped = carry_sources.iter().any(|o| subject.is_echo_of(o, cfg))
@@ -531,6 +626,42 @@ fn drop_echoes(
     let mut out = segments;
     out.retain(|_| kept.next().unwrap_or(true));
     out
+}
+
+/// Whether `[start, end]` overlaps any far-end span on this timeline, current window or carried over. The
+/// audio rule only fires while the far end had the floor: without that clause a quiet mic passage with no
+/// echo at all (both energies near the floor, their difference small) would look exactly like a ghost.
+///
+/// Kept/dropped status is deliberately ignored. "The far end was speaking then" is a fact about the
+/// timeline, and half the segments here have not been decided yet at this point in the pass.
+fn overlaps_far_end(
+    start: f64,
+    end: f64,
+    current: &[EchoCandidate],
+    carry: &[EchoCandidate],
+) -> bool {
+    current
+        .iter()
+        .chain(carry)
+        .any(|o| !o.me && start < o.end && o.start < end)
+}
+
+/// The audio verdict for one span: `Some(evidence)` covering at least one block, whose gate stayed mostly
+/// quiet, and whose mic energy is within `echo_audio_margin_db` of the echo the canceller subtracted.
+/// Every other case — no evidence, no blocks, a gate that fired for most of the span, a mic well above the
+/// estimate — is `false`, and the segment goes on to the text rules.
+fn is_mostly_echo(evidence: Option<SpanEvidence>, cfg: &CleanupConfig) -> bool {
+    let Some(e) = evidence else {
+        return false;
+    };
+    // Spelled out rather than negated: `!(a < b)` trips `neg_cmp_op_on_partial_ord`, and a NaN fraction
+    // must fail the guard rather than pass it.
+    let gate_stayed_quiet = e.double_talk_fraction < AUDIO_DOUBLE_TALK_LIMIT;
+    if e.blocks == 0 || !gate_stayed_quiet {
+        return false;
+    }
+    let excess = e.mic_db - e.echo_estimate_db;
+    excess.is_finite() && excess <= cfg.echo_audio_margin_db
 }
 
 /// Join consecutive same-speaker segments separated by at most `merge_gap_seconds` **when the other channel
@@ -1013,6 +1144,7 @@ mod tests {
                 echo_dropped_them: 1,
                 merged: 1,
                 backchannels_dropped: 1,
+                echo_dropped_audio: 0,
             }
         );
         assert_eq!(
@@ -1164,5 +1296,213 @@ mod tests {
         });
         let answer = EchoCandidate::from_words(true, &[word(12.4, 13.0, "Frankfurt.")]);
         assert!(!answer.is_echo_of(&source, &cfg));
+    }
+
+    // ---- audio evidence (#149 phase 3b) --------------------------------------------------------------
+
+    /// A canned canceller reading for every span: `blocks` non-zero and the mic sitting `excess` dB above
+    /// the echo estimate.
+    fn evidence_of(
+        blocks: usize,
+        excess: f32,
+        double_talk_fraction: f32,
+    ) -> impl Fn(f64, f64) -> Option<SpanEvidence> {
+        move |_start, _end| {
+            Some(SpanEvidence {
+                mic_db: -30.0 + excess,
+                echo_estimate_db: -30.0,
+                double_talk_fraction,
+                blocks,
+            })
+        }
+    }
+
+    #[test]
+    fn audio_evidence_drops_a_ghost_the_text_rule_would_keep() {
+        // Nothing in common with the far-end turn: containment is 0, so the text rules keep this row.
+        let segments = vec![
+            them(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(12.0, 12.6, "Gateway harness."),
+        ];
+        let (kept, kept_stats) = cleanup(segments.clone(), &echo_only(), &[]);
+        assert_eq!(kept.len(), 2, "the text rules alone keep the ghost");
+        assert_eq!(kept_stats.echo_dropped_audio, 0);
+
+        let quiet_mic = evidence_of(4, 1.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&quiet_mic));
+        assert_eq!(
+            texts(&out),
+            vec!["The calibration jig arrives from Toronto on Tuesday."]
+        );
+        assert_eq!(stats.echo_dropped_audio, 1);
+        // The audio drop is counted on its own, never folded into the text counters.
+        assert_eq!(stats.echo_dropped_me, 0);
+        assert_eq!(stats.changed(), 1);
+    }
+
+    #[test]
+    fn audio_rule_keeps_a_mic_span_louder_than_the_echo_estimate() {
+        let segments = vec![
+            them(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(12.0, 12.6, "Gateway harness."),
+        ];
+        // 9 dB above the estimate is real near-end speech riding on top of the residual echo.
+        let loud_mic = evidence_of(4, 9.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&loud_mic));
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_audio, 0);
+    }
+
+    #[test]
+    fn a_span_with_no_blocks_falls_through_to_the_text_rules() {
+        let segments = vec![
+            them(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(12.0, 12.6, "Gateway harness."),
+            me(21.0, 22.0, "Calibration jig from Toronto."),
+        ];
+        // AWS, or a recording with no sidecar: the accessor answers, but with nothing measured.
+        let empty = evidence_of(0, -40.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments.clone(), &echo_only(), &[], Some(&empty));
+        assert_eq!(stats.echo_dropped_audio, 0);
+        // The text echo rule still fires on the row that repeats the far end.
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(
+            texts(&out),
+            vec![
+                "The calibration jig arrives from Toronto on Tuesday.",
+                "Gateway harness.",
+            ]
+        );
+
+        // An accessor that returns None for the span is the same story.
+        let absent = |_s: f64, _e: f64| None;
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&absent));
+        assert_eq!(stats.echo_dropped_audio, 0);
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn audio_rule_needs_far_end_speech_under_the_mic_span() {
+        // A quiet mic passage with no far end talking is not a ghost — both energies just sit near the
+        // floor, and their difference is small for the uninteresting reason.
+        let segments = vec![
+            them(
+                0.0,
+                5.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(30.0, 31.0, "Gateway harness."),
+        ];
+        let quiet_mic = evidence_of(6, 0.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&quiet_mic));
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_audio, 0);
+    }
+
+    #[test]
+    fn a_far_end_span_carried_from_the_previous_window_still_grounds_the_audio_rule() {
+        let carry = vec![them(50.0, 62.0, "The calibration jig arrives on Tuesday.")];
+        let segments = vec![me(60.5, 61.0, "Gateway harness.")];
+        let quiet_mic = evidence_of(3, 1.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &carry, Some(&quiet_mic));
+        assert!(out.is_empty());
+        assert_eq!(stats.echo_dropped_audio, 1);
+    }
+
+    #[test]
+    fn a_span_the_gate_froze_is_not_evidence() {
+        let segments = vec![
+            them(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(12.0, 12.6, "Gateway harness."),
+        ];
+        // The adaptation gate fired for most of the span: the canceller itself says the near end
+        // dominated, and its echo estimate stopped adapting. Keep the row.
+        let frozen = evidence_of(4, 0.0, 0.75);
+        let (out, stats) =
+            cleanup_with_evidence(segments.clone(), &echo_only(), &[], Some(&frozen));
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_audio, 0);
+
+        // Exactly at the limit is still a freeze.
+        let borderline = evidence_of(4, 0.0, AUDIO_DOUBLE_TALK_LIMIT);
+        let (out, _) =
+            cleanup_with_evidence(segments.clone(), &echo_only(), &[], Some(&borderline));
+        assert_eq!(out.len(), 2);
+
+        // Just under it is not.
+        let mostly_quiet = evidence_of(4, 0.0, 0.49);
+        let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&mostly_quiet));
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.echo_dropped_audio, 1);
+    }
+
+    #[test]
+    fn the_audio_rule_never_fires_on_a_far_end_segment() {
+        // The short row sits inside the other channel's turn and its span reads as pure echo — but it is
+        // the far-end track, which the canceller never measured. Only `Me` is the mic.
+        let segments = vec![
+            me(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            them(12.0, 12.6, "Gateway harness."),
+        ];
+        let echo_only_in_the_short_span = |start: f64, end: f64| {
+            let mostly_echo = start >= 11.0 && end <= 13.0;
+            Some(SpanEvidence {
+                mic_db: if mostly_echo { -30.0 } else { -6.0 },
+                echo_estimate_db: -30.0,
+                double_talk_fraction: 0.0,
+                blocks: 4,
+            })
+        };
+        let (out, stats) = cleanup_with_evidence(
+            segments,
+            &echo_only(),
+            &[],
+            Some(&echo_only_in_the_short_span),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_audio, 0);
+    }
+
+    #[test]
+    fn a_very_negative_margin_switches_the_audio_rule_off_without_touching_the_text_rules() {
+        let segments = vec![
+            them(
+                10.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            me(12.0, 12.6, "Gateway harness."),
+            me(21.0, 22.0, "Calibration jig from Toronto."),
+        ];
+        let cfg = CleanupConfig {
+            echo_audio_margin_db: -1000.0,
+            ..echo_only()
+        };
+        let quiet_mic = evidence_of(4, 0.0, 0.0);
+        let (out, stats) = cleanup_with_evidence(segments, &cfg, &[], Some(&quiet_mic));
+        assert_eq!(stats.echo_dropped_audio, 0);
+        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(out.len(), 2);
     }
 }

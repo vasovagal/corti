@@ -12,7 +12,7 @@ use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
-use corti_transcribe::segment::{CleanupConfig, cleanup};
+use corti_transcribe::segment::{CleanupConfig, SpanEvidence, cleanup, cleanup_with_evidence};
 
 use crate::config::{AppConfig, BackendChoice};
 
@@ -55,6 +55,22 @@ impl Backend {
         Self { cfg, kind }
     }
 
+    /// Whether this backend's transcript timestamps may be compared against a `-aec-stats.json` sidecar.
+    ///
+    /// Only the local backend. AWS stays text-only by decision (#149 phase 3b): its jobs are the path where
+    /// corti is least certain the audio it timestamped is the audio corti's own canceller produced, and the
+    /// upside is nil — the shipping default is local, and a wrong answer here silently deletes transcript
+    /// rows. A build with neither backend compiled in answers `false` and never gets that far anyway.
+    pub fn audio_evidence_supported(&self) -> bool {
+        match &self.kind {
+            #[cfg(feature = "aws")]
+            BackendKind::Aws(_) => false,
+            #[cfg(feature = "local")]
+            BackendKind::Local => true,
+            BackendKind::Unavailable(_) => false,
+        }
+    }
+
     /// The deterministic segment-cleanup rules this backend's config snapshot selects. Taken from the
     /// same immutable `AppConfig` the backend was built with, so a Settings edit mid-job cannot change the
     /// rules half-way through a transcript.
@@ -63,12 +79,15 @@ impl Backend {
     }
 
     /// Provenance with the recording's durable AEC execution record rather than current Settings.
+    /// `audio_evidence` is the runtime answer from [`transcribe_recording`]: whether the segment cleanup
+    /// actually had per-block AEC statistics for this recording.
     pub fn provenance_with_aec(
         &self,
         mode: corti_vagus::provenance::GenerationMode,
         aec: crate::provenance::AecExecution<'_>,
+        audio_evidence: bool,
     ) -> corti_vagus::provenance::TranscriptProvenance {
-        crate::provenance::from_config_with_aec(&self.cfg, mode, aec)
+        crate::provenance::from_config_with_aec(&self.cfg, mode, aec, audio_evidence)
     }
 
     /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
@@ -294,11 +313,73 @@ pub fn recording_aec_plan(
     }
 }
 
+/// Fold the AEC's per-block record over `[start, end]` into the four numbers the segment cleanup asks for
+/// (#149 phase 3b). `corti-transcribe` deliberately does not depend on `corti-aec`, so the adaptation
+/// happens here, in the one crate that already links both.
+///
+/// `blocks` must be sorted by `t_start_secs`, which every producer of them is: the ring drains in order and
+/// the sidecar is written in drain order.
+pub fn span_evidence(
+    blocks: &[corti_aec::BlockStats],
+    start: f64,
+    end: f64,
+) -> Option<SpanEvidence> {
+    let s = corti_aec::span_stats(blocks, start, end)?;
+    Some(SpanEvidence {
+        mic_db: s.mean_mic_db,
+        echo_estimate_db: s.mean_echo_estimate_db,
+        double_talk_fraction: s.double_talk_fraction,
+        blocks: s.blocks,
+    })
+}
+
+/// Read the `-aec-stats.json` sidecar written beside a recording, if there is one.
+///
+/// Absent is the ordinary case, not an error: the AWS backend has no canceller, foreign audio never had
+/// one, and a capture whose AEC was disabled wrote no sidecar. A *corrupt* or wrong-schema sidecar is
+/// logged and treated as absent — the cleanup falls back to its text rules rather than failing a
+/// transcription over a diagnostic file.
+fn load_aec_block_stats(path: &Path) -> Option<Vec<corti_aec::BlockStats>> {
+    let bytes = std::fs::read(path).ok()?;
+    match serde_json::from_slice::<corti_capture::AecStatsFile>(&bytes) {
+        Ok(record) if record.schema_version == corti_capture::AEC_STATS_SCHEMA_VERSION => {
+            info!(
+                target: "corti::transcribe",
+                path = %path.display(),
+                blocks = record.blocks.len(),
+                dropped = record.stats_dropped,
+                delay_samples = record.delay_samples as u64,
+                "AEC block statistics available as cleanup evidence"
+            );
+            Some(record.blocks)
+        }
+        Ok(record) => {
+            warn!(
+                target: "corti::transcribe",
+                path = %path.display(),
+                schema_version = record.schema_version,
+                "ignoring an AEC statistics sidecar written by a different schema"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                target: "corti::transcribe",
+                path = %path.display(),
+                error = %e,
+                "ignoring an unreadable AEC statistics sidecar"
+            );
+            None
+        }
+    }
+}
+
 /// Optionally run the file-to-file AEC pass, then transcribe with the runtime-selected `backend`. This is
 /// the tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
 /// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
-/// input) for logging. Persisting any transcript sidecar is a caller's concern, not this primitive's.
+/// input) for logging, and whether the cleanup had per-block AEC statistics to work from. Persisting any
+/// transcript sidecar is a caller's concern, not this primitive's.
 ///
 /// `aec` is `Some` for foreign audio, marker-less legacy rows, or a positively identified wholly-raw
 /// writer fallback. Applied/degraded/disabled captures pass `None` to avoid changing their retained audio.
@@ -310,15 +391,19 @@ pub fn transcribe_recording(
     attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
-) -> Result<(DiarizedTranscript, PathBuf, OfflineAecOutcome)> {
+) -> Result<(DiarizedTranscript, PathBuf, OfflineAecOutcome, bool)> {
     // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
     let (input, aec_outcome): (PathBuf, OfflineAecOutcome) = if let Some(aec) = aec {
-        match corti_capture::write_clean_wav_with_lookahead(
+        // Ask for the per-block record while we are running the filter anyway: it is the only chance this
+        // path gets, and it is what lets the echo pass tell a residual-bleed row from a coincidence
+        // (#149 phase 3b). The cleaned WAV is byte-identical either way.
+        match corti_capture::write_clean_wav_with_options(
             raw_audio,
             &aec.config,
             aec.lookahead_seconds,
+            corti_capture::AecStatsSidecar::Write,
         ) {
             Ok(Some(clean)) => {
                 info!(
@@ -363,26 +448,44 @@ pub fn transcribe_recording(
     // Deterministic segment cleanup (#149) on the merged timeline the backend returned — the one place
     // where the two channels can see each other. This covers local, AWS and `corti --input`, and runs
     // before the transcript reaches the checkpoint, the note, or the LLM tier.
+    //
+    // The `-aec-stats.json` sidecar always sits beside the **raw** recording (`write_clean_wav*` names it
+    // from its input), whether it was written by the pass above or by the capture writer, so one lookup
+    // covers both. Its block times are on the cleaned timeline, which is the timeline the backend just
+    // timestamped — one emitted sample per input sample, lookahead already subtracted.
+    let blocks = backend
+        .audio_evidence_supported()
+        .then(|| load_aec_block_stats(&corti_capture::aec_stats_path(raw_audio)))
+        .flatten();
+    let audio_evidence = blocks.is_some();
     let cleanup_cfg = backend.cleanup_config();
     if !cleanup_cfg.is_noop() {
         let segments_in = transcript.segments.len();
-        let (segments, stats) =
-            cleanup(std::mem::take(&mut transcript.segments), &cleanup_cfg, &[]);
+        let segments_taken = std::mem::take(&mut transcript.segments);
+        let (segments, stats) = match blocks.as_deref() {
+            Some(blocks) => {
+                let evidence = |start: f64, end: f64| span_evidence(blocks, start, end);
+                cleanup_with_evidence(segments_taken, &cleanup_cfg, &[], Some(&evidence))
+            }
+            None => cleanup(segments_taken, &cleanup_cfg, &[]),
+        };
         transcript.segments = segments;
         info!(
             target: "corti::transcribe",
             job_id = %attempt.id,
             segments_in,
             segments_out = transcript.segments.len(),
+            audio_evidence,
             echo_dropped_me = stats.echo_dropped_me,
             echo_dropped_them = stats.echo_dropped_them,
+            echo_dropped_audio = stats.echo_dropped_audio,
             merged = stats.merged,
             backchannels_dropped = stats.backchannels_dropped,
             "segment cleanup applied"
         );
     }
 
-    Ok((transcript, input, aec_outcome))
+    Ok((transcript, input, aec_outcome, audio_evidence))
 }
 
 /// Whether an env var is set and non-empty (after trim) — the conventional "this is configured" test, and
@@ -514,5 +617,79 @@ mod tests {
         );
         let newer = json.replace("\"schema_version\":1", "\"schema_version\":999");
         assert!(decode_capture_processing(Some(&newer)).is_err());
+    }
+
+    fn block(
+        t_start_secs: f64,
+        mic_energy: f32,
+        echo_estimate_energy: f32,
+    ) -> corti_aec::BlockStats {
+        corti_aec::BlockStats {
+            t_start_secs,
+            mic_energy,
+            far_energy: 1.0,
+            echo_estimate_energy,
+            error_energy: mic_energy,
+            double_talk: false,
+            suppressed: true,
+        }
+    }
+
+    fn stats_file(blocks: Vec<corti_aec::BlockStats>) -> corti_capture::AecStatsFile {
+        corti_capture::AecStatsFile {
+            schema_version: corti_capture::AEC_STATS_SCHEMA_VERSION,
+            source: "recording.wav".into(),
+            sample_rate: 48_000,
+            frames: 48_000,
+            lookahead_seconds: 7.0,
+            config: corti_aec::AecConfig::default(),
+            delay_samples: 128,
+            delay_ms: 2.67,
+            block_hop_samples: 8_192,
+            block_hop_secs: 8_192.0 / 48_000.0,
+            stats_dropped: 0,
+            blocks,
+        }
+    }
+
+    /// The sidecar is read when it is there, ignored when it is not, and never fails a transcription:
+    /// missing, corrupt and future-schema files all mean "text rules only".
+    #[test]
+    fn aec_statistics_sidecar_loads_when_present_and_is_skipped_otherwise() {
+        let dir = std::env::temp_dir().join(format!("corti-aec-stats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("recording.wav");
+        let path = corti_capture::aec_stats_path(&raw);
+        assert_eq!(path, dir.join("recording-aec-stats.json"));
+
+        let _ = std::fs::remove_file(&path);
+        assert!(load_aec_block_stats(&path).is_none(), "absent ⇒ text-only");
+
+        let record = stats_file(vec![block(0.0, 4.0, 1.0), block(0.2, 1.0, 1.0)]);
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let blocks = load_aec_block_stats(&path).expect("a well-formed sidecar loads");
+        assert_eq!(blocks.len(), 2);
+
+        // The dB math the cleanup sees: 4:1 in energy is ~6 dB above the estimate, 1:1 is 0 dB.
+        let loud = span_evidence(&blocks, 0.0, 0.1).unwrap();
+        assert_eq!(loud.blocks, 1);
+        assert!((loud.mic_db - loud.echo_estimate_db - 6.02).abs() < 0.05);
+        assert_eq!(loud.double_talk_fraction, 0.0);
+        let quiet = span_evidence(&blocks, 0.2, 0.3).unwrap();
+        assert!((quiet.mic_db - quiet.echo_estimate_db).abs() < 1e-3);
+        // Before the first block there is nothing to say.
+        assert!(span_evidence(&blocks, -5.0, -1.0).is_none());
+
+        let mut future = record.clone();
+        future.schema_version = corti_capture::AEC_STATS_SCHEMA_VERSION + 1;
+        std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(
+            load_aec_block_stats(&path).is_none(),
+            "a schema this build does not know is not evidence"
+        );
+
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_aec_block_stats(&path).is_none(), "corrupt ⇒ text-only");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

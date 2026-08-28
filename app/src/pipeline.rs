@@ -1324,7 +1324,7 @@ pub(crate) fn transcribe_and_file(
     ctx.stats
         .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
     let transcribe_secs = t0.elapsed().as_secs_f64();
-    let (raw_transcript, _transcribed_input, aec_outcome) =
+    let (raw_transcript, _transcribed_input, aec_outcome, cleanup_audio_evidence) =
         transcribed.context("transcription failed")?;
 
     // Hosted final runs strictly after ASR and before the first post-ASR checkpoint. It owns no audio and
@@ -1388,6 +1388,7 @@ pub(crate) fn transcribe_and_file(
     checkpoint.set_provenance(ctx.backend.provenance_with_aec(
         corti_vagus::provenance::GenerationMode::Batch,
         aec_execution,
+        cleanup_audio_evidence,
     ));
     checkpoint
         .set_applied_postprocess(settled.applied_postprocess)

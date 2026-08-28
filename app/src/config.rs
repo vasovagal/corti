@@ -39,6 +39,11 @@ pub struct CleanupSettings {
     pub merge_gap_seconds: f64,
     /// Drop a bare "Yeah." spoken over the other side (`CORTI_CLEANUP_DROP_BACKCHANNELS`).
     pub drop_backchannels: bool,
+    /// How far (dB) a mic span may exceed the AEC's own echo estimate and still be dropped as echo by the
+    /// audio rule (`CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB`; a very negative value switches that rule off).
+    /// Only consulted where per-block AEC statistics exist — live with AEC on, or a batch recording with
+    /// an `-aec-stats.json` sidecar.
+    pub echo_audio_margin_db: f32,
 }
 
 impl Default for CleanupSettings {
@@ -50,6 +55,7 @@ impl Default for CleanupSettings {
             echo_containment: d.echo_containment,
             merge_gap_seconds: d.merge_gap_seconds,
             drop_backchannels: d.drop_backchannels,
+            echo_audio_margin_db: d.echo_audio_margin_db,
         }
     }
 }
@@ -241,6 +247,13 @@ impl AppConfig {
             echo_containment: finite_or(c.echo_containment, d.echo_containment).clamp(0.0, 1.0),
             merge_gap_seconds: finite_or(c.merge_gap_seconds, d.merge_gap_seconds),
             drop_backchannels: c.drop_backchannels,
+            // A large negative margin is not nonsense — it is how the audio rule is switched off — so only
+            // a non-finite value falls back to the shipping default.
+            echo_audio_margin_db: if c.echo_audio_margin_db.is_finite() {
+                c.echo_audio_margin_db
+            } else {
+                d.echo_audio_margin_db
+            },
         }
     }
 }
@@ -342,6 +355,9 @@ impl AppConfig {
         }
         if let Some(v) = env_f64("CORTI_CLEANUP_MERGE_GAP_SECONDS") {
             cfg.cleanup.merge_gap_seconds = v;
+        }
+        if let Some(v) = env_f64("CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB").filter(|v| v.is_finite()) {
+            cfg.cleanup.echo_audio_margin_db = v as f32;
         }
         if env_non_empty("CORTI_CLEANUP_DROP_BACKCHANNELS").is_some() {
             cfg.cleanup.drop_backchannels = env_bool(
@@ -569,6 +585,7 @@ mod tests {
             "CORTI_CLEANUP_ECHO_CONTAINMENT",
             "CORTI_CLEANUP_MERGE_GAP_SECONDS",
             "CORTI_CLEANUP_DROP_BACKCHANNELS",
+            "CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
             unsafe { std::env::remove_var(k) };
@@ -612,6 +629,7 @@ mod tests {
                 echo_containment: 0.85,
                 merge_gap_seconds: 1.25,
                 drop_backchannels: false,
+                echo_audio_margin_db: 1.5,
             },
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
@@ -754,6 +772,7 @@ mod tests {
             ("CORTI_CLEANUP_ECHO_CONTAINMENT", "0.85"),
             ("CORTI_CLEANUP_MERGE_GAP_SECONDS", "0"),
             ("CORTI_CLEANUP_DROP_BACKCHANNELS", "0"),
+            ("CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB", "-12.5"),
         ] {
             // SAFETY: still under ENV_LOCK.
             unsafe { std::env::set_var(key, value) };
@@ -767,6 +786,7 @@ mod tests {
                 echo_containment: 0.85,
                 merge_gap_seconds: 0.0,
                 drop_backchannels: false,
+                echo_audio_margin_db: -12.5,
             }
         );
         assert!(cfg.is_noop(), "every pass off ⇒ the whole stage is off");

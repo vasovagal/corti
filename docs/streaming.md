@@ -137,7 +137,16 @@ segments whose end is still inside `echo_window_seconds`, kept as **read-only ec
 appended a second time. So the echo lookback crosses the append boundary and the fragment merge deliberately
 does not — a row that is already synced is never rewritten (ADR 0012), which costs at most one merge per
 minute. Carry is refreshed after every successful append and is bounded by one window's segment count, so
-the fixed-high-water-mark memory contract is unchanged. After success all window
+the fixed-high-water-mark memory contract is unchanged.
+
+The live canceller is the one place in corti where the cleanup gets **audio evidence** as well as text
+(#149 phase 3b). `consume_chunks` drains `StreamingAec::block_stats()` after every push into
+`TranscriptWindow.aec_blocks`, trimmed at each flush to the window plus `echo_window_seconds` of lookback
+and hard-capped at `MAX_WINDOW_AEC_BLOCKS`; `flush_window` builds the `SpanEvidence` accessor over it, so a
+`Me` row whose mic span the filter measured as little more than the echo it was already subtracting is
+dropped whatever its wording. `finish_session` switches to `finish_with_stats()` so the tail blocks reach
+the last window, and logs the locked delay and `stats_dropped` under `corti::live`. With AEC off there are
+no blocks and the echo pass falls back to its text rules. After success all window
 lengths return to zero and their allocations are reused: memory reaches a fixed high-water mark instead of
 following call duration. The detector delivers an ID-specific finish/discard verdict before its downstream
 event; any tee drop quality-gates the result into lossless same-note fallback. Filing semantics are in

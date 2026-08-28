@@ -34,6 +34,10 @@ pub(crate) enum AecExecution<'a> {
 /// Describe the final transcript generated under `cfg`. Callers must pass the same immutable snapshot the
 /// backend/live engine owns, never re-read shared Settings at filing time.
 #[cfg_attr(not(feature = "local"), allow(dead_code))]
+/// Describe the final transcript generated under `cfg`, deriving the audio-evidence flag from the mode:
+/// only the live engine runs its own canceller alongside the transcriber, so only live can hand the
+/// cleanup a `SpanEvidence` accessor without being told. Batch callers know per-recording whether a
+/// `-aec-stats.json` sidecar was found and use [`from_config_with_aec`] directly.
 pub(crate) fn from_config(cfg: &AppConfig, mode: GenerationMode) -> TranscriptProvenance {
     let effective = cfg.aec_config();
     let aec = if mode == GenerationMode::Live {
@@ -48,22 +52,33 @@ pub(crate) fn from_config(cfg: &AppConfig, mode: GenerationMode) -> TranscriptPr
     } else {
         AecExecution::Disabled
     };
-    from_config_with_aec(cfg, mode, aec)
+    let audio_evidence = mode == GenerationMode::Live && cfg.aec_enabled;
+    from_config_with_aec(cfg, mode, aec, audio_evidence)
 }
 
+/// `audio_evidence` records whether the segment cleanup actually had the canceller's per-block statistics
+/// for this transcript (#149 phase 3b). It is a runtime fact, not a setting: the same config yields `false`
+/// for an AWS job, for a recording with no `-aec-stats.json` sidecar, and for a capture whose AEC was
+/// disabled.
 pub(crate) fn from_config_with_aec(
     cfg: &AppConfig,
     mode: GenerationMode,
     aec: AecExecution<'_>,
+    audio_evidence: bool,
 ) -> TranscriptProvenance {
     match cfg.transcribe_backend {
-        BackendChoice::Aws => aws(cfg, mode, aec),
-        BackendChoice::Local => local(cfg, mode, aec),
+        BackendChoice::Aws => aws(cfg, mode, aec, audio_evidence),
+        BackendChoice::Local => local(cfg, mode, aec, audio_evidence),
     }
 }
 
-fn aws(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
-    let mut configuration = base_configuration(cfg, mode, aec);
+fn aws(
+    cfg: &AppConfig,
+    mode: GenerationMode,
+    aec: AecExecution<'_>,
+    audio_evidence: bool,
+) -> TranscriptProvenance {
+    let mut configuration = base_configuration(cfg, mode, aec, audio_evidence);
     configuration.insert("language".into(), Value::String(cfg.language.clone()));
     configuration.insert(
         "speaker_attribution".into(),
@@ -84,7 +99,12 @@ fn aws(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> Transcri
 }
 
 #[cfg(feature = "local")]
-fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
+fn local(
+    cfg: &AppConfig,
+    mode: GenerationMode,
+    aec: AecExecution<'_>,
+    audio_evidence: bool,
+) -> TranscriptProvenance {
     use corti_transcribe_local::{LocalConfig, models};
 
     let defaults = LocalConfig::default();
@@ -100,7 +120,7 @@ fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> Transc
     };
     let selected_embedding = models::embedding_spec(&cfg.local_embedding_model);
 
-    let mut configuration = base_configuration(cfg, mode, aec);
+    let mut configuration = base_configuration(cfg, mode, aec, audio_evidence);
     configuration.insert(
         "asr_engine".into(),
         Value::String(cfg.local_asr_engine.clone()),
@@ -152,12 +172,17 @@ fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> Transc
 }
 
 #[cfg(not(feature = "local"))]
-fn local(cfg: &AppConfig, mode: GenerationMode, aec: AecExecution<'_>) -> TranscriptProvenance {
+fn local(
+    cfg: &AppConfig,
+    mode: GenerationMode,
+    aec: AecExecution<'_>,
+    audio_evidence: bool,
+) -> TranscriptProvenance {
     // This can only be observed if a build without the local backend somehow files a successful local
     // transcript. Keep it truthful rather than borrowing AWS/current settings.
     let mut provenance = TranscriptProvenance::legacy_unknown(mode);
     provenance.backend = "local-unavailable".into();
-    provenance.configuration = base_configuration(cfg, mode, aec);
+    provenance.configuration = base_configuration(cfg, mode, aec, audio_evidence);
     provenance
 }
 
@@ -165,6 +190,7 @@ fn base_configuration(
     cfg: &AppConfig,
     mode: GenerationMode,
     execution: AecExecution<'_>,
+    audio_evidence: bool,
 ) -> BTreeMap<String, Value> {
     let current = cfg.aec_config();
     let (enabled, aec_mode, outcome, effective, lookahead_seconds) = match execution {
@@ -293,7 +319,11 @@ fn base_configuration(
     configuration.insert("aec".into(), Value::Object(aec));
     configuration.insert(
         "segment_cleanup".into(),
-        segment_cleanup(&cfg.cleanup_config(), mode == GenerationMode::Live),
+        segment_cleanup(
+            &cfg.cleanup_config(),
+            mode == GenerationMode::Live,
+            audio_evidence,
+        ),
     );
     configuration.insert(
         "input".into(),
@@ -319,7 +349,7 @@ fn base_configuration(
 /// when no pass would run. Recorded so a note is self-describing: a row that looks like it is missing an
 /// echo, a fragment or a "Yeah." can be explained from the note itself. `live` additionally records whether
 /// the live path's early drop was running (#149 phase 2).
-fn segment_cleanup(cleanup: &CleanupConfig, live: bool) -> Value {
+fn segment_cleanup(cleanup: &CleanupConfig, live: bool, audio_evidence: bool) -> Value {
     if cleanup.is_noop() {
         return Value::String("off".into());
     }
@@ -345,6 +375,10 @@ fn segment_cleanup(cleanup: &CleanupConfig, live: bool) -> Value {
         "drop_backchannels".into(),
         Value::Bool(cleanup.drop_backchannels),
     );
+    map.insert(
+        "echo_audio_margin_db".into(),
+        double_value(f64::from(cleanup.echo_audio_margin_db)),
+    );
     // Whether short mic regions were withheld and judged before publication rather than only at the
     // durability boundary (#149 phase 2). Live-only, and gated by the same `echo_drop` switch — a batch
     // note has no publication to be early for.
@@ -352,6 +386,9 @@ fn segment_cleanup(cleanup: &CleanupConfig, live: bool) -> Value {
         "live_early_drop".into(),
         Value::Bool(live && cleanup.echo_drop),
     );
+    // Whether the AEC's per-block record was actually available to the echo pass, not whether it was
+    // wanted: `false` means every echo drop in this transcript came from the text rules alone.
+    map.insert("audio_evidence".into(), Value::Bool(audio_evidence));
     Value::Object(map)
 }
 
@@ -391,14 +428,23 @@ mod tests {
         assert_eq!(provenance.models.asr.id, "aws/transcribe-default");
         assert_eq!(provenance.configuration["language"], "en-GB");
         assert_eq!(provenance.configuration["input"], "completed_recording");
-        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 1);
+        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 2);
         assert_eq!(
             provenance.configuration["segment_cleanup"]["echo_containment"],
             0.7
         );
         assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_audio_margin_db"],
+            3.0
+        );
+        assert_eq!(
             provenance.configuration["segment_cleanup"]["live_early_drop"], false,
             "a completed recording has no live publication to be early for"
+        );
+        // AWS has no canceller, so a batch note filed from it can never carry audio evidence.
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["audio_evidence"],
+            false
         );
         assert!(!json.contains("private-bucket"));
         assert!(!json.contains("secret-profile"));
@@ -441,6 +487,20 @@ mod tests {
             provenance.configuration["segment_cleanup"]["live_early_drop"],
             true
         );
+        // The live engine runs its own canceller alongside the transcriber, so its cleanup always has the
+        // per-block record — unless AEC is off, in which case there is nothing to record.
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["audio_evidence"],
+            true
+        );
+        let no_aec = AppConfig {
+            aec_enabled: false,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            from_config(&no_aec, GenerationMode::Live).configuration["segment_cleanup"]["audio_evidence"],
+            false
+        );
         assert!(
             !json.contains("/private/models"),
             "absolute path leaked: {json}"
@@ -463,6 +523,7 @@ mod tests {
             &cfg,
             GenerationMode::Batch,
             AecExecution::Capture(&processing),
+            false,
         );
         assert_eq!(provenance.configuration["aec"]["mode"], "capture_streaming");
         assert_eq!(provenance.configuration["aec"]["outcome"], "degraded_mixed");
@@ -500,6 +561,7 @@ mod tests {
                     outcome,
                     capture_fallback: false,
                 },
+                false,
             );
             assert_eq!(provenance.configuration["aec"]["mode"], expected_mode);
             assert_eq!(provenance.configuration["aec"]["outcome"], expected_outcome);
