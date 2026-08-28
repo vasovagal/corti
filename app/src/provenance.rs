@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use corti_transcribe::segment::{CLEANUP_RULES_VERSION, CleanupConfig};
 use corti_vagus::provenance::{
     GenerationMode, ModelIdentity, TranscriptModels, TranscriptProvenance,
 };
@@ -291,6 +292,10 @@ fn base_configuration(
     let mut configuration = BTreeMap::new();
     configuration.insert("aec".into(), Value::Object(aec));
     configuration.insert(
+        "segment_cleanup".into(),
+        segment_cleanup(&cfg.cleanup_config()),
+    );
+    configuration.insert(
         "input".into(),
         Value::String(
             if mode == GenerationMode::Live {
@@ -308,6 +313,45 @@ fn base_configuration(
         );
     }
     configuration
+}
+
+/// The deterministic segment-cleanup rules a transcript was produced under (#149), or the string `"off"`
+/// when no pass would run. Recorded so a note is self-describing: a row that looks like it is missing an
+/// echo, a fragment or a "Yeah." can be explained from the note itself.
+fn segment_cleanup(cleanup: &CleanupConfig) -> Value {
+    if cleanup.is_noop() {
+        return Value::String("off".into());
+    }
+    let mut map = Map::new();
+    map.insert(
+        "rules".into(),
+        Value::from(u64::from(CLEANUP_RULES_VERSION)),
+    );
+    map.insert("echo_drop".into(), Value::Bool(cleanup.echo_drop));
+    map.insert(
+        "echo_window_seconds".into(),
+        double_value(cleanup.echo_window_seconds),
+    );
+    map.insert(
+        "echo_containment".into(),
+        double_value(cleanup.echo_containment),
+    );
+    map.insert(
+        "merge_gap_seconds".into(),
+        double_value(cleanup.merge_gap_seconds),
+    );
+    map.insert(
+        "drop_backchannels".into(),
+        Value::Bool(cleanup.drop_backchannels),
+    );
+    Value::Object(map)
+}
+
+/// [`float_value`] for the `f64` cleanup thresholds.
+fn double_value(value: f64) -> Value {
+    Number::from_f64(value)
+        .map(Value::Number)
+        .unwrap_or_else(|| Value::String(value.to_string()))
 }
 
 /// JSON numbers cannot represent NaN/±inf. Preserve a malformed-but-effective config value as an explicit
@@ -339,6 +383,11 @@ mod tests {
         assert_eq!(provenance.models.asr.id, "aws/transcribe-default");
         assert_eq!(provenance.configuration["language"], "en-GB");
         assert_eq!(provenance.configuration["input"], "completed_recording");
+        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 1);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_containment"],
+            0.7
+        );
         assert!(!json.contains("private-bucket"));
         assert!(!json.contains("secret-profile"));
         assert!(!json.contains("us-secret-1"));
@@ -439,6 +488,32 @@ mod tests {
             assert_eq!(provenance.configuration["aec"]["mode"], expected_mode);
             assert_eq!(provenance.configuration["aec"]["outcome"], expected_outcome);
         }
+    }
+
+    /// A `[cleanup]` table that switches every pass off is recorded as `"off"` rather than as a set of
+    /// inert thresholds, and a hand-edited threshold is clamped before it reaches the note.
+    #[test]
+    fn disabled_cleanup_is_recorded_as_off_and_nonsense_thresholds_are_clamped() {
+        let mut cfg = AppConfig::default();
+        cfg.cleanup.echo_drop = false;
+        cfg.cleanup.drop_backchannels = false;
+        cfg.cleanup.merge_gap_seconds = 0.0;
+        let provenance = from_config(&cfg, GenerationMode::Batch);
+        assert_eq!(provenance.configuration["segment_cleanup"], "off");
+
+        let mut cfg = AppConfig::default();
+        cfg.cleanup.echo_containment = 9.0;
+        cfg.cleanup.echo_window_seconds = f64::NAN;
+        let provenance = from_config(&cfg, GenerationMode::Batch);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_containment"],
+            1.0
+        );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_window_seconds"],
+            6.0
+        );
+        provenance.frontmatter_json().unwrap();
     }
 
     #[test]

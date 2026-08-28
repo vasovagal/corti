@@ -422,9 +422,12 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Shared provenance fields for both backends: this CLI never runs AEC and always files a completed file.
+/// `segment_cleanup` mirrors `app/src/provenance.rs`, so a note filed by `corti-tap --inbox` describes the
+/// same rule set as one filed by the app.
 #[cfg(feature = "inbox")]
 fn base_configuration(
     language: Option<&str>,
+    cleanup: &corti_transcribe::segment::CleanupConfig,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut configuration = std::collections::BTreeMap::new();
     if let Some(language) = language {
@@ -441,7 +444,40 @@ fn base_configuration(
         "aec".into(),
         serde_json::json!({ "enabled": false, "mode": "disabled" }),
     );
+    configuration.insert("segment_cleanup".into(), segment_cleanup_json(cleanup));
     configuration
+}
+
+/// The effective cleanup rules, or `"off"`. Same shape as the app's `segment_cleanup` provenance value.
+#[cfg(feature = "inbox")]
+fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> serde_json::Value {
+    if cleanup.is_noop() {
+        return serde_json::Value::String("off".into());
+    }
+    serde_json::json!({
+        "rules": corti_transcribe::segment::CLEANUP_RULES_VERSION,
+        "echo_drop": cleanup.echo_drop,
+        "echo_window_seconds": cleanup.echo_window_seconds,
+        "echo_containment": cleanup.echo_containment,
+        "merge_gap_seconds": cleanup.merge_gap_seconds,
+        "drop_backchannels": cleanup.drop_backchannels,
+    })
+}
+
+/// Run the shipping segment cleanup over a freshly transcribed timeline. `corti-tap` has no `config.toml`,
+/// so it uses the crate defaults — the same rules the app ships with.
+#[cfg(feature = "inbox")]
+fn clean_segments(
+    transcript: &mut corti_core::DiarizedTranscript,
+    cleanup: &corti_transcribe::segment::CleanupConfig,
+) {
+    let (segments, stats) =
+        corti_transcribe::segment::cleanup(std::mem::take(&mut transcript.segments), cleanup, &[]);
+    transcript.segments = segments;
+    eprintln!(
+        "segment cleanup: {} echo (me) / {} echo (them) / {} merged / {} backchannel",
+        stats.echo_dropped_me, stats.echo_dropped_them, stats.merged, stats.backchannels_dropped
+    );
 }
 
 #[cfg(feature = "inbox-aws")]
@@ -473,11 +509,14 @@ fn transcribe_aws(
         language: language.clone(),
         ..AwsOptions::new(bucket)
     };
-    let transcript = AwsTranscriber::new(&sdk, opts)
+    let mut transcript = AwsTranscriber::new(&sdk, opts)
         .transcribe(wav, meta)
         .context("transcription failed")?;
 
-    let mut configuration = base_configuration(Some(&language));
+    let cleanup = corti_transcribe::segment::CleanupConfig::default();
+    clean_segments(&mut transcript, &cleanup);
+
+    let mut configuration = base_configuration(Some(&language), &cleanup);
     configuration.insert(
         "speaker_attribution".into(),
         serde_json::Value::String("channel_identification_for_multichannel".into()),
@@ -527,11 +566,14 @@ fn transcribe_local(
         "transcribing locally via Parakeet ({})…",
         if wants_ggml { "Metal" } else { "CPU" }
     );
-    let transcript = LocalTranscriber::new(cfg)
+    let mut transcript = LocalTranscriber::new(cfg)
         .transcribe(wav, meta)
         .context("transcription failed")?;
 
-    let mut configuration = base_configuration(None);
+    let cleanup = corti_transcribe::segment::CleanupConfig::default();
+    clean_segments(&mut transcript, &cleanup);
+
+    let mut configuration = base_configuration(None, &cleanup);
     configuration.insert(
         "asr_engine".into(),
         serde_json::Value::String(asr_engine.clone()),
