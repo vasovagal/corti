@@ -50,17 +50,17 @@ processed/disabled. The request includes the original lookahead rather than re-r
 ## Segment cleanup — echo, fragments, backchannels (#149)
 
 `merge_by_time` is the first and only point where the two capture channels see each other, so it is the
-only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:295`) runs
-there, on **both** paths — batch (`app/src/transcribe.rs:366`, right after `Backend::transcribe`, so it
+only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:345`) runs
+there, on **both** paths — batch (`app/src/transcribe.rs`, right after `Backend::transcribe`, so it
 covers local, AWS and `corti --input`) and live (`app/src/live.rs`, inside `flush_window` before the
 append) — and always **before** the LLM tier, which is contractually forbidden from dropping or reordering
 rows (`crates/corti-postprocess/src/prompt.rs`, `validation.rs`). It is pure text/timing arithmetic: no
-audio, no model, and no confidence score (the local backend exposes none). Filler words and stutters are
-deliberately out of scope — those belong to the decoder.
+model and no confidence score (the local backend exposes none) — with one exception, the optional audio
+evidence below. Filler words and stutters are deliberately out of scope: those belong to the decoder.
 
 Three passes, in this order:
 
-1. **Echo** (`drop_echoes`, `:500`). Residual speaker bleed the AEC could not remove is decoded as a short
+1. **Echo** (`drop_echoes`, `:585`). Residual speaker bleed the AEC could not remove is decoded as a short
    `Me` utterance 1–6 s after the far end said the same words (issue #107, whose AEC root causes stay open).
    For each segment S, every **earlier, still-kept** other-channel segment O with
    `O.start ≤ S.start ≤ O.end + echo_window_seconds` is a candidate source; S is dropped when it has three
@@ -70,42 +70,109 @@ Three passes, in this order:
    stopwords and backchannels, as a set, so a stutter cannot inflate a score. Only kept segments are
    sources, so echoes never chain; one source may kill several copies; the rule is symmetric and the two
    directions are counted separately.
-2. **Merge** (`merge_fragments`, `:539`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
+2. **Merge** (`merge_fragments`, `:671`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
    so every fragment visible in a note has a measured gap above that. Consecutive same-speaker segments
    within `merge_gap_seconds` are joined — **unless the other channel started a turn in between**. That
    clause is why this is not a VAD tuning problem: `vad_min_silence` can be raised, but it cannot know that
    the far end took the floor, and raising it also delays live rows and pushes regions toward the 20 s cap.
-3. **Backchannel** (`drop_backchannel_turns`, `:583`). A segment of fewer than four words whose whole
+3. **Backchannel** (`drop_backchannel_turns`, `:715`). A segment of fewer than four words whose whole
    normalized text is backchannel ("Yeah.", "Okay yeah.", "Makes sense.") and which overlaps other-channel
    speech is dropped — **unless** the nearest earlier other-channel segment ends in `?`, which makes it an
    answer, not listening.
 
-`CleanupConfig` (`:222`) carries the five knobs; defaults are `echo_drop = true`,
+### Audio evidence — the AEC's own verdict on a mic span (#149 phase 3b)
+
+Text cannot separate two populations that read identically: a `Me` row that is residual speaker bleed, and
+a `Me` row where both people happened to use the same nouns. Lowering `echo_containment` to catch the first
+necessarily starts eating the second — measured on real calls, any drop below 0.7 containment is by
+construction unaccounted-for speech. The signal that *does* separate them is not in the transcript at all:
+it is in the canceller.
+
+`cleanup_with_evidence` (`segment.rs:372`) takes an optional
+`AudioEvidence = &dyn Fn(f64, f64) -> Option<SpanEvidence>` (`:323`), where
+`SpanEvidence { mic_db, echo_estimate_db, double_talk_fraction, blocks }` (`:308`) summarizes what the AEC
+measured over one span of the transcript's own timeline. `cleanup` is the same function with `None`.
+**`corti-transcribe` does not depend on `corti-aec`** — transcription must not pull in a DSP crate and the
+AWS backend has no canceller at all — so the caller folds `corti_aec::SpanStats` into those four fields
+(`app/src/transcribe.rs:306`, mirrored in `corti-bench`).
+
+The rule runs **inside the echo pass, before the text rules**, on `Me` segments only. S is dropped when:
+
+1. S overlaps a far-end segment (`S.start < O.end && O.start < S.end`) — the far end had the floor. Without
+   this clause a quiet passage with no echo at all (both energies at the floor, difference ≈ 0) would look
+   exactly like a ghost;
+2. the evidence covers at least one block;
+3. `double_talk_fraction < 0.5` — see below;
+4. `mic_db − echo_estimate_db ≤ echo_audio_margin_db` (default `3.0`): the mic carried little more than what
+   the canceller was already subtracting as echo.
+
+It is counted separately as `CleanupStats::echo_dropped_audio`, never folded into `echo_dropped_me`, so a
+sweep can attribute every drop to text or to audio.
+
+**A span with no blocks falls through to the text rules unchanged.** That covers the AWS backend, a
+recording with no `-aec-stats.json` sidecar, and the old end of a stats record that overflowed its bound.
+Absence of evidence is not evidence of speech.
+
+**The double-talk guard.** `double_talk` is the adaptation gate firing (`Σd² > double_talk_ratio · Σx²`):
+the canceller judged the near end to dominate and froze its filter update. Two reasons to require the gate
+to have stayed quiet over most of the span. The mechanical one: with adaptation frozen the echo estimate
+stops tracking the room, so the comparison in (4) is against a stale number. The direct one: "the gate
+fired" is the canceller's own statement that it heard near-end speech, which is precisely the case where a
+`Me` row must be kept. This is not the same as never firing during real echo — the default ratio is 2.0 and
+measured capture ERLE tops out ≈10.6 dB (#107), so a mic carrying nothing but residual echo sits far below
+`2 · Σx²` and the gate stays quiet exactly where the rule needs it to. (Today `suppressed == !double_talk`,
+because the residual suppressor's bypass is the *same* comparison — #107 root cause #1 — so the guard also
+reads as "the suppressor was engaged". The two fields are recorded separately so it keeps working when
+those gates diverge.)
+
+Where the evidence comes from:
+
+- **Live** — `app/src/live.rs` drains `StreamingAec::block_stats()` after every push into
+  `TranscriptWindow.aec_blocks`, bounded to the window plus `echo_window_seconds` of lookback (and a hard
+  `MAX_WINDOW_AEC_BLOCKS` cap), and `flush_window` builds the accessor over it. `finish_session` uses
+  `finish_with_stats()` so the tail blocks — every block of a call shorter than the lookahead — are not
+  lost, and logs the locked delay and `stats_dropped`.
+- **Batch** — `transcribe_recording` looks for `corti_capture::aec_stats_path(<recording>)`. That one path
+  covers both producers: the capture writer's in-flight filter writes it at stop, and the offline
+  `write_clean_wav_with_options` pass writes it when it runs. A missing, corrupt or future-schema sidecar
+  is logged and treated as absent.
+- **AWS** stays text-only in every case (`Backend::audio_evidence_supported`). It is the path where corti
+  is least sure the audio it timestamped is the audio corti's own canceller produced, the shipping default
+  is local, and a wrong answer here silently deletes transcript rows.
+
+`CleanupConfig` (`:222`) carries six knobs; defaults are `echo_drop = true`,
 `echo_window_seconds = 6.0`, `echo_containment = 0.7`, `merge_gap_seconds = 2.5` (non-positive disables the
-pass), `drop_backchannels = true`. The app persists them as the `[cleanup]` table in `config.toml`
-(`app/src/config.rs:169`, effective values via `AppConfig::cleanup_config`, `:235`) with
-`CORTI_CLEANUP_ECHO_DROP`, `CORTI_CLEANUP_ECHO_WINDOW_SECONDS`, `CORTI_CLEANUP_ECHO_CONTAINMENT`,
-`CORTI_CLEANUP_MERGE_GAP_SECONDS` and `CORTI_CLEANUP_DROP_BACKCHANNELS` overriding it. Hand-edited
-nonsense is clamped the same way `aec_config` clamps a non-finite AEC knob. `CleanupStats` (`:266`) is
-logged per run under `corti::transcribe` / `corti::live`, per echo direction.
+pass), `drop_backchannels = true`, `echo_audio_margin_db = 3.0`. The app persists them as the `[cleanup]`
+table in `config.toml` (`app/src/config.rs:175`, effective values via `AppConfig::cleanup_config`, `:241`)
+with `CORTI_CLEANUP_ECHO_DROP`, `CORTI_CLEANUP_ECHO_WINDOW_SECONDS`, `CORTI_CLEANUP_ECHO_CONTAINMENT`,
+`CORTI_CLEANUP_MERGE_GAP_SECONDS`, `CORTI_CLEANUP_DROP_BACKCHANNELS` and
+`CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB` overriding it. Hand-edited nonsense is clamped the same way
+`aec_config` clamps a non-finite AEC knob — except a large negative margin, which is not nonsense but the
+way the audio rule is switched off while the text rules keep running. `CleanupStats` is logged per run
+under `corti::transcribe` / `corti::live`, per echo direction and with `echo_dropped_audio` separate.
 
 The live path additionally runs the **echo** rule one step earlier, at the region rather than at the
 window: a short mic region is withheld from the Live Transcript window and the hosted Live lane until the
 far end has closed a region or `echo_window_seconds` have passed, then published or dropped by the rule
-above, through the shared `EchoCandidate` (`segment.rs:426`). Nothing published live can be retracted, which
+above, through the shared `EchoCandidate` (`segment.rs:504`). Nothing published live can be retracted, which
 is why that one rule pays a latency cost the other two do not. See
 [streaming.md](streaming.md#early-drop-before-publication-149-phase-2).
 
 Every note records the rules it was produced under: `corti.configuration.segment_cleanup`
-(`app/src/provenance.rs:322`, mirrored for `corti-tap --inbox`) is either `"off"` or
-`{"rules": 1, "echo_drop": …, "echo_window_seconds": …, "echo_containment": …, "merge_gap_seconds": …,
-"drop_backchannels": …, "live_early_drop": …}` — the last of those is true only for a live note whose echo
-rule also ran at the region, before publication (phase 2, below). `rules` is `CLEANUP_RULES_VERSION` (`segment.rs:217`) — bump it when a pass's
-behavior changes so an old note is never read as if it had today's rules.
+(`app/src/provenance.rs:352`, mirrored for `corti-tap --inbox`) is either `"off"` or
+`{"rules": 2, "echo_drop": …, "echo_window_seconds": …, "echo_containment": …, "merge_gap_seconds": …,
+"drop_backchannels": …, "echo_audio_margin_db": …, "live_early_drop": …, "audio_evidence": true|false}`.
+`rules` is `CLEANUP_RULES_VERSION` (`segment.rs:217`) — bump it when a pass's behavior changes so an old
+note is never read as if it had today's rules. `live_early_drop` is true only for a live note whose echo
+rule also ran at the region, before publication (phase 2, above). `audio_evidence` is the **runtime**
+answer, not a setting: it is `false` for an AWS job, for a recording with no sidecar, and for a capture
+whose AEC was off, and it is what tells a reader whether the echo drops in this note could have come from
+anything but text.
 
-Offline, `corti-bench process --cleanup/--no-cleanup` runs the same function after ASR, and
-`corti-bench clean --input <DiarizedTranscript.json>` re-runs just the cleanup over a transcript that
-already exists, so a threshold sweep costs no decode. `bench/scoring/cleanup.py` scores what is left
+Offline, `corti-bench process --cleanup/--no-cleanup` runs the same function after ASR — and with `--aec`
+it feeds back the sidecar it just wrote — while `corti-bench clean --input <DiarizedTranscript.json>
+[--aec-stats <path>] [--echo-audio-margin-db N]` re-runs just the cleanup over a transcript that already
+exists, so a threshold sweep costs no decode. `bench/scoring/cleanup.py` scores what is left
 (`echo_pairs_remaining`, `turns_le3`, `backchannel_turns`, `content_retention`, and `orphan_drops`, which
 must be zero) over that JSON or over a replayed corti note.
 

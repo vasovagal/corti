@@ -161,22 +161,38 @@ const AEC_PUSH_FRAMES: usize = 16 * 1024;
 /// sized by call length.
 pub struct StreamingAecFilter {
     aec: corti_aec::StreamingAec,
+    /// Where the per-block echo record goes, when anyone asked for it. `None` is the pre-#149 filter: the
+    /// canceller still fills its own bounded ring and simply drops the overflow.
+    stats: Option<AecStatsCollector>,
 }
 
 impl StreamingAecFilter {
     pub fn new(sample_rate: u32, cfg: AecConfig) -> Self {
         Self {
             aec: corti_aec::StreamingAec::new(sample_rate, bounded_capture_aec_config(cfg)),
+            stats: None,
         }
     }
 
     pub fn new_with_lookahead(sample_rate: u32, cfg: AecConfig, lookahead_seconds: f32) -> Self {
+        Self::new_with_lookahead_and_stats(sample_rate, cfg, lookahead_seconds, None)
+    }
+
+    /// [`new_with_lookahead`](Self::new_with_lookahead) that also drains the canceller's per-block record
+    /// into `stats` (#149 phase 3b). The DSP is untouched: draining a ring cannot change a sample.
+    pub fn new_with_lookahead_and_stats(
+        sample_rate: u32,
+        cfg: AecConfig,
+        lookahead_seconds: f32,
+        stats: Option<AecStatsCollector>,
+    ) -> Self {
         Self {
             aec: corti_aec::StreamingAec::new_with_lookahead_seconds(
                 sample_rate,
                 bounded_capture_aec_config(cfg),
                 lookahead_seconds,
             ),
+            stats,
         }
     }
 }
@@ -188,11 +204,29 @@ impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
     }
 
     fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
-        self.aec.push(mic, far)
+        let out = self.aec.push(mic, far);
+        if self.stats.is_some() {
+            // Drain per push so a call longer than the canceller's own ring loses nothing here.
+            let blocks = self.aec.block_stats();
+            if let Some(collector) = &self.stats {
+                collector.record(blocks);
+            }
+        }
+        out
     }
 
     fn finish(self: Box<Self>) -> Vec<f32> {
-        self.aec.finish()
+        let Self { aec, stats } = *self;
+        match stats {
+            Some(collector) => {
+                // `finish` consumes the canceller, so this is the only way to reach the blocks the flush
+                // itself records — and the locked delay.
+                let fin = aec.finish_with_stats();
+                collector.finish(fin.stats, fin.stats_dropped, fin.delay_samples);
+                fin.audio
+            }
+            None => aec.finish(),
+        }
     }
 }
 
@@ -238,8 +272,9 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
 pub const AEC_STATS_SCHEMA_VERSION: u32 = 1;
 
 /// Whether the file-to-file AEC pass also writes its per-block diagnostic sidecar. Opt-in: `corti-bench`
-/// turns it on, the app's ordinary recording path does not (the in-flight filter is the app's path, and it
-/// has its own drain seam).
+/// and the app's offline fallback turn it on; `write_clean_wav`/`write_clean_wav_with_lookahead` do not.
+/// The app's ordinary in-flight path has its own seam — [`AecStatsCollector`], drained at
+/// [`Recorder::stop_capture`] — and writes the same file to the same place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AecStatsSidecar {
     /// Do not write `-aec-stats.json`.
@@ -273,6 +308,107 @@ pub struct AecStatsFile {
     /// Blocks the bounded ring dropped before the pass could drain them (0 for a healthy run).
     pub stats_dropped: u64,
     pub blocks: Vec<corti_aec::BlockStats>,
+}
+
+/// Per-block records the in-flight collector retains before evicting the oldest. 32 768 blocks is ≈93
+/// minutes at the default 8192-tap hop / 48 kHz and ≈1 MiB — a constant, so the writer thread stays free of
+/// anything sized by call length. Overflow is counted into the sidecar's `stats_dropped`, and the hole is
+/// always at the *old* end, where the cleanup pass falls back to its text rules.
+pub const MAX_CAPTURE_BLOCK_STATS: usize = 32 * 1024;
+
+/// Bounded hand-off for the writer-thread filter's per-block echo record (#149 phase 3b).
+///
+/// [`CaptureFilter`] returns only audio and the writer thread should not do file I/O it can avoid, so the
+/// filter records here and the thread that *stops* the capture — the one that learns from
+/// [`CaptureFilterDisposition`] whether the filter's output actually reached the WAV — decides whether the
+/// record describes the retained audio and is worth persisting.
+#[derive(Clone, Default)]
+pub struct AecStatsCollector {
+    inner: std::sync::Arc<std::sync::Mutex<CollectedAecStats>>,
+}
+
+/// What the collector holds. `delay_samples` is only known once the filter finishes.
+#[derive(Default)]
+struct CollectedAecStats {
+    blocks: Vec<corti_aec::BlockStats>,
+    dropped: u64,
+    delay_samples: usize,
+    finished: bool,
+}
+
+impl AecStatsCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lock, tolerating a poisoned mutex: a panicking writer thread must not also cost the diagnostics of
+    /// the *next* call, and nothing here can leave the data structurally invalid.
+    fn lock(&self) -> std::sync::MutexGuard<'_, CollectedAecStats> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Append one `block_stats()` drain, evicting the oldest past [`MAX_CAPTURE_BLOCK_STATS`].
+    fn record(&self, blocks: Vec<corti_aec::BlockStats>) {
+        let mut guard = self.lock();
+        guard.blocks.extend(blocks);
+        if guard.blocks.len() > MAX_CAPTURE_BLOCK_STATS {
+            let excess = guard.blocks.len() - MAX_CAPTURE_BLOCK_STATS;
+            guard.blocks.drain(..excess);
+            guard.dropped = guard.dropped.saturating_add(excess as u64);
+        }
+    }
+
+    /// The filter's last word: its trailing blocks, its own ring's drop count, and the locked delay.
+    fn finish(&self, blocks: Vec<corti_aec::BlockStats>, dropped: u64, delay_samples: usize) {
+        self.record(blocks);
+        let mut guard = self.lock();
+        guard.dropped = guard.dropped.saturating_add(dropped);
+        guard.delay_samples = delay_samples;
+        guard.finished = true;
+    }
+
+    /// Take the record, leaving the collector empty. `None` until the filter has finished — a filter that
+    /// never ran, or that panicked before its flush, has nothing trustworthy to say.
+    fn take(&self) -> Option<(Vec<corti_aec::BlockStats>, u64, usize)> {
+        let mut guard = self.lock();
+        if !guard.finished {
+            return None;
+        }
+        Some((
+            std::mem::take(&mut guard.blocks),
+            guard.dropped,
+            guard.delay_samples,
+        ))
+    }
+}
+
+impl std::fmt::Debug for AecStatsCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.lock();
+        f.debug_struct("AecStatsCollector")
+            .field("blocks", &guard.blocks.len())
+            .field("dropped", &guard.dropped)
+            .field("finished", &guard.finished)
+            .finish()
+    }
+}
+
+/// Serialize one [`AecStatsFile`] to [`aec_stats_path`] and log it. The single writer for both producers:
+/// the file-to-file pass and the capture writer's in-flight filter.
+fn persist_aec_stats(raw_2track_wav: &Path, record: &AecStatsFile) -> Result<PathBuf> {
+    let stats_path = aec_stats_path(raw_2track_wav);
+    let json = serde_json::to_vec(record).context("serializing AEC block statistics")?;
+    std::fs::write(&stats_path, &json)
+        .with_context(|| format!("writing {}", stats_path.display()))?;
+    tracing::info!(
+        target: "corti::capture",
+        path = %stats_path.display(),
+        blocks = record.blocks.len(),
+        dropped = record.stats_dropped,
+        delay_samples = record.delay_samples as u64,
+        "wrote AEC block statistics"
+    );
+    Ok(stats_path)
 }
 
 /// The AEC statistics sidecar of a raw recording: `<dir>/<stem>.wav` → `<dir>/<stem>-aec-stats.json`.
@@ -435,18 +571,7 @@ pub fn write_clean_wav_with_options(
             stats_dropped: fin.stats_dropped,
             blocks,
         };
-        let stats_path = aec_stats_path(raw_2track_wav);
-        let json = serde_json::to_vec(&record).context("serializing AEC block statistics")?;
-        std::fs::write(&stats_path, &json)
-            .with_context(|| format!("writing {}", stats_path.display()))?;
-        tracing::info!(
-            target: "corti::capture",
-            path = %stats_path.display(),
-            blocks = record.blocks.len(),
-            dropped = record.stats_dropped,
-            delay_samples = record.delay_samples as u64,
-            "wrote AEC block statistics"
-        );
+        persist_aec_stats(raw_2track_wav, &record)?;
     }
 
     Ok(Some(out))
@@ -504,23 +629,35 @@ mod platform {
         }
 
         /// Lower to the engine's options while retaining the immutable request for the durable completion
-        /// record. `keep_aec = false` for layouts with no mic track.
-        fn into_capture_options(self, keep_aec: bool) -> (CaptureOptions, Option<RequestedAec>) {
+        /// record. `keep_aec = false` for layouts with no mic track. The third return is the drop-box the
+        /// in-flight filter fills with its per-block echo record (#149 phase 3b), `None` when no filter runs.
+        fn into_capture_options(
+            self,
+            keep_aec: bool,
+        ) -> (
+            CaptureOptions,
+            Option<RequestedAec>,
+            Option<AecStatsCollector>,
+        ) {
             let mut out = CaptureOptions::default();
             if let Some(tee) = self.tee {
                 out = out.with_tee(tee);
             }
             let requested = self.aec.filter(|_| keep_aec);
+            let mut collector = None;
             if let Some(aec) = requested.clone() {
+                let stats = AecStatsCollector::new();
+                collector = Some(stats.clone());
                 out = out.with_filter(Box::new(move |sample_rate| {
-                    Box::new(StreamingAecFilter::new_with_lookahead(
+                    Box::new(StreamingAecFilter::new_with_lookahead_and_stats(
                         sample_rate,
                         aec.config,
                         aec.lookahead_seconds,
+                        Some(stats),
                     )) as Box<dyn CaptureFilter>
                 }));
             }
-            (out, requested)
+            (out, requested, collector)
         }
     }
 
@@ -550,6 +687,8 @@ mod platform {
         out: PathBuf,
         requested_aec: Option<Box<RequestedAec>>,
         tap_only: bool,
+        /// Filled by the writer-thread AEC filter; drained at stop into the `-aec-stats.json` sidecar.
+        aec_stats: Option<AecStatsCollector>,
     }
 
     impl Recorder {
@@ -581,7 +720,7 @@ mod platform {
             options: RecordingOptions,
         ) -> Result<Self> {
             let out = new_recording_path(app)?;
-            let (capture_options, requested_aec) = options.into_capture_options(true);
+            let (capture_options, requested_aec, aec_stats) = options.into_capture_options(true);
             let session = CaptureSession::start_recording_with_options(
                 tap_target(pid),
                 out.clone(),
@@ -594,6 +733,7 @@ mod platform {
                 out,
                 requested_aec: requested_aec.map(Box::new),
                 tap_only: false,
+                aec_stats,
             })
         }
 
@@ -628,7 +768,8 @@ mod platform {
             options: RecordingOptions,
         ) -> Result<Self> {
             let out = new_recording_path(app)?;
-            let (capture_options, _ignored_aec) = options.into_capture_options(false);
+            let (capture_options, _ignored_aec, _ignored_stats) =
+                options.into_capture_options(false);
             let session = CaptureSession::start_tap_only_recording_with_options(
                 tap_target(pid),
                 out.clone(),
@@ -641,6 +782,7 @@ mod platform {
                 out,
                 requested_aec: None,
                 tap_only: true,
+                aec_stats: None,
             })
         }
 
@@ -698,6 +840,7 @@ mod platform {
                 out,
                 requested_aec,
                 tap_only,
+                aec_stats,
             } = self;
             let handle = session.stop()?;
             if handle.callbacks == 0 {
@@ -727,6 +870,45 @@ mod platform {
                     "dropped live tee chunks (consumer fell behind) — the live transcript may have gaps"
                 );
             }
+            // The per-block echo record is only written when the filter's output *is* the retained mic:
+            // `Applied`. A raw fallback is re-cleaned by the offline pass (which writes its own sidecar),
+            // and a degraded recording is a cleaned prefix plus a raw remainder — the record would describe
+            // audio the WAV does not contain, which is worse than no record at all (#149 phase 3b).
+            if let (Some(collector), CaptureFilterDisposition::Applied) =
+                (&aec_stats, handle.filter_disposition)
+                && let Some(aec) = requested_aec.as_deref()
+                && let Some((blocks, dropped, delay_samples)) = collector.take()
+                && !blocks.is_empty()
+            {
+                let sr = handle.sample_rate.max(1);
+                let hop = aec.config.filter_len.max(1);
+                let record = AecStatsFile {
+                    schema_version: AEC_STATS_SCHEMA_VERSION,
+                    source: out
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    sample_rate: handle.sample_rate,
+                    frames: handle.frames as usize,
+                    lookahead_seconds: aec.lookahead_seconds,
+                    config: aec.config.clone(),
+                    delay_samples,
+                    delay_ms: delay_samples as f32 * 1000.0 / sr as f32,
+                    block_hop_samples: hop,
+                    block_hop_secs: hop as f64 / sr as f64,
+                    stats_dropped: dropped,
+                    blocks,
+                };
+                // Best effort: a diagnostic sidecar must never cost a finished recording.
+                if let Err(e) = persist_aec_stats(&out, &record) {
+                    tracing::warn!(
+                        target: "corti::capture",
+                        error = %format!("{e:#}"),
+                        "could not write the AEC statistics sidecar; transcription falls back to text-only cleanup"
+                    );
+                }
+            }
+
             let processing = if tap_only {
                 CaptureProcessing::not_applicable()
             } else {
@@ -1010,6 +1192,102 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The in-flight filter's collector sees every block, records the locked delay, and does not change a
+    /// single emitted sample — the sidecar is a by-product, exactly as it is for the file-to-file pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_in_flight_filter_collects_blocks_without_changing_its_audio() {
+        use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
+
+        let sample_rate = 8_000u32;
+        let frames = 64 * 1024 + 97;
+        let cfg = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let mic: Vec<f32> = (0..frames)
+            .map(|i| {
+                let near = (i as f32 * 0.011).sin() * 0.05;
+                let echo = if i >= 24 { tap[i - 24] * 0.6 } else { 0.0 };
+                near + echo
+            })
+            .collect();
+
+        let drive = |mut filter: Box<dyn CaptureFilter>| -> Vec<f32> {
+            let mut out = Vec::with_capacity(frames);
+            for start in (0..frames).step_by(FILTER_FRAMES_PER_CHUNK) {
+                let end = (start + FILTER_FRAMES_PER_CHUNK).min(frames);
+                out.extend(filter.push(&mic[start..end], &tap[start..end]));
+            }
+            out.extend(filter.finish());
+            out
+        };
+
+        let plain = drive(Box::new(StreamingAecFilter::new_with_lookahead(
+            sample_rate,
+            cfg.clone(),
+            0.5,
+        )));
+
+        let collector = AecStatsCollector::new();
+        assert!(collector.take().is_none(), "nothing before the filter runs");
+        let collected = drive(Box::new(StreamingAecFilter::new_with_lookahead_and_stats(
+            sample_rate,
+            cfg.clone(),
+            0.5,
+            Some(collector.clone()),
+        )));
+        assert_eq!(plain, collected, "collecting must not change the audio");
+
+        let (blocks, dropped, delay_samples) = collector.take().expect("the filter finished");
+        assert_eq!(dropped, 0, "well under the collector cap");
+        assert!(delay_samples > 0, "the warm-up locked a delay");
+        // Emitted samples tile into `filter_len` blocks; the last one is short and zero-padded.
+        assert_eq!(blocks.len(), frames.div_ceil(cfg.filter_len));
+        assert_eq!(blocks[0].t_start_secs, 0.0);
+        assert!(
+            blocks
+                .windows(2)
+                .all(|w| w[1].t_start_secs > w[0].t_start_secs),
+            "the record is sorted, which `span_stats` requires"
+        );
+        assert!(collector.take().unwrap().0.is_empty(), "take() drains");
+    }
+
+    /// The collector is bounded by a constant, not by call length: past the cap the oldest blocks go and
+    /// the loss is counted into the sidecar's `stats_dropped` rather than silently papered over.
+    #[test]
+    fn the_collector_evicts_its_oldest_blocks_and_counts_them() {
+        let collector = AecStatsCollector::new();
+        let block = |t: f64| corti_aec::BlockStats {
+            t_start_secs: t,
+            mic_energy: 1.0,
+            far_energy: 1.0,
+            echo_estimate_energy: 1.0,
+            error_energy: 1.0,
+            double_talk: false,
+            suppressed: true,
+        };
+        let overflow = 100usize;
+        collector.record(
+            (0..MAX_CAPTURE_BLOCK_STATS + overflow)
+                .map(|k| block(k as f64))
+                .collect(),
+        );
+        collector.finish(vec![block(1e6)], 7, 4_242);
+        let (blocks, dropped, delay_samples) = collector.take().expect("finished");
+        assert_eq!(blocks.len(), MAX_CAPTURE_BLOCK_STATS);
+        // One more eviction when `finish` appends its trailing block.
+        assert_eq!(dropped, overflow as u64 + 1 + 7);
+        assert_eq!(delay_samples, 4_242);
+        assert_eq!(
+            blocks[0].t_start_secs,
+            (overflow + 1) as f64,
+            "the hole is at the old end"
+        );
     }
 
     /// #74 acceptance: **ERLE parity**. The in-flight filter the capture writer drives in

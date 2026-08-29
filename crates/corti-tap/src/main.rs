@@ -461,8 +461,12 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
         "echo_containment": cleanup.echo_containment,
         "merge_gap_seconds": cleanup.merge_gap_seconds,
         "drop_backchannels": cleanup.drop_backchannels,
+        "echo_audio_margin_db": cleanup.echo_audio_margin_db,
         // This CLI always files a completed recording, so there is no live publication to be early for.
         "live_early_drop": false,
+        // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult:
+        // every echo drop in a note filed here came from the text rules alone.
+        "audio_evidence": false,
     })
 }
 

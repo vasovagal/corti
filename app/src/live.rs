@@ -47,7 +47,7 @@ use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
 use corti_transcribe::segment::{
     CleanupConfig, CleanupStats, EchoCandidate, SEGMENT_GAP, SpeakerTurn, Word, cleanup,
-    diarize_words, merge_by_time, split_regions, words_to_segments,
+    cleanup_with_evidence, diarize_words, merge_by_time, split_regions, words_to_segments,
 };
 use tracing::{info, warn};
 
@@ -69,6 +69,14 @@ const MAX_DIARIZATION_AUDIO_BYTES: usize = 128 * 1024 * 1024;
 /// Independent cap for recognized words awaiting the next durable append. ASR output per minute is tiny in
 /// practice, but a hard cap makes the memory contract hold even for malformed/model-pathological output.
 const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+
+/// Hard cap on the per-block AEC statistics a window retains as cleanup evidence (#149 phase 3b). The
+/// working set is one window plus `echo_window_seconds` of lookback — at the default 8192-tap hop / 48 kHz
+/// that is ≈360 blocks for a 1-minute window — so this only ever binds when a hand-edited
+/// `echo_window_seconds` is enormous. 8192 blocks is ≈23 minutes and ≈256 KiB; the oldest go first, exactly
+/// like the canceller's own ring.
+const MAX_WINDOW_AEC_BLOCKS: usize = 8192;
+
 /// Bounded in-memory canonical-row assembly used only for the optional final pass after every raw window is
 /// already synced. Exceeding it disables that pass and leaves the existing raw note path unchanged.
 const MAX_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
@@ -976,6 +984,12 @@ struct TranscriptWindow {
     /// Live early drop (#149 phase 2). Per-recording state like `carry`, not per-window: a mic region
     /// withheld just before a boundary is still judged against far-end regions that close after it.
     early_drop: EarlyDrop,
+    /// The live canceller's per-block echo record covering this window plus `echo_window_seconds` of
+    /// lookback (#149 phase 3b), drained from `StreamingAec` after every push and trimmed at every flush.
+    /// `t_start_secs` is on the cleaned timeline — the same timeline these segments are timestamped on —
+    /// so a block time and a segment time compare directly. Empty when AEC is off, which simply leaves the
+    /// echo pass with its text rules.
+    aec_blocks: Vec<corti_aec::BlockStats>,
 }
 
 impl TranscriptWindow {
@@ -1018,6 +1032,7 @@ impl TranscriptWindow {
             early_drop: EarlyDrop::new(cleanup.clone()),
             cleanup,
             carry: Vec::new(),
+            aec_blocks: Vec::new(),
         })
     }
 
@@ -1033,6 +1048,24 @@ impl TranscriptWindow {
         self.carry.clear();
         self.carry
             .extend(appended.iter().filter(|s| s.end >= horizon).cloned());
+    }
+
+    /// Take the blocks a `StreamingAec::block_stats()` drain produced. Ordered by `t_start_secs` because
+    /// the drain is, and the two clocks (window frames, canceller blocks) advance together.
+    fn push_aec_blocks(&mut self, blocks: Vec<corti_aec::BlockStats>) {
+        self.aec_blocks.extend(blocks);
+        if self.aec_blocks.len() > MAX_WINDOW_AEC_BLOCKS {
+            let excess = self.aec_blocks.len() - MAX_WINDOW_AEC_BLOCKS;
+            self.aec_blocks.drain(..excess);
+        }
+    }
+
+    /// Drop the blocks that can no longer be evidence for anything: older than `echo_window_seconds`
+    /// before the window that is about to start. Called from `clear_after_flush`, so the retained set is
+    /// bounded by the same time window that bounds the carry.
+    fn trim_aec_blocks(&mut self) {
+        let horizon = self.start_sec() - self.cleanup.echo_window_seconds;
+        self.aec_blocks.retain(|b| b.t_start_secs >= horizon);
     }
 
     fn remaining_frames(&self) -> usize {
@@ -1075,6 +1108,7 @@ impl TranscriptWindow {
         self.them_words.clear();
         self.tap_audio.clear();
         self.buffered_text_bytes = 0;
+        self.trim_aec_blocks();
     }
 
     #[cfg(test)]
@@ -1384,7 +1418,11 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
 
             let clean = match aec.as_mut() {
                 Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => {
-                    aec.push(mic_slice, tap_slice)
+                    let cleaned = aec.push(mic_slice, tap_slice);
+                    // --- #149 phase 3b: hand the window this push's per-block echo record. ---
+                    window.push_aec_blocks(aec.block_stats());
+                    // --- end phase 3b ---
+                    cleaned
                 }
                 Some(_) => Vec::new(),
                 None => mic_slice.to_vec(),
@@ -1500,10 +1538,17 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     // Cleanup runs on the merged window, with the previous window's tail as echo sources, before anything
     // is written. Fragment merges cannot cross the append boundary (a committed row is never rewritten);
     // echo lookback can, through `carry`.
+    // With the live canceller running, its per-block record for this window is audio evidence the text
+    // rules cannot reconstruct: a `Me` row whose mic span was measured as little more than the echo the
+    // filter was already subtracting is a ghost regardless of its wording (#149 phase 3b).
     let (segments, stats) = if window.cleanup.is_noop() {
         (segments, CleanupStats::default())
-    } else {
+    } else if window.aec_blocks.is_empty() {
         cleanup(segments, &window.cleanup, &window.carry)
+    } else {
+        let blocks = &window.aec_blocks;
+        let evidence = |start: f64, end: f64| crate::transcribe::span_evidence(blocks, start, end);
+        cleanup_with_evidence(segments, &window.cleanup, &window.carry, Some(&evidence))
     };
     if !segments.is_empty() {
         writer.append_segments(&segments)?;
@@ -1514,6 +1559,8 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
             segments = segments.len(),
             echo_dropped_me = stats.echo_dropped_me,
             echo_dropped_them = stats.echo_dropped_them,
+            echo_dropped_audio = stats.echo_dropped_audio,
+            aec_blocks = window.aec_blocks.len(),
             merged = stats.merged,
             backchannels_dropped = stats.backchannels_dropped,
             buffered_audio_bytes = window.tap_audio.len() * std::mem::size_of::<f32>(),
@@ -1540,9 +1587,21 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     publisher: &P,
 ) -> Result<LiveOutcome> {
     if let Some(aec) = aec.take() {
-        let tail = aec.finish();
-        if !tail.is_empty() {
-            mic.push(&tail, sample_rate);
+        // `finish` consumes the filter, so the tail blocks — every block of a call shorter than the
+        // lookahead — are only reachable through `finish_with_stats`. The final window's cleanup is the
+        // one that needs them (#149 phase 3b).
+        let fin = aec.finish_with_stats();
+        info!(
+            target: "corti::live",
+            delay_samples = fin.delay_samples as u64,
+            delay_ms = fin.delay_samples as f64 * 1000.0 / f64::from(sample_rate.max(1)),
+            stats_dropped = fin.stats_dropped,
+            tail_blocks = fin.stats.len(),
+            "live AEC finished"
+        );
+        window.push_aec_blocks(fin.stats);
+        if !fin.audio.is_empty() {
+            mic.push(&fin.audio, sample_rate);
         }
     }
     if let Some(words) = mic.poll_words() {
@@ -2873,6 +2932,131 @@ mod tests {
             content.contains("**[00:58] Me:** Frankfurt."),
             "the held region missed its window:\n{content}"
         );
+    }
+
+    /// One synthetic canceller block: `mic_energy` against `echo_estimate_energy` is the whole signal the
+    /// audio rule reads (equal ⇒ 0 dB above the estimate ⇒ "this was echo").
+    fn block(t_start_secs: f64, mic_energy: f32, double_talk: bool) -> corti_aec::BlockStats {
+        corti_aec::BlockStats {
+            t_start_secs,
+            mic_energy,
+            far_energy: 1.0,
+            echo_estimate_energy: 1.0,
+            error_energy: mic_energy,
+            double_talk,
+            suppressed: !double_talk,
+        }
+    }
+
+    /// The per-block record a window retains is bounded twice over: by the echo lookback at every flush,
+    /// and by a hard block cap that a hand-edited `echo_window_seconds` cannot defeat.
+    #[test]
+    fn window_aec_blocks_are_bounded_by_the_echo_lookback_and_a_hard_cap() {
+        let filer = TempFiler::new("aec-blocks");
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+
+        // One block every 0.5 s across the first (one-minute) window.
+        window.push_aec_blocks(
+            (0..120)
+                .map(|k| block(f64::from(k) * 0.5, 1.0, false))
+                .collect(),
+        );
+        assert_eq!(window.aec_blocks.len(), 120);
+
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        // The next window starts at 60 s and the echo window is 6 s, so only blocks at 54 s or later can
+        // still be evidence for anything.
+        assert_eq!(window.aec_blocks.len(), 12);
+        assert_eq!(window.aec_blocks[0].t_start_secs, 54.0);
+
+        window.push_aec_blocks(
+            (0..MAX_WINDOW_AEC_BLOCKS + 50)
+                .map(|k| block(60.0 + f64::from(k as u32) * 0.001, 1.0, false))
+                .collect(),
+        );
+        assert_eq!(window.aec_blocks.len(), MAX_WINDOW_AEC_BLOCKS);
+        assert!(
+            window.aec_blocks[0].t_start_secs >= 60.0,
+            "the cap evicts from the old end"
+        );
+    }
+
+    /// The live flush hands the echo pass the canceller's own record for the window. A mic row that shares
+    /// no vocabulary with the far end — nothing the text rules can act on — is dropped anyway when its
+    /// span was measured as little more than the echo the filter was already subtracting, while a mic row
+    /// over the same far-end speech with real energy behind it survives.
+    ///
+    /// Synthetic script and synthetic blocks — this repo is public.
+    #[test]
+    fn audio_evidence_drops_a_ghost_the_text_rules_would_keep() {
+        let filer = TempFiler::new("audio-evidence");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+
+        window.push_them_words(vec![
+            word(
+                2.0,
+                20.0,
+                "The calibration jig arrives from Toronto on Tuesday.",
+            ),
+            word(38.0, 45.0, "Which desk is it going to?"),
+        ]);
+        window.push_mic_words(vec![
+            // A ghost: no content token in common with the far end, so the text rules keep it.
+            word(12.0, 12.6, "Gateway harness."),
+            // Real near-end speech over the far end's second turn.
+            word(40.0, 41.0, "Sending the notes now."),
+        ]);
+        // One block every 0.5 s. The mic is at the echo estimate through the ghost and 20 dB above it
+        // everywhere else; the gate never fires, so the estimate is trustworthy throughout.
+        window.push_aec_blocks(
+            (0..120)
+                .map(|k| {
+                    let t = f64::from(k) * 0.5;
+                    let ghost = (11.5..13.0).contains(&t);
+                    block(t, if ghost { 1.0 } else { 100.0 }, false)
+                })
+                .collect(),
+        );
+
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        let content = read(&note);
+        assert!(
+            !content.contains("Gateway harness."),
+            "the audio rule did not fire on the ghost:\n{content}"
+        );
+        assert!(
+            content.contains("**[00:40] Me:** Sending the notes now."),
+            "real near-end speech over the far end was dropped:\n{content}"
+        );
+        assert!(content.contains("Which desk is it going to?"));
+    }
+
+    /// Without the record — AEC off, or a `--no-mic` capture — the same window keeps the ghost, because
+    /// the text rules have nothing to go on. This is the control for the test above.
+    #[test]
+    fn the_same_window_keeps_the_ghost_when_no_blocks_were_recorded() {
+        let filer = TempFiler::new("no-audio-evidence");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+
+        window.push_them_words(vec![word(
+            2.0,
+            20.0,
+            "The calibration jig arrives from Toronto on Tuesday.",
+        )]);
+        window.push_mic_words(vec![word(12.0, 12.6, "Gateway harness.")]);
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        assert!(read(&note).contains("Gateway harness."));
     }
 
     /// `carry` holds only the previous window's tail, and only as echo sources: it is never appended a
