@@ -34,7 +34,7 @@
 //! Each window is merged by timestamp before its one append. Far-end `Them N` identities are window-local
 //! and may be renumbered at a boundary; stable cross-window embeddings are deliberately outside ADR 0012.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, sync_channel};
@@ -46,8 +46,8 @@ use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
 use corti_transcribe::segment::{
-    CleanupConfig, CleanupStats, SEGMENT_GAP, SpeakerTurn, Word, cleanup, diarize_words,
-    merge_by_time, words_to_segments,
+    CleanupConfig, CleanupStats, EchoCandidate, SEGMENT_GAP, SpeakerTurn, Word, cleanup,
+    diarize_words, merge_by_time, split_regions, words_to_segments,
 };
 use tracing::{info, warn};
 
@@ -75,6 +75,18 @@ const MAX_FINAL_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
 /// Live preview must not inherit the conservative five-second offline opening. This bounded 100 ms warm-up
 /// still gives the adaptive filter an opening window while making first audio available promptly.
 const LIVE_AEC_LOOKAHEAD_SECONDS: f32 = 0.1;
+
+/// A mic region longer than this (seconds) publishes immediately: residual echo the AEC could not remove is
+/// decoded as a clipped fragment of what the far end just said, never as a sustained utterance (#149
+/// phase 2, #107). Nothing longer is ever delayed, so a real sentence has zero added latency.
+const LIVE_HOLD_MAX_REGION_SECONDS: f64 = 2.0;
+/// …and neither is a region carrying more content tokens than this, whatever its duration.
+const LIVE_HOLD_MAX_CONTENT_TOKENS: usize = 3;
+/// Hard caps on the early-drop state, so a pathological VAD cannot make either collection grow with call
+/// length. Overflow releases the oldest held region early and forgets the oldest echo source: both weaken
+/// the rule for one region, neither loses a word or reorders one.
+const MAX_HELD_MIC_REGIONS: usize = 64;
+const MAX_LIVE_ECHO_SOURCES: usize = 256;
 
 fn new_live_aec(sample_rate: u32, config: corti_aec::AecConfig) -> StreamingAec {
     StreamingAec::new_with_lookahead_seconds(sample_rate, config, LIVE_AEC_LOOKAHEAD_SECONDS)
@@ -961,6 +973,9 @@ struct TranscriptWindow {
     /// landed just before the one-minute boundary is still caught. Never appended (they are already in the
     /// note) and never mutated. Bounded by one window's segment count, so the memory contract is unchanged.
     carry: Vec<TranscriptSegment>,
+    /// Live early drop (#149 phase 2). Per-recording state like `carry`, not per-window: a mic region
+    /// withheld just before a boundary is still judged against far-end regions that close after it.
+    early_drop: EarlyDrop,
 }
 
 impl TranscriptWindow {
@@ -1000,6 +1015,7 @@ impl TranscriptWindow {
             tap_audio,
             buffered_text_bytes: 0,
             diarize_far_end,
+            early_drop: EarlyDrop::new(cleanup.clone()),
             cleanup,
             carry: Vec::new(),
         })
@@ -1075,6 +1091,246 @@ fn buffered_word_bytes(words: &[Word]) -> usize {
     })
 }
 
+/// One decoded mic region withheld from the publisher until the far-end channel can be asked about it.
+struct HeldMicRegion {
+    /// The region's words, untouched — a late publication carries the original timestamps.
+    words: Vec<Word>,
+    candidate: EchoCandidate,
+    /// Call time (seconds) at which the hold expires even if the far end never closes a region.
+    deadline: f64,
+}
+
+/// What the live early drop did over one session. Logged once at the end, next to the per-window
+/// [`CleanupStats`], so a reader who noticed a missing row can tell a drop from a decode failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EarlyDropStats {
+    /// Regions withheld at least once (a held region is later either published or dropped).
+    held: usize,
+    released_published: usize,
+    released_dropped: usize,
+}
+
+/// Live region-level early drop of far-end echo (#149 phase 2).
+///
+/// [`cleanup`] runs at the one-minute durability boundary, which is early enough for the note and far too
+/// late for the Live Transcript window and the hosted Live lane: both see every closed VAD region as it
+/// falls out of the decoder, ghosts included. Neither can be corrected afterwards — a published row is
+/// immutable by construction. `LiveTranscriptStore` only ever appends a row or overlays `clean_text` on
+/// one, the delta protocol the reader applies can add a row or reset the session but not remove a row, and
+/// the hosted coordinator's watermark (rows, words, covered speech) only counts up. So the ghost has to be
+/// stopped *before* it is published, and the only way to do that is to wait.
+///
+/// The wait is bounded and only short regions pay it. A mic region of at most
+/// [`LIVE_HOLD_MAX_REGION_SECONDS`] or [`LIVE_HOLD_MAX_CONTENT_TOKENS`] is held; anything longer is a
+/// sentence, not residual echo, and publishes immediately. A held region is released as soon as the far end
+/// closes a region (which is what makes it judgeable) or `echo_window_seconds` of call time have passed
+/// since it ended, whichever comes first — so the worst case added latency is `echo_window_seconds`, 6 s by
+/// default, and the typical case is the far end drawing breath.
+///
+/// At release the phase-1 rule decides, through the same [`EchoCandidate`] the window pass uses: published
+/// with its original words and timestamps, or dropped and counted. Only Them→Me is judged here; the
+/// far-end channel is never delayed.
+///
+/// Publication is strictly FIFO. A long region arriving while something is held releases what is held
+/// first, so a late row can never overtake an earlier mic row.
+struct EarlyDrop {
+    cfg: CleanupConfig,
+    /// Recently closed far-end regions, oldest first, as read-only echo sources.
+    sources: VecDeque<EchoCandidate>,
+    /// Withheld mic regions, oldest first.
+    held: VecDeque<HeldMicRegion>,
+    stats: EarlyDropStats,
+}
+
+impl EarlyDrop {
+    fn new(cfg: CleanupConfig) -> Self {
+        Self {
+            cfg,
+            sources: VecDeque::new(),
+            held: VecDeque::new(),
+            stats: EarlyDropStats::default(),
+        }
+    }
+
+    /// The pass is gated by the same `echo_drop` knob the window pass is: one rule, one switch.
+    fn enabled(&self) -> bool {
+        self.cfg.echo_drop
+    }
+
+    /// Nothing is waiting — the invariant that must hold before every durable append.
+    fn is_idle(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    /// Residual echo is a clipped fragment; a region that is neither brief nor nearly wordless is speech.
+    fn is_short(&self, candidate: &EchoCandidate) -> bool {
+        candidate.end() - candidate.start() <= LIVE_HOLD_MAX_REGION_SECONDS
+            || candidate.content_tokens() <= LIVE_HOLD_MAX_CONTENT_TOKENS
+    }
+
+    /// A mic poll produced words. Returns the word groups to publish now, in order.
+    fn offer_mic(&mut self, words: Vec<Word>, now: f64) -> Vec<Vec<Word>> {
+        if !self.enabled() || words.is_empty() {
+            return vec![words];
+        }
+        let regions = split_regions(&words, SEGMENT_GAP);
+        if regions.is_empty() {
+            return vec![words];
+        }
+        let mut out = Vec::with_capacity(regions.len());
+        for region in regions {
+            let candidate = EchoCandidate::from_words(true, &region);
+            if !self.is_short(&candidate) {
+                // A sentence publishes now — but never ahead of a region that arrived before it.
+                out.append(&mut self.drain_held());
+                out.push(region);
+                continue;
+            }
+            let deadline = candidate.end() + self.cfg.echo_window_seconds;
+            self.held.push_back(HeldMicRegion {
+                words: region,
+                candidate,
+                deadline,
+            });
+            self.stats.held += 1;
+            // Everything popped here is older than what was just pushed, so order still holds.
+            while self.held.len() > MAX_HELD_MIC_REGIONS {
+                self.release_oldest(&mut out);
+            }
+        }
+        self.prune_sources(now);
+        out
+    }
+
+    /// A far-end poll produced words: they become echo sources, and a closed far-end region is exactly the
+    /// event a held region was waiting for. Returns the mic word groups this released.
+    fn offer_them(&mut self, words: &[Word], now: f64) -> Vec<Vec<Word>> {
+        if !self.enabled() || words.is_empty() {
+            return Vec::new();
+        }
+        for region in split_regions(words, SEGMENT_GAP) {
+            self.sources
+                .push_back(EchoCandidate::from_words(false, &region));
+        }
+        let released = self.drain_held();
+        self.prune_sources(now);
+        released
+    }
+
+    /// Call time advanced. Releases every hold whose deadline has passed; deadlines are non-decreasing, so
+    /// the front of the queue is always the next to expire.
+    fn due(&mut self, now: f64) -> Vec<Vec<Word>> {
+        if !self.enabled() || self.held.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        while self.held.front().is_some_and(|h| h.deadline <= now) {
+            self.release_oldest(&mut out);
+        }
+        self.prune_sources(now);
+        out
+    }
+
+    /// Release everything, whatever the deadline: a durable append is about to render the note, or the
+    /// session is over. Nothing is lost, only judged with the sources that exist by then.
+    fn release_all(&mut self) -> Vec<Vec<Word>> {
+        if !self.enabled() {
+            return Vec::new();
+        }
+        self.drain_held()
+    }
+
+    fn drain_held(&mut self) -> Vec<Vec<Word>> {
+        let mut out = Vec::with_capacity(self.held.len());
+        while !self.held.is_empty() {
+            self.release_oldest(&mut out);
+        }
+        out
+    }
+
+    /// Judge the oldest held region against the far-end ring and either append its words to `out` or count
+    /// the drop.
+    fn release_oldest(&mut self, out: &mut Vec<Vec<Word>>) {
+        let Some(held) = self.held.pop_front() else {
+            return;
+        };
+        let echo = self
+            .sources
+            .iter()
+            .any(|source| held.candidate.is_echo_of(source, &self.cfg));
+        if echo {
+            self.stats.released_dropped += 1;
+        } else {
+            self.stats.released_published += 1;
+            out.push(held.words);
+        }
+    }
+
+    /// A far-end region can still source an echo up to `echo_window_seconds` after it ends, for any subject
+    /// that has already been decoded — so sources are kept relative to the oldest thing still to be judged,
+    /// not to the clock.
+    fn prune_sources(&mut self, now: f64) {
+        let floor = self.held.front().map_or(now, |h| h.candidate.start());
+        let horizon = floor - self.cfg.echo_window_seconds;
+        self.sources.retain(|source| source.end() >= horizon);
+        while self.sources.len() > MAX_LIVE_ECHO_SOURCES {
+            self.sources.pop_front();
+        }
+    }
+}
+
+/// Publish one decoded mic region, or withhold it until the far end has had its chance to prove it was an
+/// echo (#149 phase 2). Publication and the note's buffer move together, so the reader and the note never
+/// disagree about which regions existed.
+fn publish_mic_words<P: TranscriptPublisher>(
+    window: &mut TranscriptWindow,
+    publisher: &P,
+    words: Vec<Word>,
+) {
+    let now = window.next_start_sec();
+    let released = window.early_drop.offer_mic(words, now);
+    emit_mic_words(window, publisher, released);
+}
+
+/// Publish one decoded far-end region. The far end is never delayed; its closing is what releases held mic
+/// regions, and it becomes an echo source for the ones still to come.
+fn publish_them_words<P: TranscriptPublisher>(
+    window: &mut TranscriptWindow,
+    publisher: &P,
+    words: Vec<Word>,
+) {
+    let now = window.next_start_sec();
+    let released = window.early_drop.offer_them(&words, now);
+    publisher.words(Speaker::Other("Them".to_string()), &words);
+    window.push_them_words(words);
+    emit_mic_words(window, publisher, released);
+}
+
+/// Call time advanced: a hold that no far-end region closed out still expires on its own.
+fn release_due_mic_words<P: TranscriptPublisher>(window: &mut TranscriptWindow, publisher: &P) {
+    let now = window.next_start_sec();
+    let released = window.early_drop.due(now);
+    emit_mic_words(window, publisher, released);
+}
+
+/// Release everything still held. Required before every [`flush_window`]: a held region is not in
+/// `window.mic_words` yet, so leaving one behind would drop it from the note.
+fn release_held_mic_words<P: TranscriptPublisher>(window: &mut TranscriptWindow, publisher: &P) {
+    let released = window.early_drop.release_all();
+    emit_mic_words(window, publisher, released);
+}
+
+fn emit_mic_words<P: TranscriptPublisher>(
+    window: &mut TranscriptWindow,
+    publisher: &P,
+    released: Vec<Vec<Word>>,
+) {
+    for words in released {
+        publisher.words(Speaker::Me, &words);
+        window.push_mic_words(words);
+    }
+}
+
 /// macOS drops Corti's TCC file-access grants whenever an ad-hoc-signed upgrade changes its code identity
 /// (ADR 0006), so vault writes can start failing mid-call while capture keeps its freshly re-prompted mic
 /// grant. Name the remedy: the raw `Operation not permitted` path is what reaches the tray, truncated.
@@ -1140,14 +1396,14 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 them.push(tap_slice, sample_rate);
             }
             if let Some(words) = mic.poll_words() {
-                publisher.words(Speaker::Me, &words);
-                window.push_mic_words(words);
+                publish_mic_words(window, publisher, words);
             }
             if let Some(words) = them.poll_words() {
-                publisher.words(Speaker::Other("Them".to_string()), &words);
-                window.push_them_words(words);
+                publish_them_words(window, publisher, words);
             }
             window.push_audio(tap_slice, take);
+            // Call time advanced, so a hold no far-end region closed out can expire on its own (#149).
+            release_due_mic_words(window, publisher);
             offset = end;
 
             // A failed checkpoint degrades the session instead of ending it: filing is best-effort and the
@@ -1196,11 +1452,12 @@ fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: Transc
     publisher: &P,
 ) -> Result<()> {
     let mic_words = mic.checkpoint();
-    publisher.words(Speaker::Me, &mic_words);
-    window.push_mic_words(mic_words);
+    publish_mic_words(window, publisher, mic_words);
     let them_words = them.checkpoint();
-    publisher.words(Speaker::Other("Them".to_string()), &them_words);
-    window.push_them_words(them_words);
+    publish_them_words(window, publisher, them_words);
+    // The forced far-end tail is the last echo source this window will get; nothing may stay held across
+    // the append, because the note is rendered from the words buffered in the window.
+    release_held_mic_words(window, publisher);
     flush_window(diarizer, window, writer)
 }
 
@@ -1211,6 +1468,10 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     window: &mut TranscriptWindow,
     writer: &mut NoteWriter<F>,
 ) -> Result<()> {
+    debug_assert!(
+        window.early_drop.is_idle(),
+        "every caller must release held mic regions before the window is rendered"
+    );
     let mut segments = words_to_segments(&window.mic_words, Speaker::Me, SEGMENT_GAP);
     if !window.them_words.is_empty() {
         let turns = if window.diarize_far_end {
@@ -1285,20 +1546,29 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
         }
     }
     if let Some(words) = mic.poll_words() {
-        publisher.words(Speaker::Me, &words);
-        window.push_mic_words(words);
+        publish_mic_words(&mut window, publisher, words);
     }
     if let Some(words) = them.poll_words() {
-        publisher.words(Speaker::Other("Them".to_string()), &words);
-        window.push_them_words(words);
+        publish_them_words(&mut window, publisher, words);
     }
     let mic_words = mic.finish();
-    publisher.words(Speaker::Me, &mic_words);
-    window.push_mic_words(mic_words);
+    publish_mic_words(&mut window, publisher, mic_words);
     let them_words = them.finish();
-    publisher.words(Speaker::Other("Them".to_string()), &them_words);
-    window.push_them_words(them_words);
+    publish_them_words(&mut window, publisher, them_words);
+    // The session is over: every held region is judged now against everything the far end ever said in
+    // range, and published or dropped. Nothing waits past the last append.
+    release_held_mic_words(&mut window, publisher);
+    let early_drop = window.early_drop.stats;
     flush_window(&diarizer, &mut window, writer)?;
+    if early_drop != EarlyDropStats::default() {
+        info!(
+            target: "corti::live",
+            held = early_drop.held,
+            released_published = early_drop.released_published,
+            released_dropped = early_drop.released_dropped,
+            "live early drop of short mic echoes"
+        );
+    }
 
     match writer.path().cloned() {
         Some(note_path) if quality.dropped_chunks == 0 => {
@@ -2245,6 +2515,363 @@ mod tests {
         assert!(
             !content.contains("Me:** Gateway timeout queue depth."),
             "cross-window echo survived — carry did not reach the next window"
+        );
+    }
+
+    /// A short mic region decoded while the far end is still mid-region is withheld, judged against that
+    /// region when it closes, and never reaches the reader at all (#149 phase 2).
+    ///
+    /// Synthetic script — this repo is public, so the shape is reproduced with invented words.
+    #[test]
+    fn a_short_mic_ghost_inside_a_far_end_region_is_never_published() {
+        let filer = TempFiler::new("early-drop-ghost");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+
+        // The far end speaks from 0.0 to 3.0, but its region only closes on the second chunk.
+        let mut them = Scripted::new(
+            vec![
+                Vec::new(),
+                vec![word(0.0, 3.0, "the settlement gateway rollout")],
+            ],
+            Vec::new(),
+        );
+        // Residual echo, decoded while that region is still open — nothing downstream can retract it.
+        let mut mic = Scripted::new(
+            vec![vec![word(1.0, 1.5, "Settlement gateway.")]],
+            Vec::new(),
+        );
+
+        let (tx, rx) = sync_channel::<CaptureChunk>(4);
+        for _ in 0..2 {
+            tx.send(CaptureChunk {
+                mic: vec![0.0; 5],
+                tap: vec![0.0; 5],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let publisher = RecordingPublisher::default();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            window.early_drop.stats,
+            EarlyDropStats {
+                held: 1,
+                released_published: 0,
+                released_dropped: 1,
+            }
+        );
+        assert_eq!(
+            publisher
+                .0
+                .borrow()
+                .iter()
+                .map(|(speaker, _)| speaker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Them"],
+            "the ghost reached the reader"
+        );
+
+        finish_session(
+            1,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            FinishQuality { dropped_chunks: 0 },
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+        let content = read(&note);
+        assert!(
+            !content.contains("Me:**"),
+            "unexpected note body:\n{content}"
+        );
+    }
+
+    /// A short mic region that is *not* an echo is published late — after the far-end region whose closing
+    /// released it — carrying its original words and timestamps. The reader orders rows by time, so a late
+    /// row still lands in its place.
+    #[test]
+    fn a_short_genuine_answer_is_published_late_with_its_original_timestamps() {
+        let filer = TempFiler::new("early-drop-answer");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+
+        let mut them = Scripted::new(
+            vec![
+                vec![word(0.0, 1.0, "which region is the replica in?")],
+                Vec::new(),
+                Vec::new(),
+                vec![word(4.0, 4.6, "Got it.")],
+            ],
+            Vec::new(),
+        );
+        let answer = word(1.4, 1.9, "Frankfurt.");
+        let mut mic = Scripted::new(vec![Vec::new(), vec![answer.clone()]], Vec::new());
+
+        let (tx, rx) = sync_channel::<CaptureChunk>(8);
+        for _ in 0..5 {
+            tx.send(CaptureChunk {
+                mic: vec![0.0; 1],
+                tap: vec![0.0; 1],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let publisher = RecordingPublisher::default();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            window.early_drop.stats,
+            EarlyDropStats {
+                held: 1,
+                released_published: 1,
+                released_dropped: 0,
+            }
+        );
+        let published = publisher.0.borrow();
+        assert_eq!(
+            published
+                .iter()
+                .map(|(speaker, words)| (speaker.as_str(), words[0].text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("Them", "which region is the replica in?"),
+                ("Them", "Got it."),
+                ("Me", "Frankfurt."),
+            ],
+            "the answer was not held until the far end closed a region"
+        );
+        assert_eq!(published[2].1, vec![answer], "timestamps were rewritten");
+        drop(published);
+
+        finish_session(
+            1,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            FinishQuality { dropped_chunks: 0 },
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+        let content = read(&note);
+        assert!(
+            content.contains("Me:** Frankfurt."),
+            "unexpected note body:\n{content}"
+        );
+    }
+
+    /// A long mic region is a sentence, not residual echo: it publishes with no added latency. It still
+    /// never overtakes a region held before it, and whatever is held when the session ends is released
+    /// rather than lost.
+    #[test]
+    fn long_mic_regions_publish_immediately_and_holds_are_released_in_order_at_finish() {
+        let filer = TempFiler::new("early-drop-order");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+
+        let mut them = Scripted::new(Vec::new(), Vec::new());
+        let opener = word(0.2, 0.7, "Okay sure.");
+        let sentence = word(
+            1.0,
+            5.0,
+            "We should move the settlement rollout to the next maintenance window.",
+        );
+        let trailing = word(6.0, 6.4, "Right.");
+        let mut mic = Scripted::new(
+            vec![
+                vec![opener.clone()],
+                vec![sentence.clone()],
+                vec![trailing.clone()],
+            ],
+            Vec::new(),
+        );
+
+        let (tx, rx) = sync_channel::<CaptureChunk>(8);
+        for _ in 0..3 {
+            tx.send(CaptureChunk {
+                mic: vec![0.0; 2],
+                tap: vec![0.0; 2],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let publisher = RecordingPublisher::default();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+
+        assert_eq!(
+            publisher
+                .0
+                .borrow()
+                .iter()
+                .map(|(_, words)| words[0].text.clone())
+                .collect::<Vec<_>>(),
+            vec![opener.text.clone(), sentence.text.clone()],
+            "the sentence overtook the region held before it"
+        );
+        assert_eq!(window.early_drop.stats.held, 2);
+
+        finish_session(
+            1,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            FinishQuality { dropped_chunks: 0 },
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+        assert_eq!(
+            publisher
+                .0
+                .borrow()
+                .iter()
+                .map(|(_, words)| words[0].text.clone())
+                .collect::<Vec<_>>(),
+            vec![opener.text, sentence.text, trailing.text],
+            "a region still held at finish was lost"
+        );
+        let content = read(&note);
+        for text in ["Okay sure.", "We should move the settlement", "Right."] {
+            assert!(content.contains(text), "unexpected note body:\n{content}");
+        }
+    }
+
+    /// The early-drop state never grows with call length. Overflowing either cap degrades the rule for one
+    /// region — it does not lose a region or reorder one.
+    #[test]
+    fn early_drop_state_is_bounded_and_overflow_releases_rather_than_loses() {
+        let mut early = EarlyDrop::new(CleanupConfig::default());
+        let mut published = 0usize;
+        for i in 0..(MAX_HELD_MIC_REGIONS + 20) {
+            let start = i as f64 * 0.1;
+            published += early
+                .offer_mic(vec![word(start, start + 0.05, "ping")], start)
+                .len();
+        }
+        assert_eq!(early.held.len(), MAX_HELD_MIC_REGIONS);
+        assert_eq!(published, 20, "overflow lost the regions it evicted");
+        published += early.release_all().len();
+        assert!(early.is_idle());
+        assert_eq!(published, MAX_HELD_MIC_REGIONS + 20);
+        assert_eq!(early.stats.released_dropped, 0, "there was nothing to echo");
+
+        // Far-end regions are normally pruned by time; the hard cap catches a pathological burst inside one
+        // instant, which no horizon can trim.
+        let mut early = EarlyDrop::new(CleanupConfig::default());
+        for _ in 0..(MAX_LIVE_ECHO_SOURCES + 10) {
+            early.offer_them(&[word(0.0, 0.5, "chatter")], 0.0);
+        }
+        assert_eq!(early.sources.len(), MAX_LIVE_ECHO_SOURCES);
+    }
+
+    /// With the echo pass switched off, the early drop is a passthrough: it holds nothing and counts
+    /// nothing, and the live path behaves exactly as it did before #149 phase 2.
+    #[test]
+    fn early_drop_disabled_publishes_every_region_immediately() {
+        let mut early = EarlyDrop::new(CleanupConfig {
+            echo_drop: false,
+            ..CleanupConfig::default()
+        });
+        let ghost = vec![word(1.0, 1.2, "Gateway.")];
+        early.offer_them(&[word(0.0, 3.0, "the settlement gateway rollout")], 3.0);
+        assert_eq!(early.offer_mic(ghost.clone(), 3.5), vec![ghost]);
+        assert!(early.is_idle());
+        assert_eq!(early.stats, EarlyDropStats::default());
+    }
+
+    /// A hold never survives a durable append: the note is rendered from the window's buffered words, so
+    /// `checkpoint_and_flush` releases every held region before it flushes.
+    #[test]
+    fn a_hold_is_released_before_the_durable_append() {
+        let filer = TempFiler::new("early-drop-boundary");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+
+        let mut them = Scripted::new(Vec::new(), Vec::new());
+        // Decoded at 58 s, so the hold would not expire on its own until 64.5 s — past this window's end.
+        let mut mic = Scripted::new(
+            vec![Vec::new(), vec![word(58.0, 58.5, "Frankfurt.")]],
+            Vec::new(),
+        );
+
+        let (tx, rx) = sync_channel::<CaptureChunk>(4);
+        for _ in 0..2 {
+            tx.send(CaptureChunk {
+                mic: vec![0.0; 30],
+                tap: vec![0.0; 30],
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        consume_chunks(
+            &rx,
+            1,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+
+        assert!(window.early_drop.is_idle());
+        let content = read(&note);
+        assert!(
+            content.contains("**[00:58] Me:** Frankfurt."),
+            "the held region missed its window:\n{content}"
         );
     }
 

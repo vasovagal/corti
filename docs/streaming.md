@@ -144,6 +144,42 @@ event; any tee drop quality-gates the result into lossless same-note fallback. F
 [transcription.md](transcription.md#live-inbox-filing-87); the write-authority amendment is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md).
 
+### Early drop, before publication (#149 phase 2)
+
+The durability boundary is early enough for the note and far too late for the Live Transcript window and the
+hosted Live lane: both see every closed VAD region the moment the decoder emits it. Nothing published there
+can be taken back. `LiveTranscriptStore` only appends a row or overlays `clean_text` on one; the delta
+protocol the reader applies (`app/ui/src/lib/liveTranscript.ts`) can add a row or reset the session but has
+no way to remove one; and the hosted coordinator's watermark — rows, words, covered speech — only counts up,
+with an in-flight clean rewrite matched back by exact row identity and timing. So a ghost has to be stopped
+*before* it is published, and the only way to do that is to wait for the far-end channel.
+
+`EarlyDrop` (`app/src/live.rs`) holds a mic region for that answer, and only a short one: at most 2 s **or**
+at most 3 content tokens. Residual echo the AEC could not remove is decoded as a clipped fragment of what the
+far end just said, never as a sustained utterance — so a longer region publishes immediately, and if it turns
+out to be an echo anyway, `cleanup` still catches it at the append. A held region is released as soon as the
+far end closes a region (the event that makes it judgeable) or once `echo_window_seconds` of call time have
+passed since it ended, whichever comes first.
+
+**The latency this costs.** Worst case for a short mic utterance is `echo_window_seconds` — 6 s by default;
+the typical case is the far end drawing breath. Long utterances are never delayed, and neither is the far-end
+channel: the rule runs Them→Me only. A held region is published with its original words and timestamps, and
+the reader orders rows by call time, so a late row lands in its place rather than at the bottom.
+
+At release the phase-1 rule decides, through the same `EchoCandidate` the window pass uses: a region matching
+a far-end region in the ring at `echo_containment` — or matching totally with its span inside one, for a
+region of one or two content tokens — is dropped and counted; anything else is published *and* buffered for
+the note in the same step, so the reader and the note never disagree about which regions existed.
+
+Nothing may stay held across a durable append or the end of a session: `checkpoint_and_flush` and
+`finish_session` release every hold before `flush_window` renders. Both collections are hard-capped (64 held
+regions, 256 sources); overflow releases the oldest hold early and forgets the oldest source, which weakens
+the rule for one region but never loses or reorders a word — publication is strictly FIFO, so a long region
+arriving while something is held releases what is held first. The pass is gated by the same
+`cleanup.echo_drop` switch as the window pass, every note records which it ran under
+(`corti.configuration.segment_cleanup.live_early_drop`), and the session's `held` /`released_published` /
+`released_dropped` counts land on the `corti::live` target next to the per-window cleanup stats.
+
 ## In-app timestamped reader and microphone test (#105, ADR 0013)
 
 The tray exposes one contextual action over the same live engine:
@@ -170,9 +206,10 @@ remain batch-only and show an unavailable state rather than starting a second ca
   durability boundary additionally forces an open region final. There is no trailing-window re-decode. When
   live filing succeeds, these committed windows **are** the filed note; batch runs only as fallback. Segment
   cleanup inherits the same boundary for merging (see above).
-- **Cleanup runs at the durability boundary, not at the region.** The Live Transcript window (ADR 0013) and
-  the hosted Live lane still see every closed VAD region, ghosts included; only the note is cleaned. Dropping
-  a ghost before it is published is a separate, latency-bearing change (#149 phase 2).
+- **Only the echo rule runs at the region.** Fragment merging and the backchannel rule still run only at the
+  durability boundary, so the Live Transcript window (ADR 0013) and the hosted Live lane keep showing a
+  "Yeah." and two halves of one sentence that the note will not. Echo is the one rule that runs early (see
+  above), because it is the one whose ghost cannot be un-published — and it runs Them→Me only.
 - **Far-end speaker numbers are window-local.** Optional diarization runs before every append, but `Them N`
   clustering may renumber at a boundary. Stable cross-window identity needs persistent embedding matching and
   is outside ADR 0012.

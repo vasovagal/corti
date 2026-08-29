@@ -50,7 +50,7 @@ processed/disabled. The request includes the original lookahead rather than re-r
 ## Segment cleanup — echo, fragments, backchannels (#149)
 
 `merge_by_time` is the first and only point where the two capture channels see each other, so it is the
-only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:268`) runs
+only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:295`) runs
 there, on **both** paths — batch (`app/src/transcribe.rs:366`, right after `Backend::transcribe`, so it
 covers local, AWS and `corti --input`) and live (`app/src/live.rs`, inside `flush_window` before the
 append) — and always **before** the LLM tier, which is contractually forbidden from dropping or reordering
@@ -60,7 +60,7 @@ deliberately out of scope — those belong to the decoder.
 
 Three passes, in this order:
 
-1. **Echo** (`drop_echoes`, `:399`). Residual speaker bleed the AEC could not remove is decoded as a short
+1. **Echo** (`drop_echoes`, `:500`). Residual speaker bleed the AEC could not remove is decoded as a short
    `Me` utterance 1–6 s after the far end said the same words (issue #107, whose AEC root causes stay open).
    For each segment S, every **earlier, still-kept** other-channel segment O with
    `O.start ≤ S.start ≤ O.end + echo_window_seconds` is a candidate source; S is dropped when it has three
@@ -70,29 +70,37 @@ Three passes, in this order:
    stopwords and backchannels, as a set, so a stutter cannot inflate a score. Only kept segments are
    sources, so echoes never chain; one source may kill several copies; the rule is symmetric and the two
    directions are counted separately.
-2. **Merge** (`merge_fragments`, `:469`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
+2. **Merge** (`merge_fragments`, `:539`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
    so every fragment visible in a note has a measured gap above that. Consecutive same-speaker segments
    within `merge_gap_seconds` are joined — **unless the other channel started a turn in between**. That
    clause is why this is not a VAD tuning problem: `vad_min_silence` can be raised, but it cannot know that
    the far end took the floor, and raising it also delays live rows and pushes regions toward the 20 s cap.
-3. **Backchannel** (`drop_backchannel_turns`, `:513`). A segment of fewer than four words whose whole
+3. **Backchannel** (`drop_backchannel_turns`, `:583`). A segment of fewer than four words whose whole
    normalized text is backchannel ("Yeah.", "Okay yeah.", "Makes sense.") and which overlaps other-channel
    speech is dropped — **unless** the nearest earlier other-channel segment ends in `?`, which makes it an
    answer, not listening.
 
-`CleanupConfig` (`:195`) carries the five knobs; defaults are `echo_drop = true`,
+`CleanupConfig` (`:222`) carries the five knobs; defaults are `echo_drop = true`,
 `echo_window_seconds = 6.0`, `echo_containment = 0.7`, `merge_gap_seconds = 2.5` (non-positive disables the
 pass), `drop_backchannels = true`. The app persists them as the `[cleanup]` table in `config.toml`
 (`app/src/config.rs:169`, effective values via `AppConfig::cleanup_config`, `:235`) with
 `CORTI_CLEANUP_ECHO_DROP`, `CORTI_CLEANUP_ECHO_WINDOW_SECONDS`, `CORTI_CLEANUP_ECHO_CONTAINMENT`,
 `CORTI_CLEANUP_MERGE_GAP_SECONDS` and `CORTI_CLEANUP_DROP_BACKCHANNELS` overriding it. Hand-edited
-nonsense is clamped the same way `aec_config` clamps a non-finite AEC knob. `CleanupStats` (`:239`) is
+nonsense is clamped the same way `aec_config` clamps a non-finite AEC knob. `CleanupStats` (`:266`) is
 logged per run under `corti::transcribe` / `corti::live`, per echo direction.
 
+The live path additionally runs the **echo** rule one step earlier, at the region rather than at the
+window: a short mic region is withheld from the Live Transcript window and the hosted Live lane until the
+far end has closed a region or `echo_window_seconds` have passed, then published or dropped by the rule
+above, through the shared `EchoCandidate` (`segment.rs:426`). Nothing published live can be retracted, which
+is why that one rule pays a latency cost the other two do not. See
+[streaming.md](streaming.md#early-drop-before-publication-149-phase-2).
+
 Every note records the rules it was produced under: `corti.configuration.segment_cleanup`
-(`app/src/provenance.rs:321`, mirrored for `corti-tap --inbox`) is either `"off"` or
+(`app/src/provenance.rs:322`, mirrored for `corti-tap --inbox`) is either `"off"` or
 `{"rules": 1, "echo_drop": …, "echo_window_seconds": …, "echo_containment": …, "merge_gap_seconds": …,
-"drop_backchannels": …}`. `rules` is `CLEANUP_RULES_VERSION` (`segment.rs:190`) — bump it when a pass's
+"drop_backchannels": …, "live_early_drop": …}` — the last of those is true only for a live note whose echo
+rule also ran at the region, before publication (phase 2, below). `rules` is `CLEANUP_RULES_VERSION` (`segment.rs:217`) — bump it when a pass's
 behavior changes so an old note is never read as if it had today's rules.
 
 Offline, `corti-bench process --cleanup/--no-cleanup` runs the same function after ASR, and

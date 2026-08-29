@@ -293,7 +293,7 @@ fn base_configuration(
     configuration.insert("aec".into(), Value::Object(aec));
     configuration.insert(
         "segment_cleanup".into(),
-        segment_cleanup(&cfg.cleanup_config()),
+        segment_cleanup(&cfg.cleanup_config(), mode == GenerationMode::Live),
     );
     configuration.insert(
         "input".into(),
@@ -317,8 +317,9 @@ fn base_configuration(
 
 /// The deterministic segment-cleanup rules a transcript was produced under (#149), or the string `"off"`
 /// when no pass would run. Recorded so a note is self-describing: a row that looks like it is missing an
-/// echo, a fragment or a "Yeah." can be explained from the note itself.
-fn segment_cleanup(cleanup: &CleanupConfig) -> Value {
+/// echo, a fragment or a "Yeah." can be explained from the note itself. `live` additionally records whether
+/// the live path's early drop was running (#149 phase 2).
+fn segment_cleanup(cleanup: &CleanupConfig, live: bool) -> Value {
     if cleanup.is_noop() {
         return Value::String("off".into());
     }
@@ -343,6 +344,13 @@ fn segment_cleanup(cleanup: &CleanupConfig) -> Value {
     map.insert(
         "drop_backchannels".into(),
         Value::Bool(cleanup.drop_backchannels),
+    );
+    // Whether short mic regions were withheld and judged before publication rather than only at the
+    // durability boundary (#149 phase 2). Live-only, and gated by the same `echo_drop` switch — a batch
+    // note has no publication to be early for.
+    map.insert(
+        "live_early_drop".into(),
+        Value::Bool(live && cleanup.echo_drop),
     );
     Value::Object(map)
 }
@@ -388,6 +396,10 @@ mod tests {
             provenance.configuration["segment_cleanup"]["echo_containment"],
             0.7
         );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["live_early_drop"], false,
+            "a completed recording has no live publication to be early for"
+        );
         assert!(!json.contains("private-bucket"));
         assert!(!json.contains("secret-profile"));
         assert!(!json.contains("us-secret-1"));
@@ -425,6 +437,10 @@ mod tests {
         assert_eq!(provenance.configuration["live_buffer_minutes"], 3);
         assert_eq!(provenance.configuration["input"], "live_pcm_stream");
         assert_eq!(provenance.configuration["aec"]["mode"], "streaming");
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["live_early_drop"],
+            true
+        );
         assert!(
             !json.contains("/private/models"),
             "absolute path leaked: {json}"
@@ -500,6 +516,15 @@ mod tests {
         cfg.cleanup.merge_gap_seconds = 0.0;
         let provenance = from_config(&cfg, GenerationMode::Batch);
         assert_eq!(provenance.configuration["segment_cleanup"], "off");
+
+        // The live early drop is the echo rule, moved earlier: switching the echo pass off switches it off.
+        let mut cfg = AppConfig::default();
+        cfg.cleanup.echo_drop = false;
+        let provenance = from_config(&cfg, GenerationMode::Live);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["live_early_drop"],
+            false
+        );
 
         let mut cfg = AppConfig::default();
         cfg.cleanup.echo_containment = 9.0;
