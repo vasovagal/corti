@@ -234,6 +234,57 @@ pub fn clean_wav_path(raw: &Path) -> PathBuf {
     raw.with_file_name(format!("{stem}-clean.wav"))
 }
 
+/// Schema version of the `-aec-stats.json` sidecar. Bump on any incompatible field change.
+pub const AEC_STATS_SCHEMA_VERSION: u32 = 1;
+
+/// Whether the file-to-file AEC pass also writes its per-block diagnostic sidecar. Opt-in: `corti-bench`
+/// turns it on, the app's ordinary recording path does not (the in-flight filter is the app's path, and it
+/// has its own drain seam).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AecStatsSidecar {
+    /// Do not write `-aec-stats.json`.
+    Off,
+    /// Write `-aec-stats.json` next to the `-clean.wav`.
+    Write,
+}
+
+/// The `-aec-stats.json` sidecar: everything needed to interpret one file-to-file AEC pass without the
+/// audio — the settings, the delay the filter locked, and the per-block echo record (#107 diagnostics).
+///
+/// `blocks[k].t_start_secs` is on the **cleaned** timeline, which for this pass is also the raw input's
+/// timeline: the pass emits one sample per input sample, so a time in this file indexes `-clean.wav`, the
+/// raw 2-track input, and the transcript alike. See [`corti_aec::BlockStats`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AecStatsFile {
+    pub schema_version: u32,
+    /// File name of the raw 2-track input this pass read.
+    pub source: String,
+    pub sample_rate: u32,
+    /// Mic frames in the input (== frames in `-clean.wav`).
+    pub frames: usize,
+    pub lookahead_seconds: f32,
+    pub config: AecConfig,
+    /// Acoustic mic↔far delay locked at the end of warm-up.
+    pub delay_samples: usize,
+    pub delay_ms: f32,
+    /// Block hop = `config.filter_len`; `blocks[k]` covers `[t_start_secs, t_start_secs + block_hop_secs)`.
+    pub block_hop_samples: usize,
+    pub block_hop_secs: f64,
+    /// Blocks the bounded ring dropped before the pass could drain them (0 for a healthy run).
+    pub stats_dropped: u64,
+    pub blocks: Vec<corti_aec::BlockStats>,
+}
+
+/// The AEC statistics sidecar of a raw recording: `<dir>/<stem>.wav` → `<dir>/<stem>-aec-stats.json`.
+/// Sibling of [`clean_wav_path`], written only when the pass is asked for [`AecStatsSidecar::Write`].
+pub fn aec_stats_path(raw: &Path) -> PathBuf {
+    let stem = raw
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".to_string());
+    raw.with_file_name(format!("{stem}-aec-stats.json"))
+}
+
 /// The **file-to-file** AEC pass: read a 2-track WAV, cancel speaker bleed on ch0 (mic) using ch1 (mono
 /// far-end tap) as the echo reference, and write the cleaned 2-track sibling (ch0 = cleaned mic, ch1 = mono
 /// tap "them"). Returns the clean path wrapped in `Some`.
@@ -264,6 +315,26 @@ pub fn write_clean_wav_with_lookahead(
     raw_2track_wav: &Path,
     aec_cfg: &corti_aec::AecConfig,
     lookahead_seconds: f32,
+) -> Result<Option<PathBuf>> {
+    write_clean_wav_with_options(
+        raw_2track_wav,
+        aec_cfg,
+        lookahead_seconds,
+        AecStatsSidecar::Off,
+    )
+}
+
+/// [`write_clean_wav_with_lookahead`] that can also emit the [`AecStatsFile`] sidecar at
+/// [`aec_stats_path`] (#107 diagnostics; `corti-bench` passes [`AecStatsSidecar::Write`]).
+///
+/// The sidecar is a pure by-product: the cleaned WAV is byte-identical either way. With the sidecar off
+/// the canceller still records into its bounded ring and simply drops the overflow — a fixed ≈128 KiB,
+/// never sized by call length.
+pub fn write_clean_wav_with_options(
+    raw_2track_wav: &Path,
+    aec_cfg: &corti_aec::AecConfig,
+    lookahead_seconds: f32,
+    sidecar: AecStatsSidecar,
 ) -> Result<Option<PathBuf>> {
     let mut reader = hound::WavReader::open(raw_2track_wav)
         .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
@@ -303,12 +374,22 @@ pub fn write_clean_wav_with_lookahead(
         lookahead_seconds,
     );
     let mut clean = Vec::with_capacity(mic.len());
+    let mut blocks: Vec<corti_aec::BlockStats> = Vec::new();
+    let want_stats = sidecar == AecStatsSidecar::Write;
     for start in (0..mic.len()).step_by(AEC_PUSH_FRAMES) {
         let end = (start + AEC_PUSH_FRAMES).min(mic.len());
         clean.extend(aec.push(&mic[start..end], &tap[start..end]));
+        // Drain per push so a call longer than the ring cannot lose blocks off the old end.
+        if want_stats {
+            blocks.extend(aec.block_stats());
+        }
     }
-    clean.extend(aec.finish());
+    let fin = aec.finish_with_stats();
+    clean.extend(fin.audio);
     clean.truncate(mic.len());
+    if want_stats {
+        blocks.extend(fin.stats);
+    }
 
     let out = clean_wav_path(raw_2track_wav);
     let out_spec = hound::WavSpec {
@@ -333,6 +414,41 @@ pub fn write_clean_wav_with_lookahead(
         frames,
         "wrote AEC-cleaned WAV"
     );
+
+    if want_stats {
+        let hop = aec_cfg.filter_len.max(1);
+        let sr = spec.sample_rate.max(1);
+        let record = AecStatsFile {
+            schema_version: AEC_STATS_SCHEMA_VERSION,
+            source: raw_2track_wav
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            sample_rate: spec.sample_rate,
+            frames: mic.len(),
+            lookahead_seconds,
+            config: aec_cfg.clone(),
+            delay_samples: fin.delay_samples,
+            delay_ms: fin.delay_samples as f32 * 1000.0 / sr as f32,
+            block_hop_samples: hop,
+            block_hop_secs: hop as f64 / sr as f64,
+            stats_dropped: fin.stats_dropped,
+            blocks,
+        };
+        let stats_path = aec_stats_path(raw_2track_wav);
+        let json = serde_json::to_vec(&record).context("serializing AEC block statistics")?;
+        std::fs::write(&stats_path, &json)
+            .with_context(|| format!("writing {}", stats_path.display()))?;
+        tracing::info!(
+            target: "corti::capture",
+            path = %stats_path.display(),
+            blocks = record.blocks.len(),
+            dropped = record.stats_dropped,
+            delay_samples = record.delay_samples as u64,
+            "wrote AEC block statistics"
+        );
+    }
+
     Ok(Some(out))
 }
 
@@ -701,6 +817,116 @@ mod tests {
             )),
             PathBuf::from("/cache/corti/recordings/20260605-140500-zoom-clean.wav")
         );
+    }
+
+    #[test]
+    fn aec_stats_path_is_a_json_sibling() {
+        assert_eq!(
+            aec_stats_path(Path::new(
+                "/cache/corti/recordings/20260605-140500-zoom.wav"
+            )),
+            PathBuf::from("/cache/corti/recordings/20260605-140500-zoom-aec-stats.json")
+        );
+    }
+
+    #[test]
+    fn aec_stats_sidecar_round_trips_and_covers_the_clean_timeline() {
+        let dir = std::env::temp_dir().join("corti-aec-stats-sidecar-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("rec.wav");
+
+        // 8 kHz + a 256-tap filter keeps the FFTs small; the length deliberately isn't a block multiple, so
+        // `finish`'s zero-padded tail block is in the record too.
+        let sample_rate = 8_000u32;
+        let frames = AEC_PUSH_FRAMES + 257;
+        let cfg = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let mic: Vec<f32> = (0..frames)
+            .map(|i| {
+                let near = (i as f32 * 0.011).sin() * 0.05;
+                let echo = if i >= 24 { tap[i - 24] * 0.6 } else { 0.0 };
+                near + echo
+            })
+            .collect();
+        {
+            let mut w = hound::WavWriter::create(
+                &raw,
+                hound::WavSpec {
+                    channels: 2,
+                    sample_rate,
+                    bits_per_sample: 32,
+                    sample_format: hound::SampleFormat::Float,
+                },
+            )
+            .unwrap();
+            for i in 0..frames {
+                w.write_sample(mic[i]).unwrap();
+                w.write_sample(tap[i]).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+
+        // Off (the default the app path takes): no sidecar, and the cleaned audio is the baseline.
+        let plain = write_clean_wav_with_lookahead(&raw, &cfg, 0.5)
+            .unwrap()
+            .unwrap();
+        assert!(!aec_stats_path(&raw).exists(), "the sidecar must be opt-in");
+        let read_clean = |p: &Path| -> Vec<f32> {
+            let mut r = hound::WavReader::open(p).unwrap();
+            let inter: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
+            inter.iter().step_by(2).copied().collect()
+        };
+        let baseline = read_clean(&plain);
+
+        // Write: same audio, plus the sidecar.
+        let out = write_clean_wav_with_options(&raw, &cfg, 0.5, AecStatsSidecar::Write)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            baseline,
+            read_clean(&out),
+            "asking for statistics must not change the cleaned audio"
+        );
+
+        let stats_path = aec_stats_path(&raw);
+        let bytes = std::fs::read(&stats_path).unwrap();
+        let record: AecStatsFile = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(record.schema_version, AEC_STATS_SCHEMA_VERSION);
+        assert_eq!(record.source, "rec.wav");
+        assert_eq!(record.sample_rate, sample_rate);
+        assert_eq!(record.frames, frames);
+        assert_eq!(record.lookahead_seconds, 0.5);
+        assert_eq!(record.config, cfg);
+        assert_eq!(record.block_hop_samples, cfg.filter_len);
+        assert_eq!(
+            record.stats_dropped, 0,
+            "draining per push must lose nothing"
+        );
+
+        // One record per emitted block, covering the whole cleaned file from 0.0 with no lookahead gap.
+        assert_eq!(record.blocks.len(), frames.div_ceil(cfg.filter_len));
+        assert_eq!(record.blocks[0].t_start_secs, 0.0);
+        let last = record.blocks.last().unwrap().t_start_secs;
+        let total = frames as f64 / sample_rate as f64;
+        assert!(
+            last < total && last + record.block_hop_secs >= total,
+            "last block starts at {last:.3} s but the file is {total:.3} s long"
+        );
+
+        // The echo is real, so the record must show the filter estimating and removing it somewhere.
+        assert!(
+            record.blocks.iter().any(|b| b.echo_estimate_energy > 0.0),
+            "no block estimated any echo"
+        );
+        let span = corti_aec::span_stats(&record.blocks, 0.0, total).unwrap();
+        assert_eq!(span.blocks, record.blocks.len());
+        assert!(span.mean_error_db < span.mean_mic_db, "no cancellation");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

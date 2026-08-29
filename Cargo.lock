@@ -1378,6 +1378,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1459,6 +1460,7 @@ dependencies = [
  "dirs",
  "hound",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

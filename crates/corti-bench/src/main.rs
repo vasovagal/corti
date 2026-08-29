@@ -60,6 +60,10 @@ struct ProcessArgs {
     /// Keep the AEC `-clean.wav` sibling instead of deleting it after transcription.
     #[arg(long)]
     keep_clean: bool,
+    /// Suppress the `<stem>-aec-stats.json` per-block echo record that `--aec` writes by default
+    /// (#107 diagnostics). The sidecar always survives the run, `--keep-clean` or not.
+    #[arg(long)]
+    no_aec_stats: bool,
 
     // --- LocalConfig knobs ---
     #[arg(long, default_value_t = 4)]
@@ -185,10 +189,21 @@ fn run_process(a: ProcessArgs) -> Result<()> {
     let wall = Instant::now();
 
     // 1. Optional AEC (mirrors the shipping pipeline: corti_capture::write_clean_wav → StreamingAec).
+    //    The harness is the diagnostic tool, so it asks for the per-block echo record by default.
     let aec_cfg = aec_config(&a.aec_knobs);
-    let (asr_input, clean_to_delete) = if a.aec {
-        match corti_capture::write_clean_wav(&a.input, &aec_cfg)
-            .with_context(|| format!("running AEC on {}", a.input.display()))?
+    let sidecar = if a.no_aec_stats {
+        corti_capture::AecStatsSidecar::Off
+    } else {
+        corti_capture::AecStatsSidecar::Write
+    };
+    let (asr_input, clean_to_delete, aec_stats) = if a.aec {
+        match corti_capture::write_clean_wav_with_options(
+            &a.input,
+            &aec_cfg,
+            corti_aec::configured_lookahead_seconds(),
+            sidecar,
+        )
+        .with_context(|| format!("running AEC on {}", a.input.display()))?
         {
             Some(clean) => {
                 let del = if a.keep_clean {
@@ -196,15 +211,19 @@ fn run_process(a: ProcessArgs) -> Result<()> {
                 } else {
                     Some(clean.clone())
                 };
-                (clean, del)
+                let stats = (!a.no_aec_stats).then(|| corti_capture::aec_stats_path(&a.input));
+                (clean, del, stats)
             }
             // 1-channel input → tap-only, nothing to cancel; transcribe the raw input.
-            None => (a.input.clone(), None),
+            None => (a.input.clone(), None, None),
         }
     } else {
-        (a.input.clone(), None)
+        (a.input.clone(), None, None)
     };
     let aec_applied = asr_input != a.input;
+    if let Some(p) = &aec_stats {
+        tracing::info!(target: "corti::bench", path = %p.display(), "AEC block statistics");
+    }
 
     // 2. Local transcription with the requested knobs.
     let cfg = local_config(&a);
@@ -236,6 +255,7 @@ fn run_process(a: ProcessArgs) -> Result<()> {
         "backend": "local",
         "aec_applied": aec_applied,
         "aec": if a.aec { Some(aec_json(&aec_cfg)) } else { None },
+        "aec_stats": aec_stats.as_ref().map(|p| p.display().to_string()),
         "config": local_config_json(&cfg),
         "n_segments": transcript.segments.len(),
         "wall_ms": wall.elapsed().as_millis(),
