@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use corti_transcribe::segment::CleanupConfig;
 use serde::{Deserialize, Serialize};
 
 /// Minimum configurable interval between durable live-transcript chunks.
@@ -16,6 +17,42 @@ pub const MIN_LIVE_BUFFER_MINUTES: u32 = 1;
 pub const MAX_LIVE_BUFFER_MINUTES: u32 = 10;
 /// Default crash-loss window for live transcripts.
 pub const DEFAULT_LIVE_BUFFER_MINUTES: u32 = 1;
+
+/// Persisted `[cleanup]` table: the deterministic post-ASR segment cleanup (#149, #107 mitigation #5).
+/// Mirrors [`CleanupConfig`] one-to-one; it lives here rather than in `corti-transcribe` because that crate
+/// has no serde dependency and no business knowing about `config.toml`.
+///
+/// Every field is overridable with `CORTI_CLEANUP_*`. Defaults are the crate's shipping values, so a config
+/// file written before this table existed behaves exactly like one that opts in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CleanupSettings {
+    /// Drop a segment that repeats what the other channel just said (`CORTI_CLEANUP_ECHO_DROP`).
+    pub echo_drop: bool,
+    /// How long after a far-end utterance starts its echo may still be decoded
+    /// (`CORTI_CLEANUP_ECHO_WINDOW_SECONDS`).
+    pub echo_window_seconds: f64,
+    /// Shared-content-token fraction that makes a segment an echo (`CORTI_CLEANUP_ECHO_CONTAINMENT`).
+    pub echo_containment: f64,
+    /// Largest silence two consecutive same-speaker segments may span and still be joined
+    /// (`CORTI_CLEANUP_MERGE_GAP_SECONDS`; non-positive disables the merge pass).
+    pub merge_gap_seconds: f64,
+    /// Drop a bare "Yeah." spoken over the other side (`CORTI_CLEANUP_DROP_BACKCHANNELS`).
+    pub drop_backchannels: bool,
+}
+
+impl Default for CleanupSettings {
+    fn default() -> Self {
+        let d = CleanupConfig::default();
+        Self {
+            echo_drop: d.echo_drop,
+            echo_window_seconds: d.echo_window_seconds,
+            echo_containment: d.echo_containment,
+            merge_gap_seconds: d.merge_gap_seconds,
+            drop_backchannels: d.drop_backchannels,
+        }
+    }
+}
 
 /// Which transcription backend to run. Both can be compiled in (`aws` + `local` features); this picks the
 /// active one at **runtime**. Persisted/serialized as the lowercase token (`"aws"` / `"local"`), matching
@@ -127,6 +164,9 @@ pub struct AppConfig {
     /// (`CORTI_LIVE_BUFFER_MINUTES`, default 1, clamped to 1–10). This is the ordinary commit interval;
     /// hard byte caps can force an earlier write and decoder lag remains independently fixed/bounded.
     pub live_buffer_minutes: u32,
+    /// Deterministic post-ASR segment cleanup (#149). **Must stay the last field**: it serializes as a
+    /// `[cleanup]` TOML table, and TOML forbids a bare key after a table header.
+    pub cleanup: CleanupSettings,
 }
 
 impl Default for AppConfig {
@@ -154,6 +194,7 @@ impl Default for AppConfig {
             retention_days: 7,
             live_filing: true,
             live_buffer_minutes: DEFAULT_LIVE_BUFFER_MINUTES,
+            cleanup: CleanupSettings::default(),
         }
     }
 }
@@ -187,6 +228,26 @@ impl AppConfig {
             max_lag_ms: d.max_lag_ms,
         }
     }
+
+    /// The effective [`CleanupConfig`], with hand-edited nonsense replaced by the shipping default the same
+    /// way [`AppConfig::aec_config`] treats a non-finite AEC knob. A negative `merge_gap_seconds` is *not*
+    /// nonsense — it is how the merge pass is switched off.
+    pub fn cleanup_config(&self) -> CleanupConfig {
+        let d = CleanupConfig::default();
+        let c = &self.cleanup;
+        CleanupConfig {
+            echo_drop: c.echo_drop,
+            echo_window_seconds: finite_or(c.echo_window_seconds, d.echo_window_seconds).max(0.0),
+            echo_containment: finite_or(c.echo_containment, d.echo_containment).clamp(0.0, 1.0),
+            merge_gap_seconds: finite_or(c.merge_gap_seconds, d.merge_gap_seconds),
+            drop_backchannels: c.drop_backchannels,
+        }
+    }
+}
+
+/// `value` unless it is NaN/±inf, in which case `fallback`.
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
 }
 
 impl AppConfig {
@@ -268,6 +329,27 @@ impl AppConfig {
         {
             cfg.live_buffer_minutes = minutes;
         }
+        if env_non_empty("CORTI_CLEANUP_ECHO_DROP").is_some() {
+            cfg.cleanup.echo_drop = env_bool("CORTI_CLEANUP_ECHO_DROP", cfg.cleanup.echo_drop);
+        }
+        if let Some(v) = env_f64("CORTI_CLEANUP_ECHO_WINDOW_SECONDS").filter(|v| *v >= 0.0) {
+            cfg.cleanup.echo_window_seconds = v;
+        }
+        if let Some(v) =
+            env_f64("CORTI_CLEANUP_ECHO_CONTAINMENT").filter(|v| (0.0..=1.0).contains(v))
+        {
+            cfg.cleanup.echo_containment = v;
+        }
+        if let Some(v) = env_f64("CORTI_CLEANUP_MERGE_GAP_SECONDS") {
+            cfg.cleanup.merge_gap_seconds = v;
+        }
+        if env_non_empty("CORTI_CLEANUP_DROP_BACKCHANNELS").is_some() {
+            cfg.cleanup.drop_backchannels = env_bool(
+                "CORTI_CLEANUP_DROP_BACKCHANNELS",
+                cfg.cleanup.drop_backchannels,
+            );
+        }
+
         // A hand-edited/old config file bypasses the Settings validator. Keep the runtime memory contract
         // binding even then; an invalid env value is ignored and this clamped persisted value wins.
         cfg.live_buffer_minutes = cfg
@@ -377,6 +459,9 @@ pub fn env_managed_fields() -> Vec<String> {
         ("CORTI_RETENTION_DAYS", "retention_days"),
         ("CORTI_LIVE_FILING", "live_filing"),
         ("CORTI_LIVE_BUFFER_MINUTES", "live_buffer_minutes"),
+        // `CORTI_CLEANUP_*` is deliberately absent: the `[cleanup]` table has no Settings UI field to
+        // disable, and `set_config` never writes it (it seeds `to_save` from the file baseline), so an
+        // override cannot be baked into `config.toml` either.
     ]
     .into_iter()
     .filter(|(var, _)| env_non_empty(var).is_some())
@@ -436,6 +521,13 @@ fn env_non_empty(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Read a finite `f64` env var. Unset, empty, unparseable or non-finite ⇒ `None` (the file/default wins).
+fn env_f64(key: &str) -> Option<f64> {
+    env_non_empty(key)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
 /// Read a boolean env var. Unset/empty ⇒ `default`; otherwise anything but `0`/`false`/`off`/`no`
 /// (case-insensitive) is treated as `true`.
 fn env_bool(key: &str, default: bool) -> bool {
@@ -472,6 +564,11 @@ mod tests {
             "CORTI_AEC",
             "CORTI_LIVE_FILING",
             "CORTI_LIVE_BUFFER_MINUTES",
+            "CORTI_CLEANUP_ECHO_DROP",
+            "CORTI_CLEANUP_ECHO_WINDOW_SECONDS",
+            "CORTI_CLEANUP_ECHO_CONTAINMENT",
+            "CORTI_CLEANUP_MERGE_GAP_SECONDS",
+            "CORTI_CLEANUP_DROP_BACKCHANNELS",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
             unsafe { std::env::remove_var(k) };
@@ -509,6 +606,13 @@ mod tests {
             retention_days: 14,
             live_filing: false,
             live_buffer_minutes: 5,
+            cleanup: CleanupSettings {
+                echo_drop: false,
+                echo_window_seconds: 4.5,
+                echo_containment: 0.85,
+                merge_gap_seconds: 1.25,
+                drop_backchannels: false,
+            },
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);
@@ -622,6 +726,57 @@ mod tests {
             AppConfig::load().live_buffer_minutes,
             MAX_LIVE_BUFFER_MINUTES,
             "invalid env must not bypass the persisted-value clamp"
+        );
+
+        clear_config_env();
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::remove_var("CORTI_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every `CORTI_CLEANUP_*` knob reaches `cleanup_config`, and an out-of-range value is ignored rather
+    /// than shipped to the rules.
+    #[test]
+    fn cleanup_env_overrides_apply_and_reject_nonsense() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("corti-cfg-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: process-global env is serialized by ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_DATA_DIR", &dir) };
+        clear_config_env();
+
+        AppConfig::default().save().unwrap();
+        assert_eq!(AppConfig::load().cleanup_config(), CleanupConfig::default());
+
+        for (key, value) in [
+            ("CORTI_CLEANUP_ECHO_DROP", "off"),
+            ("CORTI_CLEANUP_ECHO_WINDOW_SECONDS", "9.5"),
+            ("CORTI_CLEANUP_ECHO_CONTAINMENT", "0.85"),
+            ("CORTI_CLEANUP_MERGE_GAP_SECONDS", "0"),
+            ("CORTI_CLEANUP_DROP_BACKCHANNELS", "0"),
+        ] {
+            // SAFETY: still under ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+        }
+        let cfg = AppConfig::load().cleanup_config();
+        assert_eq!(
+            cfg,
+            CleanupConfig {
+                echo_drop: false,
+                echo_window_seconds: 9.5,
+                echo_containment: 0.85,
+                merge_gap_seconds: 0.0,
+                drop_backchannels: false,
+            }
+        );
+        assert!(cfg.is_noop(), "every pass off ⇒ the whole stage is off");
+
+        // Out of range: the persisted/default value survives.
+        // SAFETY: still under ENV_LOCK.
+        unsafe { std::env::set_var("CORTI_CLEANUP_ECHO_CONTAINMENT", "4") };
+        assert_eq!(
+            AppConfig::load().cleanup_config().echo_containment,
+            CleanupConfig::default().echo_containment
         );
 
         clear_config_env();

@@ -1,6 +1,7 @@
 # Chunked / live transcription
 
-_Verified against main + transcribe.cpp integration PR #92 and crash-safe rolling live commits (#87, #103)._
+_Verified against main + transcribe.cpp integration PR #92, crash-safe rolling live commits (#87, #103),
+and segment cleanup (#149)._
 
 The local backend can transcribe audio **as it arrives**, in arbitrary-sized chunks, over the same selected
 resident Parakeet engine the batch path uses — sherpa/ONNX on CPU or transcribe.cpp/GGML on Metal. There is
@@ -124,9 +125,19 @@ on disk — GGML does not require the ONNX Parakeet set. Otherwise
 never scales with call length; full still means drop + count, never block capture.
 
 One `corti-live` thread continuously drives AEC + ASR. At `live_buffer_minutes` (default 1, range 1–10), it
-forces both ASR tails final, optionally diarizes only that window's far-end PCM, merges by timestamp, renders
+forces both ASR tails final, optionally diarizes only that window's far-end PCM, merges by timestamp, runs the
+deterministic [segment cleanup](transcription.md#segment-cleanup--echo-fragments-backchannels-149), renders
 once, appends once, and `sync_all`s the note. The initial note + parent directory and the final state flip are
-also synced. A 128 MiB far-audio cap or 1 MiB text cap forces an earlier commit. After success all window
+also synced. A 128 MiB far-audio cap or 1 MiB text cap forces an earlier commit.
+
+Cleanup runs inside `flush_window`, between `merge_by_time` and the one `append_segments` call, so the
+committed rows — and therefore the note, the reader, and the hosted final pass — never contain an echo the
+rule catches. It sees one window at a time, plus `TranscriptWindow::carry`: the previous window's appended
+segments whose end is still inside `echo_window_seconds`, kept as **read-only echo sources** and never
+appended a second time. So the echo lookback crosses the append boundary and the fragment merge deliberately
+does not — a row that is already synced is never rewritten (ADR 0012), which costs at most one merge per
+minute. Carry is refreshed after every successful append and is bounded by one window's segment count, so
+the fixed-high-water-mark memory contract is unchanged. After success all window
 lengths return to zero and their allocations are reused: memory reaches a fixed high-water mark instead of
 following call duration. The detector delivers an ID-specific finish/discard verdict before its downstream
 event; any tee drop quality-gates the result into lossless same-note fallback. Filing semantics are in
@@ -157,7 +168,11 @@ remain batch-only and show an unavailable state rather than starting a second ca
 
 - **Live quality trades context for durability.** A natural VAD region is still capped at 20 s; the configured
   durability boundary additionally forces an open region final. There is no trailing-window re-decode. When
-  live filing succeeds, these committed windows **are** the filed note; batch runs only as fallback.
+  live filing succeeds, these committed windows **are** the filed note; batch runs only as fallback. Segment
+  cleanup inherits the same boundary for merging (see above).
+- **Cleanup runs at the durability boundary, not at the region.** The Live Transcript window (ADR 0013) and
+  the hosted Live lane still see every closed VAD region, ghosts included; only the note is cleaned. Dropping
+  a ghost before it is published is a separate, latency-bearing change (#149 phase 2).
 - **Far-end speaker numbers are window-local.** Optional diarization runs before every append, but `Them N`
   clustering may renumber at a boundary. Stable cross-window identity needs persistent embedding matching and
   is outside ADR 0012.

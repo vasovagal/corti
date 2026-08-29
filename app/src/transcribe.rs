@@ -12,6 +12,8 @@ use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
+use corti_transcribe::segment::{CleanupConfig, cleanup};
+
 use crate::config::{AppConfig, BackendChoice};
 
 /// The transcription backend, built once at worker startup.
@@ -51,6 +53,13 @@ impl Backend {
             error!(target: "corti::transcribe", "{reason}");
         }
         Self { cfg, kind }
+    }
+
+    /// The deterministic segment-cleanup rules this backend's config snapshot selects. Taken from the
+    /// same immutable `AppConfig` the backend was built with, so a Settings edit mid-job cannot change the
+    /// rules half-way through a transcript.
+    pub fn cleanup_config(&self) -> CleanupConfig {
+        self.cfg.cleanup_config()
     }
 
     /// Provenance with the recording's durable AEC execution record rather than current Settings.
@@ -349,7 +358,30 @@ pub fn transcribe_recording(
         (raw_audio.to_path_buf(), OfflineAecOutcome::NotRequested)
     };
 
-    let transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
+    let mut transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
+
+    // Deterministic segment cleanup (#149) on the merged timeline the backend returned — the one place
+    // where the two channels can see each other. This covers local, AWS and `corti --input`, and runs
+    // before the transcript reaches the checkpoint, the note, or the LLM tier.
+    let cleanup_cfg = backend.cleanup_config();
+    if !cleanup_cfg.is_noop() {
+        let segments_in = transcript.segments.len();
+        let (segments, stats) =
+            cleanup(std::mem::take(&mut transcript.segments), &cleanup_cfg, &[]);
+        transcript.segments = segments;
+        info!(
+            target: "corti::transcribe",
+            job_id = %attempt.id,
+            segments_in,
+            segments_out = transcript.segments.len(),
+            echo_dropped_me = stats.echo_dropped_me,
+            echo_dropped_them = stats.echo_dropped_them,
+            merged = stats.merged,
+            backchannels_dropped = stats.backchannels_dropped,
+            "segment cleanup applied"
+        );
+    }
+
     Ok((transcript, input, aec_outcome))
 }
 
