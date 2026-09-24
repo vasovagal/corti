@@ -590,6 +590,7 @@ mod tests {
         cfg.cleanup.echo_drop = false;
         cfg.cleanup.drop_backchannels = false;
         cfg.cleanup.merge_gap_seconds = 0.0;
+        cfg.cleanup.strip_fillers = false;
         let provenance = from_config(&cfg, GenerationMode::Batch);
         assert_eq!(provenance.configuration["segment_cleanup"], "off");
 
