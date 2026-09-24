@@ -1400,8 +1400,6 @@ pub(crate) fn start(
         );
         WordBankDocument::empty()
     });
-    let lexicon =
-        crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty);
     let outbox = Arc::new(TelemetryOutbox::open(default_outbox_path()?)?);
     let durable = load_or_create_master_keys().and_then(|keys| {
         let path = default_store_path()?;
@@ -1638,6 +1636,13 @@ fn start_with_components_and_policy(
         snapshot: snapshot.clone(),
         ingress_incomplete: ingress_incomplete.clone(),
         outbox,
+    };
+    // Production reads the owner's lexicon; in-memory fixtures (`persist_to_disk == false`) run
+    // without one so prompt bytes in tests stay exactly what the fixture bank produces.
+    let lexicon = if persist_to_disk {
+        crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty)
+    } else {
+        corti_lexicon::CompiledLexicon::empty()
     };
     let mut service = Service {
         coordinator,
