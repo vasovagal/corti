@@ -7118,7 +7118,19 @@ mod tests {
         }
     }
 
-    impl ProviderAccess for Arc<BlockingPrepareProviders> {
+    /// `ProviderAccess` lives in `corti-chat` now, so the orphan rule forbids implementing it for
+    /// `Arc<_>` directly; this local wrapper derefs to the shared fixture.
+    struct SharedBlockingProviders(Arc<BlockingPrepareProviders>);
+
+    impl std::ops::Deref for SharedBlockingProviders {
+        type Target = BlockingPrepareProviders;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ProviderAccess for SharedBlockingProviders {
         fn descriptor(
             &self,
             provider: &ProviderId,
@@ -8434,7 +8446,7 @@ mod tests {
             pipeline_tx,
             outbox,
             Arc::new(DenyExecutor),
-            Box::new(providers.clone()),
+            Box::new(SharedBlockingProviders(providers.clone())),
             Arc::new(NoPricing),
             Arc::new(UnarmedVertex),
             Arc::new(|_| {}),
