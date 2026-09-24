@@ -640,6 +640,7 @@ mod tests {
                 merge_gap_seconds: 1.25,
                 drop_backchannels: false,
                 echo_audio_margin_db: 1.5,
+                strip_fillers: false,
             },
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();

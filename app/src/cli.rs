@@ -207,7 +207,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Cli, String> {
                     id: args.next().ok_or("--lexicon remove requires a rule id")?,
                 },
                 "test" => LexiconCommand::Test {
-                    text: args.collect::<Vec<_>>().join(" "),
+                    text: args.by_ref().collect::<Vec<_>>().join(" "),
                 },
                 other => {
                     return Err(format!(
