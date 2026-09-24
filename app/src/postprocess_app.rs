@@ -3863,7 +3863,7 @@ enum LiveBuild {
     /// A submission covering the leading rows; `leftover` rows did not fit the model budget and go back
     /// to the front of the batcher.
     Submission {
-        submission: RequestSubmission,
+        submission: Box<RequestSubmission>,
         leftover: Vec<usize>,
     },
     /// `released` rows cannot be sent for a per-row reason and stay raw; `leftover` rows go back.
@@ -5198,7 +5198,7 @@ impl Service {
                     leftover,
                 } => {
                     self.give_back_rows(&leftover, batch.pushed_at_micros);
-                    match self.coordinator.submit_live(submission, watermark) {
+                    match self.coordinator.submit_live(*submission, watermark) {
                         Ok(()) => {}
                         Err(
                             error @ (crate::postprocess::SubmitError::DuplicateCall
@@ -5319,7 +5319,7 @@ impl Service {
             deadline,
         ) {
             Ok(submission) => LiveBuild::Submission {
-                submission,
+                submission: Box::new(submission),
                 leftover,
             },
             Err(error) => {
