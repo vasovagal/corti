@@ -199,6 +199,20 @@ struct AuthState {
     credentials_durable: bool,
     pending: Option<PendingLogin>,
     status: AuthStatus,
+    /// Unix seconds after which a transient auth error may be retried through an ordinary request.
+    /// A refresh that failed on the network is not permanent for the process: once this passes the
+    /// credential projects as usable again and the next call refreshes it.
+    error_retry_after_unix: Option<i64>,
+    /// Consecutive transient auth failures, driving the retry backoff (30 s → 10 min).
+    consecutive_errors: u32,
+}
+
+const AUTH_ERROR_RETRY_BASE_SECONDS: i64 = 30;
+const AUTH_ERROR_RETRY_MAX_SECONDS: i64 = 600;
+
+fn auth_error_backoff_seconds(consecutive_errors: u32) -> i64 {
+    let exponent = consecutive_errors.saturating_sub(1).min(5);
+    (AUTH_ERROR_RETRY_BASE_SECONDS << exponent).min(AUTH_ERROR_RETRY_MAX_SECONDS)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -323,6 +337,8 @@ impl ChatGptSubscriptionAuth {
                     credentials,
                     pending: None,
                     status,
+                    error_retry_after_unix: None,
+                    consecutive_errors: 0,
                 }),
                 operation: Mutex::new(()),
                 next_login: AtomicU64::new(1),
@@ -339,7 +355,18 @@ impl ChatGptSubscriptionAuth {
                 login_id: pending.login_id.clone(),
             };
         }
-        match state.status {
+        // A transient error whose backoff has elapsed projects as usable again, so the coordinator
+        // dispatches and the next `request_credential` performs the refresh instead of the process
+        // staying blocked until a relaunch.
+        let retry_due = state.credentials.is_some()
+            && state
+                .error_retry_after_unix
+                .is_some_and(|at| self.inner.clock.unix_seconds() >= at);
+        let status = match state.status {
+            AuthStatus::Error(_) if retry_due => AuthStatus::Normal,
+            other => other,
+        };
+        match status {
             AuthStatus::Resolving => CredentialState::Resolving,
             AuthStatus::Refreshing => CredentialState::Refreshing,
             AuthStatus::Rejected => CredentialState::Rejected,
@@ -723,6 +750,8 @@ impl ChatGptSubscriptionAuth {
             state.credentials_durable = durable;
             state.pending = None;
             state.status = AuthStatus::Normal;
+            state.error_retry_after_unix = None;
+            state.consecutive_errors = 0;
         }
         if let Err(error) = persisted {
             // The provider has already rotated the refresh token. Keeping the new in-memory credential is
@@ -769,11 +798,16 @@ impl ChatGptSubscriptionAuth {
     }
 
     fn record_auth_error(&self, error: ChatGptAuthError) {
+        let now = self.inner.clock.unix_seconds();
         let mut state = self.inner.state.lock().unwrap();
         state.pending = None;
         state.status = if error == ChatGptAuthError::Rejected {
+            state.error_retry_after_unix = None;
             AuthStatus::Rejected
         } else {
+            state.consecutive_errors = state.consecutive_errors.saturating_add(1);
+            state.error_retry_after_unix =
+                Some(now.saturating_add(auth_error_backoff_seconds(state.consecutive_errors)));
             AuthStatus::Error(error.error_code())
         };
     }
@@ -940,11 +974,37 @@ impl Drop for TokenResponse {
     }
 }
 
+/// Request-body fields whose acceptance by the private Codex Responses endpoint is provider-controlled.
+///
+/// The defaults follow what the Codex CLI itself sends as understood at the time of writing: a low
+/// reasoning effort so JSON arrives before Corti's first-text deadline, no `max_output_tokens`, and a
+/// `text.verbosity` hint. Each is a flag so a rejected field can be switched off without a code change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptBodyOptions {
+    /// `reasoning.effort`; `None` sends no `reasoning` object and accepts the backend default.
+    pub reasoning_effort: Option<String>,
+    /// Whether to send `max_output_tokens` (the catalog's per-model cap still bounds validation).
+    pub send_max_output_tokens: bool,
+    /// Whether to send `text.verbosity: "low"`.
+    pub send_verbosity: bool,
+}
+
+impl Default for ChatGptBodyOptions {
+    fn default() -> Self {
+        Self {
+            reasoning_effort: Some("low".to_owned()),
+            send_max_output_tokens: false,
+            send_verbosity: true,
+        }
+    }
+}
+
 pub struct ChatGptSubscriptionAdapter {
     transport: Box<dyn HttpTransport>,
     clock: Box<dyn Clock>,
     auth: ChatGptSubscriptionAuth,
     options: DirectAdapterOptions,
+    body_options: ChatGptBodyOptions,
     catalog: ModelCatalog,
 }
 
@@ -959,6 +1019,7 @@ impl ChatGptSubscriptionAdapter {
             clock,
             auth,
             options: DirectAdapterOptions::default(),
+            body_options: ChatGptBodyOptions::default(),
             catalog: ModelCatalog { models: Vec::new() },
         }
     }
@@ -966,6 +1027,11 @@ impl ChatGptSubscriptionAdapter {
     pub fn with_options(mut self, options: DirectAdapterOptions) -> Result<Self, PostprocessError> {
         self.options = options.validate()?;
         Ok(self)
+    }
+
+    pub fn with_body_options(mut self, options: ChatGptBodyOptions) -> Self {
+        self.body_options = options;
+        self
     }
 
     fn catalog_inner(&mut self, scope: &ProviderScope) -> Result<ModelCatalog, PostprocessError> {
@@ -1100,8 +1166,9 @@ impl ChatGptSubscriptionAdapter {
             .request_credential(false)
             .map_err(|error| ExecFailure::new(error.error_code(), false))?;
         timing.auth_us = Some(self.clock.monotonic_micros().saturating_sub(auth_start));
-        let body = chatgpt_request_body(request, self.options.max_output_tokens)
-            .map_err(ExecFailure::from_error)?;
+        let body =
+            chatgpt_request_body(request, self.options.max_output_tokens, &self.body_options)
+                .map_err(ExecFailure::from_error)?;
         let wire = build_chatgpt_wire(
             request,
             credential,
@@ -1125,8 +1192,9 @@ impl ChatGptSubscriptionAdapter {
                 .auth
                 .request_credential(true)
                 .map_err(|error| ExecFailure::new(error.error_code(), true))?;
-            let body = chatgpt_request_body(request, self.options.max_output_tokens)
-                .map_err(ExecFailure::from_error)?;
+            let body =
+                chatgpt_request_body(request, self.options.max_output_tokens, &self.body_options)
+                    .map_err(ExecFailure::from_error)?;
             let wire = build_chatgpt_wire(
                 request,
                 credential,
@@ -1374,7 +1442,13 @@ fn validate_chatgpt_request(
         return Err(ErrorCode::PolicyBlocked.into());
     }
     validate_prompt_layout(request)?;
-    if request.cache_policy.provider != ProviderCacheMode::Unavailable {
+    // The private endpoint owns its cache behaviour, so `Unavailable` is the truthful policy; `Off` is
+    // what a lane saved before that policy existed carries, and it asks for nothing the endpoint could
+    // refuse, so it is accepted rather than blocking the lane.
+    if !matches!(
+        request.cache_policy.provider,
+        ProviderCacheMode::Unavailable | ProviderCacheMode::Off
+    ) {
         return Err(ErrorCode::PolicyBlocked.into());
     }
     let model = catalog
@@ -1396,6 +1470,7 @@ fn validate_chatgpt_request(
 fn chatgpt_request_body(
     request: &HostedRequest,
     max_output_tokens: u64,
+    options: &ChatGptBodyOptions,
 ) -> Result<Vec<u8>, PostprocessError> {
     let instructions = request
         .prompt
@@ -1418,23 +1493,32 @@ fn chatgpt_request_body(
             })
         })
         .collect::<Vec<_>>();
-    json_bytes(&json!({
+    let mut text = json!({
+        "format": {
+            "type": "json_schema",
+            "name": output_schema_name(request.prompt.task()),
+            "strict": true,
+            "schema": output_schema(request.prompt.task()),
+        }
+    });
+    if options.send_verbosity {
+        text["verbosity"] = json!("low");
+    }
+    let mut body = json!({
         "model": request.model.as_str(),
         "store": false,
         "stream": true,
         "instructions": instructions,
         "input": input,
-        "max_output_tokens": max_output_tokens,
-        "text": {
-            "verbosity": "low",
-            "format": {
-                "type": "json_schema",
-                "name": output_schema_name(request.prompt.task()),
-                "strict": true,
-                "schema": output_schema(request.prompt.task()),
-            }
-        }
-    }))
+        "text": text,
+    });
+    if options.send_max_output_tokens {
+        body["max_output_tokens"] = json!(max_output_tokens);
+    }
+    if let Some(effort) = options.reasoning_effort.as_deref() {
+        body["reasoning"] = json!({"effort": effort});
+    }
+    json_bytes(&body)
 }
 
 #[derive(Deserialize)]
@@ -1499,12 +1583,14 @@ impl ChatGptStreamState {
             "response.completed" => {
                 let payload: ChatGptCompleted = serde_json::from_str(&event.data)
                     .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if payload.response.model != request.model.as_str()
-                    || payload
-                        .response
-                        .status
-                        .as_deref()
-                        .is_some_and(|status| status != "completed")
+                if !crate::common::served_model_matches(
+                    &payload.response.model,
+                    request.model.as_str(),
+                ) || payload
+                    .response
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status != "completed")
                 {
                     return Err(ExecFailure::new(ErrorCode::ModelUnavailable, true));
                 }
@@ -1777,6 +1863,99 @@ mod tests {
             serde_json::to_vec(&json!({JWT_AUTH_CLAIM: {"chatgpt_account_id": account}})).unwrap(),
         );
         format!("{header}.{payload}.signature")
+    }
+
+    #[test]
+    fn transient_refresh_failure_re_arms_after_backoff_instead_of_blocking_the_process() {
+        let stored = serde_json::to_vec(&json!({
+            "version": 1,
+            "access": "stale-access",
+            "refresh": "refresh-one",
+            "expiresAt": 500,
+            "accountId": "account-one"
+        }))
+        .unwrap();
+        let store = Arc::new(MemoryStore {
+            document: Mutex::new(Some(stored)),
+        });
+        let responses = Arc::new(Mutex::new(VecDeque::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let clock = Arc::new(TestClock::new(1_000));
+        let auth = ChatGptSubscriptionAuth::new(
+            Box::new(ScriptedTransport {
+                responses: responses.clone(),
+                requests: requests.clone(),
+            }),
+            clock.clone(),
+            store,
+        );
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Ready { .. }
+        ));
+
+        // The credential is past its refresh margin and the token endpoint is unreachable.
+        let error = auth.request_credential(false).unwrap_err();
+        assert_eq!(error, ChatGptAuthError::Protocol);
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Error { .. }
+        ));
+
+        // Still blocked one second before the backoff elapses …
+        clock
+            .unix
+            .store(1_000 + AUTH_ERROR_RETRY_BASE_SECONDS - 1, Ordering::Relaxed);
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Error { .. }
+        ));
+        // … and usable again once it has, so the coordinator dispatches and the refresh is retried.
+        clock
+            .unix
+            .store(1_000 + AUTH_ERROR_RETRY_BASE_SECONDS, Ordering::Relaxed);
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Ready { .. }
+        ));
+
+        // A second failure doubles the backoff.
+        let _ = auth.request_credential(false).unwrap_err();
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Error { .. }
+        ));
+        clock.unix.store(
+            1_000 + AUTH_ERROR_RETRY_BASE_SECONDS + 2 * AUTH_ERROR_RETRY_BASE_SECONDS - 1,
+            Ordering::Relaxed,
+        );
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Error { .. }
+        ));
+        clock.unix.store(
+            1_000 + AUTH_ERROR_RETRY_BASE_SECONDS + 2 * AUTH_ERROR_RETRY_BASE_SECONDS,
+            Ordering::Relaxed,
+        );
+        assert!(matches!(
+            auth.credential_state(),
+            CredentialState::Ready { .. }
+        ));
+
+        // A successful refresh clears the backoff entirely.
+        responses.lock().unwrap().push_back(response(
+            200,
+            json!({"access_token":jwt("account-one"),"refresh_token":"refresh-two","expires_in":3600}),
+        ));
+        auth.request_credential(false).unwrap();
+        let state = auth.inner.state.lock().unwrap();
+        assert_eq!(state.consecutive_errors, 0);
+        assert_eq!(state.error_retry_after_unix, None);
+        assert_eq!(state.status, AuthStatus::Normal);
+        assert_eq!(auth_error_backoff_seconds(1), 30);
+        assert_eq!(auth_error_backoff_seconds(2), 60);
+        assert_eq!(auth_error_backoff_seconds(6), 600);
+        assert_eq!(auth_error_backoff_seconds(40), 600);
     }
 
     #[test]
