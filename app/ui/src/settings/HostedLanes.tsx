@@ -14,6 +14,7 @@ import {
   modelUnavailableReason,
   modelsForProvider,
   parseProviderKey,
+  providerCacheAcknowledged,
   providerKey,
   providerPresentation,
   selectionForModel,
@@ -323,6 +324,7 @@ function HostedLaneCard({
           id={`hosted-provider-cache-${lane}`}
           control={control}
           selectedModel={selectedModel}
+          acknowledged={providerCacheAcknowledged(settings, control.selection.provider)}
           busy={busy}
           onChange={(providerCache) => {
             if (!selectedModel) return;
@@ -387,24 +389,56 @@ function ProviderCacheControl({
   id,
   control,
   selectedModel,
+  acknowledged,
   busy,
   onChange,
 }: {
   id: string;
   control: HostedLaneControl;
   selectedModel: ReturnType<typeof findExactModel>;
+  acknowledged: boolean;
   busy: boolean;
   onChange: (cache: HostedProviderCacheMode) => void;
 }) {
   const mode = control.selection.cache_policy.provider;
   if (selectedModel?.capabilities.implicit_cache_may_apply) {
-    return (
+    return acknowledged ? (
       <>
         <select id={id} className="jselect" value="unavoidable_implicit" disabled>
           <option value="unavoidable_implicit">Unavoidable implicit provider caching may apply</option>
         </select>
         <p className="muted small">
-          This catalog says implicit caching may occur. Corti cannot truthfully offer an Off setting.
+          This model caches implicitly on the provider side. You acknowledged provider-side caching under
+          Providers, so Corti records that truthfully; local purge cannot remove it.
+        </p>
+      </>
+    ) : (
+      <>
+        <select id={id} className="jselect" value="unavoidable_implicit" disabled>
+          <option value="unavoidable_implicit">Requires the provider-side caching acknowledgement</option>
+        </select>
+        <p className="muted small hosted-blocked">
+          This model caches implicitly on the provider whether or not Corti asks. Acknowledge provider-side
+          caching under Providers to use it; until then this lane cannot dispatch.
+        </p>
+      </>
+    );
+  }
+  if (selectedModel?.capabilities.explicit_prefix_cache) {
+    return (
+      <>
+        <select
+          id={id}
+          className="jselect"
+          value={acknowledged ? "explicit_stable_prefix" : "off"}
+          disabled
+        >
+          <option value="explicit_stable_prefix">Explicit stable-prefix cache · acknowledged</option>
+          <option value="off">Off · acknowledge provider-side caching under Providers to enable</option>
+        </select>
+        <p className="muted small">
+          Derived from the model and your acknowledgement: explicit caching marks only the stable prefix
+          (policy, schema, word bank, corrections) and may retain transcript-adjacent words remotely.
         </p>
       </>
     );

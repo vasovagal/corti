@@ -461,12 +461,35 @@ export type HostedMutationInvalidField =
   | "role_arn"
   | "region"
   | "setup_name"
-  | "key_pair";
+  | "key_pair"
+  | "provider_cache";
 export type HostedMutationInvalidReason =
   | "required"
   | "not_found"
   | "invalid"
-  | "keys_missing";
+  | "keys_missing"
+  | "acknowledgement_required";
+
+/** Mirror of Rust `postprocess_app::ProviderAcknowledgementDto`. */
+export interface ProviderAcknowledgement {
+  provider: string;
+  acknowledged: boolean;
+}
+
+/** Mirror of Rust `postprocess_app::BlockedLaneDto`. */
+export interface BlockedLane {
+  lane: HostedLane;
+  provider: string;
+  model: string;
+  reason: "acknowledgement_required" | "policy_mismatch";
+}
+
+/** Mirror of Rust `postprocess_app::HostedDeadlinesDto`. */
+export interface HostedDeadlines {
+  live_first_text_seconds: number;
+  live_deadline_seconds: number;
+  question_deadline_seconds: number;
+}
 
 /** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Secret presence is not here: it comes
  * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
@@ -504,6 +527,12 @@ export interface HostedSettingsDto {
   final_deadline_seconds: number;
   show_history_diagnostics: boolean;
   show_live_metrics_by_default: boolean;
+  /** Schema-2 fields; optional so older fixtures and snapshots still type-check. */
+  provider_cache_acknowledged?: ProviderAcknowledgement[];
+  blocked_lanes?: BlockedLane[];
+  preferences_load_error?: string | null;
+  deadlines?: HostedDeadlines;
+  lexicon_enabled?: boolean;
 }
 
 export interface HostedSelectionInput {
@@ -524,7 +553,8 @@ export type HostedPatchInput =
       kind: "set_display_preferences";
       show_history_diagnostics: boolean;
       show_live_metrics_by_default: boolean;
-    };
+    }
+  | { kind: "set_provider_cache_acknowledged"; provider: string; acknowledged: boolean };
 
 export type HostedMutationResult =
   | { status: "applied"; settings: HostedSettingsDto }

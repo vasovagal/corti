@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
   AwsCredentialOptionsDto,
   BedrockCredentialDto,
+  HostedPatchInput,
   HostedProviderScope,
   HostedProviderScopeUpdate,
   HostedProviderState,
+  ProviderAcknowledgement,
   SecretSlotRequest,
 } from "../lib/api";
 import {
@@ -12,6 +14,7 @@ import {
   billingDisclosure,
   credentialSummary,
   errorLabel,
+  providerCacheAcknowledgementGuidance,
   providerKey,
   providerPresentation,
   supportTierLabel,
@@ -21,11 +24,13 @@ import {
   type AwsProfileDiscoveryState,
   type BedrockActions,
 } from "./HostedBedrock";
+import { HostedDialog, HostedSwitch } from "./HostedCommon";
 
 interface ProviderActions {
   busy: boolean;
   onRefresh: (provider: string, transport: string) => Promise<boolean>;
   onScope: (update: HostedProviderScopeUpdate) => Promise<boolean>;
+  onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
   /** Opens the native secure-entry sheet; the key never returns through this callback. */
   onPromptSecret: (request: SecretSlotRequest) => Promise<boolean>;
   onClearSecret: (request: SecretSlotRequest) => Promise<boolean>;
@@ -51,6 +56,7 @@ const PROVIDER_ORDER: Record<string, number> = {
 export function HostedProviders({
   providers,
   scopes,
+  acknowledgements,
   bedrock,
   vertexModels,
   awsOptions,
@@ -61,6 +67,7 @@ export function HostedProviders({
 }: {
   providers: HostedProviderState[];
   scopes: HostedProviderScope[];
+  acknowledgements: ProviderAcknowledgement[];
   bedrock: BedrockCredentialDto;
   vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
@@ -185,6 +192,9 @@ export function HostedProviders({
               <HostedProviderCard
                 state={provider}
                 scope={providerScope}
+                acknowledged={acknowledgements.some(
+                  (entry) => entry.provider === provider.descriptor.provider && entry.acknowledged,
+                )}
                 bedrock={bedrock}
                 vertexModels={vertexModels}
                 awsOptions={awsOptions}
@@ -203,6 +213,7 @@ export function HostedProviders({
 function HostedProviderCard({
   state,
   scope,
+  acknowledged,
   bedrock,
   vertexModels,
   awsOptions,
@@ -212,6 +223,7 @@ function HostedProviderCard({
 }: {
   state: HostedProviderState;
   scope?: HostedProviderScope;
+  acknowledged: boolean;
   bedrock: BedrockCredentialDto;
   vertexModels: string[];
   awsOptions: AwsCredentialOptionsDto | null;
@@ -219,6 +231,7 @@ function HostedProviderCard({
   bedrockResetToken: number;
   actions: ProviderActions;
 }) {
+  const [acknowledging, setAcknowledging] = useState(false);
   const { descriptor, credential } = state;
   const presentation = providerPresentation(descriptor.provider, descriptor.transport);
   const auth = credentialSummary(credential, descriptor.transport);
@@ -452,6 +465,58 @@ function HostedProviderCard({
             ))}
           </ul>
         </details>
+      )}
+
+      {(isVertex || isDirectKey || isBedrock) && (
+        <section className="hosted-provider-cache" aria-label="Provider-side caching">
+          <HostedSwitch
+            label="Provider-side caching acknowledged"
+            description={providerCacheAcknowledgementGuidance(descriptor.transport)}
+            checked={acknowledged}
+            disabled={actions.busy}
+            onChange={(next) => {
+              if (next) {
+                setAcknowledging(true);
+                return;
+              }
+              void actions.onPatch(
+                {
+                  kind: "set_provider_cache_acknowledged",
+                  provider: descriptor.provider,
+                  acknowledged: false,
+                },
+                "Provider-side caching acknowledgement withdrawn; lanes on this provider request no explicit caching.",
+              );
+            }}
+          />
+          <HostedDialog
+            open={acknowledging}
+            title="Acknowledge provider-side caching?"
+            confirmLabel="Acknowledge provider-side caching"
+            busy={actions.busy}
+            onCancel={() => setAcknowledging(false)}
+            onConfirm={() => {
+              void actions
+                .onPatch(
+                  {
+                    kind: "set_provider_cache_acknowledged",
+                    provider: descriptor.provider,
+                    acknowledged: true,
+                  },
+                  "Provider-side caching acknowledged; lanes on this provider now use the policy their model needs.",
+                )
+                .then((saved) => {
+                  if (saved) setAcknowledging(false);
+                });
+            }}
+          >
+            <p>{providerCacheAcknowledgementGuidance(descriptor.transport)}</p>
+            <p>
+              Corti cannot purge anything the provider retains; "Purge hosted text" covers only Corti's own
+              encrypted cache. Withdraw the acknowledgement at any time to stop requesting explicit caching.
+            </p>
+          </HostedDialog>
+        </section>
       )}
 
       <p className="hosted-cost-line">

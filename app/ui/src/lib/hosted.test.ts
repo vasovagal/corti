@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { HostedModelDescriptor, HostedProviderState, HostedSettingsDto } from "./api";
+import {
+  bedrockInvalidMessage as invalidMessage,
+  blockedLaneMessage,
+  effectiveProviderCache,
+  providerCacheAcknowledged,
+  providerCacheAcknowledgementGuidance,
+} from "./hosted";
 import { AWS_REGIONS, BEDROCK_REGIONS, regionOptions } from "./awsRegions";
 import {
   VERTEX_UNARMED_WARNING,
@@ -493,5 +500,79 @@ describe("aws region lists", () => {
     expect(regionOptions(BEDROCK_REGIONS, "us-east-1")).toEqual(BEDROCK_REGIONS);
     expect(regionOptions(BEDROCK_REGIONS, null)).toEqual(BEDROCK_REGIONS);
     expect(regionOptions(BEDROCK_REGIONS, "us-gov-west-1")[0]).toBe("us-gov-west-1");
+  });
+});
+
+describe("provider cache policy derivation (#144)", () => {
+  it("derives the mode from the model and the acknowledgement, mirroring corti_chat::cache_policy", () => {
+    const gemini = model({
+      provider: "google",
+      transport: "vertex_api",
+      exact_model_id: "gemini-2.5-flash",
+      capabilities: {
+        text_input: true,
+        text_output: true,
+        streaming: true,
+        structured_output: true,
+        explicit_prefix_cache: false,
+        implicit_cache_may_apply: true,
+      },
+    });
+    expect(effectiveProviderCache(gemini, false)).toEqual({ kind: "blocked", provider: "google" });
+    expect(effectiveProviderCache(gemini, true)).toEqual({ kind: "mode", mode: "unavoidable_implicit" });
+
+    const claude = model({
+      provider: "google",
+      transport: "vertex_api",
+      exact_model_id: "claude-sonnet-4-5",
+      capabilities: {
+        text_input: true,
+        text_output: true,
+        streaming: true,
+        structured_output: true,
+        explicit_prefix_cache: true,
+        implicit_cache_may_apply: false,
+      },
+    });
+    expect(effectiveProviderCache(claude, false)).toEqual({ kind: "mode", mode: "off" });
+    expect(effectiveProviderCache(claude, true)).toEqual({ kind: "mode", mode: "explicit_stable_prefix" });
+
+    const chatgpt = model({ provider: "openai", transport: "chatgpt_subscription" });
+    expect(effectiveProviderCache(chatgpt, false)).toEqual({ kind: "mode", mode: "unavailable" });
+    expect(effectiveProviderCache(model(), true)).toEqual({ kind: "mode", mode: "off" });
+  });
+
+  it("reads the acknowledgement from the settings snapshot and tolerates older snapshots", () => {
+    expect(providerCacheAcknowledged({}, "google")).toBe(false);
+    expect(providerCacheAcknowledged({ provider_cache_acknowledged: [] }, "google")).toBe(false);
+    expect(
+      providerCacheAcknowledged(
+        { provider_cache_acknowledged: [{ provider: "google", acknowledged: true }] },
+        "google",
+      ),
+    ).toBe(true);
+    expect(
+      providerCacheAcknowledged(
+        { provider_cache_acknowledged: [{ provider: "google", acknowledged: true }] },
+        null,
+      ),
+    ).toBe(false);
+  });
+
+  it("explains a blocked lane and routes the invalid result to the Providers section", () => {
+    expect(
+      blockedLaneMessage({
+        lane: "live",
+        provider: "google",
+        model: "gemini-2.5-flash",
+        reason: "acknowledgement_required",
+      }),
+    ).toContain("Acknowledge provider-side caching under Providers");
+    expect(
+      blockedLaneMessage({ lane: "final", provider: "openai", model: "gpt-5", reason: "policy_mismatch" }),
+    ).toContain("re-select the model");
+    expect(invalidMessage("provider_cache", "acknowledgement_required")).toContain("Providers");
+    expect(providerCacheAcknowledgementGuidance("vertex_api")).toContain("Gemini");
+    expect(providerCacheAcknowledgementGuidance("chatgpt_subscription")).toContain("nothing to acknowledge");
   });
 });

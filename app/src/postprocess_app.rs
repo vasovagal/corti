@@ -411,6 +411,38 @@ pub(crate) struct HostedSettingsDto {
     pub(crate) final_deadline_seconds: u32,
     pub(crate) show_history_diagnostics: bool,
     pub(crate) show_live_metrics_by_default: bool,
+    /// Per-provider "provider-side caching acknowledged" state (schema 2).
+    pub(crate) provider_cache_acknowledged: Vec<ProviderAcknowledgementDto>,
+    /// Lanes whose saved selection cannot dispatch under the owner's current acknowledgements.
+    pub(crate) blocked_lanes: Vec<BlockedLaneDto>,
+    /// Sanitized reason the on-disk preferences could not be loaded (the app runs on defaults with
+    /// hosted egress off until it is fixed); `None` when the document loaded.
+    pub(crate) preferences_load_error: Option<String>,
+    pub(crate) deadlines: HostedDeadlinesDto,
+    pub(crate) lexicon_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderAcknowledgementDto {
+    pub(crate) provider: String,
+    pub(crate) acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BlockedLaneDto {
+    /// `live` | `final` | `question`.
+    pub(crate) lane: String,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// `acknowledgement_required` | `policy_mismatch`.
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HostedDeadlinesDto {
+    pub(crate) live_first_text_seconds: u32,
+    pub(crate) live_deadline_seconds: u32,
+    pub(crate) question_deadline_seconds: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +498,12 @@ pub(crate) enum HostedPatchInput {
         show_history_diagnostics: bool,
         show_live_metrics_by_default: bool,
     },
+    /// Acknowledge (or withdraw) provider-side caching for `openai`, `anthropic`, `google` or
+    /// `amazon`. Enabled lanes on that provider are re-derived to the policy their model needs.
+    SetProviderCacheAcknowledged {
+        provider: String,
+        acknowledged: bool,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,6 +543,7 @@ pub(crate) enum HostedMutationInvalidField {
     Region,
     SetupName,
     KeyPair,
+    ProviderCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -514,6 +553,8 @@ pub(crate) enum HostedMutationInvalidReason {
     NotFound,
     Invalid,
     KeysMissing,
+    /// The model caches implicitly on the provider; acknowledge provider-side caching first.
+    AcknowledgementRequired,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1250,12 +1291,17 @@ pub(crate) fn start(
     live_view: LiveTranscriptStore,
     pipeline_tx: Sender<PipelineMsg>,
 ) -> Result<(HostedState, HostedHandle)> {
+    // A document that fails to parse or validate must not brick raw capture, but silently running on
+    // defaults hid every hosted feature behind "nothing happens"; the reason now reaches Settings.
+    let mut preferences_load_error = None;
     let preferences = HostedPreferences::load().unwrap_or_else(|error| {
+        let message = format!("{error:#}");
         tracing::warn!(
             target: "corti::hosted",
-            error = %format!("{error:#}"),
+            error = %message,
             "hosted preferences are unreadable; all hosted egress remains off"
         );
+        preferences_load_error = Some(message);
         HostedPreferences::default()
     });
     let preferences = Arc::new(Mutex::new(preferences));
@@ -1357,6 +1403,7 @@ pub(crate) fn start(
             max_bytes: MAX_LIVE_TARGET_BYTES,
             ..corti_chat::LiveBatchPolicy::default()
         },
+        preferences_load_error,
     )?;
     state.chatgpt_auth = Some(chatgpt_auth);
     Ok((state, handle))
@@ -1410,6 +1457,7 @@ fn start_with_components(
             max_bytes: MAX_LIVE_TARGET_BYTES,
             ..corti_chat::LiveBatchPolicy::immediate()
         },
+        None,
     )
 }
 
@@ -1432,6 +1480,7 @@ fn start_with_components_and_policy(
     clock_override: Option<Arc<dyn CoordinatorClock>>,
     secret_presence_override: Option<SecretPresenceSource>,
     live_batch_policy: corti_chat::LiveBatchPolicy,
+    preferences_load_error: Option<String>,
 ) -> Result<(HostedState, HostedHandle)> {
     // Tests default to a hermetic empty projection; production explicitly supplies the private-store source.
     let secret_presence = secret_presence_override.unwrap_or_else(|| Arc::new(|_| false));
@@ -1448,6 +1497,7 @@ fn start_with_components_and_policy(
         &initial_provider_states(),
         false,
         secret_presence.as_ref(),
+        preferences_load_error.as_deref(),
     );
     let observed_pinned_revision = initial_control.pinned_question_revision;
     let snapshot = Arc::new(Mutex::new(initial_settings));
@@ -1544,9 +1594,18 @@ fn start_with_components_and_policy(
         secret_presence,
         live_batcher: corti_chat::LiveBatcher::new(live_batch_policy),
         live_backlog_released: false,
+        preferences_load_error,
     };
-    // The batcher owns quiet-period timing; the coordinator's own debounce would only stack on top.
+    // Deadlines come from the persisted preferences (hand-tunable in hosted.toml); the batcher owns
+    // quiet-period timing, so the coordinator's own debounce would only stack on top of it.
     let mut deadlines = crate::postprocess::LaneDeadlines::default();
+    {
+        let preferences = service.preferences.lock().unwrap();
+        let values = preferences.values();
+        deadlines.live_first_text_micros = u64::from(values.live_first_text_seconds) * 1_000_000;
+        deadlines.live_terminal_micros = u64::from(values.live_deadline_seconds) * 1_000_000;
+        deadlines.question_micros = u64::from(values.question_deadline_seconds) * 1_000_000;
+    }
     if !live_batch_policy.is_immediate() {
         deadlines.live_debounce_micros = 0;
     }
@@ -1756,17 +1815,15 @@ fn vertex_config_source(
     })
 }
 
-fn vertex_models_source(
-    preferences: Arc<Mutex<HostedPreferences>>,
-) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+/// The preference inputs the Vertex adapter is rebuilt from: the typed model ids and the thinking policy.
+type VertexPreferenceSource =
+    Arc<dyn Fn() -> (Vec<String>, crate::postprocess_config::ThinkingPreference) + Send + Sync>;
+
+fn vertex_models_source(preferences: Arc<Mutex<HostedPreferences>>) -> VertexPreferenceSource {
     Arc::new(move || {
-        preferences
-            .lock()
-            .unwrap()
-            .values()
-            .providers
-            .vertex_models
-            .clone()
+        let preferences = preferences.lock().unwrap();
+        let providers = &preferences.values().providers;
+        (providers.vertex_models.clone(), providers.vertex_thinking)
     })
 }
 
@@ -2110,7 +2167,7 @@ impl ApprovedProviderDirectory {
 struct VertexAdapterSlot {
     transports: Arc<dyn DirectTransportFactory>,
     resolver: Arc<VertexAdcResolver>,
-    models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    models: VertexPreferenceSource,
     built: Mutex<Option<(VertexAdapterInputs, SharedAdapter)>>,
 }
 
@@ -2118,13 +2175,16 @@ struct VertexAdapterSlot {
 struct VertexAdapterInputs {
     config: VertexConnectionConfig,
     models: Vec<String>,
+    thinking: crate::postprocess_config::ThinkingPreference,
 }
 
 impl VertexAdapterSlot {
     fn current(&self) -> Option<SharedAdapter> {
+        let (models, thinking) = (self.models)();
         let desired = VertexAdapterInputs {
             config: self.resolver.config(),
-            models: (self.models)(),
+            models,
+            thinking,
         };
         let mut built = self.built.lock().ok()?;
         if built.as_ref().map(|(inputs, _)| inputs) != Some(&desired) {
@@ -2132,6 +2192,7 @@ impl VertexAdapterSlot {
                 self.transports.as_ref(),
                 self.resolver.clone(),
                 &desired.models,
+                desired.thinking,
             )
             .map(|adapter| (desired, Arc::new(Mutex::new(adapter))));
         }
@@ -2292,7 +2353,7 @@ fn approved_direct_components(
     chatgpt_auth: ChatGptSubscriptionAuth,
     bedrock: Arc<BedrockCredentialResolver>,
     vertex: Arc<VertexAdcResolver>,
-    vertex_models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    vertex_models: VertexPreferenceSource,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
     let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
     let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
@@ -2400,10 +2461,19 @@ fn vertex_adapter(
     transports: &dyn DirectTransportFactory,
     vertex: Arc<VertexAdcResolver>,
     typed_models: &[String],
+    thinking: crate::postprocess_config::ThinkingPreference,
 ) -> Option<Box<dyn ProviderAdapter>> {
     let config = vertex.config();
     let metadata =
         VertexProjectMetadata::new(config.project?, config.region?, config.quota_project).ok()?;
+    let thinking_policy = match thinking {
+        crate::postprocess_config::ThinkingPreference::Auto => {
+            corti_postprocess_providers::ThinkingPolicy::Auto
+        }
+        crate::postprocess_config::ThinkingPreference::Omit => {
+            corti_postprocess_providers::ThinkingPolicy::Omit
+        }
+    };
     let adapter = VertexRestAdapter::new(
         transports.vertex(),
         Box::new(ProviderSystemClock::new()),
@@ -2411,7 +2481,8 @@ fn vertex_adapter(
         metadata,
         vertex_direct_models(typed_models),
     )
-    .ok()?;
+    .ok()?
+    .with_thinking_policy(thinking_policy);
     Some(Box::new(adapter))
 }
 
@@ -3783,6 +3854,8 @@ struct Service {
     live_batcher: corti_chat::LiveBatcher<usize>,
     /// Set once per session when the backlog had to be released as raw, so the notice is not repeated.
     live_backlog_released: bool,
+    /// Why hosted.toml could not be loaded at startup, surfaced in Settings; `None` when it loaded.
+    preferences_load_error: Option<String>,
 }
 
 /// What became of one batch the batcher handed to `build_live_submission`.
@@ -4085,6 +4158,44 @@ impl Service {
                 values.pinned_auto_acknowledgement_version = Some(PINNED_AUTO_DISCLOSURE_VERSION)
             })?;
         }
+        if let HostedPatchInput::SetProviderCacheAcknowledged {
+            provider,
+            acknowledged,
+        } = &request.patch
+        {
+            let provider = provider.clone();
+            let acknowledged = *acknowledged;
+            let before = self.preferences.lock().unwrap().clone();
+            if !acknowledged {
+                // The persisted document refuses an acknowledged-only policy once the acknowledgement
+                // is gone, so lanes on this provider drop to `off` first (they then show as blocked or
+                // simply stop requesting explicit caching).
+                self.downgrade_lane_cache_policies(&provider);
+            }
+            let mut known = true;
+            self.revise_preferences(|values| {
+                known = values.set_provider_cache_acknowledged(&provider, acknowledged);
+            })?;
+            if !known {
+                return Err(ErrorCode::PolicyBlocked);
+            }
+            let changed = *self.preferences.lock().unwrap() != before;
+            if changed {
+                // Lanes saved on this provider re-derive their cache policy now, so acknowledging
+                // makes a blocked Gemini lane dispatch without re-selecting the model.
+                if acknowledged {
+                    self.reconcile_lane_cache_policies(&provider);
+                }
+                self.bump_state();
+                self.refresh_snapshot();
+                return Ok(HostedMutationResult::Applied {
+                    settings: self.current_settings(),
+                });
+            }
+            return Ok(HostedMutationResult::Unchanged {
+                settings: self.current_settings(),
+            });
+        }
         if let HostedPatchInput::SetDisplayPreferences {
             show_history_diagnostics,
             show_live_metrics_by_default,
@@ -4118,7 +4229,22 @@ impl Service {
             },
             HostedPatchInput::SetLaneSelection { lane, selection } => {
                 let family = LaneFamily::from(lane);
-                let selection = LaneSelectionDto::try_from(selection)?;
+                let mut selection = LaneSelectionDto::try_from(selection)?;
+                // The cache policy is derived from the model and the owner's acknowledgement, not
+                // chosen by the UI; a model that needs an acknowledgement is refused with that reason
+                // instead of a bare policy error (#144).
+                if let Err(block) = self.normalize_cache_policy(&mut selection) {
+                    tracing::info!(
+                        target: "corti::hosted",
+                        ?block,
+                        "lane selection needs the provider-side caching acknowledgement"
+                    );
+                    return Ok(HostedMutationResult::Invalid {
+                        settings: self.current_settings(),
+                        field: HostedMutationInvalidField::ProviderCache,
+                        reason: HostedMutationInvalidReason::AcknowledgementRequired,
+                    });
+                }
                 self.validate_settings_selection(family, &selection)?;
                 ControlPatch::SetLaneSelection {
                     lane: family,
@@ -4126,7 +4252,8 @@ impl Service {
                 }
             }
             HostedPatchInput::SetPinnedAuto { enabled, .. } => ControlPatch::SetPinnedAuto(enabled),
-            HostedPatchInput::SetDisplayPreferences { .. } => unreachable!(),
+            HostedPatchInput::SetDisplayPreferences { .. }
+            | HostedPatchInput::SetProviderCacheAcknowledged { .. } => unreachable!(),
         };
         let outcome = self
             .coordinator
@@ -4739,6 +4866,130 @@ impl Service {
                 Err(ErrorCode::PolicyBlocked)
             }
             _ => Ok(()),
+        }
+    }
+
+    /// Overwrite the selection's provider cache mode with the one its model needs under the current
+    /// acknowledgement (`corti_chat::cache_policy`). A selection whose model is not in the catalog is
+    /// left untouched so `validate_settings_selection` reports `ModelUnavailable` as before.
+    fn normalize_cache_policy(
+        &self,
+        selection: &mut LaneSelectionDto,
+    ) -> Result<(), corti_chat::CachePolicyBlock> {
+        let (Some(provider), Some(transport), Some(model)) = (
+            selection.provider.as_ref(),
+            selection.transport.as_ref(),
+            selection.model.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let Ok(scope) = self.scope_for(provider, transport) else {
+            return Ok(());
+        };
+        let Some(candidate) = self
+            .coordinator
+            .provider_states()
+            .filter(|state| {
+                &state.descriptor.provider == provider && &state.descriptor.transport == transport
+            })
+            .flat_map(|state| state.models.iter())
+            .find(|candidate| {
+                &candidate.exact_model_id == model
+                    && candidate.region.as_deref() == scope.region.as_deref()
+            })
+        else {
+            return Ok(());
+        };
+        let acknowledged = self
+            .preferences
+            .lock()
+            .unwrap()
+            .values()
+            .provider_cache_acknowledged(provider.as_str());
+        let mode = corti_chat::effective_provider_cache(candidate, acknowledged)?;
+        selection.cache_policy.provider = mode;
+        Ok(())
+    }
+
+    /// After an acknowledgement changes, re-derive every complete lane selection on that provider so a
+    /// lane saved under the old policy starts dispatching (or stops being blocked) without re-selecting
+    /// its model. Failures are logged; Settings still shows the lane as blocked.
+    fn reconcile_lane_cache_policies(&mut self, provider: &str) {
+        let snapshot = self.coordinator.control_snapshot().clone();
+        let lanes = [
+            (LaneFamily::Live, snapshot.live.selection.clone()),
+            (LaneFamily::Final, snapshot.final_lane.selection.clone()),
+            (LaneFamily::Question, snapshot.questions.selection.clone()),
+        ];
+        for (family, mut selection) in lanes {
+            if selection.provider.as_ref().map(ProviderId::as_str) != Some(provider) {
+                continue;
+            }
+            let before = selection.cache_policy.provider;
+            match self.normalize_cache_policy(&mut selection) {
+                Ok(()) if selection.cache_policy.provider != before => {
+                    if let Err(error) =
+                        self.coordinator
+                            .apply_patch(ControlPatch::SetLaneSelection {
+                                lane: family,
+                                selection,
+                            })
+                    {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            ?family,
+                            ?error,
+                            "could not re-derive the lane cache policy after the acknowledgement change"
+                        );
+                    }
+                }
+                Ok(()) => {}
+                Err(block) => {
+                    tracing::info!(
+                        target: "corti::hosted",
+                        ?family,
+                        ?block,
+                        "lane stays blocked until provider-side caching is acknowledged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Before an acknowledgement is withdrawn, move every lane on that provider that relies on it back to
+    /// `off`, keeping the persisted document valid at each step.
+    fn downgrade_lane_cache_policies(&mut self, provider: &str) {
+        let snapshot = self.coordinator.control_snapshot().clone();
+        let lanes = [
+            (LaneFamily::Live, snapshot.live.selection.clone()),
+            (LaneFamily::Final, snapshot.final_lane.selection.clone()),
+            (LaneFamily::Question, snapshot.questions.selection.clone()),
+        ];
+        for (family, mut selection) in lanes {
+            if selection.provider.as_ref().map(ProviderId::as_str) != Some(provider)
+                || !matches!(
+                    selection.cache_policy.provider,
+                    ProviderCacheMode::UnavoidableImplicit
+                        | ProviderCacheMode::ExplicitStablePrefix
+                )
+            {
+                continue;
+            }
+            selection.cache_policy.provider = ProviderCacheMode::Off;
+            if let Err(error) = self
+                .coordinator
+                .apply_patch(ControlPatch::SetLaneSelection {
+                    lane: family,
+                    selection,
+                })
+            {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    ?family,
+                    ?error,
+                    "could not downgrade the lane cache policy before withdrawing the acknowledgement"
+                );
+            }
         }
     }
 
@@ -6361,6 +6612,7 @@ impl Service {
             &providers,
             chatgpt_scope_configured(&self.coordinator),
             self.secret_presence.as_ref(),
+            self.preferences_load_error.as_deref(),
         );
     }
 
@@ -6409,8 +6661,17 @@ fn settings_snapshot(
     providers: &[ProviderStateDto],
     chatgpt_scope_configured: bool,
     secret_presence: &dyn Fn(SecretPurpose) -> bool,
+    preferences_load_error: Option<&str>,
 ) -> HostedSettingsDto {
     let values = preferences.values();
+    let provider_cache_acknowledged = ["openai", "anthropic", "google", "amazon"]
+        .into_iter()
+        .map(|provider| ProviderAcknowledgementDto {
+            provider: provider.to_owned(),
+            acknowledged: values.provider_cache_acknowledged(provider),
+        })
+        .collect();
+    let blocked_lanes = blocked_lanes(values, control, providers);
     let mut providers = providers.to_vec();
     providers.sort_by(|left, right| {
         (
@@ -6463,7 +6724,75 @@ fn settings_snapshot(
         final_deadline_seconds: values.final_deadline_seconds,
         show_history_diagnostics: values.show_history_diagnostics,
         show_live_metrics_by_default: values.show_live_metrics_by_default,
+        provider_cache_acknowledged,
+        blocked_lanes,
+        preferences_load_error: preferences_load_error.map(str::to_owned),
+        deadlines: HostedDeadlinesDto {
+            live_first_text_seconds: values.live_first_text_seconds,
+            live_deadline_seconds: values.live_deadline_seconds,
+            question_deadline_seconds: values.question_deadline_seconds,
+        },
+        lexicon_enabled: values.lexicon_enabled,
     }
+}
+
+/// Lanes whose saved selection cannot dispatch as saved: the model needs an acknowledgement the owner
+/// has not given, or the saved cache policy no longer matches what the model needs. Settings shows
+/// these instead of the lane failing later with a bare `PolicyBlocked`.
+fn blocked_lanes(
+    values: &crate::postprocess_config::HostedPreferenceValues,
+    control: &ControlSnapshotDto,
+    providers: &[ProviderStateDto],
+) -> Vec<BlockedLaneDto> {
+    let lanes = [
+        ("live", &control.live),
+        ("final", &control.final_lane),
+        ("question", &control.questions),
+    ];
+    let mut blocked = Vec::new();
+    for (name, lane) in lanes {
+        let selection = &lane.selection;
+        let (Some(provider), Some(transport), Some(model_id)) = (
+            selection.provider.as_ref(),
+            selection.transport.as_ref(),
+            selection.model.as_ref(),
+        ) else {
+            continue;
+        };
+        let Some(model) = providers
+            .iter()
+            .filter(|state| {
+                &state.descriptor.provider == provider && &state.descriptor.transport == transport
+            })
+            .flat_map(|state| state.models.iter())
+            .find(|candidate| &candidate.exact_model_id == model_id)
+        else {
+            continue;
+        };
+        let acknowledged = values.provider_cache_acknowledged(provider.as_str());
+        let reason = match corti_chat::effective_provider_cache(model, acknowledged) {
+            Err(corti_chat::CachePolicyBlock::AcknowledgementRequired { .. }) => {
+                "acknowledgement_required"
+            }
+            Ok(_)
+                if !corti_chat::stored_policy_is_acceptable(
+                    model,
+                    selection.cache_policy.provider,
+                    acknowledged,
+                ) =>
+            {
+                "policy_mismatch"
+            }
+            Ok(_) => continue,
+        };
+        blocked.push(BlockedLaneDto {
+            lane: name.to_owned(),
+            provider: provider.as_str().to_owned(),
+            model: model_id.as_str().to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    blocked
 }
 
 fn scope_dto(
@@ -9736,6 +10065,7 @@ mod tests {
             &initial_provider_states(),
             false,
             &|_| false,
+            None,
         )));
         let handle = HostedHandle {
             command_tx,

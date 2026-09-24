@@ -31,6 +31,7 @@ import {
   bedrockCredentialGuidance,
   bedrockInvalidMessage,
   bedrockRefreshFailureGuidance,
+  blockedLaneMessage,
   credentialSummary,
   providerPresentation,
   type NormalizedBedrockSetup,
@@ -498,6 +499,7 @@ export default function HostedPreferences({
     busy: isBusy,
     onRefresh: onRefreshProvider,
     onScope,
+    onPatch,
     onPromptSecret,
     onClearSecret,
     onStartChatGpt,
@@ -538,6 +540,29 @@ export default function HostedPreferences({
       )}
 
       <div className="hosted-preference-pane" hidden={section !== "overview"}>
+          {settings.preferences_load_error && (
+            <section className="card hosted-blocked-card" role="alert">
+              <p className="hosted-eyebrow">Preferences not loaded</p>
+              <p>
+                Corti could not read <code>hosted.toml</code> and is running on defaults with every hosted
+                lane off. Fix or remove the file and relaunch; saving from this window would overwrite it.
+              </p>
+              <p className="muted small">{settings.preferences_load_error}</p>
+            </section>
+          )}
+          {(settings.blocked_lanes ?? []).length > 0 && (
+            <section className="card hosted-blocked-card" role="status">
+              <p className="hosted-eyebrow">Lanes that cannot dispatch</p>
+              <ul>
+                {(settings.blocked_lanes ?? []).map((blocked) => (
+                  <li key={`${blocked.lane}:${blocked.model}`}>{blockedLaneMessage(blocked)}</li>
+                ))}
+              </ul>
+              <button className="btn-secondary" type="button" onClick={() => onNavigate("provider")}>
+                Open Providers
+              </button>
+            </section>
+          )}
           <HostedSetupGuide settings={settings} onNavigate={onNavigate} />
 
           <section className="card hosted-egress-card" aria-labelledby="hosted-master-heading">
@@ -619,6 +644,7 @@ export default function HostedPreferences({
         <HostedProviders
           providers={settings.providers}
           scopes={settings.scopes}
+          acknowledgements={settings.provider_cache_acknowledged ?? []}
           bedrock={settings.bedrock}
           vertexModels={settings.vertex_models}
           awsOptions={awsOptions}

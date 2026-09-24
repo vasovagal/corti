@@ -12,7 +12,12 @@
 #![forbid(unsafe_code)]
 
 pub mod batch;
+pub mod cache_policy;
 pub mod coordinator;
 
 pub use batch::{BacklogReleaseReason, Batch, LiveBatchPolicy, LiveBatcher, ReleasedBacklog};
+pub use cache_policy::{
+    CHATGPT_SUBSCRIPTION_TRANSPORT, CachePolicyBlock, effective_provider_cache,
+    stored_policy_is_acceptable,
+};
 pub use coordinator::*;

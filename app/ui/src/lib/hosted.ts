@@ -375,6 +375,9 @@ export function bedrockInvalidMessage(
   field: HostedMutationInvalidField,
   reason: HostedMutationInvalidReason,
 ): string {
+  if (field === "provider_cache" || reason === "acknowledgement_required") {
+    return "This model caches implicitly on the provider side. Acknowledge provider-side caching for it under Providers, then select it again.";
+  }
   if (field === "key_pair" || reason === "keys_missing") {
     return "Add both an access key ID and secret access key before saving.";
   }
@@ -897,6 +900,72 @@ export function defaultProviderCache(model: HostedModelDescriptor): HostedProvid
   }
   if (model.capabilities.implicit_cache_may_apply) return "unavoidable_implicit";
   return "off";
+}
+
+/** Whether the owner acknowledged provider-side caching for `provider` (mirrors the Rust snapshot). */
+export function providerCacheAcknowledged(
+  settings: Pick<HostedSettingsDto, "provider_cache_acknowledged">,
+  provider: string | null,
+): boolean {
+  if (!provider) return false;
+  return (settings.provider_cache_acknowledged ?? []).some(
+    (entry) => entry.provider === provider && entry.acknowledged,
+  );
+}
+
+export type EffectiveProviderCache =
+  | { kind: "mode"; mode: HostedProviderCacheMode }
+  | { kind: "blocked"; provider: string };
+
+/**
+ * The provider cache mode a lane must carry for `model`, mirroring Rust `corti_chat::cache_policy`:
+ * ChatGPT is provider-owned; implicit-cache models (Gemini) need the acknowledgement before they can
+ * be used at all; explicit-prefix models use explicit caching once acknowledged and `off` until then.
+ */
+export function effectiveProviderCache(
+  model: HostedModelDescriptor,
+  acknowledged: boolean,
+): EffectiveProviderCache {
+  if (model.transport === "chatgpt_subscription") return { kind: "mode", mode: "unavailable" };
+  if (model.capabilities.implicit_cache_may_apply) {
+    return acknowledged
+      ? { kind: "mode", mode: "unavoidable_implicit" }
+      : { kind: "blocked", provider: model.provider };
+  }
+  if (model.capabilities.explicit_prefix_cache && acknowledged) {
+    return { kind: "mode", mode: "explicit_stable_prefix" };
+  }
+  return { kind: "mode", mode: "off" };
+}
+
+/** One sentence for the Providers pane explaining what acknowledging provider-side caching means. */
+export function providerCacheAcknowledgementGuidance(transport: string): string {
+  switch (transport) {
+    case "vertex_api":
+      return "Gemini models cache prompt prefixes on Google's side whether or not Corti asks; Claude on Vertex caches only the stable prefix Corti marks. Acknowledging lets lanes use Gemini and enables prefix caching for Claude.";
+    case "openai_api":
+      return "Enables OpenAI prompt caching of the stable prefix (policy, schema, word bank); transcript-adjacent words may be retained remotely for the provider's cache lifetime.";
+    case "anthropic_api":
+      return "Marks the stable prefix as cacheable with Anthropic; transcript-adjacent words may be retained remotely for the cache lifetime.";
+    case "bedrock_runtime":
+      return "Bedrock exposes no per-model cache control; acknowledging records that provider retention still applies.";
+    default:
+      return "The subscription endpoint owns its cache behavior; there is nothing to acknowledge.";
+  }
+}
+
+/** Human text for a lane the Rust side reports as blocked. */
+export function blockedLaneMessage(blocked: {
+  lane: string;
+  provider: string;
+  model: string;
+  reason: string;
+}): string {
+  const lane = blocked.lane === "final" ? "Final" : blocked.lane === "live" ? "Live" : "Questions";
+  if (blocked.reason === "acknowledgement_required") {
+    return `${lane}: ${blocked.model} caches implicitly on the provider. Acknowledge provider-side caching under Providers to use it.`;
+  }
+  return `${lane}: the saved cache policy for ${blocked.model} no longer matches what the model needs; re-select the model.`;
 }
 
 export function selectionForModel(
