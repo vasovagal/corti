@@ -1335,7 +1335,7 @@ pub(crate) fn start(
         },
     );
     let process_epoch = live_view.process_epoch();
-    let (mut state, handle) = start_with_components(
+    let (mut state, handle) = start_with_components_and_policy(
         preferences,
         word_bank,
         live_view,
@@ -1352,6 +1352,11 @@ pub(crate) fn start(
         Some(store),
         None,
         Some(Arc::new(crate::secret_store::is_present)),
+        corti_chat::LiveBatchPolicy {
+            max_rows: MAX_LIVE_TARGET_ROWS,
+            max_bytes: MAX_LIVE_TARGET_BYTES,
+            ..corti_chat::LiveBatchPolicy::default()
+        },
     )?;
     state.chatgpt_auth = Some(chatgpt_auth);
     Ok((state, handle))
@@ -1360,6 +1365,10 @@ pub(crate) fn start(
 type EventNotifier = Arc<dyn Fn(&CoordinatorEventDto) + Send + Sync>;
 type SecretPresenceSource = Arc<dyn Fn(SecretPurpose) -> bool + Send + Sync>;
 
+/// Test seam: the synchronous app tests submit Live work through `observe_rows` and expect it queued
+/// immediately, so they run the batcher with no timing. Production goes through
+/// `start_with_components_and_policy` with the default policy.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn start_with_components(
     preferences: Arc<Mutex<HostedPreferences>>,
@@ -1378,6 +1387,51 @@ fn start_with_components(
     store_override: Option<Box<dyn EncryptedPostprocessStore>>,
     clock_override: Option<Arc<dyn CoordinatorClock>>,
     secret_presence_override: Option<SecretPresenceSource>,
+) -> Result<(HostedState, HostedHandle)> {
+    start_with_components_and_policy(
+        preferences,
+        word_bank,
+        live_view,
+        pipeline_tx,
+        outbox,
+        executor,
+        providers,
+        pricing,
+        vertex_resolver,
+        notifier,
+        digest_key,
+        process_epoch,
+        persist_to_disk,
+        store_override,
+        clock_override,
+        secret_presence_override,
+        corti_chat::LiveBatchPolicy {
+            max_rows: MAX_LIVE_TARGET_ROWS,
+            max_bytes: MAX_LIVE_TARGET_BYTES,
+            ..corti_chat::LiveBatchPolicy::immediate()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_with_components_and_policy(
+    preferences: Arc<Mutex<HostedPreferences>>,
+    word_bank: WordBankDocument,
+    live_view: LiveTranscriptStore,
+    pipeline_tx: Sender<PipelineMsg>,
+    outbox: Arc<TelemetryOutbox>,
+    executor: Arc<dyn TicketExecutor>,
+    providers: Box<dyn ProviderAccess>,
+    pricing: Arc<dyn PricingCatalog>,
+    vertex_resolver: Arc<dyn VertexResolver>,
+    notifier: EventNotifier,
+    digest_key: DigestKey,
+    process_epoch: ProcessEpoch,
+    persist_to_disk: bool,
+    store_override: Option<Box<dyn EncryptedPostprocessStore>>,
+    clock_override: Option<Arc<dyn CoordinatorClock>>,
+    secret_presence_override: Option<SecretPresenceSource>,
+    live_batch_policy: corti_chat::LiveBatchPolicy,
 ) -> Result<(HostedState, HostedHandle)> {
     // Tests default to a hermetic empty projection; production explicitly supplies the private-store source.
     let secret_presence = secret_presence_override.unwrap_or_else(|| Arc::new(|_| false));
@@ -1451,7 +1505,7 @@ fn start_with_components(
         ingress_incomplete: ingress_incomplete.clone(),
         outbox,
     };
-    let service = Service {
+    let mut service = Service {
         coordinator,
         clock,
         preferences,
@@ -1488,7 +1542,15 @@ fn start_with_components(
         pinned_exchange: None,
         persist_to_disk,
         secret_presence,
+        live_batcher: corti_chat::LiveBatcher::new(live_batch_policy),
+        live_backlog_released: false,
     };
+    // The batcher owns quiet-period timing; the coordinator's own debounce would only stack on top.
+    let mut deadlines = crate::postprocess::LaneDeadlines::default();
+    if !live_batch_policy.is_immediate() {
+        deadlines.live_debounce_micros = 0;
+    }
+    service.coordinator.set_deadlines(deadlines);
     std::thread::Builder::new()
         .name("corti-hosted-control".into())
         .spawn(move || service.run(command_rx, priority_rx, ingress_rx))
@@ -3717,6 +3779,26 @@ struct Service {
     pinned_exchange: Option<AssistantExchangeDto>,
     persist_to_disk: bool,
     secret_presence: SecretPresenceSource,
+    /// Never-drop accumulation of finalized ledger rows (by index) into Live rewrite batches.
+    live_batcher: corti_chat::LiveBatcher<usize>,
+    /// Set once per session when the backlog had to be released as raw, so the notice is not repeated.
+    live_backlog_released: bool,
+}
+
+/// What became of one batch the batcher handed to `build_live_submission`.
+enum LiveBuild {
+    /// A submission covering the leading rows; `leftover` rows did not fit the model budget and go back
+    /// to the front of the batcher.
+    Submission {
+        submission: RequestSubmission,
+        leftover: Vec<usize>,
+    },
+    /// `released` rows cannot be sent for a per-row reason and stay raw; `leftover` rows go back.
+    Rejected {
+        released: Vec<usize>,
+        leftover: Vec<usize>,
+        reason: &'static str,
+    },
 }
 
 impl Service {
@@ -3778,6 +3860,7 @@ impl Service {
             let now = Instant::now();
             if now >= next_tick {
                 self.coordinator.tick();
+                self.flush_live_batches();
                 self.expire_pending_finals();
                 self.sync_pinned_revision();
                 if let Some(attempt) = self.coordinator.drive_vertex() {
@@ -3812,6 +3895,15 @@ impl Service {
                     self.cancel_pending_finals(ErrorCode::Canceled);
                     let _ = self.coordinator.begin_session();
                     self.current_recording = None;
+                    let unsent = self.live_batcher.drain_all();
+                    if !unsent.is_empty() {
+                        tracing::info!(
+                            target: "corti::hosted",
+                            rows = unsent.len(),
+                            "session ended with finalized rows still waiting for a Live rewrite"
+                        );
+                    }
+                    self.live_backlog_released = false;
                     self.ledger.clear();
                     self.ledger_bytes = 0;
                     self.session_steering = None;
@@ -3938,7 +4030,28 @@ impl Service {
         self.publish_events(true);
     }
 
+    /// Copy accepted Live clean text into the session ledger by row id, keeping the byte accounting exact.
+    fn absorb_clean_rows(&mut self, rows: &[TranscriptRow]) {
+        for row in rows {
+            if let Some(entry) = self
+                .ledger
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.row_id == row.row_id)
+                && entry.text != row.text
+            {
+                self.ledger_bytes = self
+                    .ledger_bytes
+                    .saturating_sub(entry.text.len())
+                    .saturating_add(row.text.len());
+                entry.text = row.text.clone();
+            }
+        }
+    }
+
     fn begin_session(&mut self, recording_id: String) -> Result<(), ErrorCode> {
+        let _ = self.live_batcher.drain_all();
+        self.live_backlog_released = false;
         validate_recording_id(&recording_id)?;
         self.cancel_pending_finals(ErrorCode::Superseded);
         self.coordinator
@@ -4726,7 +4839,13 @@ impl Service {
                     submission,
                     watermark,
                 }) => {
-                    let _ = self.coordinator.submit_live(*submission, watermark);
+                    if let Err(error) = self.coordinator.submit_live(*submission, watermark) {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            ?error,
+                            "hot-path Live request was refused; its rows stay raw"
+                        );
+                    }
                 }
                 Ok(HotPathCommand::Barrier { reply }) => {
                     let _ = reply.send(());
@@ -4747,12 +4866,23 @@ impl Service {
                 .saturating_add(64)
         });
         if self.ledger_bytes.saturating_add(added) > MAX_SESSION_LEDGER_BYTES {
+            tracing::warn!(
+                target: "corti::hosted",
+                rows = rows.len(),
+                "hosted session ledger is full; new rows stay raw"
+            );
             self.ingress_incomplete.store(true, Ordering::Release);
             return;
         }
         let watermark = match self.coordinator.observe_finalized_rows(&rows) {
             Ok(watermark) => watermark,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    ?error,
+                    rows = rows.len(),
+                    "coordinator refused finalized rows; they stay raw"
+                );
                 self.ingress_incomplete.store(true, Ordering::Release);
                 return;
             }
@@ -4760,59 +4890,173 @@ impl Service {
         let old_len = self.ledger.len();
         self.ledger_bytes = self.ledger_bytes.saturating_add(added);
         self.ledger.extend(rows);
-        if let Some(submission) = self.build_live_submission(recording_id, old_len, watermark) {
-            let _ = self.coordinator.submit_live(submission, watermark);
+        if lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
+            let now = self.clock.monotonic_micros();
+            let items: Vec<(usize, usize)> = (old_len..self.ledger.len())
+                .map(|index| (index, self.ledger[index].text.len()))
+                .collect();
+            self.live_batcher.push(items, now);
+            self.flush_live_batches();
         }
         if let Some(submission) = self.build_pinned_submission(recording_id, watermark) {
             self.submit_pinned_candidate(submission, watermark);
         }
     }
 
+    /// Hand due batches to the coordinator. At most one Live batch is outstanding at a time; rows that
+    /// cannot be sent for a per-row reason are released as raw (loudly), rows that merely did not fit go
+    /// back to the front of the batcher, and a backlog that grows past the policy's bounds is released
+    /// from the oldest end so the live view never falls minutes behind.
+    fn flush_live_batches(&mut self) {
+        let Some(recording_id) = self.current_recording.clone() else {
+            return;
+        };
+        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
+            let unsent = self.live_batcher.drain_all();
+            if !unsent.is_empty() {
+                tracing::info!(
+                    target: "corti::hosted",
+                    rows = unsent.len(),
+                    "Live lane is off; pending rows stay raw"
+                );
+            }
+            return;
+        }
+        let now = self.clock.monotonic_micros();
+        if let Some(released) = self.live_batcher.release_overdue(now) {
+            self.ingress_incomplete.store(true, Ordering::Release);
+            let arming = self.coordinator.live_call_is_arming();
+            tracing::warn!(
+                target: "corti::hosted",
+                rows = released.items.len(),
+                reason = ?released.reason,
+                waiting_on_credential = arming,
+                "Live cleanup is behind; releasing the oldest pending rows as raw"
+            );
+            self.live_backlog_released = true;
+        }
+        loop {
+            let outstanding = self.coordinator.live_work_pending();
+            let Some(batch) = self.live_batcher.take_due(now, outstanding) else {
+                break;
+            };
+            let watermark = self.coordinator.watermark();
+            match self.build_live_submission(&recording_id, &batch.items, watermark) {
+                LiveBuild::Submission {
+                    submission,
+                    leftover,
+                } => {
+                    self.give_back_rows(&leftover, batch.pushed_at_micros);
+                    match self.coordinator.submit_live(submission, watermark) {
+                        Ok(()) => {}
+                        Err(
+                            error @ (crate::postprocess::SubmitError::DuplicateCall
+                            | crate::postprocess::SubmitError::StaleWatermark),
+                        ) => {
+                            // Transient: the same rows are resubmitted on the next flush.
+                            tracing::debug!(
+                                target: "corti::hosted",
+                                ?error,
+                                rows = batch.items.len(),
+                                "Live batch deferred"
+                            );
+                            self.give_back_rows(&batch.items, batch.pushed_at_micros);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "corti::hosted",
+                                ?error,
+                                rows = batch.items.len(),
+                                "Live batch refused by the coordinator; its rows stay raw"
+                            );
+                            self.ingress_incomplete.store(true, Ordering::Release);
+                        }
+                    }
+                    break;
+                }
+                LiveBuild::Rejected {
+                    released,
+                    leftover,
+                    reason,
+                } => {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        rows = released.len(),
+                        reason,
+                        "Live rows cannot be rewritten and stay raw"
+                    );
+                    self.ingress_incomplete.store(true, Ordering::Release);
+                    self.give_back_rows(&leftover, batch.pushed_at_micros);
+                }
+            }
+        }
+    }
+
+    fn give_back_rows(&mut self, indices: &[usize], pushed_at_micros: u64) {
+        if indices.is_empty() {
+            return;
+        }
+        let items: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|index| {
+                (
+                    *index,
+                    self.ledger.get(*index).map_or(0, |row| row.text.len()),
+                )
+            })
+            .collect();
+        self.live_batcher.give_back(items, pushed_at_micros);
+    }
+
     fn build_live_submission(
         &mut self,
         recording_id: &str,
-        old_len: usize,
+        indices: &[usize],
         watermark: TranscriptWatermark,
-    ) -> Option<RequestSubmission> {
-        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
-            return None;
-        }
+    ) -> LiveBuild {
         let input_token_budget = self.input_token_budget(LaneFamily::Live);
-        let mut bytes = 0usize;
         let mut tokens = 0u64;
         let mut targets = Vec::new();
-        let incoming = &self.ledger[old_len..];
-        for row in incoming {
+        let mut leftover = Vec::new();
+        for (position, index) in indices.iter().enumerate() {
+            let Some(row) = self.ledger.get(*index) else {
+                continue;
+            };
             let row_tokens = estimated_row_tokens(row);
-            let next_bytes = bytes.saturating_add(row.text.len());
-            let next_tokens = tokens.saturating_add(row_tokens);
-            if row_tokens > input_token_budget
-                || next_tokens > input_token_budget
-                || (!targets.is_empty()
-                    && (targets.len() >= MAX_LIVE_TARGET_ROWS
-                        || next_bytes > MAX_LIVE_TARGET_BYTES))
-            {
+            if targets.is_empty() && row_tokens > input_token_budget {
+                // One row the model cannot take stays raw and never blocks the rows behind it.
+                return LiveBuild::Rejected {
+                    released: vec![*index],
+                    leftover: indices[position + 1..].to_vec(),
+                    reason: "row exceeds the model input budget",
+                };
+            }
+            if tokens.saturating_add(row_tokens) > input_token_budget {
+                leftover = indices[position..].to_vec();
                 break;
             }
-            bytes = next_bytes;
-            tokens = next_tokens;
+            tokens = tokens.saturating_add(row_tokens);
             targets.push(row.clone());
         }
-        if targets.len() != incoming.len() {
-            // Never imply complete hosted coverage when a latency/model token budget omitted finalized rows.
-            // The raw UI remains complete and the stronger live final safely falls back to raw.
-            self.ingress_incomplete.store(true, Ordering::Release);
-        }
         if targets.is_empty() {
-            return None;
+            return LiveBuild::Rejected {
+                released: indices.to_vec(),
+                leftover: Vec::new(),
+                reason: "batch names no ledger rows",
+            };
         }
-        let context_start = old_len.saturating_sub(MAX_CONTEXT_ROWS);
+        let first_index = indices[0].min(self.ledger.len());
+        let context_start = first_index.saturating_sub(MAX_CONTEXT_ROWS);
         let context = bounded_rows_from_end(
-            &self.ledger[context_start..old_len],
+            &self.ledger[context_start..first_index],
             input_token_budget.saturating_sub(tokens),
         )
         .0;
-        self.build_submission(
+        let deadline = self
+            .clock
+            .monotonic_micros()
+            .saturating_add(self.coordinator.deadlines().live_terminal_micros);
+        match self.build_submission(
             recording_id,
             Lane::Live,
             targets,
@@ -4821,11 +5065,25 @@ impl Service {
             false,
             watermark,
             None,
-            self.clock
-                .monotonic_micros()
-                .saturating_add(crate::postprocess::LIVE_TERMINAL_DEADLINE_MICROS),
-        )
-        .ok()
+            deadline,
+        ) {
+            Ok(submission) => LiveBuild::Submission {
+                submission,
+                leftover,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    ?error,
+                    "Live submission could not be built"
+                );
+                LiveBuild::Rejected {
+                    released: indices.to_vec(),
+                    leftover: Vec::new(),
+                    reason: "submission could not be built",
+                }
+            }
+        }
     }
 
     fn sync_pinned_revision(&mut self) {
@@ -4908,7 +5166,7 @@ impl Service {
             None,
             self.clock
                 .monotonic_micros()
-                .saturating_add(crate::postprocess::QUESTION_DEADLINE_MICROS),
+                .saturating_add(self.coordinator.deadlines().question_micros),
         )
         .ok()
     }
@@ -4932,7 +5190,7 @@ impl Service {
             None,
             self.clock
                 .monotonic_micros()
-                .saturating_add(crate::postprocess::QUESTION_DEADLINE_MICROS),
+                .saturating_add(self.coordinator.deadlines().question_micros),
         )?;
         let call_id = submission.request.call_id.clone();
         self.coordinator
@@ -5831,20 +6089,25 @@ impl Service {
         match apply.lane {
             Lane::Live => {
                 let result = match (
-                    self.current_recording.as_deref(),
+                    self.current_recording.clone(),
                     apply.output.rewritten_rows(),
                 ) {
                     (Some(recording_id), Some(rows)) => match self.live_view.apply_hosted_rows(
-                        recording_id,
+                        &recording_id,
                         rows,
                         apply.fence.transcript_revision,
                     ) {
-                        crate::live_view::HostedRowsApplyOutcome::Applied { .. } => Ok(()),
+                        crate::live_view::HostedRowsApplyOutcome::Applied { .. } => {
+                            // Questions and later Live context read the ledger, so accepted clean text
+                            // replaces the raw text there too (the live view keeps raw immutable).
+                            self.absorb_clean_rows(rows);
+                            Ok(())
+                        }
                         crate::live_view::HostedRowsApplyOutcome::Stale => {
                             tracing::warn!(
                                 target: "corti::hosted",
                                 call_id = %apply.call_id,
-                                "discarded a hosted Live result at the final transcript application fence"
+                                "discarded a hosted Live result: a target row is no longer in the live transcript"
                             );
                             Err(ErrorCode::Superseded)
                         }
@@ -9658,7 +9921,7 @@ mod tests {
     }
 
     #[test]
-    fn vertex_unarmed_event_and_app_catch_up_dispatch_only_the_newest_live_snapshot() {
+    fn vertex_unarmed_event_and_app_catch_up_dispatch_the_oldest_pending_live_batch_first() {
         let path = dir("vertex-catch-up");
         let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
         let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
@@ -9729,7 +9992,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let calls = executor.target_texts.lock().unwrap().clone();
-        assert_eq!(calls, vec![vec!["newest snapshot".to_string()]]);
+        // The first batch was parked while Vertex was unarmed and dispatches on arming; the rows that
+        // arrived meanwhile accumulated behind it instead of replacing it, and follow as the next batch.
+        assert_eq!(calls[0], vec!["old snapshot".to_string()]);
         assert_eq!(resolver.0.load(Ordering::SeqCst), 2);
         let notices: Vec<_> = events
             .lock()

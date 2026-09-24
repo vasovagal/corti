@@ -52,10 +52,39 @@ pub const MAX_VISIBLE_AD_HOC_EXCHANGES: usize = 20;
 pub const MAX_VISIBLE_ASSISTANT_BYTES: usize = 256 * 1024;
 pub const MAX_QUESTION_TEXT_BYTES: usize = 32 * 1024;
 pub const LIVE_DEBOUNCE_MICROS: u64 = 150_000;
-pub const LIVE_FIRST_TEXT_DEADLINE_MICROS: u64 = 2_000_000;
-pub const LIVE_TERMINAL_DEADLINE_MICROS: u64 = 5_000_000;
-pub const QUESTION_DEADLINE_MICROS: u64 = 30_000_000;
+/// Default first-text deadline for a Live call, measured from the response headers. Raw text is already
+/// visible, so this bounds wasted work rather than perceived latency; thinking models need the headroom.
+pub const LIVE_FIRST_TEXT_DEADLINE_MICROS: u64 = 8_000_000;
+/// Default terminal deadline for a Live call from dispatch.
+pub const LIVE_TERMINAL_DEADLINE_MICROS: u64 = 20_000_000;
+/// Default terminal deadline for a question call from enqueue.
+pub const QUESTION_DEADLINE_MICROS: u64 = 45_000_000;
 pub const FINAL_PROMOTION_MICROS: u64 = 2_000_000;
+/// A queued Live call may wait behind the in-flight one for this many terminal deadlines before it is
+/// expired unsent; the deadline is reset to one terminal deadline at dispatch.
+pub const LIVE_QUEUED_DEADLINE_MULTIPLIER: u64 = 3;
+
+/// Per-lane timing the app configures from hosted preferences. Defaults are the constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneDeadlines {
+    /// Coordinator-side debounce before a Live call becomes eligible. The app passes `0` when its own
+    /// batcher already owns quiet-period timing, so the two never stack.
+    pub live_debounce_micros: u64,
+    pub live_first_text_micros: u64,
+    pub live_terminal_micros: u64,
+    pub question_micros: u64,
+}
+
+impl Default for LaneDeadlines {
+    fn default() -> Self {
+        Self {
+            live_debounce_micros: LIVE_DEBOUNCE_MICROS,
+            live_first_text_micros: LIVE_FIRST_TEXT_DEADLINE_MICROS,
+            live_terminal_micros: LIVE_TERMINAL_DEADLINE_MICROS,
+            question_micros: QUESTION_DEADLINE_MICROS,
+        }
+    }
+}
 pub const PINNED_QUIET_DEBOUNCE_MICROS: u64 = 750_000;
 pub const PINNED_WORD_THRESHOLD: u64 = 40;
 pub const PINNED_SPEECH_THRESHOLD_MS: u64 = 30_000;
@@ -1348,6 +1377,7 @@ pub struct PostprocessCoordinator {
     ad_hoc: VecDeque<AdHocEntry>,
     awaiting_final_apply: HashMap<CallId, AwaitingFinalApply>,
     events: VecDeque<CoordinatorEventDto>,
+    deadlines: LaneDeadlines,
 }
 
 impl fmt::Debug for PostprocessCoordinator {
@@ -1457,6 +1487,7 @@ impl PostprocessCoordinator {
             ad_hoc: VecDeque::new(),
             awaiting_final_apply: HashMap::new(),
             events: VecDeque::new(),
+            deadlines: LaneDeadlines::default(),
         }
     }
 
@@ -1823,7 +1854,7 @@ impl PostprocessCoordinator {
             submission,
             watermark,
             Lane::Live,
-            LIVE_DEBOUNCE_MICROS,
+            self.deadlines.live_debounce_micros,
             None,
         )
     }
@@ -1924,10 +1955,47 @@ impl PostprocessCoordinator {
             return Err(SubmitError::WrongLane);
         }
         self.validate_submission(&submission, watermark, lane)?;
-        if matches!(lane, Lane::Live | Lane::PinnedQuestion) {
+        // Live is FIFO and never-drop: the app's batcher decides which rows form a request and keeps
+        // at most one Live call outstanding, so a queued Live call is never superseded here. Pinned
+        // questions still keep only their newest snapshot.
+        if lane == Lane::PinnedQuestion {
             self.remove_queued_lane(lane, CancellationReason::Superseded);
         }
         self.enqueue(submission, watermark, question_revision, debounce_micros)
+    }
+
+    /// Replace the per-lane deadlines; applies to calls enqueued or dispatched from now on.
+    pub fn set_deadlines(&mut self, deadlines: LaneDeadlines) {
+        self.deadlines = deadlines;
+    }
+
+    pub const fn deadlines(&self) -> LaneDeadlines {
+        self.deadlines
+    }
+
+    /// Whether the outstanding Live call is parked on a credential (Vertex unarmed or a provider still
+    /// resolving) rather than executing — a backlog behind it is expected, not a sign of slowness.
+    pub fn live_call_is_arming(&self) -> bool {
+        self.queue.iter().any(|queued| {
+            queued.submission.request.lane == Lane::Live
+                && matches!(
+                    queued.stage,
+                    QueueStage::WaitingVertex | QueueStage::WaitingCredential
+                )
+        })
+    }
+
+    /// Whether a Live call is queued, active, or awaiting application — the app's batcher holds further
+    /// rows until this is false so at most one Live batch is ever outstanding.
+    pub fn live_work_pending(&self) -> bool {
+        self.queue
+            .iter()
+            .any(|queued| queued.submission.request.lane == Lane::Live)
+            || self
+                .active
+                .values()
+                .any(|active| active.context.lane == Lane::Live)
+            || !self.pending_live_applications.is_empty()
     }
 
     fn validate_submission(
@@ -1995,7 +2063,19 @@ impl PostprocessCoordinator {
                     .request
                     .deadline
                     .0
-                    .min(now.saturating_add(QUESTION_DEADLINE_MICROS)),
+                    .min(now.saturating_add(self.deadlines.question_micros)),
+            );
+        } else if lane == Lane::Live {
+            // A Live call queued behind the in-flight one must survive that call; its own terminal
+            // deadline is re-established at dispatch.
+            submission.request.deadline = MonotonicDeadline(
+                submission.request.deadline.0.max(
+                    now.saturating_add(
+                        self.deadlines
+                            .live_terminal_micros
+                            .saturating_mul(LIVE_QUEUED_DEADLINE_MULTIPLIER),
+                    ),
+                ),
             );
         }
         let sequence = self.next_sequence()?;
@@ -2616,7 +2696,7 @@ impl PostprocessCoordinator {
 
         if lane == Lane::Live {
             queued.submission.request.deadline =
-                MonotonicDeadline(now.saturating_add(LIVE_TERMINAL_DEADLINE_MICROS));
+                MonotonicDeadline(now.saturating_add(self.deadlines.live_terminal_micros));
         }
         if lane == Lane::Final {
             if !queued.final_prepared {
@@ -3287,6 +3367,15 @@ impl PostprocessCoordinator {
 
         if let Some(reason) = stale_reason {
             let (outcome, code) = cancellation_outcome(reason);
+            tracing::warn!(
+                target: "corti::hosted",
+                call_id = %call_id,
+                ?lane,
+                ?reason,
+                provider_sent,
+                result_ok = provider_error.is_none() && output.is_some(),
+                "hosted result discarded"
+            );
             let telemetry = self.telemetry_for_ticket(
                 &ticket,
                 outcome,
@@ -3310,6 +3399,14 @@ impl PostprocessCoordinator {
         }
 
         if let Some(code) = provider_error {
+            tracing::warn!(
+                target: "corti::hosted",
+                call_id = %call_id,
+                ?lane,
+                ?code,
+                provider_sent,
+                "hosted call failed"
+            );
             if code == ErrorCode::AuthRejected {
                 self.reject_provider_credential(&ticket);
             }
@@ -3480,10 +3577,11 @@ impl PostprocessCoordinator {
         self.trim_ad_hoc();
     }
 
+    /// A Live result is fenced per target row, not per transcript revision: newer rows arriving while a
+    /// rewrite was in flight never invalidate it. The store's per-row identity check (row id, speaker,
+    /// timing) is the remaining content fence, and a new session generation still discards everything.
     fn transcript_application_is_current(&self, lane: Lane, fence: &RequestFence) -> bool {
-        lane != Lane::Live
-            || (fence.session_generation == self.watermark.session_generation
-                && fence.transcript_revision == self.watermark.transcript_revision)
+        lane != Lane::Live || fence.session_generation == self.watermark.session_generation
     }
 
     pub fn application_is_current(&self, apply: &ApplyReady) -> bool {
@@ -3519,6 +3617,12 @@ impl PostprocessCoordinator {
                 }));
             }
             Err(code) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    call_id = %call_id,
+                    ?code,
+                    "validated Live rewrite could not be applied to the live transcript"
+                );
                 telemetry.outcome = if code == ErrorCode::Superseded {
                     TerminalOutcomeDto::Superseded
                 } else {
@@ -3789,13 +3893,25 @@ impl PostprocessCoordinator {
     }
 
     fn expire_queued(&mut self, now: u64) {
-        let expired: Vec<CallId> = self
+        let expired: Vec<(CallId, Lane)> = self
             .queue
             .iter()
             .filter(|queued| queued.submission.request.deadline.is_expired_at(now))
-            .map(|queued| queued.submission.request.call_id.clone())
+            .map(|queued| {
+                (
+                    queued.submission.request.call_id.clone(),
+                    queued.submission.request.lane,
+                )
+            })
             .collect();
-        for call_id in expired {
+        for (call_id, lane) in expired {
+            tracing::warn!(
+                target: "corti::hosted",
+                call_id = %call_id,
+                ?lane,
+                provider_sent = false,
+                "hosted call expired before it was dispatched"
+            );
             self.fail_queued_call(&call_id, ErrorCode::Timeout);
         }
     }
@@ -3806,14 +3922,22 @@ impl PostprocessCoordinator {
             let live_first_text_expired = active.context.lane == Lane::Live
                 && !active.first_text_seen
                 && active.dispatch_started_at_micros.is_some_and(|started| {
-                    now.saturating_sub(started) >= LIVE_FIRST_TEXT_DEADLINE_MICROS
+                    now.saturating_sub(started) >= self.deadlines.live_first_text_micros
                 });
             if live_first_text_expired || active.deadline.is_expired_at(now) {
-                cancellations.push(call_id.clone());
+                cancellations.push((call_id.clone(), live_first_text_expired));
             }
         }
-        for call_id in cancellations {
+        for (call_id, first_text_expired) in cancellations {
             if let Some(active) = self.active.get(&call_id) {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    call_id = %call_id,
+                    lane = ?active.context.lane,
+                    provider_sent = active.provider_request_sent,
+                    first_text_expired,
+                    "hosted call exceeded its deadline and was canceled"
+                );
                 active.cancel.cancel(CancellationReason::Deadline);
                 if let Some(boundary) = active.final_boundary.as_ref() {
                     let _ = self.store.abandon_final(boundary);
@@ -5190,7 +5314,7 @@ mod tests {
     }
 
     #[test]
-    fn live_debounce_keeps_only_the_latest_pending_snapshot() {
+    fn live_submissions_are_fifo_and_never_dropped() {
         let mut harness = Harness::new();
         harness.configure(LaneFamily::Live, KnownTransport::OpenAiDirect);
         harness.enable_master();
@@ -5207,7 +5331,7 @@ mod tests {
                     Lane::Live,
                     KnownTransport::OpenAiDirect,
                     harness.clock.now(),
-                    vec![first],
+                    vec![first.clone()],
                     Vec::new(),
                 ),
                 first_mark,
@@ -5237,19 +5361,54 @@ mod tests {
         assert!(matches!(harness.dispatch_next(), DispatchOutcome::Waiting));
         harness.clock.advance(1);
         let dispatched = ticket(harness.dispatch_next());
-        assert_eq!(dispatched.request().call_id.as_str(), "live-new");
+        assert_eq!(
+            dispatched.request().call_id.as_str(),
+            "live-old",
+            "the older batch dispatches first"
+        );
         assert!(
-            !harness.coordinator.queue.iter().any(|queued| queued
+            harness.coordinator.queue.iter().any(|queued| queued
                 .submission
                 .request
                 .call_id
                 .as_str()
-                == "live-old")
+                == "live-new"),
+            "the newer batch stays queued instead of superseding the older one"
         );
+        assert!(harness.coordinator.live_work_pending());
+        assert!(
+            matches!(
+                harness.dispatch_next(),
+                DispatchOutcome::Backpressured | DispatchOutcome::Waiting
+            ),
+            "Live is single-flight while a call is active"
+        );
+
+        let first_call = dispatched.request().call_id.clone();
+        let outcome = harness.coordinator.complete(
+            dispatched,
+            Ok(terminal(
+                rewrite_output(&first, "fixture one, cleaned"),
+                complete_usage(),
+            )),
+        );
+        assert!(!matches!(outcome, CompletionOutcome::Discarded { .. }));
+        harness
+            .coordinator
+            .acknowledge_live_application(&first_call, Ok(()))
+            .unwrap();
+        harness.clock.advance(LIVE_DEBOUNCE_MICROS);
+        let next = ticket(harness.dispatch_next());
+        assert_eq!(
+            next.request().call_id.as_str(),
+            "live-new",
+            "the queued batch follows once the first completes"
+        );
+        assert!(harness.coordinator.live_work_pending());
     }
 
     #[test]
-    fn late_live_result_is_superseded_by_a_newer_transcript_revision() {
+    fn late_live_result_applies_despite_newer_rows() {
         let mut harness = Harness::new();
         harness.configure(LaneFamily::Live, KnownTransport::OpenAiDirect);
         harness.enable_master();
@@ -5275,11 +5434,18 @@ mod tests {
         harness.clock.advance(LIVE_DEBOUNCE_MICROS);
         let dispatched = ticket(harness.dispatch_next());
 
+        // Two newer batches land while the rewrite is in flight; they never invalidate it.
         let newer = row(2, "newer fixture phrase", 1_000, 2_000);
         harness
             .coordinator
             .observe_finalized_rows(std::slice::from_ref(&newer))
             .unwrap();
+        let newest = row(3, "newest fixture phrase", 2_000, 3_000);
+        harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&newest))
+            .unwrap();
+        let call_id = dispatched.request().call_id.clone();
         let outcome = harness.coordinator.complete(
             dispatched,
             Ok(terminal(
@@ -5287,14 +5453,35 @@ mod tests {
                 complete_usage(),
             )),
         );
-        assert!(matches!(
-            outcome,
-            CompletionOutcome::Discarded {
-                code: ErrorCode::Superseded,
-                ..
-            }
-        ));
-        assert!(harness.store.lock().unwrap().commits.is_empty());
+        assert!(
+            !matches!(outcome, CompletionOutcome::Discarded { .. }),
+            "a validated rewrite of still-present rows applies: {outcome:?}"
+        );
+        assert_eq!(harness.store.lock().unwrap().commits.len(), 1);
+        assert!(harness.coordinator.live_work_pending());
+        harness
+            .coordinator
+            .acknowledge_live_application(&call_id, Ok(()))
+            .unwrap();
+        assert!(!harness.coordinator.live_work_pending());
+
+        // A new session generation still fences everything from the old one.
+        let stale_fence = RequestFence {
+            session_generation: harness
+                .coordinator
+                .control_snapshot()
+                .session_generation
+                .saturating_add(1),
+            ..harness
+                .coordinator
+                .control
+                .fence(Lane::Live, harness.coordinator.watermark, None)
+        };
+        assert!(
+            !harness
+                .coordinator
+                .transcript_application_is_current(Lane::Live, &stale_fence)
+        );
     }
 
     #[test]

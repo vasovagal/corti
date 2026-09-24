@@ -376,10 +376,9 @@ export default function LiveTranscript() {
         if (terminal.lane === "live" && terminal.outcome !== "completed") {
           setLaneStates((current) => ({ ...current, live: terminal.outcome === "failed" ? "failed" : "using_raw" }));
         }
-        if (
-          terminal.error &&
-          !["canceled", "superseded"].includes(terminal.error)
-        ) {
+        // Only an explicit cancel is silent; a superseded or timed-out rewrite is now rare enough that
+        // hiding it would hide a real problem.
+        if (terminal.error && terminal.error !== "canceled") {
           const guidance = hostedErrorGuidance(terminal.error);
           setControlStatus(guidance.message);
           setControlRepair(

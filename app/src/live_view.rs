@@ -470,9 +470,11 @@ impl LiveTranscriptStore {
         hosted_rows
     }
 
-    /// Apply a validated cleanup only when session and transcript revision still match. Validation and all
-    /// row mutations happen under one lock, so an evicted/mismatched target rejects the whole application;
-    /// immutable raw text is never replaced or deleted.
+    /// Apply a validated cleanup only when the session still matches and every target row is still present
+    /// with the same identity (row id, speaker, timing). Newer rows appended since the request was built do
+    /// not invalidate it: the fence is per row, not per transcript revision. Validation and all row
+    /// mutations happen under one lock, so an evicted/mismatched target rejects the whole application;
+    /// immutable raw text is never replaced or deleted. `commit_epoch` is recorded on the rows for the UI.
     pub(crate) fn apply_hosted_rows(
         &self,
         id: &str,
@@ -485,8 +487,7 @@ impl LiveTranscriptStore {
         let _publish = self.publish.lock().unwrap();
         let events = {
             let mut inner = self.inner.lock().unwrap();
-            if inner.session_id.as_deref() != Some(id) || inner.transcript_revision != commit_epoch
-            {
+            if inner.session_id.as_deref() != Some(id) {
                 return HostedRowsApplyOutcome::Stale;
             }
             let mut indices = Vec::with_capacity(rows.len());
@@ -698,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_rows_reject_a_late_transcript_revision_atomically() {
+    fn hosted_rows_apply_after_newer_rows_and_reject_a_missing_row_atomically() {
         let store = LiveTranscriptStore::detached();
         store.begin_call("call", "Fixture");
         let first = store.append_words("call", Speaker::Me, &[word(1.0, 2.0, "first raw")]);
@@ -706,17 +707,38 @@ mod tests {
         clean.text = "first clean".into();
         store.append_words("call", Speaker::Me, &[word(3.0, 4.0, "newer raw")]);
 
+        // Rows appended after the request was built never invalidate a rewrite of rows still present.
         assert_eq!(
-            store.apply_hosted_rows("call", &[clean], 1),
+            store.apply_hosted_rows("call", std::slice::from_ref(&clean), 1),
+            HostedRowsApplyOutcome::Applied { row_count: 1 }
+        );
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.lines[0].clean_text.as_deref(), Some("first clean"));
+        assert_eq!(snapshot.lines[0].rewrite_state, HostedRewriteState::Clean);
+        assert_eq!(snapshot.lines[0].text, "first raw", "raw is never replaced");
+        assert!(snapshot.lines[1].clean_text.is_none());
+
+        // A batch that names a row the store no longer has (or with different identity) is rejected whole.
+        let mut ghost = clean.clone();
+        ghost.row_id = RowId::new("live-row-9999999999999999").unwrap();
+        let second_row = TranscriptRow {
+            row_id: snapshot.lines[1].row_id.clone(),
+            speaker: snapshot.lines[1].speaker.clone(),
+            start_ms: 3_000,
+            end_ms: 4_000,
+            text: "newer clean".into(),
+        };
+        assert_eq!(
+            store.apply_hosted_rows("call", &[second_row, ghost], 2),
             HostedRowsApplyOutcome::Stale
         );
         let snapshot = store.snapshot();
-        assert!(
-            snapshot
-                .lines
-                .iter()
-                .all(|line| line.clean_text.is_none()
-                    && line.rewrite_state == HostedRewriteState::Raw)
+        assert!(snapshot.lines[1].clean_text.is_none(), "nothing applied");
+
+        // A different session is always stale.
+        assert_eq!(
+            store.apply_hosted_rows("other", std::slice::from_ref(&clean), 3),
+            HostedRowsApplyOutcome::Stale
         );
     }
 

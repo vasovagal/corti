@@ -805,8 +805,14 @@ fn session_thread(
 ) -> LiveOutcome {
     // Hosted session setup is off capture/ASR and fails closed. Raw publication and filing do not depend on
     // this reply; the bounded row handoff below simply remains unavailable for this recording.
-    if let Some(hosted) = publisher.hosted.as_ref() {
-        let _ = hosted.begin_live_session(&publisher.id);
+    if let Some(hosted) = publisher.hosted.as_ref()
+        && let Err(error) = hosted.begin_live_session(&publisher.id)
+    {
+        tracing::warn!(
+            target: "corti::hosted",
+            ?error,
+            "hosted live session could not be opened; this recording stays raw"
+        );
     }
     let provenance =
         crate::provenance::from_config(&cfg, corti_vagus::provenance::GenerationMode::Live);
@@ -1720,8 +1726,13 @@ impl TranscriptPublisher for StorePublisher {
         let rows = self.store.append_words(&self.id, speaker, words);
         if !rows.is_empty()
             && let Some(hosted) = self.hosted.as_ref()
+            && let Err(error) = hosted.try_observe_finalized_rows(&self.id, rows)
         {
-            let _ = hosted.try_observe_finalized_rows(&self.id, rows);
+            tracing::warn!(
+                target: "corti::hosted",
+                ?error,
+                "hosted row handoff saturated; these rows stay raw"
+            );
         }
     }
 

@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod batch;
 pub mod coordinator;
 
+pub use batch::{BacklogReleaseReason, Batch, LiveBatchPolicy, LiveBatcher, ReleasedBacklog};
 pub use coordinator::*;
