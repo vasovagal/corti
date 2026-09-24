@@ -6824,6 +6824,7 @@ impl TryFrom<HostedSelectionInput> for LaneSelectionDto {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settings_snapshot(
     state_revision: u64,
     preferences: &HostedPreferences,
