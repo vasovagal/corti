@@ -28,3 +28,10 @@ hourly retention sweep — job-level, not a full resume of a recording crashed m
   and native ChatGPT subscription device authorization with direct fixed-endpoint Responses access and no
   Codex server. Live Transcript microphone tests now belong to exact window generations, so closing the
   window reliably releases or prevents the test microphone (#127, #131, #132; ADRs 0013 and 0015).
+- **v0.18.0 (unreleased, #158, ADR 0017):** the hosted coordinator moves into the platform-independent
+  `corti-chat` crate; Live results are fenced per target row and batched never-drop so the Live view
+  actually flips to clean text with Vertex or the ChatGPT subscription; per-transport thinking/reasoning
+  flags, served-model snapshot leniency and auth re-arm; one provider cache-policy derivation with a real
+  acknowledgement control (#144) and hosted.toml schema 2; question subscriptions with presets ("Asked of
+  me", running summary, topic watch), bullet answers and streamed partials; cleanup sorts by start (#157),
+  strips fillers and stutters (#154) and applies a learned lexicon grown by `corti --review`.

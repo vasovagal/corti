@@ -21,6 +21,7 @@ Append-only decision log (Context / Decision / Consequences). Guardrails in
 | [0013](0013-live-transcript-window-and-microphone-test.md) | Accepted | bounded timestamped live reader, ephemeral mic/ASR test, and foreground tray windows |
 | [0014](0014-transcript-generation-provenance.md) | Accepted | versioned, Vagus-searchable transcript provenance: Corti release, final live/batch path, models, and quality config in safe namespaced frontmatter |
 | [0015](0015-hosted-post-processing.md) | Accepted for implementation design | optional hosted cleanup/final/questions with explicit egress, support tiers, encrypted caching, fenced results, and truthful billing |
+| [0017](0017-reusable-stream-chat-harness.md) | Accepted | `corti-chat` harness: row-scoped Live fences and never-drop batching, per-transport body flags, one cache-policy derivation (#144), question subscriptions with presets, ordered cleanup with filler stripping (#154/#157) and a learned lexicon grown by `corti --review` — *amends 0015 §6; 0016 is claimed by PR #123* |
 
 **Two ADRs share number 0006** — `distribution-unsigned-cask-tap` (Accepted) and
 `far-end-recording-notice-spike` (Proposed spike) — a numbering collision left as-is; disambiguate by
