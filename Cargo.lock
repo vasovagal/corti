@@ -1393,6 +1393,7 @@ dependencies = [
  "chrono",
  "corti-aec",
  "corti-capture",
+ "corti-chat",
  "corti-core",
  "corti-detect",
  "corti-jobs",
@@ -1462,6 +1463,20 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "corti-chat"
+version = "0.17.0"
+dependencies = [
+ "corti-postprocess",
+ "corti-postprocess-providers",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]
