@@ -731,10 +731,10 @@ export const fixtures: Record<string, unknown> = {
   set_bedrock_credential_mode: { status: "unchanged", settings: hostedSettings },
   prompt_for_provider_secret: "stored",
   clear_provider_secret: null,
-  set_hosted_pinned_question: { status: "unchanged", settings: hostedSettings },
+  set_hosted_subscriptions: { status: "unchanged", settings: hostedSettings },
+  run_hosted_subscription_now: null,
   get_hosted_assistant: {
-    pinned_run_count: 0,
-    pinned: null,
+    subscriptions: [],
     exchanges: [],
   },
   submit_hosted_question: "synthetic-question-call",
@@ -880,26 +880,64 @@ export const syntheticLiveTranscript = {
 };
 
 export const syntheticAssistant = {
-  pinned_run_count: 3,
-  pinned: {
-    call_id: "synthetic-pinned-3",
-    as_of_revision: 42,
-    status: "completed",
-    error: null,
-    question: "What decision is currently supported?",
-    answer: "The fixture supports a Friday release after the deterministic checks pass.",
-    cost_label: "Estimated $0.0012",
-    context_truncated: false,
-    usage: {
-      input_tokens: 140,
-      output_tokens: 18,
-      cached_read_tokens: 96,
-      cached_write_tokens: null,
-      reasoning_tokens: null,
-      usage_complete: true,
+  subscriptions: [
+    {
+      id: "asked-of-me",
+      title: "Asked of me",
+      preset: "asked_of_me",
+      format: "bullets",
+      enabled: true,
+      run_count: 2,
+      in_flight: false,
+      pending: false,
+      exchange: {
+        call_id: "synthetic-asked-2",
+        as_of_revision: 42,
+        status: "completed",
+        error: null,
+        question: "List the questions or requests the other speakers have directed at me.",
+        answer: "- Can you own the migration runbook by Friday?\n- Do you want the demo before or after standup?",
+        cost_label: "Estimated $0.0009",
+        format: "bullets",
+        partial_answer: null,
+        previous_answer: null,
+        context_truncated: false,
+        cache: "provider_read",
+      },
     },
-    cache: "provider_read",
-  },
+    {
+      id: "summary",
+      title: "Running summary",
+      preset: "running_summary",
+      format: "bullets",
+      enabled: true,
+      run_count: 3,
+      in_flight: false,
+      pending: false,
+      exchange: {
+        call_id: "synthetic-summary-3",
+        as_of_revision: 42,
+        status: "completed",
+        error: null,
+        question: "Give a running bullet list of what has been discussed so far.",
+        answer: "- Friday release after the deterministic checks pass\n- Raw fallback stays visible until rows are clean",
+        cost_label: "Estimated $0.0012",
+        format: "bullets",
+        partial_answer: null,
+        previous_answer: null,
+        context_truncated: false,
+        usage: {
+          input_tokens: 140,
+          output_tokens: 18,
+          cached_read_tokens: 96,
+          cached_write_tokens: null,
+          reasoning_tokens: null,
+          usage_complete: true,
+        },
+        cache: "provider_read",
+      },
+    },
+  ],
   exchanges: [
     {
       call_id: "synthetic-question-1",
@@ -959,8 +997,7 @@ export const syntheticPinnedWaitingSettings = {
 };
 
 export const syntheticPolicyBlockedAssistant = {
-  pinned_run_count: 0,
-  pinned: null,
+  subscriptions: [],
   exchanges: [
     {
       call_id: "synthetic-policy-question",
@@ -982,7 +1019,8 @@ export const syntheticLiveOverrides: Record<string, unknown> = {
   get_hosted_assistant: syntheticAssistant,
   patch_hosted_settings: { status: "unchanged", settings: syntheticLiveSettings },
   update_hosted_steering: { status: "unchanged", settings: syntheticLiveSettings },
-  set_hosted_pinned_question: { status: "unchanged", settings: syntheticLiveSettings },
+  set_hosted_subscriptions: { status: "unchanged", settings: syntheticLiveSettings },
+  run_hosted_subscription_now: null,
 };
 
 export const syntheticLiveTerminal = {

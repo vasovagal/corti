@@ -430,7 +430,10 @@ export default function LiveTranscript() {
 
   const assistantRunning = Boolean(
     assistant &&
-      [assistant.pinned, ...assistant.exchanges].some(
+      [
+        ...(assistant.subscriptions ?? []).map((subscription) => subscription.exchange),
+        ...assistant.exchanges,
+      ].some(
         (exchange) =>
           exchange && ["queued", "waiting_for_credential", "running"].includes(exchange.status),
       ),
@@ -465,7 +468,10 @@ export default function LiveTranscript() {
 
   useEffect(() => {
     if (!assistant) return;
-    const completed = [assistant.pinned, ...assistant.exchanges].filter(
+    const completed = [
+      ...(assistant.subscriptions ?? []).map((subscription) => subscription.exchange),
+      ...assistant.exchanges,
+    ].filter(
       (exchange): exchange is NonNullable<typeof exchange> =>
         Boolean(exchange?.status === "completed" && exchange.answer),
     );

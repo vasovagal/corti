@@ -368,7 +368,11 @@ pub(crate) struct HostedPreferenceValues {
     pub(crate) questions: LanePreferences,
     pub(crate) providers: ProviderPreferences,
     pub(crate) default_steering: String,
+    /// Schema-1 migration sink: read so the template can become the first subscription, never
+    /// written again. Subscriptions are the only source of question templates.
+    #[serde(skip_serializing)]
     pub(crate) pinned_question_template: String,
+    /// Global "automatic questions" switch for every subscription (the schema-1 name is kept).
     pub(crate) pinned_auto_enabled: bool,
     pub(crate) pinned_auto_acknowledgement_version: Option<u32>,
     pub(crate) final_deadline_seconds: u32,
@@ -1226,16 +1230,23 @@ provider_cache = "off"
         assert_eq!(pinned.preset, "none");
         assert_eq!(pinned.output, "paragraph");
         assert_eq!(values.subscriptions_auto_acknowledgement_version, Some(1));
-        // The pinned fields stay authoritative until the subscription coordinator replaces them.
+        // The template is read for migration only; the global auto switch keeps its schema-1 name.
         assert_eq!(values.pinned_question_template, "What did we decide?");
         assert!(values.pinned_auto_enabled);
 
-        // Saving rewrites the document as schema 2 and it loads again unchanged.
+        // Saving rewrites the document as schema 2 without the migrated template, and the
+        // subscription carries it from then on.
         loaded.save_at(&path).unwrap();
         let reloaded = HostedPreferences::load_at(&path).unwrap();
-        assert_eq!(reloaded, loaded);
+        assert_eq!(reloaded.values().pinned_question_template, "");
+        assert_eq!(reloaded.values().subscriptions, values.subscriptions);
+        assert!(reloaded.values().pinned_auto_enabled);
         let rewritten = std::fs::read_to_string(&path).unwrap();
         assert!(rewritten.starts_with("schema = 2"), "{rewritten}");
+        assert!(
+            !rewritten.contains("pinned_question_template"),
+            "{rewritten}"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

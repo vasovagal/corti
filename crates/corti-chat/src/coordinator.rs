@@ -15,7 +15,7 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     sync::{
         Arc,
@@ -41,6 +41,11 @@ use corti_postprocess_providers::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::subscriptions::{
+    ProgressLedger, SubscriptionId, SubscriptionPreset, SubscriptionSpec, meaningful_progress,
+    partial_answer_from_json_prefix, rows_contain_question_for_me, validate_set,
+};
 
 pub const COORDINATOR_COMMAND_CAPACITY: usize = 256;
 pub const PROVIDER_EVENT_CAPACITY: usize = 256;
@@ -85,9 +90,13 @@ impl Default for LaneDeadlines {
         }
     }
 }
-pub const PINNED_QUIET_DEBOUNCE_MICROS: u64 = 750_000;
-pub const PINNED_WORD_THRESHOLD: u64 = 40;
-pub const PINNED_SPEECH_THRESHOLD_MS: u64 = 30_000;
+/// Subscription calls that may be active at once (each subscription is itself single-flight). The
+/// per-provider cap still applies, so with one provider this is Live plus one question in practice.
+pub const MAX_SUBSCRIPTION_CALLS: usize = 2;
+/// How much raw streamed output is kept per running question call for partial-answer display.
+const MAX_PARTIAL_STREAM_BYTES: usize = 64 * 1024;
+/// How long a subscription waits after its submission was refused before it is offered again.
+pub const SUBSCRIPTION_RETRY_MICROS: u64 = 5_000_000;
 const MAX_COORDINATOR_EVENTS: usize = 256;
 
 /// App clock used for monotonic scheduling and truthful tariff timestamps.
@@ -571,8 +580,8 @@ pub enum SubmitError {
     AdHocQueueFull,
     #[error("question text is empty or too large")]
     InvalidQuestion,
-    #[error("no committed pinned question template exists")]
-    NoPinnedTemplate,
+    #[error("no such question subscription, or it is not runnable right now")]
+    UnknownSubscription,
     #[error("invalid recording id")]
     InvalidRecordingId,
     #[error("invalid output limit")]
@@ -1119,31 +1128,59 @@ impl fmt::Debug for QueuedCall {
     }
 }
 
+/// Runtime state of one question subscription. The spec is what the owner saved; the rest is per
+/// session and never persisted.
 #[derive(Debug)]
-struct PinnedCandidate {
-    submission: RequestSubmission,
-    watermark: TranscriptWatermark,
-}
-
-#[derive(Debug)]
-struct PinnedProgress {
-    request_watermark: TranscriptWatermark,
-    candidate: Option<PinnedCandidate>,
-    quiet_due_at_micros: Option<u64>,
-    dirty_while_running: bool,
+struct SubscriptionState {
+    spec: SubscriptionSpec,
+    /// Progress at the moment the last accepted submission was built; runs are judged against it.
+    baseline: ProgressLedger,
+    /// The baseline before the current queued submission, restored if that call never dispatches.
+    baseline_before_submit: Option<ProgressLedger>,
     run_count: u64,
+    last_dispatched_at_micros: Option<u64>,
+    /// `asked_of_me` only: a Them row passed the question pre-filter since the last run.
+    cue_seen: bool,
+    /// "Catch up now": run at the next opportunity regardless of thresholds and quiet.
+    force_due: bool,
+    /// Not offered again before this instant (set after a refused submission).
+    defer_until_micros: u64,
 }
 
-impl PinnedProgress {
-    fn new(session_generation: u64) -> Self {
+impl SubscriptionState {
+    fn new(spec: SubscriptionSpec) -> Self {
         Self {
-            request_watermark: TranscriptWatermark::initial(session_generation),
-            candidate: None,
-            quiet_due_at_micros: None,
-            dirty_while_running: false,
+            spec,
+            baseline: ProgressLedger::default(),
+            baseline_before_submit: None,
             run_count: 0,
+            last_dispatched_at_micros: None,
+            cue_seen: false,
+            force_due: false,
+            defer_until_micros: 0,
         }
     }
+
+    fn reset_for_session(&mut self) {
+        self.baseline = ProgressLedger::default();
+        self.baseline_before_submit = None;
+        self.run_count = 0;
+        self.last_dispatched_at_micros = None;
+        self.cue_seen = false;
+        self.force_due = false;
+        self.defer_until_micros = 0;
+    }
+}
+
+/// Content-free per-subscription status for the assistant view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubscriptionStatusDto {
+    pub id: SubscriptionId,
+    pub run_count: u64,
+    /// A call for this subscription is queued or running.
+    pub in_flight: bool,
+    /// The subscription has met its thresholds and will run once its quiet period passes.
+    pub pending: bool,
 }
 
 struct TransientResult {
@@ -1171,6 +1208,8 @@ struct ActiveCall {
     dispatch_started_at_micros: Option<u64>,
     dispatched_at_unix_ms: Option<i64>,
     first_text_seen: bool,
+    /// Bounded raw prefix of a streamed question answer (JSON), for partial display only.
+    partial_stream: Option<String>,
     observed_terminal_usage: Option<NormalizedUsage>,
     model: ModelId,
     region: Option<String>,
@@ -1372,8 +1411,8 @@ pub struct PostprocessCoordinator {
     next_question_revision: u64,
     watermark: TranscriptWatermark,
     last_progress_at_micros: u64,
-    pinned: PinnedProgress,
-    pinned_template: Option<SensitiveText>,
+    progress: ProgressLedger,
+    subscriptions: BTreeMap<SubscriptionId, SubscriptionState>,
     ad_hoc: VecDeque<AdHocEntry>,
     awaiting_final_apply: HashMap<CallId, AwaitingFinalApply>,
     events: VecDeque<CoordinatorEventDto>,
@@ -1388,11 +1427,8 @@ impl fmt::Debug for PostprocessCoordinator {
             .field("queued", &self.queue.len())
             .field("active", &self.active.len())
             .field("watermark", &self.watermark)
-            .field("pinned", &self.pinned)
-            .field(
-                "pinned_template_bytes",
-                &self.pinned_template.as_ref().map(SensitiveText::len),
-            )
+            .field("progress", &self.progress)
+            .field("subscription_count", &self.subscriptions.len())
             .field("ad_hoc_count", &self.ad_hoc.len())
             .field("awaiting_final_apply", &self.awaiting_final_apply.len())
             .field("event_count", &self.events.len())
@@ -1412,7 +1448,7 @@ impl PostprocessCoordinator {
     ) -> Self {
         Self::new_with_snapshot(
             ControlSnapshotDto::defaults(process_epoch),
-            None,
+            Vec::new(),
             clock,
             digest_key,
             persistence,
@@ -1428,7 +1464,7 @@ impl PostprocessCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_snapshot(
         snapshot: ControlSnapshotDto,
-        pinned_template: Option<String>,
+        subscriptions: Vec<SubscriptionSpec>,
         clock: Arc<dyn CoordinatorClock>,
         digest_key: Arc<DigestKey>,
         persistence: Box<dyn ControlPersistence>,
@@ -1480,10 +1516,12 @@ impl PostprocessCoordinator {
             next_question_revision: 1,
             watermark: TranscriptWatermark::initial(session_generation),
             last_progress_at_micros: 0,
-            pinned: PinnedProgress::new(session_generation),
-            pinned_template: pinned_template
-                .filter(|text| !text.trim().is_empty())
-                .map(SensitiveText::new),
+            progress: ProgressLedger::default(),
+            subscriptions: subscriptions
+                .into_iter()
+                .filter(|spec| spec.validate().is_ok())
+                .map(|spec| (spec.id.clone(), SubscriptionState::new(spec)))
+                .collect(),
             ad_hoc: VecDeque::new(),
             awaiting_final_apply: HashMap::new(),
             events: VecDeque::new(),
@@ -1758,7 +1796,10 @@ impl PostprocessCoordinator {
         self.awaiting_final_apply.clear();
         self.vertex.clear_pending();
         self.watermark = TranscriptWatermark::initial(snapshot.session_generation);
-        self.pinned = PinnedProgress::new(snapshot.session_generation);
+        self.progress = ProgressLedger::default();
+        for state in self.subscriptions.values_mut() {
+            state.reset_for_session();
+        }
         self.last_progress_at_micros = self.clock.monotonic_micros();
         self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
             snapshot.clone(),
@@ -1806,43 +1847,255 @@ impl PostprocessCoordinator {
             .checked_add(u64::try_from(rows.len()).map_err(|_| SubmitError::GenerationOverflow)?)
             .ok_or(SubmitError::GenerationOverflow)?;
         self.last_progress_at_micros = self.clock.monotonic_micros();
-        if self.meaningful_pinned_progress(self.watermark) {
-            self.pinned.quiet_due_at_micros = Some(
-                self.last_progress_at_micros
-                    .saturating_add(PINNED_QUIET_DEBOUNCE_MICROS),
-            );
-            if self.active_lane_count(Lane::PinnedQuestion) > 0 {
-                self.pinned.dirty_while_running = true;
+        self.progress.observe(rows, self.last_progress_at_micros);
+        for state in self.subscriptions.values_mut() {
+            if state.spec.preset == SubscriptionPreset::AskedOfMe
+                && !state.cue_seen
+                && rows_contain_question_for_me(rows, &state.spec.name_hints)
+            {
+                state.cue_seen = true;
             }
         }
         Ok(self.watermark)
     }
 
-    pub fn edit_pinned_template(&mut self, text: String) -> Result<(), SubmitError> {
-        if text.len() > MAX_QUESTION_TEXT_BYTES || text.chars().any(char::is_control) {
-            return Err(SubmitError::InvalidQuestion);
+    /// Replace the saved subscription set. A subscription whose question, preset or context changed (or
+    /// that is new) has its in-flight work canceled and its progress baseline reset so the transcript
+    /// already on screen is answered; unchanged ones keep their state. Bumps the question revision so
+    /// every earlier subscription call is fenced out.
+    pub fn set_subscriptions(&mut self, specs: Vec<SubscriptionSpec>) -> Result<(), SubmitError> {
+        validate_set(&specs).map_err(|_| SubmitError::InvalidQuestion)?;
+        let mut next: BTreeMap<SubscriptionId, SubscriptionState> = BTreeMap::new();
+        for spec in specs {
+            let state = match self.subscriptions.remove(&spec.id) {
+                Some(mut existing) if !existing.spec.changes_question(&spec) => {
+                    existing.spec = spec;
+                    existing
+                }
+                Some(mut existing) => {
+                    self.cancel_subscription(&existing.spec.id, CancellationReason::Superseded);
+                    existing.spec = spec;
+                    existing.baseline = ProgressLedger::default();
+                    existing.baseline_before_submit = None;
+                    existing.cue_seen = false;
+                    existing.force_due = false;
+                    existing.defer_until_micros = 0;
+                    existing
+                }
+                None => SubscriptionState::new(spec),
+            };
+            next.insert(state.spec.id.clone(), state);
         }
-        self.cancel_scope(CancellationScope::Pinned(CancellationReason::Superseded));
-        self.remove_queued_lane(Lane::PinnedQuestion, CancellationReason::Superseded);
-        self.pinned.candidate = None;
-        self.pinned_template = (!text.trim().is_empty()).then(|| SensitiveText::new(text));
+        let removed: Vec<SubscriptionId> = self.subscriptions.keys().cloned().collect();
+        for id in removed {
+            self.cancel_subscription(&id, CancellationReason::Superseded);
+        }
+        self.subscriptions = next;
         self.control
             .commit_pinned_question_revision()
             .map_err(|_| SubmitError::GenerationOverflow)?;
-        // A newly saved question should be able to answer the substantial transcript already on screen.
-        // Starting its progress baseline at "now" made late setup look broken until another 40 words arrived.
-        // Subsequent accepted runs still advance the baseline normally, preserving bounded coalesced updates.
-        self.pinned.request_watermark = if self.pinned_template.is_some() {
-            TranscriptWatermark::initial(self.watermark.session_generation)
-        } else {
-            self.watermark
-        };
-        self.pinned.quiet_due_at_micros = None;
-        self.pinned.dirty_while_running = false;
         self.push_event(CoordinatorEventDto::ControlChanged(Box::new(
             self.control.snapshot().clone(),
         )));
         Ok(())
+    }
+
+    pub fn subscription_specs(&self) -> impl Iterator<Item = &SubscriptionSpec> {
+        self.subscriptions.values().map(|state| &state.spec)
+    }
+
+    pub fn subscription_spec(&self, id: &SubscriptionId) -> Option<&SubscriptionSpec> {
+        self.subscriptions.get(id).map(|state| &state.spec)
+    }
+
+    pub fn subscription_statuses(&self) -> Vec<SubscriptionStatusDto> {
+        let now = self.clock.monotonic_micros();
+        self.subscriptions
+            .values()
+            .map(|state| SubscriptionStatusDto {
+                id: state.spec.id.clone(),
+                run_count: state.run_count,
+                in_flight: self.subscription_in_flight(&state.spec.id),
+                pending: self.subscription_thresholds_met(state, now)
+                    && self.control.snapshot().enabled_for(Lane::PinnedQuestion)
+                    && self.control.snapshot().pinned_auto_enabled,
+            })
+            .collect()
+    }
+
+    pub fn subscription_run_count(&self, id: &SubscriptionId) -> u64 {
+        self.subscriptions
+            .get(id)
+            .map_or(0, |state| state.run_count)
+    }
+
+    /// "Catch up now": run the subscription at the next opportunity whatever the thresholds say. A call
+    /// already in flight is left to finish; the forced run follows it.
+    pub fn run_subscription_now(&mut self, id: &SubscriptionId) -> Result<(), SubmitError> {
+        let state = self
+            .subscriptions
+            .get_mut(id)
+            .ok_or(SubmitError::UnknownSubscription)?;
+        state.force_due = true;
+        state.defer_until_micros = 0;
+        Ok(())
+    }
+
+    /// Hold a subscription back (after its submission was refused) so the app is not asked to rebuild
+    /// it every tick.
+    pub fn defer_subscription(&mut self, id: &SubscriptionId, micros: u64) {
+        if let Some(state) = self.subscriptions.get_mut(id) {
+            state.defer_until_micros = self.clock.monotonic_micros().saturating_add(micros);
+        }
+    }
+
+    fn subscription_in_flight(&self, id: &SubscriptionId) -> bool {
+        let matches = |target: Option<&corti_postprocess::TargetId>| {
+            target.is_some_and(|target| target.as_str() == id.as_str())
+        };
+        self.queue.iter().any(|queued| {
+            queued.submission.request.lane == Lane::PinnedQuestion
+                && matches(queued.submission.request.target_id.as_ref())
+        }) || self.active.values().any(|active| {
+            active.context.lane == Lane::PinnedQuestion
+                && matches(active.context.target_id.as_ref())
+        })
+    }
+
+    /// Thresholds only (not quiet, spacing, or in-flight state): enough relevant progress since the
+    /// baseline, plus the `asked_of_me` cue, or an explicit "run now".
+    fn subscription_thresholds_met(&self, state: &SubscriptionState, _now: u64) -> bool {
+        if state.force_due {
+            return true;
+        }
+        if !state.spec.enabled {
+            return false;
+        }
+        if !meaningful_progress(&state.spec.trigger, &state.baseline, &self.progress) {
+            return false;
+        }
+        state.spec.preset != SubscriptionPreset::AskedOfMe || state.cue_seen
+    }
+
+    /// The subscriptions the app should build and submit right now: enabled, automatic questions on,
+    /// thresholds met, quiet period and minimum spacing elapsed, nothing in flight for the same id, and
+    /// not deferred. Order is by id so the app's work is deterministic.
+    pub fn due_subscriptions(&self, now: u64) -> Vec<SubscriptionId> {
+        let control = self.control.snapshot();
+        if !control.enabled_for(Lane::PinnedQuestion) || !control.pinned_auto_enabled {
+            return Vec::new();
+        }
+        self.subscriptions
+            .values()
+            .filter(|state| now >= state.defer_until_micros)
+            .filter(|state| !self.subscription_in_flight(&state.spec.id))
+            .filter(|state| self.subscription_thresholds_met(state, now))
+            .filter(|state| {
+                if state.force_due {
+                    return true;
+                }
+                let trigger = &state.spec.trigger;
+                let quiet_since = self.progress.last_progress_at(trigger.on_speakers);
+                let quiet_ok = now.saturating_sub(quiet_since) >= trigger.quiet_micros;
+                let spacing_ok = state
+                    .last_dispatched_at_micros
+                    .is_none_or(|last| now.saturating_sub(last) >= trigger.min_interval_micros);
+                quiet_ok && spacing_ok
+            })
+            .map(|state| state.spec.id.clone())
+            .collect()
+    }
+
+    /// Submit the request the app built for a due subscription. The request must be on the
+    /// `PinnedQuestion` lane and carry the subscription id as its `target_id`. It is fenced with the
+    /// current question revision and runs FIFO behind other subscription work.
+    pub fn submit_subscription(
+        &mut self,
+        id: &SubscriptionId,
+        submission: RequestSubmission,
+        watermark: TranscriptWatermark,
+    ) -> Result<(), SubmitError> {
+        if submission.request.lane != Lane::PinnedQuestion {
+            return Err(SubmitError::WrongLane);
+        }
+        if submission
+            .request
+            .target_id
+            .as_ref()
+            .is_none_or(|target| target.as_str() != id.as_str())
+        {
+            return Err(SubmitError::UnknownSubscription);
+        }
+        if !self.subscriptions.contains_key(id) || self.subscription_in_flight(id) {
+            return Err(SubmitError::UnknownSubscription);
+        }
+        self.validate_submission(&submission, watermark, Lane::PinnedQuestion)?;
+        let question_revision = self.control.snapshot().pinned_question_revision;
+        self.enqueue(submission, watermark, Some(question_revision), 0)?;
+        let progress = self.progress;
+        if let Some(state) = self.subscriptions.get_mut(id) {
+            state.baseline_before_submit = Some(state.baseline);
+            state.baseline = progress;
+            state.cue_seen = false;
+            state.force_due = false;
+        }
+        Ok(())
+    }
+
+    /// Cancel every queued or active call of one subscription.
+    fn cancel_subscription(&mut self, id: &SubscriptionId, reason: CancellationReason) {
+        let matches = |lane: Lane, target: Option<&corti_postprocess::TargetId>| {
+            lane == Lane::PinnedQuestion
+                && target.is_some_and(|target| target.as_str() == id.as_str())
+        };
+        for active in self.active.values() {
+            if matches(active.context.lane, active.context.target_id.as_ref()) {
+                active.cancel.cancel(reason);
+            }
+        }
+        let mut retained = VecDeque::with_capacity(self.queue.len());
+        let mut removed = Vec::new();
+        while let Some(queued) = self.queue.pop_front() {
+            if matches(
+                queued.submission.request.lane,
+                queued.submission.request.target_id.as_ref(),
+            ) {
+                removed.push(queued);
+            } else {
+                retained.push_back(queued);
+            }
+        }
+        self.queue = retained;
+        for queued in removed {
+            self.finish_queued_canceled(&queued, reason);
+        }
+    }
+
+    /// A subscription call that left the queue without dispatching gives its progress back so the
+    /// next tick can offer the subscription again.
+    fn restore_subscription_baseline(&mut self, request: &HostedRequest) {
+        if request.lane != Lane::PinnedQuestion {
+            return;
+        }
+        let Some(target) = request.target_id.as_ref() else {
+            return;
+        };
+        let Ok(id) = SubscriptionId::new(target.as_str()) else {
+            return;
+        };
+        if let Some(state) = self.subscriptions.get_mut(&id)
+            && let Some(previous) = state.baseline_before_submit.take()
+        {
+            state.baseline = previous;
+        }
+    }
+
+    /// The presentable prefix of a running question call's streamed answer, if any text has arrived.
+    pub fn partial_answer(&self, call_id: &CallId) -> Option<String> {
+        self.active
+            .get(call_id)
+            .and_then(|active| active.partial_stream.as_deref())
+            .and_then(partial_answer_from_json_prefix)
     }
 
     pub fn submit_live(
@@ -1865,34 +2118,6 @@ impl PostprocessCoordinator {
         watermark: TranscriptWatermark,
     ) -> Result<(), SubmitError> {
         self.submit_auto(submission, watermark, Lane::Final, 0, None)
-    }
-
-    pub fn submit_pinned_snapshot(
-        &mut self,
-        submission: RequestSubmission,
-        watermark: TranscriptWatermark,
-    ) -> Result<(), SubmitError> {
-        if submission.request.lane != Lane::PinnedQuestion {
-            return Err(SubmitError::WrongLane);
-        }
-        if self.pinned_template.is_none() || self.control.snapshot().pinned_question_revision == 0 {
-            return Err(SubmitError::NoPinnedTemplate);
-        }
-        self.validate_submission(&submission, watermark, Lane::PinnedQuestion)?;
-        // A due-but-not-yet-dispatched pinned request is still pending state: replace it immediately with
-        // this newest transcript snapshot. An in-flight request is left alone and sets the dirty rerun bit.
-        self.remove_queued_lane(Lane::PinnedQuestion, CancellationReason::Superseded);
-        self.pinned.candidate = Some(PinnedCandidate {
-            submission,
-            watermark,
-        });
-        if self.meaningful_pinned_progress(watermark) {
-            self.pinned.quiet_due_at_micros = Some(
-                self.last_progress_at_micros
-                    .saturating_add(PINNED_QUIET_DEBOUNCE_MICROS),
-            );
-        }
-        Ok(())
     }
 
     pub fn submit_ad_hoc(
@@ -1956,11 +2181,9 @@ impl PostprocessCoordinator {
         }
         self.validate_submission(&submission, watermark, lane)?;
         // Live is FIFO and never-drop: the app's batcher decides which rows form a request and keeps
-        // at most one Live call outstanding, so a queued Live call is never superseded here. Pinned
-        // questions still keep only their newest snapshot.
-        if lane == Lane::PinnedQuestion {
-            self.remove_queued_lane(lane, CancellationReason::Superseded);
-        }
+        // at most one Live call outstanding, so a queued Live call is never superseded here.
+        // Subscription questions are single-flight per subscription and enqueue through
+        // `submit_subscription`.
         self.enqueue(submission, watermark, question_revision, debounce_micros)
     }
 
@@ -2156,15 +2379,11 @@ impl PostprocessCoordinator {
             })
     }
 
-    pub fn pinned_run_count(&self) -> u64 {
-        self.pinned.run_count
-    }
-
     /// Tick deterministic deadlines/debounces. Vertex resolution itself is driven separately so callers can
-    /// hand the opaque attempt to an injected ADC worker.
+    /// hand the opaque attempt to an injected ADC worker. Subscription scheduling is pull-based: the app
+    /// asks `due_subscriptions` after each tick and builds only the requests that are due.
     pub fn tick(&mut self) {
         let now = self.clock.monotonic_micros();
-        self.maybe_queue_pinned(now);
         self.expire_queued(now);
         self.expire_active(now);
         self.transient_results.retain(|key, _| {
@@ -2173,59 +2392,6 @@ impl PostprocessCoordinator {
                     && queued.submission.request_key == *key
             })
         });
-    }
-
-    fn meaningful_pinned_progress(&self, watermark: TranscriptWatermark) -> bool {
-        let baseline = self.pinned.request_watermark;
-        watermark.finalized_rows > baseline.finalized_rows
-            && (watermark
-                .finalized_word_tokens
-                .saturating_sub(baseline.finalized_word_tokens)
-                >= PINNED_WORD_THRESHOLD
-                || watermark
-                    .covered_speech_ms
-                    .saturating_sub(baseline.covered_speech_ms)
-                    >= PINNED_SPEECH_THRESHOLD_MS)
-    }
-
-    fn maybe_queue_pinned(&mut self, now: u64) {
-        if !self.control.snapshot().enabled_for(Lane::PinnedQuestion)
-            || !self.control.snapshot().pinned_auto_enabled
-            || self.pinned_template.is_none()
-            || self.active_lane_count(Lane::PinnedQuestion) > 0
-            || self
-                .queue
-                .iter()
-                .any(|queued| queued.submission.request.lane == Lane::PinnedQuestion)
-        {
-            return;
-        }
-        let Some(due) = self.pinned.quiet_due_at_micros else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        let Some(candidate) = self.pinned.candidate.take() else {
-            return;
-        };
-        if !self.meaningful_pinned_progress(candidate.watermark) {
-            return;
-        }
-        let question_revision = self.control.snapshot().pinned_question_revision;
-        if self
-            .submit_auto(
-                candidate.submission,
-                candidate.watermark,
-                Lane::PinnedQuestion,
-                0,
-                Some(question_revision),
-            )
-            .is_ok()
-        {
-            self.pinned.quiet_due_at_micros = None;
-            self.pinned.dirty_while_running = false;
-        }
     }
 
     pub fn drive_vertex(&mut self) -> Option<VertexResolutionAttempt> {
@@ -2414,13 +2580,6 @@ impl PostprocessCoordinator {
         self.queue = retained;
         for queued in removed {
             self.finish_queued_canceled(&queued, reason);
-        }
-        if self.pinned.candidate.as_ref().is_some_and(|candidate| {
-            &candidate.submission.request.provider == provider
-                && &candidate.submission.request.transport == transport
-        }) {
-            self.pinned.candidate = None;
-            self.pinned.quiet_due_at_micros = None;
         }
     }
 
@@ -2750,6 +2909,7 @@ impl PostprocessCoordinator {
                 dispatch_started_at_micros: None,
                 dispatched_at_unix_ms: None,
                 first_text_seen: false,
+                partial_stream: None,
                 observed_terminal_usage: None,
                 model: submission.request.model.clone(),
                 region: submission.scope.region.clone(),
@@ -2757,9 +2917,18 @@ impl PostprocessCoordinator {
             },
         );
         if lane == Lane::PinnedQuestion {
-            self.pinned.request_watermark = queued.watermark;
-            self.pinned.run_count = self.pinned.run_count.saturating_add(1);
-            self.pinned.dirty_while_running = false;
+            let now = self.clock.monotonic_micros();
+            if let Some(id) = submission
+                .request
+                .target_id
+                .as_ref()
+                .and_then(|target| SubscriptionId::new(target.as_str()).ok())
+                && let Some(state) = self.subscriptions.get_mut(&id)
+            {
+                state.run_count = state.run_count.saturating_add(1);
+                state.last_dispatched_at_micros = Some(now);
+                state.baseline_before_submit = None;
+            }
         }
         if lane == Lane::AdHocQuestion {
             self.set_question_status(&call_id, QuestionStatusDto::Running, None);
@@ -2984,9 +3153,8 @@ impl PostprocessCoordinator {
         }
         let lane = queued.submission.request.lane;
         let lane_limit_reached = match lane {
-            Lane::Live | Lane::PinnedQuestion | Lane::AdHocQuestion => {
-                self.active_lane_count(lane) >= 1
-            }
+            Lane::Live | Lane::AdHocQuestion => self.active_lane_count(lane) >= 1,
+            Lane::PinnedQuestion => self.active_lane_count(lane) >= MAX_SUBSCRIPTION_CALLS,
             Lane::Final => self.active_lane_count(lane) >= MAX_FINAL_CALLS,
         };
         if lane_limit_reached {
@@ -3234,9 +3402,24 @@ impl PostprocessCoordinator {
                 active.dispatch_started_at_micros = Some(self.clock.monotonic_micros());
                 active.dispatched_at_unix_ms = Some(self.clock.unix_millis());
             }
-            ProviderEventKind::FirstText | ProviderEventKind::TextDelta(_) => {
+            ProviderEventKind::FirstText => {
                 if !active.cancel.is_cancelled() {
                     active.first_text_seen = true;
+                }
+            }
+            ProviderEventKind::TextDelta(delta) => {
+                if !active.cancel.is_cancelled() {
+                    active.first_text_seen = true;
+                    // Question answers stream as one JSON object; keep a bounded prefix so the
+                    // assistant can show the answer as it forms. Rewrite lanes never surface partials.
+                    if active.context.lane.is_question() {
+                        let stream = active.partial_stream.get_or_insert_with(String::new);
+                        if stream.len().saturating_add(delta.as_str().len())
+                            <= MAX_PARTIAL_STREAM_BYTES
+                        {
+                            stream.push_str(delta.as_str());
+                        }
+                    }
                 }
             }
             ProviderEventKind::UsageProvisional(usage) => {
@@ -3564,16 +3747,9 @@ impl PostprocessCoordinator {
         })
     }
 
-    fn after_lane_completion(&mut self, lane: Lane) {
-        if lane == Lane::PinnedQuestion && self.pinned.dirty_while_running {
-            self.pinned.dirty_while_running = false;
-            if self.meaningful_pinned_progress(self.watermark) {
-                self.pinned.quiet_due_at_micros = Some(
-                    self.last_progress_at_micros
-                        .saturating_add(PINNED_QUIET_DEBOUNCE_MICROS),
-                );
-            }
-        }
+    fn after_lane_completion(&mut self, _lane: Lane) {
+        // A subscription that progressed while its call ran is offered again by `due_subscriptions`
+        // once the quiet period passes: the baseline moved at submission, so the comparison is exact.
         self.trim_ad_hoc();
     }
 
@@ -3990,10 +4166,6 @@ impl PostprocessCoordinator {
         for queued in removed {
             self.finish_queued_canceled(&queued, reason);
         }
-        if matches(Lane::PinnedQuestion) {
-            self.pinned.candidate = None;
-            self.pinned.quiet_due_at_micros = None;
-        }
     }
 
     fn remove_queued_lane(&mut self, lane: Lane, reason: CancellationReason) {
@@ -4025,6 +4197,7 @@ impl PostprocessCoordinator {
     }
 
     fn finish_queued_canceled(&mut self, queued: &QueuedCall, reason: CancellationReason) {
+        self.restore_subscription_baseline(&queued.submission.request);
         let (outcome, code) = cancellation_outcome(reason);
         if let Some(boundary) = (queued.submission.request.lane == Lane::Final)
             .then(|| final_boundary(&queued.submission))
@@ -4050,6 +4223,7 @@ impl PostprocessCoordinator {
     }
 
     fn finish_queued_failure(&mut self, queued: &QueuedCall, code: ErrorCode) {
+        self.restore_subscription_baseline(&queued.submission.request);
         if let Some(boundary) = (queued.submission.request.lane == Lane::Final)
             .then(|| final_boundary(&queued.submission))
             .filter(|_| queued.final_prepared)
@@ -4577,10 +4751,11 @@ mod tests {
         ModelId, NormalizedUsage, OUTPUT_SCHEMA_VERSION, OutputTokenAccounting,
         PROMPT_TEMPLATE_VERSION, PricingError, QuestionOutput, QuestionTerminal, RawUsage,
         Replacement, RequestGroupId, RequestKeyMaterial, RewriteOutput, RowId, TargetId, Tariff,
-        TariffCatalog, TariffRates, WordBankDocument,
+        TariffCatalog, TariffRates, TextDelta, WordBankDocument,
     };
 
     use super::*;
+    use crate::subscriptions::DEFAULT_QUIET_MICROS;
 
     #[derive(Clone)]
     struct FakeClock {
@@ -5685,26 +5860,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pinned_policy_hits_exact_thresholds_and_coalesces_one_dirty_rerun() {
-        let mut harness = Harness::new();
+    fn subscription_submission(
+        call: &str,
+        id: &str,
+        now: u64,
+        context_rows: Vec<TranscriptRow>,
+    ) -> RequestSubmission {
+        let mut submission = submission(
+            call,
+            Lane::PinnedQuestion,
+            KnownTransport::OpenAiDirect,
+            now,
+            Vec::new(),
+            context_rows,
+        );
+        submission.request.target_id = Some(TargetId::new(id).unwrap());
+        submission
+    }
+
+    fn speaker_row(
+        id: u64,
+        speaker: &str,
+        text: impl Into<String>,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> TranscriptRow {
+        let mut row = row(id, text, start_ms, end_ms);
+        row.speaker = speaker.into();
+        row
+    }
+
+    fn enable_subscriptions(harness: &mut Harness, specs: Vec<SubscriptionSpec>) {
         harness.configure(LaneFamily::Question, KnownTransport::OpenAiDirect);
         harness.enable_master();
         harness
             .coordinator
             .apply_patch(ControlPatch::SetPinnedAuto(true))
             .unwrap();
-        harness
-            .coordinator
-            .edit_pinned_template("fixture pinned template".into())
-            .unwrap();
+        harness.coordinator.set_subscriptions(specs).unwrap();
+    }
+
+    #[test]
+    fn subscription_policy_hits_exact_thresholds_and_reruns_after_completion() {
+        let mut harness = Harness::new();
+        let summary = SubscriptionSpec::from_preset(
+            SubscriptionId::new("summary").unwrap(),
+            SubscriptionPreset::RunningSummary,
+        );
+        let id = summary.id.clone();
+        enable_subscriptions(&mut harness, vec![summary]);
         assert_eq!(
             harness
                 .coordinator
                 .control_snapshot()
                 .pinned_question_revision,
             2,
-            "the frontend owns edit debounce; the backend commits one accepted edit atomically"
+            "enabling automatic questions and saving the set each commit one revision"
         );
 
         let words_39 = (0..39)
@@ -5712,124 +5923,367 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let context_39 = row(1, words_39, 0, 29_999);
-        let mark_39 = harness
+        harness
             .coordinator
             .observe_finalized_rows(std::slice::from_ref(&context_39))
             .unwrap();
-        harness
-            .coordinator
-            .submit_pinned_snapshot(
-                submission(
-                    "pinned-39",
-                    Lane::PinnedQuestion,
-                    KnownTransport::OpenAiDirect,
-                    harness.clock.now(),
-                    Vec::new(),
-                    vec![context_39],
-                ),
-                mark_39,
-            )
-            .unwrap();
-        harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS);
-        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Empty));
+        harness.clock.advance(DEFAULT_QUIET_MICROS);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "39 words and under 30 s of speech is below both thresholds"
+        );
 
         let threshold = row(2, "w39", 29_999, 30_000);
-        let mark_40 = harness
+        let mark = harness
             .coordinator
             .observe_finalized_rows(std::slice::from_ref(&threshold))
             .unwrap();
-        harness
-            .coordinator
-            .submit_pinned_snapshot(
-                submission(
-                    "pinned-40",
-                    Lane::PinnedQuestion,
-                    KnownTransport::OpenAiDirect,
-                    harness.clock.now(),
-                    Vec::new(),
-                    vec![threshold.clone()],
-                ),
-                mark_40,
-            )
-            .unwrap();
-        harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS - 1);
-        assert!(matches!(harness.dispatch_next(), DispatchOutcome::Empty));
-        harness.clock.advance(1);
-        harness.coordinator.tick();
+        harness.clock.advance(DEFAULT_QUIET_MICROS - 1);
         assert!(
-            harness.coordinator.queue.iter().any(|queued| queued
-                .submission
-                .request
-                .call_id
-                .as_str()
-                == "pinned-40")
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "the quiet period has not elapsed"
         );
-
-        // Even after the debounce has put a call in the scheduler queue, a newer not-yet-dispatched
-        // snapshot replaces it. This is separate from the one dirty rerun allowed during an active call.
-        let replacement = row(3, "w40", 30_000, 30_001);
-        let replacement_mark = harness
-            .coordinator
-            .observe_finalized_rows(std::slice::from_ref(&replacement))
-            .unwrap();
+        harness.clock.advance(1);
+        assert_eq!(
+            harness.coordinator.due_subscriptions(harness.clock.now()),
+            vec![id.clone()]
+        );
         harness
             .coordinator
-            .submit_pinned_snapshot(
-                submission(
-                    "pinned-newest-pending",
-                    Lane::PinnedQuestion,
-                    KnownTransport::OpenAiDirect,
+            .submit_subscription(
+                &id,
+                subscription_submission(
+                    "sub-1",
+                    "summary",
                     harness.clock.now(),
-                    Vec::new(),
-                    vec![replacement.clone()],
+                    vec![context_39.clone(), threshold.clone()],
                 ),
-                replacement_mark,
+                mark,
             )
             .unwrap();
-        harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "a queued call makes the subscription single-flight"
+        );
         let first = ticket(harness.dispatch_next());
-        assert_eq!(first.request().call_id.as_str(), "pinned-newest-pending");
-        assert_eq!(harness.coordinator.pinned_run_count(), 1);
+        assert_eq!(first.request().call_id.as_str(), "sub-1");
+        assert_eq!(
+            first.request().target_id.as_ref().unwrap().as_str(),
+            "summary"
+        );
+        assert_eq!(harness.coordinator.subscription_run_count(&id), 1);
 
         let more_words = (0..40)
             .map(|index| format!("n{index}"))
             .collect::<Vec<_>>()
             .join(" ");
-        let newer = row(4, more_words, 30_001, 31_001);
+        let newer = row(3, more_words, 30_000, 31_000);
         let newer_mark = harness
             .coordinator
             .observe_finalized_rows(std::slice::from_ref(&newer))
             .unwrap();
+        harness.clock.advance(DEFAULT_QUIET_MICROS);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "progress while the call runs waits for it to finish"
+        );
+        let completed = harness.coordinator.complete(
+            first,
+            Ok(terminal(
+                question_output(&threshold, "- fixture summary"),
+                complete_usage(),
+            )),
+        );
+        assert!(matches!(completed, CompletionOutcome::Apply(_)));
+        assert_eq!(
+            harness.coordinator.due_subscriptions(harness.clock.now()),
+            vec![id.clone()],
+            "the words that arrived during the run count against the new baseline"
+        );
         harness
             .coordinator
-            .submit_pinned_snapshot(
-                submission(
-                    "pinned-rerun",
-                    Lane::PinnedQuestion,
-                    KnownTransport::OpenAiDirect,
+            .submit_subscription(
+                &id,
+                subscription_submission(
+                    "sub-2",
+                    "summary",
                     harness.clock.now(),
-                    Vec::new(),
                     vec![newer.clone()],
                 ),
                 newer_mark,
             )
             .unwrap();
-        harness.clock.advance(PINNED_QUIET_DEBOUNCE_MICROS);
-        let completed = harness.coordinator.complete(
-            first,
+        let rerun = ticket(harness.dispatch_next());
+        assert_eq!(rerun.request().call_id.as_str(), "sub-2");
+        assert_eq!(harness.coordinator.subscription_run_count(&id), 2);
+        let done = harness.coordinator.complete(
+            rerun,
             Ok(terminal(
-                question_output(&replacement, "fixture pinned answer"),
+                question_output(&newer, "- fixture summary\n- second point"),
+                complete_usage(),
+            )),
+        );
+        assert!(matches!(done, CompletionOutcome::Apply(_)));
+        harness.clock.advance(DEFAULT_QUIET_MICROS);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "nothing new since the second run"
+        );
+    }
+
+    #[test]
+    fn asked_of_me_runs_only_after_a_them_row_that_looks_like_a_question_for_the_owner() {
+        let mut harness = Harness::new();
+        let mut asked = SubscriptionSpec::from_preset(
+            SubscriptionId::new("asked-of-me").unwrap(),
+            SubscriptionPreset::AskedOfMe,
+        );
+        asked.name_hints = vec!["Xavier".into()];
+        let id = asked.id.clone();
+        enable_subscriptions(&mut harness, vec![asked]);
+
+        harness
+            .coordinator
+            .observe_finalized_rows(&[speaker_row(
+                1,
+                "Them",
+                "Let's go through the roadmap first",
+                0,
+                3_000,
+            )])
+            .unwrap();
+        harness.clock.advance(1_000_000);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "a Them statement is progress but not a question"
+        );
+
+        harness
+            .coordinator
+            .observe_finalized_rows(&[speaker_row(
+                2,
+                "Me",
+                "What do you all think about it?",
+                3_000,
+                5_000,
+            )])
+            .unwrap();
+        harness.clock.advance(1_000_000);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "the owner's own question does not count"
+        );
+
+        let directed = speaker_row(
+            3,
+            "Them",
+            "Xavier could you own the migration",
+            5_000,
+            7_000,
+        );
+        let mark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&directed))
+            .unwrap();
+        harness.clock.advance(999_999);
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty(),
+            "one second of quiet after the question"
+        );
+        harness.clock.advance(1);
+        assert_eq!(
+            harness.coordinator.due_subscriptions(harness.clock.now()),
+            vec![id.clone()]
+        );
+        let statuses = harness.coordinator.subscription_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].pending && !statuses[0].in_flight);
+
+        harness
+            .coordinator
+            .submit_subscription(
+                &id,
+                subscription_submission(
+                    "asked-1",
+                    "asked-of-me",
+                    harness.clock.now(),
+                    vec![directed],
+                ),
+                mark,
+            )
+            .unwrap();
+        let in_flight = harness.coordinator.subscription_statuses();
+        assert!(in_flight[0].in_flight && !in_flight[0].pending);
+        let ticket = ticket(harness.dispatch_next());
+        assert_eq!(ticket.request().call_id.as_str(), "asked-1");
+    }
+
+    #[test]
+    fn run_now_bypasses_thresholds_and_a_changed_question_cancels_in_flight_work() {
+        let mut harness = Harness::new();
+        let mut custom = SubscriptionSpec::from_preset(
+            SubscriptionId::new("custom").unwrap(),
+            SubscriptionPreset::None,
+        );
+        custom.template = "What did we decide?".into();
+        let id = custom.id.clone();
+        enable_subscriptions(&mut harness, vec![custom.clone()]);
+        let context = row(1, "a few words", 0, 1_000);
+        let mark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&context))
+            .unwrap();
+        assert!(
+            harness
+                .coordinator
+                .due_subscriptions(harness.clock.now())
+                .is_empty()
+        );
+        harness.coordinator.run_subscription_now(&id).unwrap();
+        assert_eq!(
+            harness.coordinator.due_subscriptions(harness.clock.now()),
+            vec![id.clone()],
+            "catch up now ignores thresholds and quiet"
+        );
+        harness
+            .coordinator
+            .submit_subscription(
+                &id,
+                subscription_submission("custom-1", "custom", harness.clock.now(), vec![context]),
+                mark,
+            )
+            .unwrap();
+        let ticket = ticket(harness.dispatch_next());
+        assert!(!ticket.cancellation().is_cancelled());
+
+        let mut replaced = custom;
+        replaced.template = "What is still open?".into();
+        harness
+            .coordinator
+            .set_subscriptions(vec![replaced])
+            .unwrap();
+        assert!(
+            ticket.cancellation().is_cancelled(),
+            "a changed question supersedes the running call"
+        );
+        assert_eq!(
+            harness
+                .coordinator
+                .control_snapshot()
+                .pinned_question_revision,
+            3
+        );
+        let discarded = harness
+            .coordinator
+            .complete(ticket, Err(PostprocessError::from(ErrorCode::Canceled)));
+        assert!(matches!(
+            discarded,
+            CompletionOutcome::Failed { .. } | CompletionOutcome::Discarded { .. }
+        ));
+        assert!(
+            !harness.coordinator.subscription_statuses()[0].in_flight,
+            "the canceled call is no longer in flight"
+        );
+
+        let unknown = SubscriptionId::new("missing").unwrap();
+        assert_eq!(
+            harness.coordinator.run_subscription_now(&unknown),
+            Err(SubmitError::UnknownSubscription)
+        );
+    }
+
+    #[test]
+    fn streamed_text_deltas_expose_a_partial_answer_for_question_calls() {
+        let mut harness = Harness::new();
+        let summary = SubscriptionSpec::from_preset(
+            SubscriptionId::new("summary").unwrap(),
+            SubscriptionPreset::RunningSummary,
+        );
+        let id = summary.id.clone();
+        enable_subscriptions(&mut harness, vec![summary]);
+        let context = row(1, "some words", 0, 1_000);
+        let mark = harness
+            .coordinator
+            .observe_finalized_rows(std::slice::from_ref(&context))
+            .unwrap();
+        harness.coordinator.run_subscription_now(&id).unwrap();
+        harness
+            .coordinator
+            .submit_subscription(
+                &id,
+                subscription_submission(
+                    "stream-1",
+                    "summary",
+                    harness.clock.now(),
+                    vec![context.clone()],
+                ),
+                mark,
+            )
+            .unwrap();
+        let ticket = ticket(harness.dispatch_next());
+        let call_id = ticket.request().call_id.clone();
+        assert_eq!(harness.coordinator.partial_answer(&call_id), None);
+        harness
+            .coordinator
+            .on_provider_event(provider_event(&ticket, ProviderEventKind::DispatchStarted))
+            .unwrap();
+        harness
+            .coordinator
+            .on_provider_event(provider_event(
+                &ticket,
+                ProviderEventKind::TextDelta(
+                    TextDelta::new("{\"schema\":1,\"answer\":\"- First").unwrap(),
+                ),
+            ))
+            .unwrap();
+        harness
+            .coordinator
+            .on_provider_event(provider_event(
+                &ticket,
+                ProviderEventKind::TextDelta(TextDelta::new(" point\\n- Sec").unwrap()),
+            ))
+            .unwrap();
+        assert_eq!(
+            harness.coordinator.partial_answer(&call_id).as_deref(),
+            Some("- First point\n- Sec")
+        );
+        let completed = harness.coordinator.complete(
+            ticket,
+            Ok(terminal(
+                question_output(&context, "- First point\n- Second point"),
                 complete_usage(),
             )),
         );
         assert!(matches!(completed, CompletionOutcome::Apply(_)));
-        let rerun = ticket(harness.dispatch_next());
-        assert_eq!(rerun.request().call_id.as_str(), "pinned-rerun");
-        assert_eq!(harness.coordinator.pinned_run_count(), 2);
-        assert!(matches!(
-            harness.dispatch_next(),
-            DispatchOutcome::Waiting | DispatchOutcome::Empty | DispatchOutcome::Backpressured
-        ));
+        assert_eq!(
+            harness.coordinator.partial_answer(&call_id),
+            None,
+            "partials live only while the call is active"
+        );
     }
 
     #[test]

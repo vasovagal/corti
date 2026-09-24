@@ -3310,3 +3310,111 @@ summary:focus-visible,
     outline-offset: 2px;
   }
 }
+
+/* ----- Subscribed questions (live assistant + settings editor) ----- */
+.live-subscription-cards {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.live-subscription-card {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-top: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+.live-subscription-asked {
+  border-color: var(--rewrite-cyan);
+}
+.live-subscription-paused {
+  opacity: 0.7;
+}
+.live-subscription-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.live-subscription-title strong {
+  font-size: 12px;
+}
+.live-subscription-title span,
+.live-subscription-revision {
+  color: var(--fg-muted);
+  font-size: 10px;
+}
+.live-subscription-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 6px;
+}
+.live-subscription-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.live-subscription-empty {
+  display: grid;
+  gap: 4px;
+}
+.live-answer-bullets {
+  margin: 3px 0;
+  padding-left: 16px;
+}
+.live-answer-bullets li {
+  margin: 2px 0;
+}
+.hosted-subscription-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.hosted-subscription {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.hosted-subscription-paused {
+  opacity: 0.75;
+}
+.hosted-subscription-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.hosted-subscription-toggle {
+  display: grid;
+  gap: 2px;
+  text-align: left;
+  min-width: 0;
+  flex: 1;
+}
+.hosted-subscription-fields {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.hosted-subscription-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+}
+.hosted-subscription-wide {
+  grid-column: 1 / -1;
+}
+.hosted-subscription-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}

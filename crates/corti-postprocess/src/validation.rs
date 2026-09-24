@@ -294,10 +294,7 @@ pub fn parse_and_validate_question(
     if output.answer.len() > max_answer_bytes {
         return Err(ValidationError::AggregateLimit);
     }
-    validate_plain_text(&output.answer)?;
-    if contains_markup(&output.answer) {
-        return Err(ValidationError::Markup);
-    }
+    validate_answer_text(&output.answer)?;
     if output.context_truncated != expected_context_truncated {
         return Err(ValidationError::TruncationMismatch);
     }
@@ -361,6 +358,38 @@ fn validate_plain_text(text: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::ControlCharacter);
     }
     Ok(())
+}
+
+/// Question answers may span lines and use plain list markers (`- ` or `1. ` at a line start) so a
+/// subscription can return a running bullet list; every other control character and every other
+/// kind of markup is still refused. Rewrites stay single-line plain text.
+fn validate_answer_text(text: &str) -> Result<(), ValidationError> {
+    if text
+        .chars()
+        .any(|ch| (ch.is_control() && ch != '\n') || is_bidi_control(ch))
+    {
+        return Err(ValidationError::ControlCharacter);
+    }
+    for line in text.lines() {
+        if contains_markup(strip_list_marker(line.trim_start())) {
+            return Err(ValidationError::Markup);
+        }
+    }
+    Ok(())
+}
+
+fn strip_list_marker(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("- ") {
+        return rest;
+    }
+    if let Some((digits, rest)) = line.split_once(". ")
+        && !digits.is_empty()
+        && digits.len() <= 3
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return rest;
+    }
+    line
 }
 
 fn is_bidi_control(ch: char) -> bool {
@@ -556,6 +585,40 @@ mod tests {
                 .answer(),
             EXPLICIT_NO_ANSWER
         );
+    }
+
+    #[test]
+    fn question_answers_may_be_plain_bullet_lists_but_never_other_markup() {
+        let context = [row("r-1", "Synthetic context")];
+        let answer = |text: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "answer": text,
+                "cited_row_ids": ["r-1"],
+                "context_truncated": false,
+            }))
+            .unwrap()
+        };
+        let bullets = "- First point\n- Second point\n1. Numbered too";
+        assert_eq!(
+            parse_and_validate_question(&answer(bullets), &context, false, 1_024)
+                .unwrap()
+                .answer(),
+            bullets
+        );
+        for rejected in [
+            "# Heading\n- point",
+            "- **bold** point",
+            "- point\n> quoted",
+            "- `code`",
+            "line one\r\nline two",
+            "- [link](https://example.invalid)",
+        ] {
+            assert!(
+                parse_and_validate_question(&answer(rejected), &context, false, 1_024).is_err(),
+                "{rejected:?} must be refused"
+            );
+        }
     }
 
     #[test]

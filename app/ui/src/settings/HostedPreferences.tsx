@@ -12,8 +12,8 @@ import {
   refreshHostedProvider,
   replaceHostedWordBank,
   saveBedrockSetup,
+  setHostedSubscriptions,
   setHostedVertexModels,
-  setHostedPinnedQuestion,
   signOutChatGptSubscription,
   startChatGptDeviceLogin,
   updateHostedProviderScope,
@@ -24,6 +24,7 @@ import {
   type HostedPatchInput,
   type HostedProviderScopeUpdate,
   type HostedSettingsDto,
+  type HostedSubscription,
   type SecretSlotRequest,
 } from "../lib/api";
 import { shouldInstallHostedSettings } from "../lib/liveHosted";
@@ -419,23 +420,19 @@ export default function HostedPreferences({
     }
   }
 
-  async function onPinned(template: string): Promise<boolean> {
+  async function onSubscriptions(subscriptions: HostedSubscription[]): Promise<boolean> {
     if (busyRef.current) return false;
     busyRef.current = true;
-    setBusy("Pinned question update");
+    setBusy("Question subscriptions update");
     setStatus("");
     setStatusAction(null);
     try {
       const current = settingsRef.current;
       if (!current) return false;
-      const result = await setHostedPinnedQuestion(current.state_revision, template);
-      const accepted = acceptMutation(
-        result,
-        template.trim() ? "Pinned question template saved." : "Pinned question template cleared.",
-      );
-      return accepted;
+      const result = await setHostedSubscriptions(current.state_revision, subscriptions);
+      return acceptMutation(result, "Subscribed questions saved.");
     } catch (error) {
-      setStatus(`Pinned question update failed: ${String(error)}`);
+      setStatus(`Question subscriptions update failed: ${String(error)}`);
       return false;
     } finally {
       busyRef.current = false;
@@ -492,7 +489,7 @@ export default function HostedPreferences({
     busy: isBusy,
     onSteering,
     onWordBank,
-    onPinned,
+    onSubscriptions,
     onPatch,
   };
   const providerActions = {

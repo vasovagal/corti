@@ -14,6 +14,7 @@
 pub mod batch;
 pub mod cache_policy;
 pub mod coordinator;
+pub mod subscriptions;
 
 pub use batch::{BacklogReleaseReason, Batch, LiveBatchPolicy, LiveBatcher, ReleasedBacklog};
 pub use cache_policy::{
@@ -21,3 +22,9 @@ pub use cache_policy::{
     stored_policy_is_acceptable,
 };
 pub use coordinator::*;
+pub use subscriptions::{
+    AnswerFormat, ContextWindow, MAX_SUBSCRIPTIONS, MAX_TEMPLATE_BYTES, ProgressLedger,
+    SpeakerFilter, SubscriptionError, SubscriptionId, SubscriptionPreset, SubscriptionSpec,
+    TriggerPolicy, looks_asked_of_me, partial_answer_from_json_prefix, preset_title,
+    rows_contain_question_for_me,
+};

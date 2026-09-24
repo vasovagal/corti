@@ -1,18 +1,19 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import type { HostedPatchInput, HostedSettingsDto } from "../lib/api";
+import type { HostedPatchInput, HostedSettingsDto, HostedSubscription } from "../lib/api";
 import {
   filterWordEntries,
   removeWordEntry,
   replaceWordEntry,
   splitBulkEntries,
 } from "../lib/hosted";
-import { HostedDialog, HostedSwitch } from "./HostedCommon";
+import { HostedDialog } from "./HostedCommon";
+import { HostedQuestions } from "./HostedQuestions";
 
 interface LanguageActions {
   busy: boolean;
   onSteering: (text: string) => Promise<boolean>;
   onWordBank: (entries: string[]) => Promise<boolean>;
-  onPinned: (template: string) => Promise<boolean>;
+  onSubscriptions: (subscriptions: HostedSubscription[]) => Promise<boolean>;
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
 }
 
@@ -72,7 +73,7 @@ export function HostedLanguagePreferences({
       <div className="hosted-language-grid">
         <SteeringDefault settings={settings} actions={actions} />
         <WordBank settings={settings} actions={actions} />
-        <PinnedQuestion settings={settings} actions={actions} />
+        <HostedQuestions settings={settings} actions={actions} />
       </div>
     </section>
   );
@@ -332,117 +333,6 @@ function WordBank({
         <p>
           This changes the stable prompt prefix, invalidates affected exact-cache keys, and fences in-flight
           results. Provider-held cache cannot be purged by Corti.
-        </p>
-      </HostedDialog>
-    </LanguageCard>
-  );
-}
-
-function PinnedQuestion({
-  settings,
-  actions,
-}: {
-  settings: HostedSettingsDto;
-  actions: LanguageActions;
-}) {
-  const [template, setTemplate] = useState("");
-  const [acknowledging, setAcknowledging] = useState(false);
-  const templatePresent = settings.control.pinned_question_revision > 0;
-  const laneReady = settings.control.questions.enabled && Boolean(settings.control.questions.selection.model);
-
-  async function saveTemplate(event: FormEvent) {
-    event.preventDefault();
-    if (!template.trim()) return;
-    if (await actions.onPinned(template)) setTemplate("");
-  }
-
-  return (
-    <LanguageCard
-      title="Pinned question"
-      description="Exactly one saved template; its content is never returned in the Settings document."
-      meta={
-        <span className={templatePresent ? "hosted-configured" : "muted"}>
-          {templatePresent ? "Template saved" : "No template"}
-        </span>
-      }
-      className="hosted-pinned-card"
-    >
-      <form onSubmit={(event) => void saveTemplate(event)}>
-        <label className="settings-field">
-          <span>{templatePresent ? "Replace saved template" : "New template"}</span>
-          <input
-            type="text"
-            value={template}
-            maxLength={32 * 1024}
-            placeholder={templatePresent ? "Enter a complete replacement" : "Ask about the current transcript"}
-            onChange={(event) => setTemplate(event.target.value)}
-          />
-        </label>
-        <div className="other-row">
-          <button className="btn-primary" type="submit" disabled={!template.trim() || actions.busy}>
-            {templatePresent ? "Replace template" : "Save template"}
-          </button>
-          <button
-            className="btn-quiet"
-            type="button"
-            disabled={!templatePresent || actions.busy}
-            onClick={() => void actions.onPinned("")}
-          >
-            Clear saved template
-          </button>
-        </div>
-      </form>
-
-      <HostedSwitch
-        label="Run pinned question automatically"
-        description={
-          settings.control.pinned_auto_enabled
-            ? "Acknowledged; meaningful transcript progress can trigger another run."
-            : "Off by default; enabling requires a repeated-cost acknowledgement."
-        }
-        checked={settings.control.pinned_auto_enabled}
-        disabled={actions.busy || (!settings.control.pinned_auto_enabled && (!templatePresent || !laneReady))}
-        onChange={(enabled) => {
-          if (enabled) {
-            setAcknowledging(true);
-          } else {
-            void actions.onPatch(
-              { kind: "set_pinned_auto", enabled: false, acknowledged: false },
-              "Automatic pinned questions are off.",
-            );
-          }
-        }}
-      />
-      {!laneReady && (
-        <p className="muted small">Enable the Questions lane with an exact catalog model before auto-run.</p>
-      )}
-      <p className="muted small">
-        A run becomes eligible after 40 new word tokens or 30 seconds of covered speech, then a 750 ms quiet
-        period. Edits debounce for 500 ms and coalesce at most one dirty rerun.
-      </p>
-
-      <HostedDialog
-        open={acknowledging}
-        title="Allow repeated paid questions?"
-        confirmLabel="Acknowledge repeated cost"
-        busy={actions.busy}
-        onCancel={() => setAcknowledging(false)}
-        onConfirm={() => {
-          void actions.onPatch(
-            { kind: "set_pinned_auto", enabled: true, acknowledged: true },
-            "Automatic pinned questions enabled.",
-          ).then((saved) => {
-            if (saved) setAcknowledging(false);
-          });
-        }}
-      >
-        <p>
-          Each meaningful transcript update can create another paid provider request. An exact local cache hit
-          may avoid a provider request, but is not guaranteed. Cancellation after dispatch may still be billed.
-        </p>
-        <p>
-          Automatic answers use the Questions lane's separately selected provider and model. Turning on this
-          switch does not change Master or that lane.
         </p>
       </HostedDialog>
     </LanguageCard>

@@ -6,7 +6,7 @@
 //! deliberately deny-by-default until an approved credential/store factory is installed; this wiring still
 //! exposes truthful provider posture, Vertex arming/catch-up, controls, history, and hermetic injection seams.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,7 +64,8 @@ use crate::postprocess::{
 };
 use crate::postprocess_config::{
     AwsCredentialMode, BedrockProviderPreferences, EGRESS_DISCLOSURE_VERSION, HostedPreferences,
-    MAX_VERTEX_MODELS, PINNED_AUTO_DISCLOSURE_VERSION, ProviderScopePreferences, SecretPurpose,
+    MAX_VERTEX_MODELS, PINNED_AUTO_DISCLOSURE_VERSION, ProviderScopePreferences,
+    QuestionSubscriptionPreferences, SecretPurpose,
 };
 use crate::private_file::{atomic_write_private, read_private};
 use crate::vertex_creds::{VertexAdapterCredentials, VertexAdcResolver, VertexConnectionConfig};
@@ -420,6 +421,9 @@ pub(crate) struct HostedSettingsDto {
     pub(crate) preferences_load_error: Option<String>,
     pub(crate) deadlines: HostedDeadlinesDto,
     pub(crate) lexicon_enabled: bool,
+    /// Saved question subscriptions (schema 2), templates included: they are owner-authored
+    /// configuration, never transcript content.
+    pub(crate) subscriptions: Vec<QuestionSubscriptionPreferences>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,10 +580,41 @@ pub(crate) struct ProviderRefreshRequest {
     pub(crate) transport: String,
 }
 
+/// Replace the whole saved subscription set. A `template` of `None` keeps the template already saved
+/// under that id (so an edit of title or thresholds never requires retyping the question).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PinnedQuestionUpdateRequest {
+pub(crate) struct SubscriptionsUpdateRequest {
     pub(crate) observed_state_revision: u64,
-    pub(crate) template: String,
+    pub(crate) subscriptions: Vec<SubscriptionInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SubscriptionInput {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) template: Option<String>,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_preset")]
+    pub(crate) preset: String,
+    #[serde(default = "default_output")]
+    pub(crate) output: String,
+    #[serde(default)]
+    pub(crate) trigger: Option<crate::postprocess_config::SubscriptionTriggerPreferences>,
+    #[serde(default)]
+    pub(crate) context: Option<crate::postprocess_config::SubscriptionContextPreferences>,
+    #[serde(default)]
+    pub(crate) name_hints: Vec<String>,
+}
+
+fn default_preset() -> String {
+    "none".to_owned()
+}
+
+fn default_output() -> String {
+    "paragraph".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -602,6 +637,12 @@ pub(crate) struct AssistantExchangeDto {
     pub(crate) question: String,
     pub(crate) answer: Option<String>,
     pub(crate) cost_label: Option<String>,
+    /// `paragraph` | `bullets`: how `answer` should be laid out.
+    pub(crate) format: String,
+    /// The readable prefix of a streamed answer while the call runs; cleared once it settles.
+    pub(crate) partial_answer: Option<String>,
+    /// For a subscription rerun: the last accepted answer, shown until the new one lands.
+    pub(crate) previous_answer: Option<String>,
 }
 
 impl fmt::Debug for AssistantExchangeDto {
@@ -614,14 +655,36 @@ impl fmt::Debug for AssistantExchangeDto {
             .field("question_bytes", &self.question.len())
             .field("answer_bytes", &self.answer.as_ref().map(String::len))
             .field("cost_label", &self.cost_label)
+            .field("format", &self.format)
+            .field(
+                "partial_answer_bytes",
+                &self.partial_answer.as_ref().map(String::len),
+            )
+            .field(
+                "previous_answer_bytes",
+                &self.previous_answer.as_ref().map(String::len),
+            )
             .finish()
     }
 }
 
+/// One subscription as the live window's assistant shows it: the saved shape plus session state.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AssistantSubscriptionDto {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) preset: String,
+    pub(crate) format: String,
+    pub(crate) enabled: bool,
+    pub(crate) run_count: u64,
+    pub(crate) in_flight: bool,
+    pub(crate) pending: bool,
+    pub(crate) exchange: Option<AssistantExchangeDto>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AssistantSnapshotDto {
-    pub(crate) pinned_run_count: u64,
-    pub(crate) pinned: Option<AssistantExchangeDto>,
+    pub(crate) subscriptions: Vec<AssistantSubscriptionDto>,
     pub(crate) exchanges: Vec<AssistantExchangeDto>,
 }
 
@@ -805,8 +868,8 @@ pub(crate) fn cancel_hosted_question(
 }
 
 #[tauri::command]
-pub(crate) fn set_hosted_pinned_question(
-    request: PinnedQuestionUpdateRequest,
+pub(crate) fn set_hosted_subscriptions(
+    request: SubscriptionsUpdateRequest,
     state: State<'_, HostedState>,
     window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
@@ -814,8 +877,32 @@ pub(crate) fn set_hosted_pinned_question(
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
-        .send(ServiceCommand::SetPinnedTemplate {
+        .send(ServiceCommand::SetSubscriptions {
             request,
+            reply: reply_tx,
+        })
+        .map_err(sanitized_error)?;
+    reply_rx
+        .recv()
+        .map_err(|_| "hosted coordinator stopped".to_string())?
+        .map_err(sanitized_error)
+}
+
+/// "Catch up now": run one subscription at the next opportunity regardless of its thresholds.
+#[tauri::command]
+pub(crate) fn run_hosted_subscription_now(
+    id: String,
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    require_live_window(&window)?;
+    let id =
+        corti_chat::SubscriptionId::new(id).map_err(|_| "invalid subscription id".to_string())?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    state
+        .handle
+        .send(ServiceCommand::RunSubscriptionNow {
+            id,
             reply: reply_tx,
         })
         .map_err(sanitized_error)?;
@@ -1499,7 +1586,6 @@ fn start_with_components_and_policy(
         secret_presence.as_ref(),
         preferences_load_error.as_deref(),
     );
-    let observed_pinned_revision = initial_control.pinned_question_revision;
     let snapshot = Arc::new(Mutex::new(initial_settings));
     let persistence = Box::new(HostedControlPersistence {
         preferences: preferences.clone(),
@@ -1511,16 +1597,11 @@ fn start_with_components_and_policy(
     });
     let clock: Arc<dyn CoordinatorClock> =
         clock_override.unwrap_or_else(|| Arc::new(SystemCoordinatorClock::new()));
-    let pinned = preferences
-        .lock()
-        .unwrap()
-        .values()
-        .pinned_question_template
-        .clone();
+    let subscriptions = subscription_specs(preferences.lock().unwrap().values());
     let digest_key = Arc::new(digest_key);
     let coordinator = PostprocessCoordinator::new_with_snapshot(
         initial_control,
-        (!pinned.trim().is_empty()).then_some(pinned),
+        subscriptions,
         clock.clone(),
         digest_key.clone(),
         persistence,
@@ -1589,8 +1670,7 @@ fn start_with_components_and_policy(
         pending_finals: HashMap::new(),
         final_by_call: HashMap::new(),
         call_cache: HashMap::new(),
-        observed_pinned_revision,
-        pinned_exchange: None,
+        subscription_exchanges: BTreeMap::new(),
         persist_to_disk,
         secret_presence,
         live_batcher: corti_chat::LiveBatcher::new(live_batch_policy),
@@ -1744,7 +1824,7 @@ fn control_from_preferences(
         control_revision: revision,
         steering_revision: revision,
         bank_revision,
-        pinned_question_revision: (!values.pinned_question_template.trim().is_empty()) as u64,
+        pinned_question_revision: (!values.subscriptions.is_empty()) as u64,
         master_enabled: values.master_enabled,
         egress_acknowledged: values.egress_acknowledgement_version
             == Some(EGRESS_DISCLOSURE_VERSION),
@@ -3775,9 +3855,13 @@ enum ServiceCommand {
         call_id: CallId,
         reply: Sender<bool>,
     },
-    SetPinnedTemplate {
-        request: PinnedQuestionUpdateRequest,
+    SetSubscriptions {
+        request: SubscriptionsUpdateRequest,
         reply: Sender<Result<HostedMutationResult, ErrorCode>>,
+    },
+    RunSubscriptionNow {
+        id: corti_chat::SubscriptionId,
+        reply: Sender<Result<(), ErrorCode>>,
     },
     AssistantSnapshot {
         reply: Sender<AssistantSnapshotDto>,
@@ -3847,8 +3931,8 @@ struct Service {
     pending_finals: HashMap<RequestGroupId, PendingFinal>,
     final_by_call: HashMap<CallId, RequestGroupId>,
     call_cache: HashMap<CallId, CacheObservation>,
-    observed_pinned_revision: u64,
-    pinned_exchange: Option<AssistantExchangeDto>,
+    /// The latest exchange per subscription id for the assistant view (session only).
+    subscription_exchanges: BTreeMap<String, AssistantExchangeDto>,
     persist_to_disk: bool,
     secret_presence: SecretPresenceSource,
     /// Never-drop accumulation of finalized ledger rows (by index) into Live rewrite batches.
@@ -3936,7 +4020,7 @@ impl Service {
                 self.coordinator.tick();
                 self.flush_live_batches();
                 self.expire_pending_finals();
-                self.sync_pinned_revision();
+                self.flush_due_subscriptions();
                 if let Some(attempt) = self.coordinator.drive_vertex() {
                     self.spawn_vertex_resolution(attempt);
                 }
@@ -3981,7 +4065,7 @@ impl Service {
                     self.ledger.clear();
                     self.ledger_bytes = 0;
                     self.session_steering = None;
-                    self.pinned_exchange = None;
+                    self.subscription_exchanges.clear();
                     self.ingress_incomplete.store(false, Ordering::Release);
                     self.bump_state();
                 }
@@ -4093,8 +4177,18 @@ impl Service {
                     .cancel_call(&call_id, CancellationReason::Explicit);
                 let _ = reply.send(canceled);
             }
-            ServiceCommand::SetPinnedTemplate { request, reply } => {
-                let result = self.set_pinned_template(request);
+            ServiceCommand::SetSubscriptions { request, reply } => {
+                let result = self.set_subscriptions(request);
+                let _ = reply.send(result);
+            }
+            ServiceCommand::RunSubscriptionNow { id, reply } => {
+                let result = self
+                    .coordinator
+                    .run_subscription_now(&id)
+                    .map_err(submit_error_code);
+                if result.is_ok() {
+                    self.flush_due_subscriptions();
+                }
                 let _ = reply.send(result);
             }
             ServiceCommand::AssistantSnapshot { reply } => {
@@ -4135,7 +4229,7 @@ impl Service {
         self.ledger.clear();
         self.ledger_bytes = 0;
         self.session_steering = None;
-        self.pinned_exchange = None;
+        self.subscription_exchanges.clear();
         self.ingress_incomplete.store(false, Ordering::Release);
         self.bump_state();
         Ok(())
@@ -4262,10 +4356,10 @@ impl Service {
             .map_err(control_error_code)?;
         if !matches!(outcome, PatchOutcome::Unchanged(_)) {
             self.bump_state();
-            // A user may save the template, enable Questions, acknowledge Master, and enable automatic
+            // A user may save subscriptions, enable Questions, acknowledge Master, and enable automatic
             // updates in any order. Reconsider the transcript already present after every effective control
             // change so that sequence never requires another 40 words merely to start the first answer.
-            self.schedule_pinned_from_current();
+            self.flush_due_subscriptions();
         }
         self.refresh_snapshot();
         Ok(match outcome {
@@ -5025,42 +5119,64 @@ impl Service {
         }
     }
 
-    fn set_pinned_template(
+    fn set_subscriptions(
         &mut self,
-        request: PinnedQuestionUpdateRequest,
+        request: SubscriptionsUpdateRequest,
     ) -> Result<HostedMutationResult, ErrorCode> {
         if request.observed_state_revision != self.state_revision {
             return Ok(HostedMutationResult::Conflict {
                 settings: self.current_settings(),
             });
         }
-        let template = request.template;
-        if template.len() > crate::postprocess::MAX_QUESTION_TEXT_BYTES
-            || template.chars().any(char::is_control)
-        {
-            return Err(ErrorCode::PolicyBlocked);
-        }
-        if self
+        let current = self
             .preferences
             .lock()
             .unwrap()
             .values()
-            .pinned_question_template
-            == template
-        {
+            .subscriptions
+            .clone();
+        let next: Vec<QuestionSubscriptionPreferences> = request
+            .subscriptions
+            .into_iter()
+            .map(|input| {
+                let existing = current.iter().find(|saved| saved.id == input.id);
+                QuestionSubscriptionPreferences {
+                    id: input.id,
+                    title: input.title,
+                    template: input
+                        .template
+                        .or_else(|| existing.map(|saved| saved.template.clone()))
+                        .unwrap_or_default(),
+                    enabled: input.enabled,
+                    preset: input.preset,
+                    output: input.output,
+                    trigger: input.trigger.unwrap_or_default(),
+                    context: input.context.unwrap_or_default(),
+                    name_hints: input.name_hints,
+                }
+            })
+            .collect();
+        if next == current {
             return Ok(HostedMutationResult::Unchanged {
                 settings: self.current_settings(),
             });
         }
-        // The frontend is the single debounce owner. Persist and fence one accepted revision atomically on
-        // this serial service thread so an older response/edit can never win after a newer revision.
-        self.revise_preferences(|values| values.pinned_question_template = template.clone())?;
+        let specs = subscription_specs_strict(&next)?;
+        // Persist first, then fence one accepted revision atomically on this serial service thread so
+        // an older response/edit can never win after a newer revision.
+        self.revise_preferences(|values| values.subscriptions = next.clone())?;
         self.coordinator
-            .edit_pinned_template(template)
+            .set_subscriptions(specs)
             .map_err(submit_error_code)?;
-        self.pinned_exchange = None;
+        let kept: std::collections::HashSet<&str> = next
+            .iter()
+            .map(|subscription| subscription.id.as_str())
+            .collect();
+        self.subscription_exchanges
+            .retain(|id, _| kept.contains(id.as_str()));
         self.bump_state();
         self.refresh_snapshot();
+        self.flush_due_subscriptions();
         Ok(HostedMutationResult::Applied {
             settings: self.current_settings(),
         })
@@ -5126,19 +5242,16 @@ impl Service {
             self.ingress_incomplete.store(true, Ordering::Release);
             return;
         }
-        let watermark = match self.coordinator.observe_finalized_rows(&rows) {
-            Ok(watermark) => watermark,
-            Err(error) => {
-                tracing::warn!(
-                    target: "corti::hosted",
-                    ?error,
-                    rows = rows.len(),
-                    "coordinator refused finalized rows; they stay raw"
-                );
-                self.ingress_incomplete.store(true, Ordering::Release);
-                return;
-            }
-        };
+        if let Err(error) = self.coordinator.observe_finalized_rows(&rows) {
+            tracing::warn!(
+                target: "corti::hosted",
+                ?error,
+                rows = rows.len(),
+                "coordinator refused finalized rows; they stay raw"
+            );
+            self.ingress_incomplete.store(true, Ordering::Release);
+            return;
+        }
         let old_len = self.ledger.len();
         self.ledger_bytes = self.ledger_bytes.saturating_add(added);
         self.ledger.extend(rows);
@@ -5150,9 +5263,7 @@ impl Service {
             self.live_batcher.push(items, now);
             self.flush_live_batches();
         }
-        if let Some(submission) = self.build_pinned_submission(recording_id, watermark) {
-            self.submit_pinned_candidate(submission, watermark);
-        }
+        self.flush_due_subscriptions();
     }
 
     /// Hand due batches to the coordinator. At most one Live batch is outstanding at a time; rows that
@@ -5338,89 +5449,111 @@ impl Service {
         }
     }
 
-    fn sync_pinned_revision(&mut self) {
-        let revision = self.coordinator.control_snapshot().pinned_question_revision;
-        if revision == self.observed_pinned_revision {
-            return;
-        }
-        self.observed_pinned_revision = revision;
-        self.schedule_pinned_from_current();
-    }
-
-    fn schedule_pinned_from_current(&mut self) {
+    /// Build and submit every subscription the coordinator reports due. Scheduling is pull-based: the
+    /// coordinator owns thresholds, quiet periods, spacing and single-flight per subscription; the
+    /// Service only assembles the request (context window over the cleaned ledger, question text with
+    /// its layout instruction) when asked. A refused submission defers that subscription briefly so
+    /// it is not rebuilt every tick.
+    fn flush_due_subscriptions(&mut self) {
         let Some(recording_id) = self.current_recording.clone() else {
             return;
         };
-        let watermark = self.coordinator.watermark();
-        if let Some(submission) = self.build_pinned_submission(&recording_id, watermark) {
-            self.submit_pinned_candidate(submission, watermark);
+        let now = self.clock.monotonic_micros();
+        for id in self.coordinator.due_subscriptions(now) {
+            let Some(spec) = self.coordinator.subscription_spec(&id).cloned() else {
+                continue;
+            };
+            let watermark = self.coordinator.watermark();
+            let submission =
+                match self.build_subscription_submission(&recording_id, &spec, watermark) {
+                    Ok(submission) => submission,
+                    Err(code) => {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            subscription = %id.as_str(),
+                            ?code,
+                            "question subscription could not be built; retrying later"
+                        );
+                        self.coordinator
+                            .defer_subscription(&id, crate::postprocess::SUBSCRIPTION_RETRY_MICROS);
+                        continue;
+                    }
+                };
+            let call_id = submission.request.call_id.clone();
+            match self
+                .coordinator
+                .submit_subscription(&id, submission, watermark)
+            {
+                Ok(()) => {
+                    let previous_answer =
+                        self.subscription_exchanges
+                            .get(id.as_str())
+                            .and_then(|exchange| {
+                                exchange
+                                    .answer
+                                    .clone()
+                                    .or_else(|| exchange.previous_answer.clone())
+                            });
+                    self.subscription_exchanges.insert(
+                        id.as_str().to_owned(),
+                        AssistantExchangeDto {
+                            call_id,
+                            as_of_revision: watermark.transcript_revision,
+                            status: QuestionStatusDto::Queued,
+                            error: None,
+                            question: spec.effective_template(),
+                            answer: None,
+                            cost_label: None,
+                            format: spec.format.as_str().to_owned(),
+                            partial_answer: None,
+                            previous_answer,
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        subscription = %id.as_str(),
+                        ?error,
+                        "question subscription was refused by the coordinator; retrying later"
+                    );
+                    self.coordinator
+                        .defer_subscription(&id, crate::postprocess::SUBSCRIPTION_RETRY_MICROS);
+                }
+            }
         }
     }
 
-    fn submit_pinned_candidate(
-        &mut self,
-        submission: RequestSubmission,
-        watermark: TranscriptWatermark,
-    ) {
-        let call_id = submission.request.call_id.clone();
-        if self
-            .coordinator
-            .submit_pinned_snapshot(submission, watermark)
-            .is_ok()
-        {
-            let question = self
-                .preferences
-                .lock()
-                .unwrap()
-                .values()
-                .pinned_question_template
-                .clone();
-            self.pinned_exchange = Some(AssistantExchangeDto {
-                call_id,
-                as_of_revision: watermark.transcript_revision,
-                status: QuestionStatusDto::Queued,
-                error: None,
-                question,
-                answer: None,
-                cost_label: None,
-            });
-        }
-    }
-
-    fn build_pinned_submission(
+    fn build_subscription_submission(
         &mut self,
         recording_id: &str,
+        spec: &corti_chat::SubscriptionSpec,
         watermark: TranscriptWatermark,
-    ) -> Option<RequestSubmission> {
-        let template = self
-            .preferences
-            .lock()
-            .unwrap()
-            .values()
-            .pinned_question_template
-            .clone();
-        if template.trim().is_empty()
-            || !self.coordinator.control_snapshot().pinned_auto_enabled
-            || !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Question)
-        {
-            return None;
+    ) -> Result<RequestSubmission, ErrorCode> {
+        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Question) {
+            return Err(ErrorCode::PolicyBlocked);
         }
+        let window = spec.context.select(&self.ledger);
         let (context, context_truncated) =
-            bounded_question_context(&self.ledger, self.input_token_budget(LaneFamily::Question));
+            bounded_question_context(window, self.input_token_budget(LaneFamily::Question));
+        let question = spec.question_text();
+        let group_id = self.next_group_id("subscription")?;
+        let target_id = TargetId::new(spec.id.as_str()).map_err(|_| ErrorCode::Internal)?;
+        let deadline = self
+            .clock
+            .monotonic_micros()
+            .saturating_add(self.coordinator.deadlines().question_micros);
         self.build_submission(
             recording_id,
             Lane::PinnedQuestion,
             Vec::new(),
             context,
-            Some(&template),
+            Some(&question),
             context_truncated,
             watermark,
-            None,
-            self.clock
-                .monotonic_micros()
-                .saturating_add(self.coordinator.deadlines().question_micros),
+            Some((group_id, Some(target_id))),
+            deadline,
         )
-        .ok()
     }
 
     fn submit_ad_hoc(&mut self, question: String) -> Result<CallId, ErrorCode> {
@@ -5458,6 +5591,9 @@ impl Service {
             .into_iter()
             .filter_map(|summary| {
                 let content = self.coordinator.question_content(&summary.call_id)?;
+                let partial_answer = (summary.status == QuestionStatusDto::Running)
+                    .then(|| self.coordinator.partial_answer(&summary.call_id))
+                    .flatten();
                 Some(AssistantExchangeDto {
                     call_id: summary.call_id,
                     as_of_revision: summary.as_of_revision,
@@ -5466,12 +5602,39 @@ impl Service {
                     question: content.question.to_owned(),
                     answer: content.answer.map(str::to_owned),
                     cost_label: summary.cost.as_ref().map(CostEstimate::render),
+                    format: "paragraph".to_owned(),
+                    partial_answer,
+                    previous_answer: None,
                 })
             })
             .collect();
+        let statuses = self.coordinator.subscription_statuses();
+        let subscriptions = self
+            .coordinator
+            .subscription_specs()
+            .map(|spec| {
+                let status = statuses.iter().find(|status| status.id == spec.id);
+                let mut exchange = self.subscription_exchanges.get(spec.id.as_str()).cloned();
+                if let Some(exchange) = exchange.as_mut()
+                    && exchange.status == QuestionStatusDto::Running
+                {
+                    exchange.partial_answer = self.coordinator.partial_answer(&exchange.call_id);
+                }
+                AssistantSubscriptionDto {
+                    id: spec.id.as_str().to_owned(),
+                    title: spec.title.clone(),
+                    preset: spec.preset.as_str().to_owned(),
+                    format: spec.format.as_str().to_owned(),
+                    enabled: spec.enabled,
+                    run_count: status.map_or(0, |status| status.run_count),
+                    in_flight: status.is_some_and(|status| status.in_flight),
+                    pending: status.is_some_and(|status| status.pending),
+                    exchange,
+                }
+            })
+            .collect();
         AssistantSnapshotDto {
-            pinned_run_count: self.coordinator.pinned_run_count(),
-            pinned: self.pinned_exchange.clone(),
+            subscriptions,
             exchanges,
         }
     }
@@ -6393,12 +6556,16 @@ impl Service {
                 }
             }
             Lane::PinnedQuestion => {
-                if let Some(exchange) = self.pinned_exchange.as_mut()
-                    && exchange.call_id == apply.call_id
+                if let Some(exchange) = self
+                    .subscription_exchanges
+                    .values_mut()
+                    .find(|exchange| exchange.call_id == apply.call_id)
                 {
                     exchange.status = QuestionStatusDto::Completed;
                     exchange.error = None;
                     exchange.answer = apply.output.answer().map(str::to_owned);
+                    exchange.partial_answer = None;
+                    exchange.previous_answer = None;
                 }
             }
             Lane::AdHocQuestion => {}
@@ -6540,11 +6707,14 @@ impl Service {
             let CoordinatorEventDto::Terminal(telemetry) = event else {
                 continue;
             };
-            if let Some(exchange) = self.pinned_exchange.as_mut()
-                && exchange.call_id == telemetry.call_id
+            if let Some(exchange) = self
+                .subscription_exchanges
+                .values_mut()
+                .find(|exchange| exchange.call_id == telemetry.call_id)
             {
                 exchange.cost_label = Some(telemetry.cost.render());
                 if telemetry.outcome != TerminalOutcomeDto::Completed {
+                    exchange.partial_answer = None;
                     exchange.status = if matches!(
                         telemetry.outcome,
                         TerminalOutcomeDto::Canceled | TerminalOutcomeDto::Superseded
@@ -6734,7 +6904,84 @@ fn settings_snapshot(
             question_deadline_seconds: values.question_deadline_seconds,
         },
         lexicon_enabled: values.lexicon_enabled,
+        subscriptions: values.subscriptions.clone(),
     }
+}
+
+/// The saved subscriptions as coordinator specs; entries the coordinator cannot represent are skipped
+/// with a warning rather than blocking every other subscription (the document validator already
+/// bounds them, so this only guards a hand-edited file).
+fn subscription_specs(
+    values: &crate::postprocess_config::HostedPreferenceValues,
+) -> Vec<corti_chat::SubscriptionSpec> {
+    values
+        .subscriptions
+        .iter()
+        .filter_map(|saved| match subscription_spec(saved) {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    id = %saved.id,
+                    ?error,
+                    "saved question subscription is not usable and is skipped"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Like `subscription_specs` but refuses the whole set on the first bad entry (for edits).
+fn subscription_specs_strict(
+    saved: &[QuestionSubscriptionPreferences],
+) -> Result<Vec<corti_chat::SubscriptionSpec>, ErrorCode> {
+    saved
+        .iter()
+        .map(|entry| subscription_spec(entry).map_err(|_| ErrorCode::PolicyBlocked))
+        .collect()
+}
+
+fn subscription_spec(
+    saved: &QuestionSubscriptionPreferences,
+) -> Result<corti_chat::SubscriptionSpec, corti_chat::SubscriptionError> {
+    use corti_chat::{
+        AnswerFormat, ContextWindow, SpeakerFilter, SubscriptionId, SubscriptionPreset,
+        SubscriptionSpec, TriggerPolicy,
+    };
+    let preset = SubscriptionPreset::parse(&saved.preset)?;
+    let format = match saved.output.as_str() {
+        // `json_questions` is reserved in the document; bullets are its presentation for now.
+        "json_questions" => AnswerFormat::Bullets,
+        other => AnswerFormat::parse(other)?,
+    };
+    let spec = SubscriptionSpec {
+        id: SubscriptionId::new(saved.id.clone())?,
+        title: if saved.title.trim().is_empty() {
+            corti_chat::preset_title(preset).to_owned()
+        } else {
+            saved.title.clone()
+        },
+        template: saved.template.clone(),
+        enabled: saved.enabled,
+        preset,
+        format,
+        trigger: TriggerPolicy {
+            quiet_micros: saved.trigger.quiet_ms.saturating_mul(1_000),
+            min_new_words: saved.trigger.min_new_words,
+            min_new_speech_ms: saved.trigger.min_new_speech_ms,
+            min_interval_micros: saved.trigger.min_interval_ms.saturating_mul(1_000),
+            on_speakers: SpeakerFilter::parse(&saved.trigger.on_speakers)?,
+        },
+        context: ContextWindow::parse(
+            &saved.context.window,
+            saved.context.minutes,
+            saved.context.rows,
+        )?,
+        name_hints: saved.name_hints.clone(),
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
 /// Lanes whose saved selection cannot dispatch as saved: the model needs an acknowledgement the owner
@@ -7268,7 +7515,7 @@ fn submit_error_code(error: SubmitError) -> ErrorCode {
         | SubmitError::WrongLane
         | SubmitError::SelectionChanged
         | SubmitError::ProviderBlocked
-        | SubmitError::NoPinnedTemplate => ErrorCode::PolicyBlocked,
+        | SubmitError::UnknownSubscription => ErrorCode::PolicyBlocked,
         SubmitError::StaleWatermark | SubmitError::DuplicateCall => ErrorCode::Superseded,
         SubmitError::Deadline => ErrorCode::Timeout,
         SubmitError::AdHocQueueFull | SubmitError::InvalidQuestion => ErrorCode::RateLimited,
@@ -9950,12 +10197,22 @@ mod tests {
         }
 
         let (reply, receive) = std::sync::mpsc::channel();
-        let before_pinned = handle.snapshot();
+        let before_subscriptions = handle.snapshot();
         handle
-            .send(ServiceCommand::SetPinnedTemplate {
-                request: PinnedQuestionUpdateRequest {
-                    observed_state_revision: before_pinned.state_revision,
-                    template: "fixture pinned question".into(),
+            .send(ServiceCommand::SetSubscriptions {
+                request: SubscriptionsUpdateRequest {
+                    observed_state_revision: before_subscriptions.state_revision,
+                    subscriptions: vec![SubscriptionInput {
+                        id: "custom".into(),
+                        title: "Fixture question".into(),
+                        template: Some("fixture pinned question".into()),
+                        enabled: true,
+                        preset: "none".into(),
+                        output: "paragraph".into(),
+                        trigger: None,
+                        context: None,
+                        name_hints: Vec::new(),
+                    }],
                 },
                 reply,
             })
@@ -9964,10 +10221,15 @@ mod tests {
             receive.recv().unwrap().unwrap(),
             HostedMutationResult::Applied { .. }
         ));
-        // Let the revision observer see the saved template while auto-run is still off. Enabling auto later
-        // must reconsider existing context rather than relying on a lucky same-tick ordering.
-        std::thread::sleep(Duration::from_millis(30));
         let settings = handle.snapshot();
+        assert_eq!(settings.subscriptions.len(), 1);
+        assert_eq!(
+            settings.subscriptions[0].template,
+            "fixture pinned question"
+        );
+        // Saving while auto-run is still off must not run anything; enabling auto later must reconsider
+        // the context already present rather than relying on a lucky same-tick ordering.
+        std::thread::sleep(Duration::from_millis(30));
         handle
             .patch_for_test(HostedPatchRequest {
                 observed_state_revision: settings.state_revision,
@@ -9977,19 +10239,29 @@ mod tests {
                 },
             })
             .unwrap();
-        // Saving the template after substantial speech should schedule its initial answer from the transcript
-        // already present; requiring another threshold made late onboarding appear to do nothing.
+        // Saving a subscription after substantial speech should schedule its initial answer from the
+        // transcript already present; requiring another threshold made late onboarding appear to do nothing.
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let snapshot = assistant(&handle);
-            if snapshot.pinned.as_ref().is_some_and(|exchange| {
-                exchange.status == QuestionStatusDto::Completed
-                    && exchange.answer.as_deref() == Some("fixture grounded answer")
-            }) {
-                assert_eq!(snapshot.pinned_run_count, 1);
+            let custom = snapshot
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id == "custom");
+            if let Some(custom) = custom
+                && custom.exchange.as_ref().is_some_and(|exchange| {
+                    exchange.status == QuestionStatusDto::Completed
+                        && exchange.answer.as_deref() == Some("fixture grounded answer")
+                })
+            {
+                assert_eq!(custom.run_count, 1);
+                assert_eq!(custom.exchange.as_ref().unwrap().format, "paragraph");
                 break;
             }
-            assert!(Instant::now() < deadline, "pinned answer did not settle");
+            assert!(
+                Instant::now() < deadline,
+                "subscription answer did not settle"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         handle.end_live_session(&recording_id).unwrap();
@@ -10020,10 +10292,15 @@ mod tests {
                 question: "fixture private question".into(),
                 answer: Some("fixture private answer".into()),
                 cost_label: None,
+                format: "bullets".into(),
+                partial_answer: Some("fixture private partial".into()),
+                previous_answer: Some("fixture private previous".into()),
             }
         );
         assert!(!assistant_debug.contains("private question"));
         assert!(!assistant_debug.contains("private answer"));
+        assert!(!assistant_debug.contains("private partial"));
+        assert!(!assistant_debug.contains("private previous"));
         for forbidden in [
             "fixture-secret-value",
             "bearer ",
