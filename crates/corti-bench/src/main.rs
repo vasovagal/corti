@@ -157,6 +157,9 @@ struct CleanupKnobs {
     /// Skip the backchannel pass.
     #[arg(long)]
     no_drop_backchannels: bool,
+    /// Skip the filler/stutter pass (#154).
+    #[arg(long)]
+    no_strip_fillers: bool,
     #[arg(long)]
     echo_window_seconds: Option<f64>,
     #[arg(long)]
@@ -181,6 +184,7 @@ impl CleanupKnobs {
         Some(CleanupConfig {
             echo_drop: !self.no_echo_drop,
             drop_backchannels: !self.no_drop_backchannels,
+            strip_fillers: !self.no_strip_fillers,
             echo_window_seconds: self.echo_window_seconds.unwrap_or(d.echo_window_seconds),
             echo_containment: self.echo_containment.unwrap_or(d.echo_containment),
             merge_gap_seconds: self.merge_gap_seconds.unwrap_or(d.merge_gap_seconds),
@@ -204,12 +208,15 @@ fn cleanup_json(
         "merge_gap_seconds": cfg.merge_gap_seconds,
         "drop_backchannels": cfg.drop_backchannels,
         "echo_audio_margin_db": cfg.echo_audio_margin_db,
+        "strip_fillers": cfg.strip_fillers,
         "audio_evidence": audio_evidence,
         "echo_dropped_me": stats.echo_dropped_me,
         "echo_dropped_them": stats.echo_dropped_them,
         "echo_dropped_audio": stats.echo_dropped_audio,
         "merged": stats.merged,
         "backchannels_dropped": stats.backchannels_dropped,
+        "fillers_removed": stats.fillers_removed,
+        "stutters_collapsed": stats.stutters_collapsed,
     })
 }
 

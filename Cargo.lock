@@ -1397,6 +1397,7 @@ dependencies = [
  "corti-core",
  "corti-detect",
  "corti-jobs",
+ "corti-lexicon",
  "corti-postprocess",
  "corti-postprocess-providers",
  "corti-queue",
@@ -1523,6 +1524,20 @@ dependencies = [
  "chrono",
  "rusqlite",
  "serde_json",
+]
+
+[[package]]
+name = "corti-lexicon"
+version = "0.17.0"
+dependencies = [
+ "corti-core",
+ "corti-transcribe",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]

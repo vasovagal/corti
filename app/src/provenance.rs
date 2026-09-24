@@ -379,6 +379,10 @@ fn segment_cleanup(cleanup: &CleanupConfig, live: bool, audio_evidence: bool) ->
         "echo_audio_margin_db".into(),
         double_value(f64::from(cleanup.echo_audio_margin_db)),
     );
+    // Rules 3 (#154): filler/stutter stripping, and the learned lexicon applied as the last pass. The
+    // lexicon is described by revision/digest/count only; its rules never enter a note.
+    map.insert("strip_fillers".into(), Value::Bool(cleanup.strip_fillers));
+    map.insert("lexicon".into(), crate::lexicon::provenance_summary());
     // Whether short mic regions were withheld and judged before publication rather than only at the
     // durability boundary (#149 phase 2). Live-only, and gated by the same `echo_drop` switch — a batch
     // note has no publication to be early for.
@@ -428,7 +432,17 @@ mod tests {
         assert_eq!(provenance.models.asr.id, "aws/transcribe-default");
         assert_eq!(provenance.configuration["language"], "en-GB");
         assert_eq!(provenance.configuration["input"], "completed_recording");
-        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 2);
+        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 3);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["strip_fillers"],
+            true
+        );
+        assert!(
+            provenance.configuration["segment_cleanup"]
+                .get("lexicon")
+                .is_some(),
+            "the lexicon is always described, even when absent"
+        );
         assert_eq!(
             provenance.configuration["segment_cleanup"]["echo_containment"],
             0.7

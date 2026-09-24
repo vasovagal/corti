@@ -5234,6 +5234,7 @@ mod tests {
                 billing_basis: descriptor.billing_basis,
                 cache_policy: fixture_cache_policy(),
                 word_bank_canonical_digest: bank.content_digest(),
+                lexicon_canonical_digest: "",
                 effective_steering: "fixture steering",
                 targets: &target_rows,
                 context: &context_rows,

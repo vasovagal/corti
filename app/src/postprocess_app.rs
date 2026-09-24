@@ -21,11 +21,11 @@ use corti_postprocess::{
     BillingBasis, CacheObservation, CachePolicy, CallId, CancellationReason, CanonicalPrompt,
     ConnectionScopeId, CostEstimate, CredentialState, DigestKey, ErrorCode, HostedRequest, Lane,
     LocalCacheMode, ModelCatalog, ModelId, MonotonicDeadline, OUTPUT_SCHEMA_VERSION,
-    PROMPT_TEMPLATE_VERSION, PricingCatalog, PricingError, PricingQuery, ProcessEpoch, PromptTask,
-    ProviderAdapter, ProviderCacheKey, ProviderCacheKeyMaterial, ProviderCacheMode,
-    ProviderDescriptor, ProviderEventSink, ProviderId, ProviderScope, ProviderTerminal,
-    RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial, RowId, SupportTier, TargetId,
-    TranscriptRow, TransportId, WordBankDocument,
+    PROMPT_TEMPLATE_VERSION, PricingCatalog, PricingError, PricingQuery, ProcessEpoch,
+    PromptCorrection, PromptTask, ProviderAdapter, ProviderCacheKey, ProviderCacheKeyMaterial,
+    ProviderCacheMode, ProviderDescriptor, ProviderEventSink, ProviderId, ProviderScope,
+    ProviderTerminal, RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial, RowId,
+    SupportTier, TargetId, TranscriptRow, TransportId, WordBankDocument,
 };
 use corti_postprocess_providers::{
     ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
@@ -1400,6 +1400,8 @@ pub(crate) fn start(
         );
         WordBankDocument::empty()
     });
+    let lexicon =
+        crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty);
     let outbox = Arc::new(TelemetryOutbox::open(default_outbox_path()?)?);
     let durable = load_or_create_master_keys().and_then(|keys| {
         let path = default_store_path()?;
@@ -1642,6 +1644,8 @@ fn start_with_components_and_policy(
         clock,
         preferences,
         word_bank,
+        lexicon_corrections: prompt_corrections(&lexicon),
+        lexicon,
         digest_key,
         live_view,
         ingress_incomplete,
@@ -3903,6 +3907,10 @@ struct Service {
     clock: Arc<dyn CoordinatorClock>,
     preferences: Arc<Mutex<HostedPreferences>>,
     word_bank: WordBankDocument,
+    /// The learned correction lexicon: its corrections ride the prompt prefix and its digest is part
+    /// of every request key. Reloaded with the word bank at each session begin.
+    lexicon: corti_lexicon::CompiledLexicon,
+    lexicon_corrections: Vec<PromptCorrection>,
     digest_key: Arc<DigestKey>,
     live_view: LiveTranscriptStore,
     ingress_incomplete: Arc<AtomicBool>,
@@ -4222,6 +4230,7 @@ impl Service {
         self.live_backlog_released = false;
         validate_recording_id(&recording_id)?;
         self.cancel_pending_finals(ErrorCode::Superseded);
+        self.reload_prompt_inputs();
         self.coordinator
             .begin_session()
             .map_err(control_error_code)?;
@@ -4233,6 +4242,49 @@ impl Service {
         self.ingress_incomplete.store(false, Ordering::Release);
         self.bump_state();
         Ok(())
+    }
+
+    /// Re-read the word bank and the lexicon from disk at every session begin so rules added by
+    /// `corti --review` (or a bank edited by another process) are live for the next call. A changed
+    /// digest fences in-flight and cached work exactly like a Settings edit; unchanged digests fence
+    /// nothing. In-memory fixtures (`persist_to_disk == false`) keep what they were given.
+    fn reload_prompt_inputs(&mut self) {
+        if !self.persist_to_disk {
+            return;
+        }
+        let mut changed = false;
+        match crate::word_bank::load() {
+            Ok(bank) if bank.content_digest() != self.word_bank.content_digest() => {
+                self.word_bank = bank;
+                changed = true;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "corti::hosted",
+                error = %format!("{error:#}"),
+                "word bank is unreadable at session begin; keeping the loaded one"
+            ),
+        }
+        let lexicon =
+            crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty);
+        if lexicon.digest() != self.lexicon.digest() {
+            self.lexicon_corrections = prompt_corrections(&lexicon);
+            self.lexicon = lexicon;
+            changed = true;
+        }
+        if changed {
+            match self.coordinator.apply_patch(ControlPatch::BankChanged) {
+                Ok(_) => {
+                    self.bump_state();
+                    self.refresh_snapshot();
+                }
+                Err(error) => tracing::warn!(
+                    target: "corti::hosted",
+                    ?error,
+                    "prompt inputs changed on disk but the bank fence could not be advanced"
+                ),
+            }
+        }
     }
 
     fn patch(&mut self, request: HostedPatchRequest) -> Result<HostedMutationResult, ErrorCode> {
@@ -5898,15 +5950,22 @@ impl Service {
         let scope = self.scope_for(&provider, &transport)?;
         let steering = self.effective_steering();
         let prompt = if lane.is_question() {
-            CanonicalPrompt::question(
+            CanonicalPrompt::question_with_corrections(
                 &self.word_bank,
+                &self.lexicon_corrections,
                 &steering,
                 &context,
                 question.ok_or(ErrorCode::PolicyBlocked)?,
                 context_truncated,
             )
         } else {
-            CanonicalPrompt::rewrite(&self.word_bank, &steering, &context, &targets)
+            CanonicalPrompt::rewrite_with_corrections(
+                &self.word_bank,
+                &self.lexicon_corrections,
+                &steering,
+                &context,
+                &targets,
+            )
         };
         let (group_id, target_id) = match identity {
             Some(value) => value,
@@ -5945,6 +6004,7 @@ impl Service {
                         },
                         provider_cache_mode: lane_control.selection.cache_policy.provider,
                         word_bank_canonical_digest: self.word_bank.content_digest(),
+                        lexicon_canonical_digest: self.lexicon.digest(),
                     },
                 )
             });
@@ -5982,6 +6042,7 @@ impl Service {
                 billing_basis: descriptor.billing_basis,
                 cache_policy: request.cache_policy,
                 word_bank_canonical_digest: self.word_bank.content_digest(),
+                lexicon_canonical_digest: self.lexicon.digest(),
                 effective_steering: &steering,
                 targets: &request.targets,
                 context: &request.context,
@@ -6907,6 +6968,18 @@ fn settings_snapshot(
         lexicon_enabled: values.lexicon_enabled,
         subscriptions: values.subscriptions.clone(),
     }
+}
+
+/// The lexicon's rules as prompt corrections, in application order.
+fn prompt_corrections(lexicon: &corti_lexicon::CompiledLexicon) -> Vec<PromptCorrection> {
+    lexicon
+        .corrections()
+        .into_iter()
+        .map(|correction| PromptCorrection {
+            from: correction.from,
+            to: correction.to,
+        })
+        .collect()
 }
 
 /// The saved subscriptions as coordinator specs; entries the coordinator cannot represent are skipped
@@ -8659,6 +8732,7 @@ mod tests {
                     provider: ProviderCacheMode::Off,
                 },
                 word_bank_canonical_digest: "fixture-bank",
+                lexicon_canonical_digest: "",
                 effective_steering: "",
                 targets: &targets,
                 context: &[],
@@ -8919,6 +8993,7 @@ mod tests {
                         provider: ProviderCacheMode::ExplicitStablePrefix,
                     },
                     word_bank_canonical_digest: "bank",
+                    lexicon_canonical_digest: "",
                     effective_steering: "",
                     targets: &targets,
                     context: &[],
@@ -8943,6 +9018,7 @@ mod tests {
                     prompt_task: PromptTask::Rewrite,
                     provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
                     word_bank_canonical_digest: "bank",
+                    lexicon_canonical_digest: "",
                 },
             )
         };
@@ -9784,6 +9860,7 @@ mod tests {
                     provider: ProviderCacheMode::Off,
                 },
                 word_bank_canonical_digest: "fixture-bank",
+                lexicon_canonical_digest: "",
                 effective_steering: "",
                 targets: &[],
                 context: &[],

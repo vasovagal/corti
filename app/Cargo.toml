@@ -27,6 +27,7 @@ corti-jobs = { workspace = true }
 corti-postprocess = { workspace = true }
 corti-postprocess-providers = { workspace = true }
 corti-chat = { workspace = true }
+corti-lexicon = { workspace = true }
 corti-transcribe = { workspace = true }
 corti-vagus = { workspace = true }
 

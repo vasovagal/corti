@@ -491,6 +491,7 @@ fn provider_cache_key() -> ProviderCacheKey {
         prompt_task: PromptTask::Rewrite,
         provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
         word_bank_canonical_digest: "synthetic-bank-digest",
+        lexicon_canonical_digest: "synthetic-lexicon-digest",
     };
     ProviderCacheKey::derive(&DigestKey::new([17; 32]), &material)
 }

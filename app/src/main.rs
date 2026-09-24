@@ -29,6 +29,8 @@ mod console;
 #[cfg(target_os = "macos")]
 mod jobs;
 #[cfg(target_os = "macos")]
+mod lexicon;
+#[cfg(target_os = "macos")]
 mod live;
 #[cfg(target_os = "macos")]
 mod live_test;

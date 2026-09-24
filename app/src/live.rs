@@ -46,8 +46,8 @@ use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
 use corti_transcribe::segment::{
-    CleanupConfig, CleanupStats, EchoCandidate, SEGMENT_GAP, SpeakerTurn, Word, cleanup,
-    cleanup_with_evidence, diarize_words, merge_by_time, split_regions, words_to_segments,
+    CleanupConfig, CleanupStats, EchoCandidate, SEGMENT_GAP, SpeakerTurn, TextRule, Word,
+    cleanup_with_rules, diarize_words, merge_by_time, split_regions, words_to_segments,
 };
 use tracing::{info, warn};
 
@@ -886,7 +886,8 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         engine.diarizes_far_end(),
         cfg.cleanup_config(),
     )
-    .context("reserving the bounded live transcript window")?;
+    .context("reserving the bounded live transcript window")?
+    .with_lexicon(crate::lexicon::load_compiled().map(std::sync::Arc::new));
     Ok(SessionParts {
         engine,
         mic,
@@ -982,6 +983,9 @@ struct TranscriptWindow {
     diarize_far_end: bool,
     /// Deterministic segment cleanup applied to each window before its one append (#149).
     cleanup: CleanupConfig,
+    /// The learned correction lexicon, applied as the last cleanup pass on every window. Loaded once
+    /// per session, so a rule added mid-call lands on the next session (`corti --review` says so).
+    lexicon: Option<std::sync::Arc<corti_lexicon::CompiledLexicon>>,
     /// The tail of the **previous** window's appended segments — every one whose end is still inside
     /// `echo_window_seconds` of this window's start. They are read-only echo sources: an echo whose source
     /// landed just before the one-minute boundary is still caught. Never appended (they are already in the
@@ -1037,9 +1041,20 @@ impl TranscriptWindow {
             diarize_far_end,
             early_drop: EarlyDrop::new(cleanup.clone()),
             cleanup,
+            lexicon: None,
             carry: Vec::new(),
             aec_blocks: Vec::new(),
         })
+    }
+
+    /// Attach the learned lexicon (or none) to every window flush.
+    #[cfg_attr(not(feature = "local"), allow(dead_code))]
+    fn with_lexicon(
+        mut self,
+        lexicon: Option<std::sync::Arc<corti_lexicon::CompiledLexicon>>,
+    ) -> Self {
+        self.lexicon = lexicon;
+        self
     }
 
     /// Seconds from call start at which the *next* window begins.
@@ -1547,14 +1562,24 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     // With the live canceller running, its per-block record for this window is audio evidence the text
     // rules cannot reconstruct: a `Me` row whose mic span was measured as little more than the echo the
     // filter was already subtracting is a ghost regardless of its wording (#149 phase 3b).
-    let (segments, stats) = if window.cleanup.is_noop() {
+    let rule = window
+        .lexicon
+        .as_deref()
+        .map(|lexicon| lexicon as &dyn TextRule);
+    let (segments, stats) = if window.cleanup.is_noop() && rule.is_none() {
         (segments, CleanupStats::default())
     } else if window.aec_blocks.is_empty() {
-        cleanup(segments, &window.cleanup, &window.carry)
+        cleanup_with_rules(segments, &window.cleanup, &window.carry, None, rule)
     } else {
         let blocks = &window.aec_blocks;
         let evidence = |start: f64, end: f64| crate::transcribe::span_evidence(blocks, start, end);
-        cleanup_with_evidence(segments, &window.cleanup, &window.carry, Some(&evidence))
+        cleanup_with_rules(
+            segments,
+            &window.cleanup,
+            &window.carry,
+            Some(&evidence),
+            rule,
+        )
     };
     if !segments.is_empty() {
         writer.append_segments(&segments)?;
@@ -1926,8 +1951,13 @@ impl<F: NoteFiler> NoteWriter<F> {
     }
 
     fn final_transcript(&self) -> Option<DiarizedTranscript> {
-        (!self.final_transcript_incomplete)
-            .then(|| DiarizedTranscript::new(self.final_segments.clone()))
+        (!self.final_transcript_incomplete).then(|| {
+            // Windows append `Me` and `Them` interleaved by start already, but the assembled final
+            // transcript is what the hosted Final lane and the note see: keep it in time order (#157).
+            let mut segments = self.final_segments.clone();
+            segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+            DiarizedTranscript::new(segments)
+        })
     }
 
     fn rewrite_settled_final(

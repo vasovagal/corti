@@ -37,8 +37,8 @@ pub use pricing::{
     PricingCatalog, PricingError, PricingQuery, RawUsage, Tariff, TariffCatalog, TariffRates,
 };
 pub use prompt::{
-    CanonicalPrompt, OUTPUT_SCHEMA_VERSION, PROMPT_TEMPLATE_VERSION, PromptMessage, PromptRole,
-    PromptSection, PromptTask,
+    CanonicalPrompt, OUTPUT_SCHEMA_VERSION, PROMPT_TEMPLATE_VERSION, PromptCorrection,
+    PromptMessage, PromptRole, PromptSection, PromptTask,
 };
 pub use validation::{
     EXPLICIT_NO_ANSWER, QUESTION_SCHEMA_VERSION, QuestionOutput, REWRITE_SCHEMA_VERSION,
