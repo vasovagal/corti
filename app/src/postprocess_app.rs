@@ -1538,6 +1538,7 @@ fn start_with_components_and_policy(
         &startup_providers,
         chatgpt_scope_configured(&coordinator),
         secret_presence.as_ref(),
+        preferences_load_error.as_deref(),
     );
     let (ingress, ingress_rx) = CoordinatorIngress::standard();
     let (command_tx, command_rx) = sync_channel(SERVICE_COMMAND_CAPACITY);
