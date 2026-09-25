@@ -132,7 +132,9 @@ also synced. A 128 MiB far-audio cap or 1 MiB text cap forces an earlier commit.
 
 Cleanup runs inside `flush_window`, between `merge_by_time` and the one `append_segments` call, so the
 committed rows — and therefore the note, the reader, and the hosted final pass — never contain an echo the
-rule catches. It sees one window at a time, plus `TranscriptWindow::carry`: the previous window's appended
+rule catches. Its passes run in a fixed order (rules 3, ADR 0017): sort by start (#157) → echo → merge →
+backchannel → filler/stutter stripping (#154, `strip_fillers`, on by default) → the learned lexicon
+(`~/.local/share/corti/lexicon.json`, loaded once per session and applied through the `TextRule` seam). It sees one window at a time, plus `TranscriptWindow::carry`: the previous window's appended
 segments whose end is still inside `echo_window_seconds`, kept as **read-only echo sources** and never
 appended a second time. So the echo lookback crosses the append boundary and the fragment merge deliberately
 does not — a row that is already synced is never rewritten (ADR 0012), which costs at most one merge per

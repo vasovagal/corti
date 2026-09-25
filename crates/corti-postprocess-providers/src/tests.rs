@@ -491,6 +491,7 @@ fn provider_cache_key() -> ProviderCacheKey {
         prompt_task: PromptTask::Rewrite,
         provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
         word_bank_canonical_digest: "synthetic-bank-digest",
+        lexicon_canonical_digest: "synthetic-lexicon-digest",
     };
     ProviderCacheKey::derive(&DigestKey::new([17; 32]), &material)
 }
@@ -2389,4 +2390,187 @@ fn bedrock_adapter_debug_never_renders_credentials_or_content() {
     assert!(rendered.contains("<injected>"));
     assert!(!rendered.contains("AKID"));
     assert!(!rendered.contains("synthetic-fixture-secret-access-key"));
+}
+
+// ----- Phase 2: thinking/reasoning controls, body flags, served-model leniency -----
+
+#[test]
+fn served_model_suffixes_are_accepted_but_siblings_are_refused() {
+    use crate::common::served_model_matches;
+    assert!(served_model_matches("gpt-5", "gpt-5"));
+    assert!(served_model_matches("gpt-5-2025-08-07", "gpt-5"));
+    assert!(served_model_matches(
+        "gemini-2.5-flash@001",
+        "gemini-2.5-flash"
+    ));
+    assert!(served_model_matches(
+        "claude-sonnet-4-5-20250929",
+        "claude-sonnet-4-5"
+    ));
+    assert!(!served_model_matches("gpt-5-mini", "gpt-5"));
+    assert!(!served_model_matches(
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash"
+    ));
+    assert!(!served_model_matches("gpt-5", "gpt-5-2025-08-07"));
+    assert!(!served_model_matches("gpt-5-", "gpt-5"));
+    assert!(!served_model_matches("gpt-5-2025--08", "gpt-5"));
+    assert!(!served_model_matches("gpt-5@", "gpt-5"));
+    assert!(!served_model_matches("other", "gpt-5"));
+}
+
+#[test]
+fn chatgpt_body_sends_low_reasoning_and_omits_max_output_tokens_by_default_and_accepts_off_cache() {
+    let (handle, mut adapter) = chatgpt_adapter(vec![
+        Script::json(CHATGPT_MODEL_LIST),
+        Script::sse(chatgpt_stream()),
+    ]);
+    adapter.catalog(&scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::ChatGptSubscription,
+        CHATGPT_MODEL_ID,
+        ProviderCacheMode::Off,
+    );
+    let sink = CollectingSink::default();
+    adapter
+        .execute(&request, &CancellationToken::new(), &sink)
+        .expect("an `off` cache policy asks for nothing the private endpoint could refuse");
+    let captured = handle.captured();
+    let body = captured[1].body.as_ref().unwrap();
+    assert_eq!(body["reasoning"]["effort"], "low");
+    assert!(body.get("max_output_tokens").is_none());
+    assert_eq!(body["text"]["verbosity"], "low");
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+
+    let (handle, adapter) = chatgpt_adapter(vec![
+        Script::json(CHATGPT_MODEL_LIST),
+        Script::sse(chatgpt_stream()),
+    ]);
+    let mut adapter = adapter.with_body_options(crate::chatgpt::ChatGptBodyOptions {
+        reasoning_effort: None,
+        send_max_output_tokens: true,
+        send_verbosity: false,
+    });
+    adapter.catalog(&scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::ChatGptSubscription,
+        CHATGPT_MODEL_ID,
+        ProviderCacheMode::Unavailable,
+    );
+    adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap();
+    let captured = handle.captured();
+    let body = captured[1].body.as_ref().unwrap();
+    assert!(body.get("reasoning").is_none());
+    assert_eq!(body["max_output_tokens"], 8192);
+    assert!(body["text"].get("verbosity").is_none());
+}
+
+#[test]
+fn chatgpt_explicit_prefix_cache_policy_is_still_refused_before_egress() {
+    let (handle, mut adapter) = chatgpt_adapter(vec![Script::json(CHATGPT_MODEL_LIST)]);
+    adapter.catalog(&scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::ChatGptSubscription,
+        CHATGPT_MODEL_ID,
+        ProviderCacheMode::ExplicitStablePrefix,
+    );
+    let error = adapter
+        .execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, corti_postprocess::ErrorCode::PolicyBlocked);
+    assert_eq!(handle.captured().len(), 1, "only the catalog call was made");
+}
+
+#[test]
+fn openai_reasoning_models_get_low_effort_and_dated_snapshots_are_accepted() {
+    let (handle, mut adapter) = openai_adapter(vec![
+        Script::json(OPENAI_MODEL_LIST),
+        Script::sse(openai_stream()),
+    ]);
+    adapter.catalog(&scope()).unwrap();
+    let request = hosted_request(
+        KnownTransport::OpenAiDirect,
+        "gpt-5.6-luna",
+        ProviderCacheMode::Off,
+    );
+    let _ = adapter.execute(
+        &request,
+        &CancellationToken::new(),
+        &CollectingSink::default(),
+    );
+    let captured = handle.captured();
+    let body = captured[1].body.as_ref().unwrap();
+    assert_eq!(body["reasoning"]["effort"], "low");
+    assert_eq!(body["max_output_tokens"], 8192);
+}
+
+#[test]
+fn vertex_gemini_thinking_control_follows_the_id_class_and_the_adapter_policy() {
+    fn body_for(model_id: &str, policy: crate::vertex::ThinkingPolicy) -> serde_json::Value {
+        let model = VertexModel::inferred(ModelId::new(model_id).unwrap()).unwrap();
+        let (handle, state, mut adapter) =
+            vertex_adapter_with(vec![model], vec![Script::sse(vertex_stream())]);
+        adapter = adapter.with_thinking_policy(policy);
+        let _ = state;
+        adapter.catalog(&vertex_scope()).unwrap();
+        let request = hosted_request(
+            KnownTransport::VertexDirect,
+            model_id,
+            ProviderCacheMode::UnavoidableImplicit,
+        );
+        // The served model in the shared fixture does not match these ids; only the request body
+        // matters here, and it is captured before the response is parsed.
+        let _ = adapter.execute(
+            &request,
+            &CancellationToken::new(),
+            &CollectingSink::default(),
+        );
+        let captured = handle.captured();
+        captured.last().unwrap().body.clone().unwrap()
+    }
+
+    let flash = body_for("gemini-2.5-flash", crate::vertex::ThinkingPolicy::Auto);
+    assert_eq!(
+        flash["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        0
+    );
+    let pro = body_for("gemini-2.5-pro", crate::vertex::ThinkingPolicy::Auto);
+    assert_eq!(
+        pro["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+        128
+    );
+    let three = body_for("gemini-3-flash", crate::vertex::ThinkingPolicy::Auto);
+    assert_eq!(
+        three["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "low"
+    );
+    let unknown = body_for("gemini-synthetic-001", crate::vertex::ThinkingPolicy::Auto);
+    assert!(unknown["generationConfig"].get("thinkingConfig").is_none());
+    let omitted = body_for("gemini-2.5-flash", crate::vertex::ThinkingPolicy::Omit);
+    assert!(omitted["generationConfig"].get("thinkingConfig").is_none());
+    assert_eq!(omitted["generationConfig"]["candidateCount"], 1);
+}
+
+#[test]
+fn vertex_claude_publisher_never_receives_a_thinking_config() {
+    let model = VertexModel::inferred(ModelId::new(VERTEX_CLAUDE_MODEL_ID).unwrap()).unwrap();
+    assert_eq!(model.thinking(), crate::vertex::ThinkingControl::Omit);
+    let gemini = VertexModel::inferred(ModelId::new("gemini-2.5-flash").unwrap()).unwrap();
+    assert_eq!(gemini.thinking(), crate::vertex::ThinkingControl::Budget(0));
+    assert_eq!(
+        gemini
+            .with_thinking(crate::vertex::ThinkingControl::Level("high"))
+            .thinking(),
+        crate::vertex::ThinkingControl::Level("high")
+    );
 }

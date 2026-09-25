@@ -41,4 +41,8 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
     after a persisted disclosure acknowledgement, while audio never does. Raw text is immutable fallback,
     provider/tool support tiers stay visible, ambiguous paid calls never auto-repeat, and unknown or
     subscription cost stays nullable rather than `$0.00`. Claude Free/Pro/Max routing is blocked absent
-    written Anthropic permission. (ADR 0015)
+    written Anthropic permission. (ADR 0015) A hosted Live result is fenced **per target row** (id,
+    speaker, timing) plus session/controls, never per transcript revision; the Live lane is FIFO and
+    never-drop with one batch outstanding; question subscriptions are single-flight per id; every discard,
+    expiry or refusal logs under `corti::hosted`; the learned lexicon rides the prompt prefix and the cache
+    keys but is never applied to Live Transcript store rows — raw stays verbatim. (ADR 0017)

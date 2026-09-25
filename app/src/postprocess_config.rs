@@ -18,12 +18,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::private_file::{atomic_write_private, read_private};
 
-pub(crate) const HOSTED_PREFERENCES_SCHEMA: u32 = 1;
+/// Schema 2 (v0.18) adds lane deadlines, the Vertex thinking policy, the lexicon switch, and question
+/// subscriptions. A schema-1 document is migrated on load; an older binary refuses schema 2 and runs
+/// with hosted egress off, which is the documented downgrade posture.
+pub(crate) const HOSTED_PREFERENCES_SCHEMA: u32 = 2;
+const LEGACY_HOSTED_PREFERENCES_SCHEMA: u32 = 1;
 pub(crate) const EGRESS_DISCLOSURE_VERSION: u32 = 1;
 pub(crate) const PINNED_AUTO_DISCLOSURE_VERSION: u32 = 1;
 pub(crate) const PROVIDER_CACHE_DISCLOSURE_VERSION: u32 = 1;
 const DEFAULT_FINAL_DEADLINE_SECONDS: u32 = 90;
 const MAX_FINAL_DEADLINE_SECONDS: u32 = 10 * 60;
+pub(crate) const DEFAULT_LIVE_FIRST_TEXT_SECONDS: u32 = 8;
+pub(crate) const DEFAULT_LIVE_DEADLINE_SECONDS: u32 = 20;
+pub(crate) const DEFAULT_QUESTION_DEADLINE_SECONDS: u32 = 45;
+const MAX_LIVE_FIRST_TEXT_SECONDS: u32 = 60;
+const MAX_LIVE_DEADLINE_SECONDS: u32 = 120;
+const MAX_QUESTION_DEADLINE_SECONDS: u32 = 300;
+const MAX_SUBSCRIPTIONS: usize = 16;
+const MAX_SUBSCRIPTION_TEMPLATE_BYTES: usize = 32 * 1024;
+/// The subscription the schema-1 pinned template migrates into.
+pub(crate) const MIGRATED_PINNED_SUBSCRIPTION_ID: &str = "pinned";
 const MAX_HOSTED_PREFERENCES_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_VERTEX_MODELS: usize = 32;
 
@@ -199,6 +213,94 @@ impl Default for BedrockProviderPreferences {
     }
 }
 
+/// Whether the Vertex adapter sends its per-model thinking control (`Auto`) or omits it (`Omit`), the
+/// escape hatch when a model rejects the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ThinkingPreference {
+    #[default]
+    Auto,
+    Omit,
+}
+
+/// One saved question subscription (schema 2). Enum-like fields are plain strings here so the document
+/// stays readable and the coordinator, not the config module, decides what each preset means.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct QuestionSubscriptionPreferences {
+    /// Stable id: `[a-z0-9-]{1,32}`; rides `target_id` on every call the subscription makes.
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) template: String,
+    pub(crate) enabled: bool,
+    /// `none` | `asked_of_me` | `running_summary` | `topic_watch`.
+    pub(crate) preset: String,
+    /// `paragraph` | `bullets` | `json_questions`.
+    pub(crate) output: String,
+    pub(crate) trigger: SubscriptionTriggerPreferences,
+    pub(crate) context: SubscriptionContextPreferences,
+    /// Names the owner answers to, for the `asked_of_me` preset's cheap pre-filter.
+    pub(crate) name_hints: Vec<String>,
+}
+
+impl Default for QuestionSubscriptionPreferences {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            template: String::new(),
+            enabled: false,
+            preset: "none".to_owned(),
+            output: "paragraph".to_owned(),
+            trigger: SubscriptionTriggerPreferences::default(),
+            context: SubscriptionContextPreferences::default(),
+            name_hints: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct SubscriptionTriggerPreferences {
+    pub(crate) quiet_ms: u64,
+    pub(crate) min_new_words: u64,
+    pub(crate) min_new_speech_ms: u64,
+    pub(crate) min_interval_ms: u64,
+    /// `all` | `them` | `me`.
+    pub(crate) on_speakers: String,
+}
+
+impl Default for SubscriptionTriggerPreferences {
+    fn default() -> Self {
+        Self {
+            quiet_ms: 750,
+            min_new_words: 40,
+            min_new_speech_ms: 30_000,
+            min_interval_ms: 0,
+            on_speakers: "all".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct SubscriptionContextPreferences {
+    /// `whole` | `last_minutes` | `last_rows`.
+    pub(crate) window: String,
+    pub(crate) minutes: u32,
+    pub(crate) rows: u32,
+}
+
+impl Default for SubscriptionContextPreferences {
+    fn default() -> Self {
+        Self {
+            window: "whole".to_owned(),
+            minutes: 0,
+            rows: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ProviderPreferences {
@@ -207,6 +309,8 @@ pub(crate) struct ProviderPreferences {
     /// a caller may invoke, so this is the only way to reach a model Corti does not already know about.
     pub(crate) vertex_models: Vec<String>,
     pub(crate) vertex_provider_cache_acknowledgement_version: Option<u32>,
+    /// Escape hatch for the Gemini thinking control (schema 2).
+    pub(crate) vertex_thinking: ThinkingPreference,
     pub(crate) openai: DirectProviderPreferences,
     pub(crate) anthropic: DirectProviderPreferences,
     pub(crate) bedrock: BedrockProviderPreferences,
@@ -222,6 +326,7 @@ impl Default for ProviderPreferences {
             vertex: ProviderScopePreferences::default(),
             vertex_models: Vec::new(),
             vertex_provider_cache_acknowledgement_version: None,
+            vertex_thinking: ThinkingPreference::Auto,
             openai: DirectProviderPreferences::openai(),
             anthropic: DirectProviderPreferences::anthropic(),
             bedrock: BedrockProviderPreferences::default(),
@@ -263,13 +368,30 @@ pub(crate) struct HostedPreferenceValues {
     pub(crate) questions: LanePreferences,
     pub(crate) providers: ProviderPreferences,
     pub(crate) default_steering: String,
+    /// Schema-1 migration sink: read so the template can become the first subscription, never
+    /// written again. Subscriptions are the only source of question templates.
+    #[serde(skip_serializing)]
     pub(crate) pinned_question_template: String,
+    /// Global "automatic questions" switch for every subscription (the schema-1 name is kept).
     pub(crate) pinned_auto_enabled: bool,
     pub(crate) pinned_auto_acknowledgement_version: Option<u32>,
     pub(crate) final_deadline_seconds: u32,
     pub(crate) egress_acknowledgement_version: Option<u32>,
     pub(crate) show_history_diagnostics: bool,
     pub(crate) show_live_metrics_by_default: bool,
+    // ----- schema 2 -----
+    /// Live first-text deadline, measured from the response headers.
+    pub(crate) live_first_text_seconds: u32,
+    /// Live terminal deadline from dispatch.
+    pub(crate) live_deadline_seconds: u32,
+    /// Question terminal deadline from enqueue.
+    pub(crate) question_deadline_seconds: u32,
+    /// Whether the learned correction lexicon participates in cleanup and prompts.
+    pub(crate) lexicon_enabled: bool,
+    /// Question subscriptions; the schema-1 pinned template migrates into the first one.
+    pub(crate) subscriptions: Vec<QuestionSubscriptionPreferences>,
+    /// Acknowledgement that automatic subscriptions make repeated paid calls.
+    pub(crate) subscriptions_auto_acknowledgement_version: Option<u32>,
 }
 
 impl Default for HostedPreferenceValues {
@@ -288,7 +410,62 @@ impl Default for HostedPreferenceValues {
             egress_acknowledgement_version: None,
             show_history_diagnostics: false,
             show_live_metrics_by_default: false,
+            live_first_text_seconds: DEFAULT_LIVE_FIRST_TEXT_SECONDS,
+            live_deadline_seconds: DEFAULT_LIVE_DEADLINE_SECONDS,
+            question_deadline_seconds: DEFAULT_QUESTION_DEADLINE_SECONDS,
+            lexicon_enabled: true,
+            subscriptions: Vec::new(),
+            subscriptions_auto_acknowledgement_version: None,
         }
+    }
+}
+
+impl HostedPreferenceValues {
+    /// Whether the owner acknowledged provider-side caching for `provider` (`openai`, `anthropic`,
+    /// `google`, `amazon`). Experimental transports have no controllable policy and report `false`.
+    pub(crate) fn provider_cache_acknowledged(&self, provider: &str) -> bool {
+        let version = match provider {
+            "openai" => self.providers.openai.provider_cache_acknowledgement_version,
+            "anthropic" => {
+                self.providers
+                    .anthropic
+                    .provider_cache_acknowledgement_version
+            }
+            "google" => self.providers.vertex_provider_cache_acknowledgement_version,
+            "amazon" => {
+                self.providers
+                    .bedrock
+                    .provider_cache_acknowledgement_version
+            }
+            _ => None,
+        };
+        version == Some(PROVIDER_CACHE_DISCLOSURE_VERSION)
+    }
+
+    /// Record or withdraw the provider-side caching acknowledgement. Returns `false` for a provider that
+    /// has no such control.
+    pub(crate) fn set_provider_cache_acknowledged(
+        &mut self,
+        provider: &str,
+        acknowledged: bool,
+    ) -> bool {
+        let value = acknowledged.then_some(PROVIDER_CACHE_DISCLOSURE_VERSION);
+        match provider {
+            "openai" => self.providers.openai.provider_cache_acknowledgement_version = value,
+            "anthropic" => {
+                self.providers
+                    .anthropic
+                    .provider_cache_acknowledgement_version = value
+            }
+            "google" => self.providers.vertex_provider_cache_acknowledgement_version = value,
+            "amazon" => {
+                self.providers
+                    .bedrock
+                    .provider_cache_acknowledgement_version = value
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -361,10 +538,45 @@ impl HostedPreferences {
         };
         let text = std::str::from_utf8(&bytes)
             .with_context(|| format!("decoding hosted preferences {}", path.display()))?;
-        let document: Self = toml::from_str(text)
+        let mut document: Self = toml::from_str(text)
             .with_context(|| format!("parsing hosted preferences {}", path.display()))?;
+        if document.schema == LEGACY_HOSTED_PREFERENCES_SCHEMA {
+            document = document.migrate_v1_to_v2();
+        }
         document.validate()?;
         Ok(document)
+    }
+
+    /// Schema 1 → 2: every new field already carries its default from `serde(default)`; the one semantic
+    /// move is the single pinned template becoming the first question subscription. The `pinned_*`
+    /// fields stay authoritative until the subscription coordinator replaces them, so both are kept in
+    /// step here rather than one being dropped.
+    fn migrate_v1_to_v2(mut self) -> Self {
+        self.schema = HOSTED_PREFERENCES_SCHEMA;
+        let values = &mut self.preferences;
+        let template = values.pinned_question_template.trim();
+        if !template.is_empty()
+            && !values
+                .subscriptions
+                .iter()
+                .any(|subscription| subscription.id == MIGRATED_PINNED_SUBSCRIPTION_ID)
+        {
+            values.subscriptions.insert(
+                0,
+                QuestionSubscriptionPreferences {
+                    id: MIGRATED_PINNED_SUBSCRIPTION_ID.to_owned(),
+                    title: "Pinned question".to_owned(),
+                    template: template.to_owned(),
+                    enabled: values.pinned_auto_enabled,
+                    ..QuestionSubscriptionPreferences::default()
+                },
+            );
+        }
+        if values.subscriptions_auto_acknowledgement_version.is_none() {
+            values.subscriptions_auto_acknowledgement_version =
+                values.pinned_auto_acknowledgement_version;
+        }
+        self
     }
 
     fn save_at(&self, path: &Path) -> Result<()> {
@@ -384,6 +596,20 @@ impl HostedPreferences {
             (1..=MAX_FINAL_DEADLINE_SECONDS).contains(&self.preferences.final_deadline_seconds),
             "hosted final deadline must be between 1 and {MAX_FINAL_DEADLINE_SECONDS} seconds"
         );
+        ensure!(
+            (1..=MAX_LIVE_FIRST_TEXT_SECONDS).contains(&self.preferences.live_first_text_seconds),
+            "hosted live first-text deadline must be between 1 and {MAX_LIVE_FIRST_TEXT_SECONDS} seconds"
+        );
+        ensure!(
+            (2..=MAX_LIVE_DEADLINE_SECONDS).contains(&self.preferences.live_deadline_seconds),
+            "hosted live deadline must be between 2 and {MAX_LIVE_DEADLINE_SECONDS} seconds"
+        );
+        ensure!(
+            (5..=MAX_QUESTION_DEADLINE_SECONDS)
+                .contains(&self.preferences.question_deadline_seconds),
+            "hosted question deadline must be between 5 and {MAX_QUESTION_DEADLINE_SECONDS} seconds"
+        );
+        validate_subscriptions(&self.preferences.subscriptions)?;
         if self.preferences.master_enabled {
             ensure!(
                 self.preferences.egress_acknowledgement_version == Some(EGRESS_DISCLOSURE_VERSION),
@@ -459,6 +685,89 @@ fn validate_direct_provider(
 ) -> Result<()> {
     if provider.credential.purpose() != expected {
         bail!("hosted credential reference does not match its provider slot");
+    }
+    Ok(())
+}
+
+fn validate_subscriptions(subscriptions: &[QuestionSubscriptionPreferences]) -> Result<()> {
+    ensure!(
+        subscriptions.len() <= MAX_SUBSCRIPTIONS,
+        "at most {MAX_SUBSCRIPTIONS} question subscriptions can be saved"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for subscription in subscriptions {
+        ensure!(
+            !subscription.id.is_empty()
+                && subscription.id.len() <= 32
+                && subscription
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
+            "{:?} is not a valid subscription id (a-z, 0-9, '-', at most 32)",
+            subscription.id
+        );
+        ensure!(
+            seen.insert(subscription.id.as_str()),
+            "duplicate subscription id {:?}",
+            subscription.id
+        );
+        ensure!(
+            subscription.title.len() <= 128 && !subscription.title.chars().any(char::is_control),
+            "subscription {:?} has an invalid title",
+            subscription.id
+        );
+        ensure!(
+            subscription.template.len() <= MAX_SUBSCRIPTION_TEMPLATE_BYTES
+                && !subscription
+                    .template
+                    .chars()
+                    .any(|ch| ch.is_control() && ch != '\n'),
+            "subscription {:?} has an invalid template",
+            subscription.id
+        );
+        ensure!(
+            matches!(
+                subscription.preset.as_str(),
+                "none" | "asked_of_me" | "running_summary" | "topic_watch"
+            ),
+            "subscription {:?} has an unknown preset {:?}",
+            subscription.id,
+            subscription.preset
+        );
+        ensure!(
+            matches!(
+                subscription.output.as_str(),
+                "paragraph" | "bullets" | "json_questions"
+            ),
+            "subscription {:?} has an unknown output format {:?}",
+            subscription.id,
+            subscription.output
+        );
+        ensure!(
+            matches!(
+                subscription.trigger.on_speakers.as_str(),
+                "all" | "them" | "me"
+            ),
+            "subscription {:?} has an unknown speaker filter",
+            subscription.id
+        );
+        ensure!(
+            matches!(
+                subscription.context.window.as_str(),
+                "whole" | "last_minutes" | "last_rows"
+            ),
+            "subscription {:?} has an unknown context window",
+            subscription.id
+        );
+        ensure!(
+            subscription.name_hints.len() <= 16
+                && subscription
+                    .name_hints
+                    .iter()
+                    .all(|hint| !hint.trim().is_empty() && hint.len() <= 64),
+            "subscription {:?} has invalid name hints",
+            subscription.id
+        );
     }
     Ok(())
 }
@@ -867,10 +1176,152 @@ revision = 4
 codex_experimental_approved = true
 "#;
         let loaded: HostedPreferences = toml::from_str(document).unwrap();
+        let loaded = loaded.migrate_v1_to_v2();
         loaded.validate().unwrap();
         assert!(loaded.values().providers.legacy_codex_experimental_approved);
         let rewritten = toml::to_string_pretty(&loaded).unwrap();
         assert!(!rewritten.contains("codex"), "{rewritten}");
+    }
+
+    #[test]
+    fn schema_one_migrates_to_two_with_the_pinned_template_as_a_subscription() {
+        let path = test_path("migrate-v1");
+        let document = r#"
+schema = 1
+revision = 12
+
+[preferences]
+master_enabled = true
+egress_acknowledgement_version = 1
+pinned_question_template = "What did we decide?"
+pinned_auto_enabled = true
+pinned_auto_acknowledgement_version = 1
+
+[preferences.live]
+enabled = true
+provider = "google"
+transport = "vertex_api"
+model = "claude-sonnet-4-5"
+local_cache = "reusable"
+provider_cache = "off"
+"#;
+        atomic_write_private(&path, document.as_bytes(), "hosted preferences").unwrap();
+        let loaded = HostedPreferences::load_at(&path).unwrap();
+        assert_eq!(loaded.schema(), HOSTED_PREFERENCES_SCHEMA);
+        assert_eq!(loaded.revision(), 12, "migration is not a user edit");
+        let values = loaded.values();
+        assert!(values.master_enabled);
+        assert_eq!(
+            values.live_first_text_seconds,
+            DEFAULT_LIVE_FIRST_TEXT_SECONDS
+        );
+        assert_eq!(values.live_deadline_seconds, DEFAULT_LIVE_DEADLINE_SECONDS);
+        assert_eq!(
+            values.question_deadline_seconds,
+            DEFAULT_QUESTION_DEADLINE_SECONDS
+        );
+        assert!(values.lexicon_enabled);
+        assert_eq!(values.providers.vertex_thinking, ThinkingPreference::Auto);
+        assert_eq!(values.subscriptions.len(), 1);
+        let pinned = &values.subscriptions[0];
+        assert_eq!(pinned.id, MIGRATED_PINNED_SUBSCRIPTION_ID);
+        assert_eq!(pinned.template, "What did we decide?");
+        assert!(pinned.enabled);
+        assert_eq!(pinned.preset, "none");
+        assert_eq!(pinned.output, "paragraph");
+        assert_eq!(values.subscriptions_auto_acknowledgement_version, Some(1));
+        // The template is read for migration only; the global auto switch keeps its schema-1 name.
+        assert_eq!(values.pinned_question_template, "What did we decide?");
+        assert!(values.pinned_auto_enabled);
+
+        // Saving rewrites the document as schema 2 without the migrated template, and the
+        // subscription carries it from then on.
+        loaded.save_at(&path).unwrap();
+        let reloaded = HostedPreferences::load_at(&path).unwrap();
+        assert_eq!(reloaded.values().pinned_question_template, "");
+        assert_eq!(reloaded.values().subscriptions, values.subscriptions);
+        assert!(reloaded.values().pinned_auto_enabled);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.starts_with("schema = 2"), "{rewritten}");
+        assert!(
+            !rewritten.contains("pinned_question_template"),
+            "{rewritten}"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn schema_two_deadline_and_subscription_bounds_are_enforced() {
+        let base = HostedPreferences::default();
+        assert!(
+            base.revise(|values| values.live_first_text_seconds = 0)
+                .is_err()
+        );
+        assert!(
+            base.revise(|values| values.live_deadline_seconds = 1)
+                .is_err()
+        );
+        assert!(
+            base.revise(|values| values.question_deadline_seconds = 301)
+                .is_err()
+        );
+        let tuned = base
+            .revise(|values| {
+                values.live_first_text_seconds = 12;
+                values.live_deadline_seconds = 30;
+                values.question_deadline_seconds = 60;
+                values.providers.vertex_thinking = ThinkingPreference::Omit;
+            })
+            .unwrap();
+        assert_eq!(tuned.revision(), 1);
+        assert_eq!(tuned.values().live_deadline_seconds, 30);
+
+        let subscription = |id: &str| QuestionSubscriptionPreferences {
+            id: id.to_owned(),
+            title: "Running summary".to_owned(),
+            template: "Summarise what we have discussed so far.".to_owned(),
+            enabled: true,
+            preset: "running_summary".to_owned(),
+            output: "bullets".to_owned(),
+            ..QuestionSubscriptionPreferences::default()
+        };
+        assert!(
+            base.revise(|values| values.subscriptions = vec![subscription("summary")])
+                .is_ok()
+        );
+        assert!(
+            base.revise(|values| values.subscriptions =
+                vec![subscription("summary"), subscription("summary")])
+                .is_err(),
+            "duplicate ids"
+        );
+        assert!(
+            base.revise(|values| values.subscriptions = vec![subscription("Not Valid!")])
+                .is_err()
+        );
+        assert!(
+            base.revise(|values| {
+                let mut bad = subscription("summary");
+                bad.output = "haiku".to_owned();
+                values.subscriptions = vec![bad];
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_cache_acknowledgement_round_trips() {
+        let mut values = HostedPreferenceValues::default();
+        assert!(!values.provider_cache_acknowledged("google"));
+        assert!(values.set_provider_cache_acknowledged("google", true));
+        assert!(values.provider_cache_acknowledged("google"));
+        assert!(!values.provider_cache_acknowledged("openai"));
+        assert!(values.set_provider_cache_acknowledged("google", false));
+        assert!(!values.provider_cache_acknowledged("google"));
+        assert!(
+            !values.set_provider_cache_acknowledged("chatgpt", true),
+            "experimental transports have no controllable policy"
+        );
     }
 
     #[test]

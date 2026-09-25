@@ -44,6 +44,9 @@ pub struct CleanupSettings {
     /// Only consulted where per-block AEC statistics exist — live with AEC on, or a batch recording with
     /// an `-aec-stats.json` sidecar.
     pub echo_audio_margin_db: f32,
+    /// Strip `um`/`uh`/`ah`/`er`/`hmm` and collapse repeated words and bigrams in every row
+    /// (`CORTI_CLEANUP_STRIP_FILLERS`; #154). On by default.
+    pub strip_fillers: bool,
 }
 
 impl Default for CleanupSettings {
@@ -56,6 +59,7 @@ impl Default for CleanupSettings {
             merge_gap_seconds: d.merge_gap_seconds,
             drop_backchannels: d.drop_backchannels,
             echo_audio_margin_db: d.echo_audio_margin_db,
+            strip_fillers: d.strip_fillers,
         }
     }
 }
@@ -254,6 +258,7 @@ impl AppConfig {
             } else {
                 d.echo_audio_margin_db
             },
+            strip_fillers: c.strip_fillers,
         }
     }
 }
@@ -364,6 +369,10 @@ impl AppConfig {
                 "CORTI_CLEANUP_DROP_BACKCHANNELS",
                 cfg.cleanup.drop_backchannels,
             );
+        }
+        if env_non_empty("CORTI_CLEANUP_STRIP_FILLERS").is_some() {
+            cfg.cleanup.strip_fillers =
+                env_bool("CORTI_CLEANUP_STRIP_FILLERS", cfg.cleanup.strip_fillers);
         }
 
         // A hand-edited/old config file bypasses the Settings validator. Keep the runtime memory contract
@@ -586,6 +595,7 @@ mod tests {
             "CORTI_CLEANUP_MERGE_GAP_SECONDS",
             "CORTI_CLEANUP_DROP_BACKCHANNELS",
             "CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB",
+            "CORTI_CLEANUP_STRIP_FILLERS",
         ] {
             // SAFETY: callers hold ENV_LOCK, so no other thread reads/writes env concurrently.
             unsafe { std::env::remove_var(k) };
@@ -630,6 +640,7 @@ mod tests {
                 merge_gap_seconds: 1.25,
                 drop_backchannels: false,
                 echo_audio_margin_db: 1.5,
+                strip_fillers: false,
             },
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
@@ -773,6 +784,7 @@ mod tests {
             ("CORTI_CLEANUP_MERGE_GAP_SECONDS", "0"),
             ("CORTI_CLEANUP_DROP_BACKCHANNELS", "0"),
             ("CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB", "-12.5"),
+            ("CORTI_CLEANUP_STRIP_FILLERS", "off"),
         ] {
             // SAFETY: still under ENV_LOCK.
             unsafe { std::env::set_var(key, value) };
@@ -787,6 +799,7 @@ mod tests {
                 merge_gap_seconds: 0.0,
                 drop_backchannels: false,
                 echo_audio_margin_db: -12.5,
+                strip_fillers: false,
             }
         );
         assert!(cfg.is_noop(), "every pass off ⇒ the whole stage is off");

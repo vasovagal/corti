@@ -154,6 +154,51 @@ impl fmt::Debug for VertexProjectMetadata {
     }
 }
 
+/// How the adapter asks a Gemini model to budget its reasoning before the first answer token.
+///
+/// Corti's live rewrite is latency-bound and must emit JSON as its first text, so the default per id class
+/// keeps thinking minimal. It is a catalog fact inferred from the id, never a runtime retry: a provider that
+/// rejects the field surfaces a sanitized 400 and the operator can switch the policy to
+/// [`ThinkingPolicy::Omit`]. Claude on Vertex is untouched (thinking there is opt-in already).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    /// Send no thinking configuration and accept the model default.
+    Omit,
+    /// `generationConfig.thinkingConfig.thinkingBudget` in tokens; `0` disables thinking where allowed.
+    Budget(u32),
+    /// `generationConfig.thinkingConfig.thinkingLevel` for models that expose levels rather than budgets.
+    Level(&'static str),
+}
+
+impl ThinkingControl {
+    /// The conservative default for an id class. Unknown ids get no control at all rather than a guess.
+    pub fn inferred(model_id: &str, publisher: VertexPublisher) -> Self {
+        if publisher != VertexPublisher::Google {
+            return Self::Omit;
+        }
+        if model_id.starts_with("gemini-2.5-flash") {
+            Self::Budget(0)
+        } else if model_id.starts_with("gemini-2.5-pro") {
+            Self::Budget(128)
+        } else if model_id.starts_with("gemini-3") {
+            Self::Level("low")
+        } else {
+            Self::Omit
+        }
+    }
+}
+
+/// Adapter-wide override for the per-model thinking control, so an operator can switch it off when a
+/// provider rejects the field instead of relying on a runtime retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingPolicy {
+    /// Use each model's inferred [`ThinkingControl`].
+    #[default]
+    Auto,
+    /// Never send a thinking configuration.
+    Omit,
+}
+
 /// One exact model from an authenticated project/region capability snapshot. The provider factory, not this
 /// crate, owns how that snapshot is obtained. No alias or default model is added by the adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +211,7 @@ pub struct VertexModel {
     deprecated: bool,
     benchmarked_for_live: bool,
     tariff_version: Option<String>,
+    thinking: ThinkingControl,
 }
 
 impl VertexModel {
@@ -180,6 +226,7 @@ impl VertexModel {
             return Err(VertexConfigurationError::InvalidModelLimits);
         }
         let publisher = VertexPublisher::for_model_id(exact_model_id.as_str());
+        let thinking = ThinkingControl::inferred(exact_model_id.as_str(), publisher);
         Ok(Self {
             exact_model_id,
             publisher,
@@ -192,7 +239,17 @@ impl VertexModel {
             deprecated: false,
             benchmarked_for_live: false,
             tariff_version: None,
+            thinking,
         })
+    }
+
+    pub const fn thinking(&self) -> ThinkingControl {
+        self.thinking
+    }
+
+    pub const fn with_thinking(mut self, value: ThinkingControl) -> Self {
+        self.thinking = value;
+        self
     }
 
     /// Publisher and documented limits from the id alone, for a model an operator typed rather than one the
@@ -259,6 +316,7 @@ pub struct VertexRestAdapter {
     metadata: VertexProjectMetadata,
     models: Vec<VertexModel>,
     options: DirectAdapterOptions,
+    thinking_policy: ThinkingPolicy,
     catalog: ModelCatalog,
     catalog_armed: bool,
 }
@@ -289,6 +347,7 @@ impl VertexRestAdapter {
             metadata,
             models,
             options: DirectAdapterOptions::default(),
+            thinking_policy: ThinkingPolicy::default(),
             catalog: ModelCatalog { models: Vec::new() },
             catalog_armed: false,
         })
@@ -299,8 +358,25 @@ impl VertexRestAdapter {
         Ok(self)
     }
 
+    /// Override the per-model thinking control for every request this adapter sends.
+    pub const fn with_thinking_policy(mut self, policy: ThinkingPolicy) -> Self {
+        self.thinking_policy = policy;
+        self
+    }
+
     pub const fn metadata(&self) -> &VertexProjectMetadata {
         &self.metadata
+    }
+
+    fn thinking_for(&self, model: &ModelId) -> ThinkingControl {
+        match self.thinking_policy {
+            ThinkingPolicy::Omit => ThinkingControl::Omit,
+            ThinkingPolicy::Auto => self
+                .models
+                .iter()
+                .find(|candidate| &candidate.exact_model_id == model)
+                .map_or(ThinkingControl::Omit, |candidate| candidate.thinking),
+        }
     }
 
     fn catalog_inner(&mut self, scope: &ProviderScope) -> Result<ModelCatalog, PostprocessError> {
@@ -372,7 +448,11 @@ impl VertexRestAdapter {
 
         let publisher = VertexPublisher::for_model_id(request.model.as_str());
         let body = match publisher {
-            VertexPublisher::Google => vertex_request_body(request, self.options.max_output_tokens),
+            VertexPublisher::Google => vertex_request_body(
+                request,
+                self.options.max_output_tokens,
+                self.thinking_for(&request.model),
+            ),
             VertexPublisher::Anthropic => crate::anthropic_wire::request_body(
                 request,
                 self.options.max_output_tokens,
@@ -663,6 +743,7 @@ fn validate_vertex_request<'a>(
 fn vertex_request_body(
     request: &HostedRequest,
     max_output_tokens: u64,
+    thinking: ThinkingControl,
 ) -> Result<Vec<u8>, PostprocessError> {
     let prompt = request.prompt.messages();
     let system_parts = prompt[..2]
@@ -673,6 +754,21 @@ fn vertex_request_body(
         .iter()
         .map(|message| json!({"text": message.content()}))
         .collect::<Vec<_>>();
+    let mut generation_config = json!({
+        "candidateCount": 1,
+        "maxOutputTokens": max_output_tokens,
+        "responseMimeType": "application/json",
+        "responseJsonSchema": output_schema(request.prompt.task())
+    });
+    match thinking {
+        ThinkingControl::Omit => {}
+        ThinkingControl::Budget(budget) => {
+            generation_config["thinkingConfig"] = json!({"thinkingBudget": budget});
+        }
+        ThinkingControl::Level(level) => {
+            generation_config["thinkingConfig"] = json!({"thinkingLevel": level});
+        }
+    }
     json_bytes(&json!({
         "systemInstruction": {
             "parts": system_parts
@@ -681,12 +777,7 @@ fn vertex_request_body(
             "role": "user",
             "parts": user_parts
         }],
-        "generationConfig": {
-            "candidateCount": 1,
-            "maxOutputTokens": max_output_tokens,
-            "responseMimeType": "application/json",
-            "responseJsonSchema": output_schema(request.prompt.task())
-        }
+        "generationConfig": generation_config
     }))
 }
 
@@ -775,7 +866,10 @@ impl VertexStreamState {
             return Err(ExecFailure::new(ErrorCode::PolicyBlocked, true));
         }
         if let Some(model_version) = chunk.model_version.as_deref()
-            && resource_tail(model_version) != request.model.as_str()
+            && !crate::common::served_model_matches(
+                resource_tail(model_version),
+                request.model.as_str(),
+            )
         {
             return Err(ExecFailure::new(ErrorCode::ModelUnavailable, true));
         }
@@ -1107,6 +1201,15 @@ struct GoogleErrorEnvelope {
 
 fn vertex_error_code(status: u16, bytes: &[u8]) -> Option<ErrorCode> {
     let envelope: GoogleErrorEnvelope = serde_json::from_slice(bytes).ok()?;
+    // The Google `status` is a fixed vocabulary (INVALID_ARGUMENT, PERMISSION_DENIED, …); the free-form
+    // `message` is never logged. A 400 here is the signal that a body field (for example the thinking
+    // configuration) was refused, which the operator resolves through the adapter's thinking policy.
+    tracing::warn!(
+        target: "corti::hosted",
+        http_status = status,
+        google_status = crate::common::sanitized_identifier(envelope.error.status.as_deref()),
+        "Vertex rejected a hosted request"
+    );
     Some(vertex_stream_error_code_with_http(&envelope.error, status))
 }
 

@@ -17,8 +17,9 @@ import {
   promptForProviderSecret,
   refreshHostedProvider,
   replaceHostedWordBank,
+  runHostedSubscriptionNow,
   saveBedrockSetup,
-  setHostedPinnedQuestion,
+  setHostedSubscriptions,
   submitHostedQuestion,
   updateHostedProviderScope,
   updateHostedSteering,
@@ -56,7 +57,7 @@ describe("hosted Tauri command bindings", () => {
     });
   });
 
-  it("uses secret-free scope, catalog refresh, and pinned-template commands", async () => {
+  it("uses secret-free scope, catalog refresh, and subscription commands", async () => {
     await updateHostedProviderScope(8, {
       provider: "google",
       transport: "vertex_api",
@@ -82,12 +83,28 @@ describe("hosted Tauri command bindings", () => {
       request: { provider: "google", transport: "vertex_api" },
     });
 
-    await setHostedPinnedQuestion(9, "Synthetic pinned question");
-    expect(bridge.invoke).toHaveBeenLastCalledWith("set_hosted_pinned_question", {
+    const subscription = {
+      id: "asked-of-me",
+      title: "Asked of me",
+      template: "",
+      enabled: true,
+      preset: "asked_of_me" as const,
+      output: "bullets" as const,
+      trigger: { quiet_ms: 1_000, min_new_words: 1, min_new_speech_ms: 0, min_interval_ms: 0, on_speakers: "them" as const },
+      context: { window: "last_minutes" as const, minutes: 5, rows: 0 },
+      name_hints: ["Xavier"],
+    };
+    await setHostedSubscriptions(9, [subscription]);
+    expect(bridge.invoke).toHaveBeenLastCalledWith("set_hosted_subscriptions", {
       request: {
         observed_state_revision: 9,
-        template: "Synthetic pinned question",
+        subscriptions: [subscription],
       },
+    });
+
+    await runHostedSubscriptionNow("asked-of-me");
+    expect(bridge.invoke).toHaveBeenLastCalledWith("run_hosted_subscription_now", {
+      id: "asked-of-me",
     });
   });
 

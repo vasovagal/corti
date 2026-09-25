@@ -165,6 +165,9 @@ pub struct RequestKeyMaterial<'a> {
     pub billing_basis: BillingBasis,
     pub cache_policy: CachePolicy,
     pub word_bank_canonical_digest: &'a str,
+    /// The learned lexicon's content digest: its corrections are in the prompt prefix and its rules
+    /// rewrote the rows, so a different lexicon is a different request.
+    pub lexicon_canonical_digest: &'a str,
     pub effective_steering: &'a str,
     pub targets: &'a [TranscriptRow],
     pub context: &'a [TranscriptRow],
@@ -177,7 +180,7 @@ pub struct RequestKeyMaterial<'a> {
 impl RequestKeyMaterial<'_> {
     fn encode(self, encoder: &mut CanonicalCborHmac) {
         // Schema-defined map order is part of key-v2. Values use shortest-form CBOR integers and NFC text.
-        encoder.map(19);
+        encoder.map(20);
         encoder.key("provider_id");
         encoder.text(self.provider.as_str());
         encoder.key("transport_id");
@@ -206,6 +209,8 @@ impl RequestKeyMaterial<'_> {
         encode_cache_policy(encoder, self.cache_policy);
         encoder.key("word_bank_canonical_digest");
         encoder.text(self.word_bank_canonical_digest);
+        encoder.key("lexicon_canonical_digest");
+        encoder.text(self.lexicon_canonical_digest);
         encoder.key("steering_canonical_digest");
         let steering: String = self.effective_steering.nfc().collect();
         encoder.byte_string(&Sha256::digest(steering.as_bytes()));
@@ -236,11 +241,13 @@ pub struct ProviderCacheKeyMaterial<'a> {
     pub prompt_task: PromptTask,
     pub provider_cache_mode: crate::ProviderCacheMode,
     pub word_bank_canonical_digest: &'a str,
+    /// The lexicon's corrections are part of the stable prefix, so its digest is part of its identity.
+    pub lexicon_canonical_digest: &'a str,
 }
 
 impl ProviderCacheKeyMaterial<'_> {
     fn encode(self, encoder: &mut CanonicalCborHmac) {
-        encoder.map(12);
+        encoder.map(13);
         encoder.key("provider_id");
         encoder.text(self.provider.as_str());
         encoder.key("transport_id");
@@ -265,6 +272,8 @@ impl ProviderCacheKeyMaterial<'_> {
         encoder.text(provider_cache_name(self.provider_cache_mode));
         encoder.key("word_bank_canonical_digest");
         encoder.text(self.word_bank_canonical_digest);
+        encoder.key("lexicon_canonical_digest");
+        encoder.text(self.lexicon_canonical_digest);
     }
 }
 
@@ -477,6 +486,7 @@ mod tests {
                 provider: ProviderCacheMode::Off,
             },
             word_bank_canonical_digest: "bank-digest",
+            lexicon_canonical_digest: "lexicon-digest",
             effective_steering: "synthetic policy",
             targets: target,
             context: &[],
@@ -558,6 +568,9 @@ mod tests {
         changed.word_bank_canonical_digest = "different-bank-digest";
         assert_changed!(changed);
         let mut changed = base;
+        changed.lexicon_canonical_digest = "different-lexicon-digest";
+        assert_changed!(changed);
+        let mut changed = base;
         changed.effective_steering = "different synthetic policy";
         assert_changed!(changed);
         let mut changed = base;
@@ -603,6 +616,7 @@ mod tests {
             prompt_task: PromptTask::Rewrite,
             provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
             word_bank_canonical_digest: material.word_bank_canonical_digest,
+            lexicon_canonical_digest: material.lexicon_canonical_digest,
         };
         let provider = ProviderCacheKey::derive(&key, &provider_material);
         assert_ne!(
@@ -633,6 +647,7 @@ mod tests {
             prompt_task: PromptTask::Rewrite,
             provider_cache_mode: request_material.cache_policy.provider,
             word_bank_canonical_digest: "opaque-bank-digest",
+            lexicon_canonical_digest: "opaque-lexicon-digest",
         };
         let provider = ProviderCacheKey::derive(&key, &provider_material);
         assert!(!provider.as_str().contains("bank"));

@@ -1,19 +1,15 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type FormEvent,
-  type RefObject,
-} from "react";
+import { useMemo, useState, type FormEvent, type RefObject } from "react";
 import {
   cancelHostedQuestion,
-  setHostedPinnedQuestion,
+  runHostedSubscriptionNow,
+  setHostedSubscriptions,
   submitHostedQuestion,
   type HostedAssistantExchange,
   type HostedAssistantSnapshot,
+  type HostedAssistantSubscription,
   type HostedPatchInput,
   type HostedSettingsDto,
+  type HostedSubscriptionPreset,
   type PreferencesSection,
 } from "../lib/api";
 import {
@@ -31,6 +27,15 @@ import {
   tokenEntries,
   type LiveCallDetail,
 } from "../lib/liveHosted";
+import {
+  MAX_SUBSCRIPTIONS,
+  displayedAnswer,
+  newSubscriptionId,
+  orderAssistantCards,
+  presetDefaults,
+  presetLabel,
+  splitAnswerLines,
+} from "../lib/subscriptions";
 import { HostedDialog, HostedSwitch } from "../settings/HostedCommon";
 
 interface AssistantProps {
@@ -47,6 +52,8 @@ interface AssistantProps {
   onPatch: (patch: HostedPatchInput, success: string) => Promise<boolean>;
   onOpenPreferences: (section: PreferencesSection) => Promise<void>;
 }
+
+const QUICK_ADD_PRESETS: HostedSubscriptionPreset[] = ["asked_of_me", "running_summary"];
 
 export function Assistant({
   snapshot,
@@ -65,70 +72,17 @@ export function Assistant({
   const [question, setQuestion] = useState("");
   const [questionBusy, setQuestionBusy] = useState("");
   const [questionError, setQuestionError] = useState<HostedActionGuidance | null>(null);
-  const [pinnedDraft, setPinnedDraft] = useState("");
-  const [pinnedDirty, setPinnedDirty] = useState(false);
-  const [pinnedSaveState, setPinnedSaveState] = useState("");
+  const [subscriptionBusy, setSubscriptionBusy] = useState("");
+  const [subscriptionStatus, setSubscriptionStatus] = useState("");
   const [confirmAuto, setConfirmAuto] = useState(false);
-  const pinnedInitialized = useRef(false);
-  const pinnedSaveSequence = useRef(0);
-  const lastAcceptedPinned = useRef<HostedAssistantExchange | null>(null);
-
-  useEffect(() => {
-    if (snapshot?.pinned?.status === "completed" && snapshot.pinned.answer) {
-      lastAcceptedPinned.current = snapshot.pinned;
-    }
-    if (!pinnedInitialized.current && snapshot) {
-      if (snapshot.pinned?.question) setPinnedDraft(snapshot.pinned.question);
-      pinnedInitialized.current = true;
-    }
-  }, [snapshot]);
-
-  useEffect(() => {
-    if (!pinnedDirty) return;
-    const sequence = ++pinnedSaveSequence.current;
-    setPinnedSaveState("Waiting to save…");
-    const timer = window.setTimeout(() => {
-      const observedRevision = settings?.state_revision;
-      if (observedRevision === undefined) {
-        setPinnedSaveState("Save unavailable");
-        return;
-      }
-      setPinnedSaveState("Saving…");
-      void setHostedPinnedQuestion(observedRevision, pinnedDraft)
-        .then(async (result) => {
-          if (pinnedSaveSequence.current !== sequence) return;
-          if (result.status === "conflict" || result.status === "invalid") {
-            setPinnedSaveState(
-              result.status === "conflict"
-                ? "Settings changed; review and try again"
-                : "Template was invalid; nothing was saved",
-            );
-            await onRefresh();
-            return;
-          }
-          setPinnedDirty(false);
-          setPinnedSaveState(pinnedDraft.trim() ? "Saved" : "Cleared");
-          await onRefresh();
-        })
-        .catch((reason) => {
-          if (pinnedSaveSequence.current === sequence) {
-            setPinnedSaveState(`Save failed: ${String(reason)}`);
-          }
-        });
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [onRefresh, pinnedDirty, pinnedDraft, settings?.state_revision]);
 
   const exchanges = useMemo(
     () => boundAssistantExchanges(snapshot?.exchanges ?? []),
     [snapshot?.exchanges],
   );
   const omitted = Math.max(0, (snapshot?.exchanges.length ?? 0) - exchanges.length);
-  const pinned = snapshot?.pinned ?? null;
-  const shownPinnedAnswer = pinned?.answer ?? lastAcceptedPinned.current?.answer ?? null;
-  const pinnedAnswerIsEarlier = Boolean(
-    shownPinnedAnswer && pinned && pinned.status !== "completed" && !pinned.answer,
-  );
+  const cards = useMemo(() => orderAssistantCards(snapshot?.subscriptions ?? []), [snapshot?.subscriptions]);
+  const saved = settings?.subscriptions ?? [];
   const questionConfiguration = settings
     ? laneConfigurationGuidance(settings, "question")
     : null;
@@ -139,9 +93,7 @@ export function Assistant({
       settings?.control.master_enabled &&
       settings.control.questions.enabled,
   );
-  const templatePresent = Boolean(
-    settings && (settings.control.pinned_question_revision > 0 || pinnedDraft.trim()),
-  );
+  const autoEnabled = Boolean(settings?.control.pinned_auto_enabled);
 
   async function submitQuestion(event: FormEvent) {
     event.preventDefault();
@@ -173,6 +125,75 @@ export function Assistant({
       setQuestionBusy("");
     }
   }
+
+  async function addPreset(preset: HostedSubscriptionPreset) {
+    if (!settings || subscriptionBusy) return;
+    setSubscriptionBusy(`add-${preset}`);
+    setSubscriptionStatus("");
+    try {
+      const id = newSubscriptionId(preset, saved.map((item) => item.id));
+      const result = await setHostedSubscriptions(settings.state_revision, [
+        ...saved,
+        presetDefaults(preset, id),
+      ]);
+      if (result.status === "conflict") {
+        setSubscriptionStatus("Settings changed elsewhere; refreshed. Try again.");
+      } else if (result.status === "invalid" || result.status === "disabled_for_session") {
+        setSubscriptionStatus("The question could not be saved.");
+      } else {
+        setSubscriptionStatus(`${presetLabel(preset)} added.`);
+      }
+      await onRefresh();
+    } catch (reason) {
+      setSubscriptionStatus(`Could not add the question: ${String(reason)}`);
+    } finally {
+      setSubscriptionBusy("");
+    }
+  }
+
+  async function setEnabled(id: string, enabled: boolean) {
+    if (!settings || subscriptionBusy) return;
+    setSubscriptionBusy(`toggle-${id}`);
+    setSubscriptionStatus("");
+    try {
+      const next = saved.map((item) => (item.id === id ? { ...item, enabled } : item));
+      const result = await setHostedSubscriptions(settings.state_revision, next);
+      if (result.status === "conflict") {
+        setSubscriptionStatus("Settings changed elsewhere; refreshed. Try again.");
+      }
+      await onRefresh();
+    } catch (reason) {
+      setSubscriptionStatus(`Could not update the question: ${String(reason)}`);
+    } finally {
+      setSubscriptionBusy("");
+    }
+  }
+
+  async function runNow(id: string) {
+    if (subscriptionBusy) return;
+    setSubscriptionBusy(`run-${id}`);
+    setSubscriptionStatus("");
+    try {
+      await runHostedSubscriptionNow(id);
+      await onRefresh();
+    } catch (reason) {
+      setSubscriptionStatus(`Could not run the question: ${String(reason)}`);
+    } finally {
+      setSubscriptionBusy("");
+    }
+  }
+
+  const subscriptionGuidance = !sessionActive
+    ? "Start the microphone test or join a live call to run subscribed questions."
+    : questionConfiguration
+      ? questionConfiguration.message
+      : !settings?.control.questions.enabled
+        ? "Enable Questions to run subscribed questions."
+        : !settings.control.master_enabled
+          ? "Turn on Master to allow subscribed questions to run."
+          : !autoEnabled
+            ? "Turn on Automatic questions, or use Catch up now on a card."
+            : null;
 
   return (
     <div className="live-assistant-panel">
@@ -207,102 +228,108 @@ export function Assistant({
         </div>
       )}
 
-      <section className="live-pinned-card" aria-labelledby="live-pinned-heading">
+      <section className="live-pinned-card live-subscriptions" aria-labelledby="live-subscriptions-heading">
         <header>
           <div>
-            <h3 id="live-pinned-heading">Pinned question</h3>
-            <span>{snapshot?.pinned_run_count ?? 0} session run(s)</span>
+            <h3 id="live-subscriptions-heading">Subscribed questions</h3>
+            <span>
+              {cards.length} / {MAX_SUBSCRIPTIONS} saved · re-asked as the transcript grows
+            </span>
           </div>
-          <span className={templatePresent ? "live-answer-state live-answer-completed" : "live-answer-state"}>
-            {templatePresent ? "Saved" : "Not set"}
-          </span>
-        </header>
-        <label className="live-assistant-field">
-          <span>{templatePresent ? "Replace or edit the one pinned question" : "Pin one question"}</span>
-          <textarea
-            rows={2}
-            maxLength={32 * 1024}
-            value={pinnedDraft}
-            placeholder={
-              templatePresent && !pinnedDraft
-                ? "Enter a complete replacement for the saved question"
-                : "Ask for the current decision, risk, or next step"
-            }
-            onChange={(event) => {
-              setPinnedDraft(event.target.value);
-              setPinnedDirty(true);
-            }}
-          />
-        </label>
-        <p
-          className={`live-debounce-state${pinnedSaveState.startsWith("Save failed") ? " live-assistant-error" : ""}`}
-          role={pinnedSaveState.startsWith("Save failed") ? "alert" : "status"}
-          aria-live="polite"
-        >
-          {pinnedSaveState || "Edits save after 500 ms of quiet."}
-        </p>
-        {pinnedSaveState.startsWith("Save failed") && (
           <button
-            className="btn-quiet live-inline-repair"
+            className="btn-quiet"
             type="button"
             onClick={() => void onOpenPreferences("hosted-language")}
           >
-            Edit pinned question in Preferences
+            Manage
           </button>
-        )}
+        </header>
 
         {settings && (
           <HostedSwitch
-            label="Automatic updates"
+            label="Automatic questions"
             description={
-              settings.control.pinned_auto_enabled
-                ? "Meaningful transcript progress can run this question again."
-                : "Off · enabling requires repeated-cost acknowledgement."
+              autoEnabled
+                ? "Each subscription runs again when its own thresholds are met."
+                : "Off · enabling requires repeated-cost acknowledgement. Catch up now still works per card."
             }
-            checked={settings.control.pinned_auto_enabled}
-            disabled={!templatePresent || !settings.control.questions.enabled || !questionsConfigured}
+            checked={autoEnabled}
+            disabled={!settings.control.questions.enabled || !questionsConfigured}
             onChange={(enabled) => {
               if (enabled) setConfirmAuto(true);
               else {
                 void onPatch(
                   { kind: "set_pinned_auto", enabled: false, acknowledged: false },
-                  "Automatic pinned questions are off.",
+                  "Automatic questions are off.",
                 );
               }
             }}
           />
         )}
 
-        {templatePresent && (
-          <p className="live-pinned-guidance">
-            {!sessionActive
-              ? "Start the microphone test or join a live call to run this question."
-              : questionConfiguration
-                ? questionConfiguration.message
-                : !settings?.control.questions.enabled
-                  ? "Enable Questions to run the pinned question."
-                  : !settings.control.master_enabled
-                    ? "Turn on Master to allow the pinned question to run."
-                    : !settings.control.pinned_auto_enabled
-                      ? "Turn on Automatic updates to run this question as the transcript grows."
-                      : (snapshot?.pinned_run_count ?? 0) === 0
-                        ? "Waiting for enough context: about 40 words or 30 seconds of speech, followed by a short pause. Existing context counts after setup."
-                        : "The next update runs after about 40 new words or 30 seconds of new speech and a short pause."}
-          </p>
+        {subscriptionGuidance && cards.length > 0 && (
+          <p className="live-pinned-guidance">{subscriptionGuidance}</p>
         )}
 
-        {pinned ? (
-          <QuestionResult
-            exchange={pinned}
-            shownAnswer={shownPinnedAnswer}
-            answerIsEarlier={pinnedAnswerIsEarlier}
-            call={calls.find((item) => item.call_id === pinned.call_id)}
-            detailsEnabled={detailsEnabled}
-            onOpenPreferences={onOpenPreferences}
-          />
+        {cards.length === 0 ? (
+          <div className="live-subscription-empty">
+            <p className="live-answer-placeholder">
+              No subscribed questions yet. Add one to keep a running answer while you listen.
+            </p>
+            <div className="live-subscription-add">
+              {QUICK_ADD_PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  className="btn-secondary"
+                  type="button"
+                  disabled={!settings || Boolean(subscriptionBusy)}
+                  onClick={() => void addPreset(preset)}
+                >
+                  {subscriptionBusy === `add-${preset}` ? "Adding…" : `Add “${presetLabel(preset)}”`}
+                </button>
+              ))}
+            </div>
+          </div>
         ) : (
-          <p className="live-answer-placeholder">
-            The running answer and its transcript revision will appear here.
+          <ol className="live-subscription-cards">
+            {cards.map((card) => (
+              <li key={card.id}>
+                <SubscriptionCard
+                  card={card}
+                  call={card.exchange ? calls.find((item) => item.call_id === card.exchange?.call_id) : undefined}
+                  detailsEnabled={detailsEnabled}
+                  sessionActive={sessionActive}
+                  questionsReady={questionsReady}
+                  autoEnabled={autoEnabled}
+                  busy={subscriptionBusy}
+                  onRunNow={() => void runNow(card.id)}
+                  onSetEnabled={(enabled) => void setEnabled(card.id, enabled)}
+                  onOpenPreferences={onOpenPreferences}
+                />
+              </li>
+            ))}
+          </ol>
+        )}
+        {cards.length > 0 && cards.length < MAX_SUBSCRIPTIONS && (
+          <div className="live-subscription-add">
+            {QUICK_ADD_PRESETS.filter((preset) => !cards.some((card) => card.preset === preset)).map(
+              (preset) => (
+                <button
+                  key={preset}
+                  className="btn-quiet"
+                  type="button"
+                  disabled={!settings || Boolean(subscriptionBusy)}
+                  onClick={() => void addPreset(preset)}
+                >
+                  {subscriptionBusy === `add-${preset}` ? "Adding…" : `+ ${presetLabel(preset)}`}
+                </button>
+              ),
+            )}
+          </div>
+        )}
+        {subscriptionStatus && (
+          <p className="live-debounce-state" role="status" aria-live="polite">
+            {subscriptionStatus}
           </p>
         )}
       </section>
@@ -414,8 +441,9 @@ export function Assistant({
               <li key={exchange.call_id}>
                 <QuestionResult
                   exchange={exchange}
-                  shownAnswer={exchange.answer}
+                  shownAnswer={exchange.answer ?? exchange.partial_answer ?? null}
                   answerIsEarlier={false}
+                  answerIsPartial={!exchange.answer && Boolean(exchange.partial_answer)}
                   call={calls.find((item) => item.call_id === exchange.call_id)}
                   detailsEnabled={detailsEnabled}
                   onOpenPreferences={onOpenPreferences}
@@ -440,18 +468,174 @@ export function Assistant({
         onConfirm={() => {
           void onPatch(
             { kind: "set_pinned_auto", enabled: true, acknowledged: true },
-            "Automatic pinned questions enabled.",
+            "Automatic questions enabled.",
           ).then((saved) => {
             if (saved) setConfirmAuto(false);
           });
         }}
       >
         <p>
-          Each meaningful transcript update can make another paid request. Cancellation after dispatch may
-          still be billed; an exact local cache hit is not guaranteed.
+          Each subscribed question can make another paid request whenever its thresholds are met.
+          Cancellation after dispatch may still be billed; an exact local cache hit is not guaranteed.
         </p>
       </HostedDialog>
     </div>
+  );
+}
+
+function SubscriptionCard({
+  card,
+  call,
+  detailsEnabled,
+  sessionActive,
+  questionsReady,
+  autoEnabled,
+  busy,
+  onRunNow,
+  onSetEnabled,
+  onOpenPreferences,
+}: {
+  card: HostedAssistantSubscription;
+  call: LiveCallDetail | undefined;
+  detailsEnabled: boolean;
+  sessionActive: boolean;
+  questionsReady: boolean;
+  autoEnabled: boolean;
+  busy: string;
+  onRunNow: () => void;
+  onSetEnabled: (enabled: boolean) => void;
+  onOpenPreferences: (section: PreferencesSection) => Promise<void>;
+}) {
+  const exchange = card.exchange;
+  const shown = displayedAnswer(card);
+  const askedOfMe = card.preset === "asked_of_me";
+  const failed = exchange?.status === "failed" || exchange?.status === "canceled";
+  const failureGuidance = exchange?.error ? hostedErrorGuidance(exchange.error) : null;
+  const costLabel = exchange?.cost_label ?? (call ? formatHostedCost(call.cost) : null);
+  const usage = exchange?.usage ?? call?.usage;
+  const tokens = usage ? tokenEntries(usage) : [];
+  const stateLabel = exchange
+    ? questionStatusLabel(exchange.status)
+    : card.pending
+      ? "Waiting for quiet"
+      : card.enabled
+        ? "Watching"
+        : "Paused";
+  const stateClass = exchange
+    ? `live-answer-state live-answer-${exchange.status}`
+    : "live-answer-state";
+  return (
+    <article
+      className={`live-answer live-subscription-card${askedOfMe ? " live-subscription-asked" : ""}${card.enabled ? "" : " live-subscription-paused"}`}
+      data-subscription={card.id}
+    >
+      <header>
+        <div className="live-subscription-title">
+          <strong>{askedOfMe ? "Last question for you" : card.title}</strong>
+          <span>
+            {presetLabel(card.preset)} · {card.run_count} run(s)
+          </span>
+        </div>
+        <span className={stateClass}>{card.in_flight && !exchange ? "Queued" : stateLabel}</span>
+      </header>
+      {exchange && <span className="live-subscription-revision">As of transcript r{exchange.as_of_revision.toLocaleString()}</span>}
+      {shown.text ? (
+        <div className="live-answer-copy">
+          {shown.kind === "previous" && (
+            <p className="live-answer-updating">Updating · previous accepted answer shown</p>
+          )}
+          {shown.kind === "partial" && <p className="live-answer-updating">Streaming…</p>}
+          <AnswerBody text={shown.text} />
+        </div>
+      ) : failed ? (
+        <p className="live-answer-fallback">
+          No answer applied{exchange?.error ? ` · ${errorLabel(exchange.error)}` : ""}. The transcript remains
+          available.
+        </p>
+      ) : exchange ? (
+        <p className="live-answer-running">{questionStatusLabel(exchange.status)}…</p>
+      ) : (
+        <p className="live-answer-placeholder">
+          {!card.enabled
+            ? "Paused. Turn it on to run again."
+            : !sessionActive
+              ? "Runs once a live session is active."
+              : askedOfMe
+                ? "Waits for the other speakers to ask you something, then a short pause. Use Catch up now to check right away."
+                : autoEnabled
+                  ? "Waiting for enough new context: about 40 words or 30 seconds of speech, then a short pause."
+                  : "Automatic questions are off. Use Catch up now to run it once."}
+        </p>
+      )}
+      {failureGuidance && (
+        <div className="live-answer-remedy">
+          <span>{failureGuidance.message}</span>
+          {failureGuidance.section && failureGuidance.actionLabel && (
+            <button
+              className="btn-quiet"
+              type="button"
+              onClick={() => void onOpenPreferences(failureGuidance.section!)}
+            >
+              {failureGuidance.actionLabel}
+            </button>
+          )}
+        </div>
+      )}
+      {exchange?.context_truncated && <p className="live-context-note">Earlier transcript omitted.</p>}
+      <div className="live-answer-accounting">
+        <span>{costLabel ?? (exchange ? (failed ? "Cost unavailable" : "Cost pending") : "No run yet")}</span>
+        {detailsEnabled && exchange && <span>{cacheObservationLabel(exchange.cache ?? call?.cache)}</span>}
+      </div>
+      {detailsEnabled && tokens.length > 0 && (
+        <dl className="live-answer-tokens" aria-label="Answer token usage">
+          {tokens.map(([label, value]) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      <div className="live-subscription-actions">
+        <button
+          className="btn-secondary"
+          type="button"
+          disabled={!questionsReady || card.in_flight || Boolean(busy)}
+          onClick={onRunNow}
+          title={card.in_flight ? "A run is already in progress" : "Ask now, whatever the thresholds say"}
+        >
+          {busy === `run-${card.id}` ? "Queuing…" : card.in_flight ? "Running…" : "Catch up now"}
+        </button>
+        <HostedSwitch
+          compact
+          label={card.enabled ? "On" : "Off"}
+          checked={card.enabled}
+          disabled={Boolean(busy)}
+          onChange={onSetEnabled}
+        />
+      </div>
+    </article>
+  );
+}
+
+/** Bullet answers render as a list; everything else as paragraphs. Plain text only — never HTML. */
+function AnswerBody({ text }: { text: string }) {
+  const { bullets, lines } = splitAnswerLines(text);
+  if (bullets) {
+    return (
+      <ul className="live-answer-bullets">
+        {lines.map((line, index) => (
+          <li key={`${index}-${line}`}>{line}</li>
+        ))}
+      </ul>
+    );
+  }
+  return (
+    <>
+      {lines.map((line, index) => (
+        <p key={`${index}-${line}`}>{line}</p>
+      ))}
+    </>
   );
 }
 
@@ -459,6 +643,7 @@ function QuestionResult({
   exchange,
   shownAnswer,
   answerIsEarlier,
+  answerIsPartial = false,
   call,
   detailsEnabled,
   onOpenPreferences,
@@ -468,6 +653,7 @@ function QuestionResult({
   exchange: HostedAssistantExchange;
   shownAnswer: string | null;
   answerIsEarlier: boolean;
+  answerIsPartial?: boolean;
   call: LiveCallDetail | undefined;
   detailsEnabled: boolean;
   onOpenPreferences: (section: PreferencesSection) => Promise<void>;
@@ -490,7 +676,8 @@ function QuestionResult({
       {shownAnswer ? (
         <div className="live-answer-copy">
           {answerIsEarlier && <p className="live-answer-updating">Updating · previous accepted answer shown</p>}
-          <p>{shownAnswer}</p>
+          {answerIsPartial && <p className="live-answer-updating">Streaming…</p>}
+          <AnswerBody text={shownAnswer} />
         </div>
       ) : failed ? (
         <p className="live-answer-fallback">

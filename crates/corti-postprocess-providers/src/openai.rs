@@ -472,7 +472,21 @@ fn openai_request_body(
     if let Some(cache_key) = cache_key {
         body["prompt_cache_key"] = Value::String(cache_key.as_str().to_owned());
     }
+    if wants_low_reasoning_effort(request.model.as_str()) {
+        // Reasoning models think before the first output token by default; Corti's rewrite is
+        // latency-bound and structured, so ask for the lowest effort the family accepts.
+        body["reasoning"] = json!({"effort": "low"});
+    }
     json_bytes(&body)
+}
+
+/// Reasoning-capable OpenAI families: `gpt-5*` and the `o<digit>` series. Older families reject the
+/// `reasoning` object, so it is only sent where the id class is known to accept it.
+fn wants_low_reasoning_effort(model_id: &str) -> bool {
+    model_id.starts_with("gpt-5")
+        || (model_id.len() >= 2
+            && model_id.starts_with('o')
+            && model_id.as_bytes()[1].is_ascii_digit())
 }
 
 struct OpenAiStreamState {
@@ -541,12 +555,14 @@ impl OpenAiStreamState {
             "response.completed" => {
                 let payload: OpenAiCompleted = serde_json::from_str(&event.data)
                     .map_err(|_| ExecFailure::new(ErrorCode::MalformedOutput, true))?;
-                if payload.response.model != request.model.as_str()
-                    || payload
-                        .response
-                        .status
-                        .as_deref()
-                        .is_some_and(|status| status != "completed")
+                if !crate::common::served_model_matches(
+                    &payload.response.model,
+                    request.model.as_str(),
+                ) || payload
+                    .response
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status != "completed")
                 {
                     return Err(ExecFailure::new(ErrorCode::ModelUnavailable, true));
                 }

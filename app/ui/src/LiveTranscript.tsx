@@ -376,10 +376,9 @@ export default function LiveTranscript() {
         if (terminal.lane === "live" && terminal.outcome !== "completed") {
           setLaneStates((current) => ({ ...current, live: terminal.outcome === "failed" ? "failed" : "using_raw" }));
         }
-        if (
-          terminal.error &&
-          !["canceled", "superseded"].includes(terminal.error)
-        ) {
+        // Only an explicit cancel is silent; a superseded or timed-out rewrite is now rare enough that
+        // hiding it would hide a real problem.
+        if (terminal.error && terminal.error !== "canceled") {
           const guidance = hostedErrorGuidance(terminal.error);
           setControlStatus(guidance.message);
           setControlRepair(
@@ -431,7 +430,10 @@ export default function LiveTranscript() {
 
   const assistantRunning = Boolean(
     assistant &&
-      [assistant.pinned, ...assistant.exchanges].some(
+      [
+        ...(assistant.subscriptions ?? []).map((subscription) => subscription.exchange),
+        ...assistant.exchanges,
+      ].some(
         (exchange) =>
           exchange && ["queued", "waiting_for_credential", "running"].includes(exchange.status),
       ),
@@ -466,7 +468,10 @@ export default function LiveTranscript() {
 
   useEffect(() => {
     if (!assistant) return;
-    const completed = [assistant.pinned, ...assistant.exchanges].filter(
+    const completed = [
+      ...(assistant.subscriptions ?? []).map((subscription) => subscription.exchange),
+      ...assistant.exchanges,
+    ].filter(
       (exchange): exchange is NonNullable<typeof exchange> =>
         Boolean(exchange?.status === "completed" && exchange.answer),
     );

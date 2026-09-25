@@ -300,12 +300,19 @@ corti-pipeline (sole queue.db writer)
 - Vertex tokens stay in memory. Corti uses ADC but never copies its refresh credential into Corti storage.
 - ChatGPT access/refresh tokens are Corti-owned; other applications' credential files are never read.
 
-`HostedPreferences` contains: master/live/final/question defaults; provider/model selection per lane;
-provider scopes (non-secret alias/project/region/quota-project); default steering; the one saved pinned-question
-template and auto-run acknowledgement; local/provider cache policy; final deadline; egress acknowledgement
-version; `show_history_diagnostics`; and `show_live_metrics_by_default`.
+`HostedPreferences` (schema 2, ADR 0017) contains: master/live/final/question defaults; provider/model
+selection per lane; provider scopes (non-secret alias/project/region/quota-project); per-provider
+provider-side caching acknowledgements; default steering; the saved **question subscriptions** (id, title,
+template, preset, layout, trigger, context window, name hints) and the global automatic-questions
+acknowledgement; local/provider cache policy; live first-text / live terminal / question deadlines and the
+final deadline; the Vertex thinking policy; `lexicon_enabled`; egress acknowledgement version;
+`show_history_diagnostics`; and `show_live_metrics_by_default`. The schema-1 `pinned_question_template`
+is read once at migration into the first subscription and never written again. A document that fails to
+load is a persistent Settings banner (hosted egress stays off); an older binary refuses schema 2.
 
-The saved pinned text is a template reused between calls. Answers and ad-hoc history are session-only.
+`~/.local/share/corti/lexicon.json` holds the learned correction lexicon (mode 0600, digest-verified,
+ADR 0017); `corti --review` and `corti --lexicon` are its writers and the app re-reads it at every hosted
+session begin. Answers and ad-hoc history are session-only.
 
 ### 6.2 Managed runtime state
 
@@ -319,9 +326,12 @@ final_lane_revision    final model/toggle/policy
 question_lane_revision question model/toggle/policy
 steering_revision      effective default/session steering
 bank_revision          canonical word-bank content
-question_revision      pinned/ad-hoc identity
+question_revision      subscription-set / ad-hoc identity (bumped when the saved set or the auto switch changes)
 session_generation     recording identity/restart
 ```
+
+A Live result's application is **not** fenced on `transcript_revision` (ADR 0017): it applies while the
+controls above are current and every target row still exists with identical id/speaker/timing.
 
 Patch commands include the caller's observed control revision. Rust validates, persists, returns the
 canonical new snapshot, and emits one `hosted-state-changed` event so Settings and Live windows converge.
@@ -377,10 +387,16 @@ revision is a new call. Canceling cannot promise remote compute or billing stopp
 ### 7.2 Live cleanup lane
 
 - Trigger: one or more VAD-closed rows from `consume_chunks`; never open/unstable words.
-- Quiet debounce: 150 ms. A request targets at most 8 new rows and 4 KiB UTF-8; excess remains newest pending.
+- Accumulation (ADR 0017): a pure `LiveBatcher` collects finalized rows and dispatches when quiet ≥ 400 ms,
+  or max-wait ≥ 2 s, or 8 rows / 4 KiB (the head row is always included, however large), spaced ≥ 250 ms.
+  Excess **accumulates** into the next batch; nothing is superseded. Rows the app cannot build for a
+  per-row reason are released as raw with a `corti::hosted` warning; a backlog past 32 rows / 45 s is
+  released as raw from the oldest end with one notice per episode.
 - Context: up to 8 preceding rows, latest validated clean text where available, otherwise raw.
-- Single-flight per session. While in flight, replace one pending snapshot with the newest fenced target set.
-- Deadlines: first text within 2 s and terminal result within 5 s of dispatch. Missing either cancels/discards.
+- At most one Live batch outstanding per session (queued, active or awaiting application); FIFO.
+- Deadlines (configurable in hosted.toml; defaults): first text within 8 s of the response headers and a
+  terminal result within 20 s of dispatch; a queued successor survives the in-flight call. Missing a
+  deadline cancels/discards loudly.
 - Stable row identity is assigned before fan-out: `publish_words` returns finalized view-row envelopes to the
   bounded UI store, coordinator, and ledger. The ledger separately records the canonical durability rows
   produced by `flush_window` after optional far-end diarization. This matters because current immediate
@@ -392,7 +408,8 @@ revision is a new call. Canceling cannot promise remote compute or billing stopp
   raw. If no strong final applies, exact clean mappings plus raw for every uncovered row are rewritten once
   before the state flip. If no eligible clean row exists, the existing raw body is simply flipped.
 - A saturated coordinator, disabled lane, auth wait, timeout, malformed output, stale fence, or provider error
-  leaves that row visibly raw. No raw text is deleted.
+  leaves that row visibly raw and logs why (call id, lane, code, whether the provider was reached). No raw
+  text is deleted. A result whose rows are all still present applies whatever arrived after it.
 
 ### 7.3 Final lane and crash state
 
@@ -482,14 +499,24 @@ Token readiness remains separate from `Service error` for project/IAM/API/billin
 
 - **Ad hoc:** explicit submit snapshots the newest clean-or-raw ledger revision. One runs at a time; FIFO cap
   8. Every item remains visible with queued/as-of/cancel/error/usage state. Deadline 30 s. No coalescing.
-- **Pinned:** exactly one saved question template. React debounces edits for 500 ms, but Rust owns revision,
-  cancellation, progress, and execution. Empty text clears it.
-- Meaningful progress is at least **40 newly finalized Unicode word tokens or 30 newly covered speech
-  seconds**, with at least one new row, since the last accepted pinned answer/request watermark. Once reached,
-  Rust waits a 750 ms quiet period. Progress during an in-flight call sets one dirty bit; at completion at most
-  one newest-watermark rerun is scheduled.
-- Turning on automatic pinned evaluation requires acknowledgement that it can make repeated paid calls. The
-  card shows run count and known/unknown session estimate.
+- **Subscriptions (ADR 0017):** up to 16 saved questions, each with a trigger (new words / new speech
+  counted over all, `Them` or `Me` rows; quiet period; minimum spacing), a context window (whole session,
+  last N minutes or last N rows) and a layout (paragraph or bullets). Presets: `asked_of_me` (`Them` rows
+  only, 1 s quiet, a cheap directed-question pre-filter before any paid call, last five minutes, bullets;
+  shown first as "Last question for you"), `running_summary`, `topic_watch`, custom. Rust owns the
+  revision, cancellation, progress and execution; the coordinator names what is due and the app builds the
+  request, so each subscription is single-flight and FIFO behind other subscription work. Changing a
+  question cancels its in-flight run and re-answers the transcript already on screen; "Catch up now" runs
+  one regardless of thresholds.
+- Default thresholds: at least **40 newly finalized Unicode word tokens or 30 newly covered speech
+  seconds** from the counted speakers, with at least one new row, since the subscription's last submitted
+  request; then a 750 ms quiet period. Progress during an in-flight call is simply offered again once the
+  call finishes and the quiet period passes.
+- Turning on automatic questions requires acknowledgement that subscriptions make repeated paid calls. Each
+  card shows run count, state and cost; while a rerun is in flight the previous accepted answer stays
+  visible, and streamed partial text is shown as it forms.
+- Answers may span lines with plain `- ` / `1. ` list markers; every other control character and markup is
+  refused. Questions read the cleaned ledger (accepted Live text is copied in).
 - Question context is capped at the newest 16,000 input tokens (or the smaller catalog limit after prompt and
   output reserve). The answer says `Earlier transcript omitted` and shows its as-of revision when truncated.
 - Answers/thread bodies remain in memory: pinned answer plus at most 20 ad-hoc exchanges/256 KiB. They never
@@ -645,6 +672,13 @@ a hit.
 
 Provider caching defaults off until a separate provider-retention acknowledgement. It may be enabled only
 for an account/workload the user declares eligible. Corti purge cannot purge provider-side cache; UI says so.
+
+The policy a lane carries is **derived once** (`corti_chat::effective_provider_cache`, ADR 0017, #144):
+ChatGPT subscription → unavailable; implicit-cache models → unavoidable-implicit once the provider is
+acknowledged, otherwise the lane is blocked with that reason; explicit-prefix models → explicit once
+acknowledged, off until then. Lane selection normalises to the derived value; adapters and the document
+validator confirm it. The learned lexicon's corrections are part of the stable prompt prefix, so its digest
+is part of both the request key and the provider prefix key.
 
 ## 10. Persistence and migrations
 

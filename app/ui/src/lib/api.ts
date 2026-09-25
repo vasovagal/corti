@@ -461,12 +461,35 @@ export type HostedMutationInvalidField =
   | "role_arn"
   | "region"
   | "setup_name"
-  | "key_pair";
+  | "key_pair"
+  | "provider_cache";
 export type HostedMutationInvalidReason =
   | "required"
   | "not_found"
   | "invalid"
-  | "keys_missing";
+  | "keys_missing"
+  | "acknowledgement_required";
+
+/** Mirror of Rust `postprocess_app::ProviderAcknowledgementDto`. */
+export interface ProviderAcknowledgement {
+  provider: string;
+  acknowledged: boolean;
+}
+
+/** Mirror of Rust `postprocess_app::BlockedLaneDto`. */
+export interface BlockedLane {
+  lane: HostedLane;
+  provider: string;
+  model: string;
+  reason: "acknowledgement_required" | "policy_mismatch";
+}
+
+/** Mirror of Rust `postprocess_app::HostedDeadlinesDto`. */
+export interface HostedDeadlines {
+  live_first_text_seconds: number;
+  live_deadline_seconds: number;
+  question_deadline_seconds: number;
+}
 
 /** Mirror of Rust `postprocess_app::AwsCredentialOptionsDto`. Secret presence is not here: it comes
  * from `HostedSettingsDto.bedrock`, which refreshes on every coordinator event. */
@@ -504,6 +527,13 @@ export interface HostedSettingsDto {
   final_deadline_seconds: number;
   show_history_diagnostics: boolean;
   show_live_metrics_by_default: boolean;
+  /** Schema-2 fields; optional so older fixtures and snapshots still type-check. */
+  provider_cache_acknowledged?: ProviderAcknowledgement[];
+  blocked_lanes?: BlockedLane[];
+  preferences_load_error?: string | null;
+  deadlines?: HostedDeadlines;
+  lexicon_enabled?: boolean;
+  subscriptions?: HostedSubscription[];
 }
 
 export interface HostedSelectionInput {
@@ -524,7 +554,8 @@ export type HostedPatchInput =
       kind: "set_display_preferences";
       show_history_diagnostics: boolean;
       show_live_metrics_by_default: boolean;
-    };
+    }
+  | { kind: "set_provider_cache_acknowledged"; provider: string; acknowledged: boolean };
 
 export type HostedMutationResult =
   | { status: "applied"; settings: HostedSettingsDto }
@@ -693,15 +724,61 @@ export interface HostedAssistantExchange {
   question: string;
   answer: string | null;
   cost_label: string | null;
+  /** `paragraph` | `bullets`; optional against an older coordinator. */
+  format?: string;
+  /** Readable prefix of a streamed answer while the call runs. */
+  partial_answer?: string | null;
+  /** For a subscription rerun: the last accepted answer until the new one lands. */
+  previous_answer?: string | null;
   /** Protocol-v2 additions are optional against an older coordinator. */
   context_truncated?: boolean;
   usage?: HostedNormalizedUsage | null;
   cache?: HostedCacheObservation | null;
 }
 
+export type HostedSubscriptionPreset = "none" | "asked_of_me" | "running_summary" | "topic_watch";
+export type HostedSubscriptionOutput = "paragraph" | "bullets" | "json_questions";
+export type HostedSubscriptionSpeakers = "all" | "them" | "me";
+export type HostedSubscriptionWindow = "whole" | "last_minutes" | "last_rows";
+
+/** Mirror of Rust `postprocess_config::QuestionSubscriptionPreferences` (hosted.toml schema 2). */
+export interface HostedSubscription {
+  id: string;
+  title: string;
+  template: string;
+  enabled: boolean;
+  preset: HostedSubscriptionPreset;
+  output: HostedSubscriptionOutput;
+  trigger: {
+    quiet_ms: number;
+    min_new_words: number;
+    min_new_speech_ms: number;
+    min_interval_ms: number;
+    on_speakers: HostedSubscriptionSpeakers;
+  };
+  context: {
+    window: HostedSubscriptionWindow;
+    minutes: number;
+    rows: number;
+  };
+  name_hints: string[];
+}
+
+/** One subscription in the live assistant: saved shape plus this session's state. */
+export interface HostedAssistantSubscription {
+  id: string;
+  title: string;
+  preset: HostedSubscriptionPreset;
+  format: string;
+  enabled: boolean;
+  run_count: number;
+  in_flight: boolean;
+  pending: boolean;
+  exchange: HostedAssistantExchange | null;
+}
+
 export interface HostedAssistantSnapshot {
-  pinned_run_count: number;
-  pinned: HostedAssistantExchange | null;
+  subscriptions: HostedAssistantSubscription[];
   exchanges: HostedAssistantExchange[];
 }
 
@@ -753,13 +830,18 @@ export const refreshHostedProvider = (
     request: { provider, transport },
   });
 
-export const setHostedPinnedQuestion = (
+/** Replace the whole saved question-subscription set (revision-checked). */
+export const setHostedSubscriptions = (
   observedStateRevision: number,
-  template: string,
+  subscriptions: HostedSubscription[],
 ): Promise<HostedMutationResult> =>
-  invoke<HostedMutationResult>("set_hosted_pinned_question", {
-    request: { observed_state_revision: observedStateRevision, template },
+  invoke<HostedMutationResult>("set_hosted_subscriptions", {
+    request: { observed_state_revision: observedStateRevision, subscriptions },
   });
+
+/** "Catch up now": run one subscription at the next opportunity regardless of its thresholds. */
+export const runHostedSubscriptionNow = (id: string): Promise<void> =>
+  invoke<void>("run_hosted_subscription_now", { id });
 
 export const startChatGptDeviceLogin = (): Promise<HostedProviderState> =>
   invoke<HostedProviderState>("start_chatgpt_device_login");

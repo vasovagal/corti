@@ -7,6 +7,8 @@
 //! ```text
 //! corti --redo <recording> [--local|--aws|--backend <b>] [--print]
 //! corti --list
+//! corti --review <note.md>... [--lexicon <path>] [--dry-run]
+//! corti --lexicon list | add <from> <to> | remove <id> | test <text>
 //! corti --help | --version
 //! ```
 //!
@@ -41,6 +43,8 @@ USAGE:
     corti --input <wav> [options]          transcribe a WAV to a note at a path you choose (primitive)
     corti --redo <recording> [options]     re-transcribe a tracked recording and file via vagus
     corti --list                           list tracked recordings and their pipeline status
+    corti --review <note.md>... [options]  review old transcripts and learn corrections into the lexicon
+    corti --lexicon <command>              manage the learned correction lexicon
     corti --help | -h                      show this help
     corti --version | -V                   show the version
 
@@ -56,6 +60,22 @@ REDO OPTIONS (--redo):
     --backend <aws|local>    backend to use for this run (default: the configured backend)
     --local | --aws          shorthand for --backend local|aws
     --print                  print the transcript to stdout; do NOT file a note or touch the queue
+
+REVIEW OPTIONS (--review):
+    --lexicon <path>         the lexicon file to grow (default: ~/.local/share/corti/lexicon.json)
+    --dry-run                show suspects and take decisions, but write nothing
+
+LEXICON COMMANDS (--lexicon):
+    list                     print every rule (id, from → to, source)
+    add <from> <to>          add a word or phrase correction (case-insensitive, whole words)
+    remove <id>              remove one rule by id
+    test <text>              print <text> with the current rules applied
+
+--review walks each note's turns and flags what looks wrong: near-misses to word-bank terms and existing
+corrections, two spellings of one name, unknown capitalised words, and leftover fillers. For each suspect
+you keep it, replace it (which saves a rule), add a phrase rule, skip that kind, or quit. Each accepted rule
+is written immediately after a re-read and revision check, so it is live for the next session; the note
+itself is never rewritten.
 
 --input is the plain primitive: you give it an exact WAV and an exact --output path, it transcribes and
 writes a note (frontmatter + title + transcript) — no cache/queue/vagus, nothing is filed or indexed. AEC
@@ -73,8 +93,29 @@ pub enum Cli {
     Redo(RedoArgs),
     Transcribe(TranscribeArgs),
     List,
+    Review(ReviewArgs),
+    Lexicon(LexiconCommand),
     Help,
     Version,
+}
+
+/// Options for `--review`: notes to walk and where the lexicon lives.
+#[derive(Debug, PartialEq)]
+pub struct ReviewArgs {
+    pub notes: Vec<String>,
+    /// Lexicon path override; `None` ⇒ the app's private lexicon.
+    pub lexicon: Option<String>,
+    /// `--dry-run`: decide, but write nothing.
+    pub dry_run: bool,
+}
+
+/// `--lexicon <command>`.
+#[derive(Debug, PartialEq)]
+pub enum LexiconCommand {
+    List,
+    Add { from: String, to: String },
+    Remove { id: String },
+    Test { text: String },
 }
 
 /// Options for `--redo`: corti resolves the recording (cache dir + queue) and files through vagus.
@@ -127,6 +168,60 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Cli, String> {
             Some(extra) => Err(format!("--list takes no arguments (got `{extra}`)")),
             None => Ok(Cli::List),
         },
+        "--review" => {
+            let mut notes = Vec::new();
+            let mut lexicon = None;
+            let mut dry_run = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--lexicon" => {
+                        lexicon = Some(args.next().ok_or("--lexicon requires a path")?);
+                    }
+                    "--dry-run" => dry_run = true,
+                    other if other.starts_with("--") => {
+                        return Err(format!("unknown option to --review: `{other}`"));
+                    }
+                    note => notes.push(note.to_string()),
+                }
+            }
+            if notes.is_empty() {
+                return Err("--review requires at least one note path".to_string());
+            }
+            Ok(Cli::Review(ReviewArgs {
+                notes,
+                lexicon,
+                dry_run,
+            }))
+        }
+        "--lexicon" => {
+            let command = args
+                .next()
+                .ok_or("--lexicon requires a command (list|add|remove|test)")?;
+            let command = match command.as_str() {
+                "list" => LexiconCommand::List,
+                "add" => LexiconCommand::Add {
+                    from: args.next().ok_or("--lexicon add requires <from> <to>")?,
+                    to: args.next().ok_or("--lexicon add requires <from> <to>")?,
+                },
+                "remove" => LexiconCommand::Remove {
+                    id: args.next().ok_or("--lexicon remove requires a rule id")?,
+                },
+                "test" => LexiconCommand::Test {
+                    text: args.by_ref().collect::<Vec<_>>().join(" "),
+                },
+                other => {
+                    return Err(format!(
+                        "unknown --lexicon command `{other}` (expected list|add|remove|test)"
+                    ));
+                }
+            };
+            if let Some(extra) = args.next() {
+                return Err(format!(
+                    "--lexicon takes no further arguments (got `{extra}`)"
+                ));
+            }
+            Ok(Cli::Lexicon(command))
+        }
         "--redo" => {
             let input = args
                 .next()
@@ -220,6 +315,8 @@ pub fn dispatch(cli: Cli) -> i32 {
         Cli::List => run_list(),
         Cli::Redo(args) => run_redo(args),
         Cli::Transcribe(args) => run_transcribe(args),
+        Cli::Review(args) => run_review(args),
+        Cli::Lexicon(command) => run_lexicon(command),
     };
     match result {
         Ok(()) => 0,
@@ -228,6 +325,212 @@ pub fn dispatch(cli: Cli) -> i32 {
             1
         }
     }
+}
+
+/// `--review`: walk each note's turns, flag suspects, and grow the lexicon one accepted rule at a time.
+fn run_review(args: ReviewArgs) -> Result<()> {
+    use corti_lexicon::{CompiledLexicon, find_suspects, run_review};
+
+    let path = match args.lexicon.as_deref() {
+        Some(path) => PathBuf::from(path),
+        None => crate::lexicon::lexicon_path()?,
+    };
+    let mut document = crate::lexicon::load_at(&path)?;
+    let bank: Vec<String> = crate::word_bank::load()
+        .map(|bank| bank.entries().to_vec())
+        .unwrap_or_default();
+    let mut io = StdReviewIo {
+        dry_run: args.dry_run,
+    };
+    for note in &args.notes {
+        let text = std::fs::read_to_string(note).with_context(|| format!("reading {note}"))?;
+        let transcript = corti_core::DiarizedTranscript::parse_markdown(&text);
+        if transcript.segments.is_empty() {
+            eprintln!("{note}: no transcript turns found; skipped");
+            continue;
+        }
+        let compiled = CompiledLexicon::compile(&document).context("compiling the lexicon")?;
+        let suspects = find_suspects(&transcript.segments, &bank, &compiled);
+        println!(
+            "{note}: {} turn(s), {} suspect(s){}",
+            transcript.segments.len(),
+            suspects.len(),
+            if args.dry_run { " (dry run)" } else { "" }
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        let dry_run = args.dry_run;
+        let mut revision = document.revision();
+        let mut latest = document.clone();
+        let summary = run_review(&suspects, &mut io, &now, |rule| {
+            if dry_run {
+                return Ok(());
+            }
+            let saved = crate::lexicon::add_rule_checked(&path, rule, revision)
+                .map_err(|error| format!("{error:#}"))?;
+            revision = saved.revision();
+            latest = saved;
+            Ok(())
+        });
+        document = latest;
+        println!(
+            "{note}: reviewed {}, kept {}, rules added {}, skipped {}, refused {}{}",
+            summary.reviewed,
+            summary.kept,
+            summary.rules_added,
+            summary.skipped,
+            summary.refused,
+            if summary.quit { ", quit" } else { "" }
+        );
+        if summary.quit {
+            break;
+        }
+    }
+    println!(
+        "lexicon: {} rule(s) at revision {} ({})",
+        document.rules().len(),
+        document.revision(),
+        path.display()
+    );
+    if document.rules().is_empty() {
+        println!("no corrections yet; the next live session runs without a lexicon");
+    } else {
+        println!("corrections apply to the next transcript and the next live session");
+    }
+    Ok(())
+}
+
+/// Terminal prompts for the review session: one line per suspect, one key per decision.
+struct StdReviewIo {
+    dry_run: bool,
+}
+
+impl corti_lexicon::ReviewIo for StdReviewIo {
+    fn decide(
+        &mut self,
+        suspect: &corti_lexicon::Suspect,
+        index: usize,
+        total: usize,
+    ) -> corti_lexicon::Decision {
+        use corti_lexicon::Decision;
+        println!();
+        println!(
+            "[{index}/{total}] {}",
+            corti_lexicon::review::describe(suspect)
+        );
+        println!("    {}", suspect.context);
+        loop {
+            print!(
+                "    (k)eep · r <text> replace · a <from> => <to> phrase rule · (s)kip this kind · (q)uit{} > ",
+                if self.dry_run { " [dry run]" } else { "" }
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+                return Decision::Quit;
+            }
+            let line = line.trim();
+            let (key, rest) = line.split_once(' ').unwrap_or((line, ""));
+            match key {
+                "" | "k" | "keep" => return Decision::Keep,
+                "s" | "skip" => return Decision::SkipKind,
+                "q" | "quit" => return Decision::Quit,
+                "r" | "replace" if !rest.trim().is_empty() => {
+                    return Decision::Rule {
+                        to: rest.trim().to_string(),
+                    };
+                }
+                "a" | "add" => {
+                    if let Some((from, to)) = rest.split_once("=>")
+                        && !from.trim().is_empty()
+                        && !to.trim().is_empty()
+                    {
+                        return Decision::RuleFrom {
+                            from: from.trim().to_string(),
+                            to: to.trim().to_string(),
+                        };
+                    }
+                    println!("    a needs `a <from> => <to>`");
+                }
+                _ => println!("    k, r <text>, a <from> => <to>, s, or q"),
+            }
+        }
+    }
+
+    fn notify(&mut self, message: &str) {
+        println!("    {message}");
+    }
+}
+
+/// `--lexicon`: inspect or edit the learned correction lexicon by hand.
+fn run_lexicon(command: LexiconCommand) -> Result<()> {
+    use corti_lexicon::{CompiledLexicon, LexiconRule, RuleSource};
+
+    let path = crate::lexicon::lexicon_path()?;
+    let document = crate::lexicon::load_at(&path)?;
+    match command {
+        LexiconCommand::List => {
+            if document.rules().is_empty() {
+                println!("no rules ({})", path.display());
+                return Ok(());
+            }
+            println!(
+                "{} rule(s) at revision {} ({})",
+                document.rules().len(),
+                document.revision(),
+                path.display()
+            );
+            for rule in document.rules() {
+                println!(
+                    "{}  {:<8} {:?}  {} → {}",
+                    rule.id,
+                    format!("{:?}", rule.source).to_lowercase(),
+                    rule.kind,
+                    rule.from,
+                    rule.to
+                );
+            }
+        }
+        LexiconCommand::Add { from, to } => {
+            let rule = LexiconRule::new(
+                &from,
+                &to,
+                RuleSource::Manual,
+                chrono::Utc::now().to_rfc3339(),
+            )
+            .context("building the rule")?;
+            let id = rule.id.clone();
+            let saved = crate::lexicon::add_rule_checked(&path, rule, document.revision())?;
+            println!(
+                "added {id}: {from} → {to} (revision {}, {} rule(s))",
+                saved.revision(),
+                saved.rules().len()
+            );
+        }
+        LexiconCommand::Remove { id } => {
+            let next = document.without_rule(&id).context("removing the rule")?;
+            crate::lexicon::save_at(&path, &next)?;
+            println!(
+                "removed {id} (revision {}, {} rule(s))",
+                next.revision(),
+                next.rules().len()
+            );
+        }
+        LexiconCommand::Test { text } => {
+            let compiled = CompiledLexicon::compile(&document).context("compiling the lexicon")?;
+            let ids = compiled.matching_rule_ids(&text);
+            match compiled.apply(&text) {
+                Some(applied) => {
+                    println!("{applied}");
+                    eprintln!("applied: {}", ids.join(", "));
+                }
+                None => {
+                    println!("{text}");
+                    eprintln!("no rule applies");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `--list`: every tracked recording, newest first, with its status and filed note (if any).
@@ -781,6 +1084,51 @@ mod tests {
                 print_only: false,
             }))
         );
+    }
+
+    #[test]
+    fn parses_review_and_lexicon_commands() {
+        assert_eq!(
+            p(&[
+                "--review",
+                "a.md",
+                "b.md",
+                "--dry-run",
+                "--lexicon",
+                "/tmp/lex.json"
+            ]),
+            Ok(Cli::Review(ReviewArgs {
+                notes: vec!["a.md".into(), "b.md".into()],
+                lexicon: Some("/tmp/lex.json".into()),
+                dry_run: true,
+            }))
+        );
+        assert!(p(&["--review"]).is_err());
+        assert!(p(&["--review", "a.md", "--nope"]).is_err());
+        assert_eq!(
+            p(&["--lexicon", "list"]),
+            Ok(Cli::Lexicon(LexiconCommand::List))
+        );
+        assert_eq!(
+            p(&["--lexicon", "add", "corty", "Corti"]),
+            Ok(Cli::Lexicon(LexiconCommand::Add {
+                from: "corty".into(),
+                to: "Corti".into()
+            }))
+        );
+        assert_eq!(
+            p(&["--lexicon", "remove", "r-abc"]),
+            Ok(Cli::Lexicon(LexiconCommand::Remove { id: "r-abc".into() }))
+        );
+        assert_eq!(
+            p(&["--lexicon", "test", "we", "ship", "corty"]),
+            Ok(Cli::Lexicon(LexiconCommand::Test {
+                text: "we ship corty".into()
+            }))
+        );
+        assert!(p(&["--lexicon"]).is_err());
+        assert!(p(&["--lexicon", "add", "only-from"]).is_err());
+        assert!(p(&["--lexicon", "list", "extra"]).is_err());
     }
 
     #[test]

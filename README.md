@@ -48,6 +48,11 @@ signals. Exactly what this app does: audio → notes.
   ChatGPT subscription. ChatGPT sign-in uses a Corti-owned device credential in its private secret store and calls
   OpenAI's fixed Responses endpoint directly—there is no Codex server and no OpenAI API-key charge for that
   transport.
+- **Subscribed questions and a learned lexicon.** Save questions the assistant re-asks as the call goes on
+  — "what are they asking me?" as a catch-up card, a running bullet summary, a topic watch, or your own —
+  each with its own trigger and context window. Transcript cleanup strips fillers and stutters, keeps turns
+  in time order, and applies corrections you teach it: `corti --review <note.md>` walks an old transcript's
+  suspect words and saves the rules you accept; they apply to the next transcript and the next live session.
 - **Crash-safe live inbox filing.** With the local backend, the app transcribes continuously and
   commits bounded, optionally diarized windows to the vagus note mid-call (one minute by default,
   configurable to 1–10). Every chunk is OS-synced before its memory is reused, so a Corti/macOS crash

@@ -33,10 +33,12 @@ pub use blocked::{ClaudeSubscriptionDescriptor, claude_subscription_descriptor};
 pub use chatgpt::{
     CHATGPT_CONSERVATIVE_MAX_OUTPUT_TOKENS, CHATGPT_DEVICE_VERIFICATION_URL,
     CHATGPT_FALLBACK_CONTEXT_TOKENS, CHATGPT_SUBSCRIPTION_ADAPTER_VERSION, ChatGptAuthError,
-    ChatGptClock, ChatGptCredentialStore, ChatGptDeviceAuthorization, ChatGptLoginPoll,
-    ChatGptStoreError, ChatGptSubscriptionAdapter, ChatGptSubscriptionAuth,
+    ChatGptBodyOptions, ChatGptClock, ChatGptCredentialStore, ChatGptDeviceAuthorization,
+    ChatGptLoginPoll, ChatGptStoreError, ChatGptSubscriptionAdapter, ChatGptSubscriptionAuth,
 };
-pub use common::{CacheKeyError, DirectAdapterOptions, ProviderCacheKeySource};
+pub use common::{
+    CacheKeyError, DirectAdapterOptions, ProviderCacheKeySource, served_model_matches,
+};
 pub use openai::{
     OPENAI_LUNA_MAX_CONTEXT_TOKENS, OPENAI_LUNA_MAX_OUTPUT_TOKENS, OPENAI_LUNA_MODEL_ID,
     OPENAI_RESPONSES_ADAPTER_VERSION, OpenAiResponsesAdapter,
@@ -49,11 +51,13 @@ pub use transport::{
     TransportErrorKind, UreqTransport, WallClock,
 };
 pub use vertex::{
-    AdcAccessToken, AdcAccessTokenSource, VERTEX_REST_ADAPTER_VERSION, VertexConfigurationError,
-    VertexModel, VertexProjectMetadata, VertexPublisher, VertexRestAdapter,
+    AdcAccessToken, AdcAccessTokenSource, ThinkingControl, ThinkingPolicy,
+    VERTEX_REST_ADAPTER_VERSION, VertexConfigurationError, VertexModel, VertexProjectMetadata,
+    VertexPublisher, VertexRestAdapter,
 };
 pub use vertex_auth::{
-    VERTEX_CREDENTIAL_POLL_INTERVAL_MICROS, VertexAutoPending, VertexCredentialResolver,
+    VERTEX_CREDENTIAL_POLL_INTERVAL_MICROS, VERTEX_ERROR_RETRY_BASE_MICROS,
+    VERTEX_ERROR_RETRY_MAX_MICROS, VertexAutoPending, VertexCredentialResolver,
     VertexCredentialState, VertexDispatchDisposition, VertexDispatchIntent, VertexPendingError,
     VertexPendingRetention, VertexResolutionAttempt, VertexResolutionKind, VertexResolutionOutcome,
     VertexResolutionUpdate, VertexResolverError, VertexUnarmedNotice,

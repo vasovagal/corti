@@ -6,7 +6,7 @@
 //! deliberately deny-by-default until an approved credential/store factory is installed; this wiring still
 //! exposes truthful provider posture, Vertex arming/catch-up, controls, history, and hermetic injection seams.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,11 +21,11 @@ use corti_postprocess::{
     BillingBasis, CacheObservation, CachePolicy, CallId, CancellationReason, CanonicalPrompt,
     ConnectionScopeId, CostEstimate, CredentialState, DigestKey, ErrorCode, HostedRequest, Lane,
     LocalCacheMode, ModelCatalog, ModelId, MonotonicDeadline, OUTPUT_SCHEMA_VERSION,
-    PROMPT_TEMPLATE_VERSION, PricingCatalog, PricingError, PricingQuery, ProcessEpoch, PromptTask,
-    ProviderAdapter, ProviderCacheKey, ProviderCacheKeyMaterial, ProviderCacheMode,
-    ProviderDescriptor, ProviderEventSink, ProviderId, ProviderScope, ProviderTerminal,
-    RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial, RowId, SupportTier, TargetId,
-    TranscriptRow, TransportId, WordBankDocument,
+    PROMPT_TEMPLATE_VERSION, PricingCatalog, PricingError, PricingQuery, ProcessEpoch,
+    PromptCorrection, PromptTask, ProviderAdapter, ProviderCacheKey, ProviderCacheKeyMaterial,
+    ProviderCacheMode, ProviderDescriptor, ProviderEventSink, ProviderId, ProviderScope,
+    ProviderTerminal, RequestFence, RequestGroupId, RequestKey, RequestKeyMaterial, RowId,
+    SupportTier, TargetId, TranscriptRow, TransportId, WordBankDocument,
 };
 use corti_postprocess_providers::{
     ANTHROPIC_MESSAGES_ADAPTER_VERSION, AnthropicMessagesAdapter, ApiKey, ApiKeySource,
@@ -64,7 +64,8 @@ use crate::postprocess::{
 };
 use crate::postprocess_config::{
     AwsCredentialMode, BedrockProviderPreferences, EGRESS_DISCLOSURE_VERSION, HostedPreferences,
-    MAX_VERTEX_MODELS, PINNED_AUTO_DISCLOSURE_VERSION, ProviderScopePreferences, SecretPurpose,
+    MAX_VERTEX_MODELS, PINNED_AUTO_DISCLOSURE_VERSION, ProviderScopePreferences,
+    QuestionSubscriptionPreferences, SecretPurpose,
 };
 use crate::private_file::{atomic_write_private, read_private};
 use crate::vertex_creds::{VertexAdapterCredentials, VertexAdcResolver, VertexConnectionConfig};
@@ -411,6 +412,41 @@ pub(crate) struct HostedSettingsDto {
     pub(crate) final_deadline_seconds: u32,
     pub(crate) show_history_diagnostics: bool,
     pub(crate) show_live_metrics_by_default: bool,
+    /// Per-provider "provider-side caching acknowledged" state (schema 2).
+    pub(crate) provider_cache_acknowledged: Vec<ProviderAcknowledgementDto>,
+    /// Lanes whose saved selection cannot dispatch under the owner's current acknowledgements.
+    pub(crate) blocked_lanes: Vec<BlockedLaneDto>,
+    /// Sanitized reason the on-disk preferences could not be loaded (the app runs on defaults with
+    /// hosted egress off until it is fixed); `None` when the document loaded.
+    pub(crate) preferences_load_error: Option<String>,
+    pub(crate) deadlines: HostedDeadlinesDto,
+    pub(crate) lexicon_enabled: bool,
+    /// Saved question subscriptions (schema 2), templates included: they are owner-authored
+    /// configuration, never transcript content.
+    pub(crate) subscriptions: Vec<QuestionSubscriptionPreferences>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ProviderAcknowledgementDto {
+    pub(crate) provider: String,
+    pub(crate) acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BlockedLaneDto {
+    /// `live` | `final` | `question`.
+    pub(crate) lane: String,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    /// `acknowledgement_required` | `policy_mismatch`.
+    pub(crate) reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct HostedDeadlinesDto {
+    pub(crate) live_first_text_seconds: u32,
+    pub(crate) live_deadline_seconds: u32,
+    pub(crate) question_deadline_seconds: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +502,12 @@ pub(crate) enum HostedPatchInput {
         show_history_diagnostics: bool,
         show_live_metrics_by_default: bool,
     },
+    /// Acknowledge (or withdraw) provider-side caching for `openai`, `anthropic`, `google` or
+    /// `amazon`. Enabled lanes on that provider are re-derived to the policy their model needs.
+    SetProviderCacheAcknowledged {
+        provider: String,
+        acknowledged: bool,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -505,6 +547,7 @@ pub(crate) enum HostedMutationInvalidField {
     Region,
     SetupName,
     KeyPair,
+    ProviderCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -514,6 +557,8 @@ pub(crate) enum HostedMutationInvalidReason {
     NotFound,
     Invalid,
     KeysMissing,
+    /// The model caches implicitly on the provider; acknowledge provider-side caching first.
+    AcknowledgementRequired,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -535,10 +580,41 @@ pub(crate) struct ProviderRefreshRequest {
     pub(crate) transport: String,
 }
 
+/// Replace the whole saved subscription set. A `template` of `None` keeps the template already saved
+/// under that id (so an edit of title or thresholds never requires retyping the question).
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct PinnedQuestionUpdateRequest {
+pub(crate) struct SubscriptionsUpdateRequest {
     pub(crate) observed_state_revision: u64,
-    pub(crate) template: String,
+    pub(crate) subscriptions: Vec<SubscriptionInput>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct SubscriptionInput {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) template: Option<String>,
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default = "default_preset")]
+    pub(crate) preset: String,
+    #[serde(default = "default_output")]
+    pub(crate) output: String,
+    #[serde(default)]
+    pub(crate) trigger: Option<crate::postprocess_config::SubscriptionTriggerPreferences>,
+    #[serde(default)]
+    pub(crate) context: Option<crate::postprocess_config::SubscriptionContextPreferences>,
+    #[serde(default)]
+    pub(crate) name_hints: Vec<String>,
+}
+
+fn default_preset() -> String {
+    "none".to_owned()
+}
+
+fn default_output() -> String {
+    "paragraph".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -561,6 +637,12 @@ pub(crate) struct AssistantExchangeDto {
     pub(crate) question: String,
     pub(crate) answer: Option<String>,
     pub(crate) cost_label: Option<String>,
+    /// `paragraph` | `bullets`: how `answer` should be laid out.
+    pub(crate) format: String,
+    /// The readable prefix of a streamed answer while the call runs; cleared once it settles.
+    pub(crate) partial_answer: Option<String>,
+    /// For a subscription rerun: the last accepted answer, shown until the new one lands.
+    pub(crate) previous_answer: Option<String>,
 }
 
 impl fmt::Debug for AssistantExchangeDto {
@@ -573,14 +655,36 @@ impl fmt::Debug for AssistantExchangeDto {
             .field("question_bytes", &self.question.len())
             .field("answer_bytes", &self.answer.as_ref().map(String::len))
             .field("cost_label", &self.cost_label)
+            .field("format", &self.format)
+            .field(
+                "partial_answer_bytes",
+                &self.partial_answer.as_ref().map(String::len),
+            )
+            .field(
+                "previous_answer_bytes",
+                &self.previous_answer.as_ref().map(String::len),
+            )
             .finish()
     }
 }
 
+/// One subscription as the live window's assistant shows it: the saved shape plus session state.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AssistantSubscriptionDto {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) preset: String,
+    pub(crate) format: String,
+    pub(crate) enabled: bool,
+    pub(crate) run_count: u64,
+    pub(crate) in_flight: bool,
+    pub(crate) pending: bool,
+    pub(crate) exchange: Option<AssistantExchangeDto>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct AssistantSnapshotDto {
-    pub(crate) pinned_run_count: u64,
-    pub(crate) pinned: Option<AssistantExchangeDto>,
+    pub(crate) subscriptions: Vec<AssistantSubscriptionDto>,
     pub(crate) exchanges: Vec<AssistantExchangeDto>,
 }
 
@@ -764,8 +868,8 @@ pub(crate) fn cancel_hosted_question(
 }
 
 #[tauri::command]
-pub(crate) fn set_hosted_pinned_question(
-    request: PinnedQuestionUpdateRequest,
+pub(crate) fn set_hosted_subscriptions(
+    request: SubscriptionsUpdateRequest,
     state: State<'_, HostedState>,
     window: tauri::WebviewWindow,
 ) -> Result<HostedMutationResult, String> {
@@ -773,8 +877,32 @@ pub(crate) fn set_hosted_pinned_question(
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     state
         .handle
-        .send(ServiceCommand::SetPinnedTemplate {
+        .send(ServiceCommand::SetSubscriptions {
             request,
+            reply: reply_tx,
+        })
+        .map_err(sanitized_error)?;
+    reply_rx
+        .recv()
+        .map_err(|_| "hosted coordinator stopped".to_string())?
+        .map_err(sanitized_error)
+}
+
+/// "Catch up now": run one subscription at the next opportunity regardless of its thresholds.
+#[tauri::command]
+pub(crate) fn run_hosted_subscription_now(
+    id: String,
+    state: State<'_, HostedState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), String> {
+    require_live_window(&window)?;
+    let id =
+        corti_chat::SubscriptionId::new(id).map_err(|_| "invalid subscription id".to_string())?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    state
+        .handle
+        .send(ServiceCommand::RunSubscriptionNow {
+            id,
             reply: reply_tx,
         })
         .map_err(sanitized_error)?;
@@ -1250,12 +1378,17 @@ pub(crate) fn start(
     live_view: LiveTranscriptStore,
     pipeline_tx: Sender<PipelineMsg>,
 ) -> Result<(HostedState, HostedHandle)> {
+    // A document that fails to parse or validate must not brick raw capture, but silently running on
+    // defaults hid every hosted feature behind "nothing happens"; the reason now reaches Settings.
+    let mut preferences_load_error = None;
     let preferences = HostedPreferences::load().unwrap_or_else(|error| {
+        let message = format!("{error:#}");
         tracing::warn!(
             target: "corti::hosted",
-            error = %format!("{error:#}"),
+            error = %message,
             "hosted preferences are unreadable; all hosted egress remains off"
         );
+        preferences_load_error = Some(message);
         HostedPreferences::default()
     });
     let preferences = Arc::new(Mutex::new(preferences));
@@ -1335,7 +1468,7 @@ pub(crate) fn start(
         },
     );
     let process_epoch = live_view.process_epoch();
-    let (mut state, handle) = start_with_components(
+    let (mut state, handle) = start_with_components_and_policy(
         preferences,
         word_bank,
         live_view,
@@ -1352,6 +1485,12 @@ pub(crate) fn start(
         Some(store),
         None,
         Some(Arc::new(crate::secret_store::is_present)),
+        corti_chat::LiveBatchPolicy {
+            max_rows: MAX_LIVE_TARGET_ROWS,
+            max_bytes: MAX_LIVE_TARGET_BYTES,
+            ..corti_chat::LiveBatchPolicy::default()
+        },
+        preferences_load_error,
     )?;
     state.chatgpt_auth = Some(chatgpt_auth);
     Ok((state, handle))
@@ -1360,6 +1499,10 @@ pub(crate) fn start(
 type EventNotifier = Arc<dyn Fn(&CoordinatorEventDto) + Send + Sync>;
 type SecretPresenceSource = Arc<dyn Fn(SecretPurpose) -> bool + Send + Sync>;
 
+/// Test seam: the synchronous app tests submit Live work through `observe_rows` and expect it queued
+/// immediately, so they run the batcher with no timing. Production goes through
+/// `start_with_components_and_policy` with the default policy.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn start_with_components(
     preferences: Arc<Mutex<HostedPreferences>>,
@@ -1379,6 +1522,53 @@ fn start_with_components(
     clock_override: Option<Arc<dyn CoordinatorClock>>,
     secret_presence_override: Option<SecretPresenceSource>,
 ) -> Result<(HostedState, HostedHandle)> {
+    start_with_components_and_policy(
+        preferences,
+        word_bank,
+        live_view,
+        pipeline_tx,
+        outbox,
+        executor,
+        providers,
+        pricing,
+        vertex_resolver,
+        notifier,
+        digest_key,
+        process_epoch,
+        persist_to_disk,
+        store_override,
+        clock_override,
+        secret_presence_override,
+        corti_chat::LiveBatchPolicy {
+            max_rows: MAX_LIVE_TARGET_ROWS,
+            max_bytes: MAX_LIVE_TARGET_BYTES,
+            ..corti_chat::LiveBatchPolicy::immediate()
+        },
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_with_components_and_policy(
+    preferences: Arc<Mutex<HostedPreferences>>,
+    word_bank: WordBankDocument,
+    live_view: LiveTranscriptStore,
+    pipeline_tx: Sender<PipelineMsg>,
+    outbox: Arc<TelemetryOutbox>,
+    executor: Arc<dyn TicketExecutor>,
+    providers: Box<dyn ProviderAccess>,
+    pricing: Arc<dyn PricingCatalog>,
+    vertex_resolver: Arc<dyn VertexResolver>,
+    notifier: EventNotifier,
+    digest_key: DigestKey,
+    process_epoch: ProcessEpoch,
+    persist_to_disk: bool,
+    store_override: Option<Box<dyn EncryptedPostprocessStore>>,
+    clock_override: Option<Arc<dyn CoordinatorClock>>,
+    secret_presence_override: Option<SecretPresenceSource>,
+    live_batch_policy: corti_chat::LiveBatchPolicy,
+    preferences_load_error: Option<String>,
+) -> Result<(HostedState, HostedHandle)> {
     // Tests default to a hermetic empty projection; production explicitly supplies the private-store source.
     let secret_presence = secret_presence_override.unwrap_or_else(|| Arc::new(|_| false));
     let initial_control = control_from_preferences(
@@ -1394,8 +1584,8 @@ fn start_with_components(
         &initial_provider_states(),
         false,
         secret_presence.as_ref(),
+        preferences_load_error.as_deref(),
     );
-    let observed_pinned_revision = initial_control.pinned_question_revision;
     let snapshot = Arc::new(Mutex::new(initial_settings));
     let persistence = Box::new(HostedControlPersistence {
         preferences: preferences.clone(),
@@ -1407,16 +1597,11 @@ fn start_with_components(
     });
     let clock: Arc<dyn CoordinatorClock> =
         clock_override.unwrap_or_else(|| Arc::new(SystemCoordinatorClock::new()));
-    let pinned = preferences
-        .lock()
-        .unwrap()
-        .values()
-        .pinned_question_template
-        .clone();
+    let subscriptions = subscription_specs(preferences.lock().unwrap().values());
     let digest_key = Arc::new(digest_key);
     let coordinator = PostprocessCoordinator::new_with_snapshot(
         initial_control,
-        (!pinned.trim().is_empty()).then_some(pinned),
+        subscriptions,
         clock.clone(),
         digest_key.clone(),
         persistence,
@@ -1434,6 +1619,7 @@ fn start_with_components(
         &startup_providers,
         chatgpt_scope_configured(&coordinator),
         secret_presence.as_ref(),
+        preferences_load_error.as_deref(),
     );
     let (ingress, ingress_rx) = CoordinatorIngress::standard();
     let (command_tx, command_rx) = sync_channel(SERVICE_COMMAND_CAPACITY);
@@ -1451,11 +1637,20 @@ fn start_with_components(
         ingress_incomplete: ingress_incomplete.clone(),
         outbox,
     };
-    let service = Service {
+    // Production reads the owner's lexicon; in-memory fixtures (`persist_to_disk == false`) run
+    // without one so prompt bytes in tests stay exactly what the fixture bank produces.
+    let lexicon = if persist_to_disk {
+        crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty)
+    } else {
+        corti_lexicon::CompiledLexicon::empty()
+    };
+    let mut service = Service {
         coordinator,
         clock,
         preferences,
         word_bank,
+        lexicon_corrections: prompt_corrections(&lexicon),
+        lexicon,
         digest_key,
         live_view,
         ingress_incomplete,
@@ -1484,11 +1679,27 @@ fn start_with_components(
         pending_finals: HashMap::new(),
         final_by_call: HashMap::new(),
         call_cache: HashMap::new(),
-        observed_pinned_revision,
-        pinned_exchange: None,
+        subscription_exchanges: BTreeMap::new(),
         persist_to_disk,
         secret_presence,
+        live_batcher: corti_chat::LiveBatcher::new(live_batch_policy),
+        live_backlog_released: false,
+        preferences_load_error,
     };
+    // Deadlines come from the persisted preferences (hand-tunable in hosted.toml); the batcher owns
+    // quiet-period timing, so the coordinator's own debounce would only stack on top of it.
+    let mut deadlines = crate::postprocess::LaneDeadlines::default();
+    {
+        let preferences = service.preferences.lock().unwrap();
+        let values = preferences.values();
+        deadlines.live_first_text_micros = u64::from(values.live_first_text_seconds) * 1_000_000;
+        deadlines.live_terminal_micros = u64::from(values.live_deadline_seconds) * 1_000_000;
+        deadlines.question_micros = u64::from(values.question_deadline_seconds) * 1_000_000;
+    }
+    if !live_batch_policy.is_immediate() {
+        deadlines.live_debounce_micros = 0;
+    }
+    service.coordinator.set_deadlines(deadlines);
     std::thread::Builder::new()
         .name("corti-hosted-control".into())
         .spawn(move || service.run(command_rx, priority_rx, ingress_rx))
@@ -1622,7 +1833,7 @@ fn control_from_preferences(
         control_revision: revision,
         steering_revision: revision,
         bank_revision,
-        pinned_question_revision: (!values.pinned_question_template.trim().is_empty()) as u64,
+        pinned_question_revision: (!values.subscriptions.is_empty()) as u64,
         master_enabled: values.master_enabled,
         egress_acknowledged: values.egress_acknowledgement_version
             == Some(EGRESS_DISCLOSURE_VERSION),
@@ -1694,17 +1905,15 @@ fn vertex_config_source(
     })
 }
 
-fn vertex_models_source(
-    preferences: Arc<Mutex<HostedPreferences>>,
-) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+/// The preference inputs the Vertex adapter is rebuilt from: the typed model ids and the thinking policy.
+type VertexPreferenceSource =
+    Arc<dyn Fn() -> (Vec<String>, crate::postprocess_config::ThinkingPreference) + Send + Sync>;
+
+fn vertex_models_source(preferences: Arc<Mutex<HostedPreferences>>) -> VertexPreferenceSource {
     Arc::new(move || {
-        preferences
-            .lock()
-            .unwrap()
-            .values()
-            .providers
-            .vertex_models
-            .clone()
+        let preferences = preferences.lock().unwrap();
+        let providers = &preferences.values().providers;
+        (providers.vertex_models.clone(), providers.vertex_thinking)
     })
 }
 
@@ -2048,7 +2257,7 @@ impl ApprovedProviderDirectory {
 struct VertexAdapterSlot {
     transports: Arc<dyn DirectTransportFactory>,
     resolver: Arc<VertexAdcResolver>,
-    models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    models: VertexPreferenceSource,
     built: Mutex<Option<(VertexAdapterInputs, SharedAdapter)>>,
 }
 
@@ -2056,13 +2265,16 @@ struct VertexAdapterSlot {
 struct VertexAdapterInputs {
     config: VertexConnectionConfig,
     models: Vec<String>,
+    thinking: crate::postprocess_config::ThinkingPreference,
 }
 
 impl VertexAdapterSlot {
     fn current(&self) -> Option<SharedAdapter> {
+        let (models, thinking) = (self.models)();
         let desired = VertexAdapterInputs {
             config: self.resolver.config(),
-            models: (self.models)(),
+            models,
+            thinking,
         };
         let mut built = self.built.lock().ok()?;
         if built.as_ref().map(|(inputs, _)| inputs) != Some(&desired) {
@@ -2070,6 +2282,7 @@ impl VertexAdapterSlot {
                 self.transports.as_ref(),
                 self.resolver.clone(),
                 &desired.models,
+                desired.thinking,
             )
             .map(|adapter| (desired, Arc::new(Mutex::new(adapter))));
         }
@@ -2230,7 +2443,7 @@ fn approved_direct_components(
     chatgpt_auth: ChatGptSubscriptionAuth,
     bedrock: Arc<BedrockCredentialResolver>,
     vertex: Arc<VertexAdcResolver>,
-    vertex_models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    vertex_models: VertexPreferenceSource,
 ) -> (Arc<dyn TicketExecutor>, Box<dyn ProviderAccess>) {
     let openai_credential = DirectCredential::new(secrets.clone(), OPENAI_API_KEY_ACCOUNT);
     let anthropic_credential = DirectCredential::new(secrets, ANTHROPIC_API_KEY_ACCOUNT);
@@ -2338,10 +2551,19 @@ fn vertex_adapter(
     transports: &dyn DirectTransportFactory,
     vertex: Arc<VertexAdcResolver>,
     typed_models: &[String],
+    thinking: crate::postprocess_config::ThinkingPreference,
 ) -> Option<Box<dyn ProviderAdapter>> {
     let config = vertex.config();
     let metadata =
         VertexProjectMetadata::new(config.project?, config.region?, config.quota_project).ok()?;
+    let thinking_policy = match thinking {
+        crate::postprocess_config::ThinkingPreference::Auto => {
+            corti_postprocess_providers::ThinkingPolicy::Auto
+        }
+        crate::postprocess_config::ThinkingPreference::Omit => {
+            corti_postprocess_providers::ThinkingPolicy::Omit
+        }
+    };
     let adapter = VertexRestAdapter::new(
         transports.vertex(),
         Box::new(ProviderSystemClock::new()),
@@ -2349,7 +2571,8 @@ fn vertex_adapter(
         metadata,
         vertex_direct_models(typed_models),
     )
-    .ok()?;
+    .ok()?
+    .with_thinking_policy(thinking_policy);
     Some(Box::new(adapter))
 }
 
@@ -3641,9 +3864,13 @@ enum ServiceCommand {
         call_id: CallId,
         reply: Sender<bool>,
     },
-    SetPinnedTemplate {
-        request: PinnedQuestionUpdateRequest,
+    SetSubscriptions {
+        request: SubscriptionsUpdateRequest,
         reply: Sender<Result<HostedMutationResult, ErrorCode>>,
+    },
+    RunSubscriptionNow {
+        id: corti_chat::SubscriptionId,
+        reply: Sender<Result<(), ErrorCode>>,
     },
     AssistantSnapshot {
         reply: Sender<AssistantSnapshotDto>,
@@ -3685,6 +3912,10 @@ struct Service {
     clock: Arc<dyn CoordinatorClock>,
     preferences: Arc<Mutex<HostedPreferences>>,
     word_bank: WordBankDocument,
+    /// The learned correction lexicon: its corrections ride the prompt prefix and its digest is part
+    /// of every request key. Reloaded with the word bank at each session begin.
+    lexicon: corti_lexicon::CompiledLexicon,
+    lexicon_corrections: Vec<PromptCorrection>,
     digest_key: Arc<DigestKey>,
     live_view: LiveTranscriptStore,
     ingress_incomplete: Arc<AtomicBool>,
@@ -3713,10 +3944,32 @@ struct Service {
     pending_finals: HashMap<RequestGroupId, PendingFinal>,
     final_by_call: HashMap<CallId, RequestGroupId>,
     call_cache: HashMap<CallId, CacheObservation>,
-    observed_pinned_revision: u64,
-    pinned_exchange: Option<AssistantExchangeDto>,
+    /// The latest exchange per subscription id for the assistant view (session only).
+    subscription_exchanges: BTreeMap<String, AssistantExchangeDto>,
     persist_to_disk: bool,
     secret_presence: SecretPresenceSource,
+    /// Never-drop accumulation of finalized ledger rows (by index) into Live rewrite batches.
+    live_batcher: corti_chat::LiveBatcher<usize>,
+    /// Set once per session when the backlog had to be released as raw, so the notice is not repeated.
+    live_backlog_released: bool,
+    /// Why hosted.toml could not be loaded at startup, surfaced in Settings; `None` when it loaded.
+    preferences_load_error: Option<String>,
+}
+
+/// What became of one batch the batcher handed to `build_live_submission`.
+enum LiveBuild {
+    /// A submission covering the leading rows; `leftover` rows did not fit the model budget and go back
+    /// to the front of the batcher.
+    Submission {
+        submission: Box<RequestSubmission>,
+        leftover: Vec<usize>,
+    },
+    /// `released` rows cannot be sent for a per-row reason and stay raw; `leftover` rows go back.
+    Rejected {
+        released: Vec<usize>,
+        leftover: Vec<usize>,
+        reason: &'static str,
+    },
 }
 
 impl Service {
@@ -3778,8 +4031,9 @@ impl Service {
             let now = Instant::now();
             if now >= next_tick {
                 self.coordinator.tick();
+                self.flush_live_batches();
                 self.expire_pending_finals();
-                self.sync_pinned_revision();
+                self.flush_due_subscriptions();
                 if let Some(attempt) = self.coordinator.drive_vertex() {
                     self.spawn_vertex_resolution(attempt);
                 }
@@ -3812,10 +4066,19 @@ impl Service {
                     self.cancel_pending_finals(ErrorCode::Canceled);
                     let _ = self.coordinator.begin_session();
                     self.current_recording = None;
+                    let unsent = self.live_batcher.drain_all();
+                    if !unsent.is_empty() {
+                        tracing::info!(
+                            target: "corti::hosted",
+                            rows = unsent.len(),
+                            "session ended with finalized rows still waiting for a Live rewrite"
+                        );
+                    }
+                    self.live_backlog_released = false;
                     self.ledger.clear();
                     self.ledger_bytes = 0;
                     self.session_steering = None;
-                    self.pinned_exchange = None;
+                    self.subscription_exchanges.clear();
                     self.ingress_incomplete.store(false, Ordering::Release);
                     self.bump_state();
                 }
@@ -3927,8 +4190,18 @@ impl Service {
                     .cancel_call(&call_id, CancellationReason::Explicit);
                 let _ = reply.send(canceled);
             }
-            ServiceCommand::SetPinnedTemplate { request, reply } => {
-                let result = self.set_pinned_template(request);
+            ServiceCommand::SetSubscriptions { request, reply } => {
+                let result = self.set_subscriptions(request);
+                let _ = reply.send(result);
+            }
+            ServiceCommand::RunSubscriptionNow { id, reply } => {
+                let result = self
+                    .coordinator
+                    .run_subscription_now(&id)
+                    .map_err(submit_error_code);
+                if result.is_ok() {
+                    self.flush_due_subscriptions();
+                }
                 let _ = reply.send(result);
             }
             ServiceCommand::AssistantSnapshot { reply } => {
@@ -3938,9 +4211,31 @@ impl Service {
         self.publish_events(true);
     }
 
+    /// Copy accepted Live clean text into the session ledger by row id, keeping the byte accounting exact.
+    fn absorb_clean_rows(&mut self, rows: &[TranscriptRow]) {
+        for row in rows {
+            if let Some(entry) = self
+                .ledger
+                .iter_mut()
+                .rev()
+                .find(|entry| entry.row_id == row.row_id)
+                && entry.text != row.text
+            {
+                self.ledger_bytes = self
+                    .ledger_bytes
+                    .saturating_sub(entry.text.len())
+                    .saturating_add(row.text.len());
+                entry.text = row.text.clone();
+            }
+        }
+    }
+
     fn begin_session(&mut self, recording_id: String) -> Result<(), ErrorCode> {
+        let _ = self.live_batcher.drain_all();
+        self.live_backlog_released = false;
         validate_recording_id(&recording_id)?;
         self.cancel_pending_finals(ErrorCode::Superseded);
+        self.reload_prompt_inputs();
         self.coordinator
             .begin_session()
             .map_err(control_error_code)?;
@@ -3948,10 +4243,53 @@ impl Service {
         self.ledger.clear();
         self.ledger_bytes = 0;
         self.session_steering = None;
-        self.pinned_exchange = None;
+        self.subscription_exchanges.clear();
         self.ingress_incomplete.store(false, Ordering::Release);
         self.bump_state();
         Ok(())
+    }
+
+    /// Re-read the word bank and the lexicon from disk at every session begin so rules added by
+    /// `corti --review` (or a bank edited by another process) are live for the next call. A changed
+    /// digest fences in-flight and cached work exactly like a Settings edit; unchanged digests fence
+    /// nothing. In-memory fixtures (`persist_to_disk == false`) keep what they were given.
+    fn reload_prompt_inputs(&mut self) {
+        if !self.persist_to_disk {
+            return;
+        }
+        let mut changed = false;
+        match crate::word_bank::load() {
+            Ok(bank) if bank.content_digest() != self.word_bank.content_digest() => {
+                self.word_bank = bank;
+                changed = true;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "corti::hosted",
+                error = %format!("{error:#}"),
+                "word bank is unreadable at session begin; keeping the loaded one"
+            ),
+        }
+        let lexicon =
+            crate::lexicon::load_compiled().unwrap_or_else(corti_lexicon::CompiledLexicon::empty);
+        if lexicon.digest() != self.lexicon.digest() {
+            self.lexicon_corrections = prompt_corrections(&lexicon);
+            self.lexicon = lexicon;
+            changed = true;
+        }
+        if changed {
+            match self.coordinator.apply_patch(ControlPatch::BankChanged) {
+                Ok(_) => {
+                    self.bump_state();
+                    self.refresh_snapshot();
+                }
+                Err(error) => tracing::warn!(
+                    target: "corti::hosted",
+                    ?error,
+                    "prompt inputs changed on disk but the bank fence could not be advanced"
+                ),
+            }
+        }
     }
 
     fn patch(&mut self, request: HostedPatchRequest) -> Result<HostedMutationResult, ErrorCode> {
@@ -3971,6 +4309,44 @@ impl Service {
             self.revise_preferences(|values| {
                 values.pinned_auto_acknowledgement_version = Some(PINNED_AUTO_DISCLOSURE_VERSION)
             })?;
+        }
+        if let HostedPatchInput::SetProviderCacheAcknowledged {
+            provider,
+            acknowledged,
+        } = &request.patch
+        {
+            let provider = provider.clone();
+            let acknowledged = *acknowledged;
+            let before = self.preferences.lock().unwrap().clone();
+            if !acknowledged {
+                // The persisted document refuses an acknowledged-only policy once the acknowledgement
+                // is gone, so lanes on this provider drop to `off` first (they then show as blocked or
+                // simply stop requesting explicit caching).
+                self.downgrade_lane_cache_policies(&provider);
+            }
+            let mut known = true;
+            self.revise_preferences(|values| {
+                known = values.set_provider_cache_acknowledged(&provider, acknowledged);
+            })?;
+            if !known {
+                return Err(ErrorCode::PolicyBlocked);
+            }
+            let changed = *self.preferences.lock().unwrap() != before;
+            if changed {
+                // Lanes saved on this provider re-derive their cache policy now, so acknowledging
+                // makes a blocked Gemini lane dispatch without re-selecting the model.
+                if acknowledged {
+                    self.reconcile_lane_cache_policies(&provider);
+                }
+                self.bump_state();
+                self.refresh_snapshot();
+                return Ok(HostedMutationResult::Applied {
+                    settings: self.current_settings(),
+                });
+            }
+            return Ok(HostedMutationResult::Unchanged {
+                settings: self.current_settings(),
+            });
         }
         if let HostedPatchInput::SetDisplayPreferences {
             show_history_diagnostics,
@@ -4005,7 +4381,22 @@ impl Service {
             },
             HostedPatchInput::SetLaneSelection { lane, selection } => {
                 let family = LaneFamily::from(lane);
-                let selection = LaneSelectionDto::try_from(selection)?;
+                let mut selection = LaneSelectionDto::try_from(selection)?;
+                // The cache policy is derived from the model and the owner's acknowledgement, not
+                // chosen by the UI; a model that needs an acknowledgement is refused with that reason
+                // instead of a bare policy error (#144).
+                if let Err(block) = self.normalize_cache_policy(&mut selection) {
+                    tracing::info!(
+                        target: "corti::hosted",
+                        ?block,
+                        "lane selection needs the provider-side caching acknowledgement"
+                    );
+                    return Ok(HostedMutationResult::Invalid {
+                        settings: self.current_settings(),
+                        field: HostedMutationInvalidField::ProviderCache,
+                        reason: HostedMutationInvalidReason::AcknowledgementRequired,
+                    });
+                }
                 self.validate_settings_selection(family, &selection)?;
                 ControlPatch::SetLaneSelection {
                     lane: family,
@@ -4013,7 +4404,8 @@ impl Service {
                 }
             }
             HostedPatchInput::SetPinnedAuto { enabled, .. } => ControlPatch::SetPinnedAuto(enabled),
-            HostedPatchInput::SetDisplayPreferences { .. } => unreachable!(),
+            HostedPatchInput::SetDisplayPreferences { .. }
+            | HostedPatchInput::SetProviderCacheAcknowledged { .. } => unreachable!(),
         };
         let outcome = self
             .coordinator
@@ -4021,10 +4413,10 @@ impl Service {
             .map_err(control_error_code)?;
         if !matches!(outcome, PatchOutcome::Unchanged(_)) {
             self.bump_state();
-            // A user may save the template, enable Questions, acknowledge Master, and enable automatic
+            // A user may save subscriptions, enable Questions, acknowledge Master, and enable automatic
             // updates in any order. Reconsider the transcript already present after every effective control
             // change so that sequence never requires another 40 words merely to start the first answer.
-            self.schedule_pinned_from_current();
+            self.flush_due_subscriptions();
         }
         self.refresh_snapshot();
         Ok(match outcome {
@@ -4629,6 +5021,130 @@ impl Service {
         }
     }
 
+    /// Overwrite the selection's provider cache mode with the one its model needs under the current
+    /// acknowledgement (`corti_chat::cache_policy`). A selection whose model is not in the catalog is
+    /// left untouched so `validate_settings_selection` reports `ModelUnavailable` as before.
+    fn normalize_cache_policy(
+        &self,
+        selection: &mut LaneSelectionDto,
+    ) -> Result<(), corti_chat::CachePolicyBlock> {
+        let (Some(provider), Some(transport), Some(model)) = (
+            selection.provider.as_ref(),
+            selection.transport.as_ref(),
+            selection.model.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        let Ok(scope) = self.scope_for(provider, transport) else {
+            return Ok(());
+        };
+        let Some(candidate) = self
+            .coordinator
+            .provider_states()
+            .filter(|state| {
+                &state.descriptor.provider == provider && &state.descriptor.transport == transport
+            })
+            .flat_map(|state| state.models.iter())
+            .find(|candidate| {
+                &candidate.exact_model_id == model
+                    && candidate.region.as_deref() == scope.region.as_deref()
+            })
+        else {
+            return Ok(());
+        };
+        let acknowledged = self
+            .preferences
+            .lock()
+            .unwrap()
+            .values()
+            .provider_cache_acknowledged(provider.as_str());
+        let mode = corti_chat::effective_provider_cache(candidate, acknowledged)?;
+        selection.cache_policy.provider = mode;
+        Ok(())
+    }
+
+    /// After an acknowledgement changes, re-derive every complete lane selection on that provider so a
+    /// lane saved under the old policy starts dispatching (or stops being blocked) without re-selecting
+    /// its model. Failures are logged; Settings still shows the lane as blocked.
+    fn reconcile_lane_cache_policies(&mut self, provider: &str) {
+        let snapshot = self.coordinator.control_snapshot().clone();
+        let lanes = [
+            (LaneFamily::Live, snapshot.live.selection.clone()),
+            (LaneFamily::Final, snapshot.final_lane.selection.clone()),
+            (LaneFamily::Question, snapshot.questions.selection.clone()),
+        ];
+        for (family, mut selection) in lanes {
+            if selection.provider.as_ref().map(ProviderId::as_str) != Some(provider) {
+                continue;
+            }
+            let before = selection.cache_policy.provider;
+            match self.normalize_cache_policy(&mut selection) {
+                Ok(()) if selection.cache_policy.provider != before => {
+                    if let Err(error) =
+                        self.coordinator
+                            .apply_patch(ControlPatch::SetLaneSelection {
+                                lane: family,
+                                selection,
+                            })
+                    {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            ?family,
+                            ?error,
+                            "could not re-derive the lane cache policy after the acknowledgement change"
+                        );
+                    }
+                }
+                Ok(()) => {}
+                Err(block) => {
+                    tracing::info!(
+                        target: "corti::hosted",
+                        ?family,
+                        ?block,
+                        "lane stays blocked until provider-side caching is acknowledged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Before an acknowledgement is withdrawn, move every lane on that provider that relies on it back to
+    /// `off`, keeping the persisted document valid at each step.
+    fn downgrade_lane_cache_policies(&mut self, provider: &str) {
+        let snapshot = self.coordinator.control_snapshot().clone();
+        let lanes = [
+            (LaneFamily::Live, snapshot.live.selection.clone()),
+            (LaneFamily::Final, snapshot.final_lane.selection.clone()),
+            (LaneFamily::Question, snapshot.questions.selection.clone()),
+        ];
+        for (family, mut selection) in lanes {
+            if selection.provider.as_ref().map(ProviderId::as_str) != Some(provider)
+                || !matches!(
+                    selection.cache_policy.provider,
+                    ProviderCacheMode::UnavoidableImplicit
+                        | ProviderCacheMode::ExplicitStablePrefix
+                )
+            {
+                continue;
+            }
+            selection.cache_policy.provider = ProviderCacheMode::Off;
+            if let Err(error) = self
+                .coordinator
+                .apply_patch(ControlPatch::SetLaneSelection {
+                    lane: family,
+                    selection,
+                })
+            {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    ?family,
+                    ?error,
+                    "could not downgrade the lane cache policy before withdrawing the acknowledgement"
+                );
+            }
+        }
+    }
+
     fn refresh_provider(
         &mut self,
         provider: &ProviderId,
@@ -4660,42 +5176,64 @@ impl Service {
         }
     }
 
-    fn set_pinned_template(
+    fn set_subscriptions(
         &mut self,
-        request: PinnedQuestionUpdateRequest,
+        request: SubscriptionsUpdateRequest,
     ) -> Result<HostedMutationResult, ErrorCode> {
         if request.observed_state_revision != self.state_revision {
             return Ok(HostedMutationResult::Conflict {
                 settings: self.current_settings(),
             });
         }
-        let template = request.template;
-        if template.len() > crate::postprocess::MAX_QUESTION_TEXT_BYTES
-            || template.chars().any(char::is_control)
-        {
-            return Err(ErrorCode::PolicyBlocked);
-        }
-        if self
+        let current = self
             .preferences
             .lock()
             .unwrap()
             .values()
-            .pinned_question_template
-            == template
-        {
+            .subscriptions
+            .clone();
+        let next: Vec<QuestionSubscriptionPreferences> = request
+            .subscriptions
+            .into_iter()
+            .map(|input| {
+                let existing = current.iter().find(|saved| saved.id == input.id);
+                QuestionSubscriptionPreferences {
+                    id: input.id,
+                    title: input.title,
+                    template: input
+                        .template
+                        .or_else(|| existing.map(|saved| saved.template.clone()))
+                        .unwrap_or_default(),
+                    enabled: input.enabled,
+                    preset: input.preset,
+                    output: input.output,
+                    trigger: input.trigger.unwrap_or_default(),
+                    context: input.context.unwrap_or_default(),
+                    name_hints: input.name_hints,
+                }
+            })
+            .collect();
+        if next == current {
             return Ok(HostedMutationResult::Unchanged {
                 settings: self.current_settings(),
             });
         }
-        // The frontend is the single debounce owner. Persist and fence one accepted revision atomically on
-        // this serial service thread so an older response/edit can never win after a newer revision.
-        self.revise_preferences(|values| values.pinned_question_template = template.clone())?;
+        let specs = subscription_specs_strict(&next)?;
+        // Persist first, then fence one accepted revision atomically on this serial service thread so
+        // an older response/edit can never win after a newer revision.
+        self.revise_preferences(|values| values.subscriptions = next.clone())?;
         self.coordinator
-            .edit_pinned_template(template)
+            .set_subscriptions(specs)
             .map_err(submit_error_code)?;
-        self.pinned_exchange = None;
+        let kept: std::collections::HashSet<&str> = next
+            .iter()
+            .map(|subscription| subscription.id.as_str())
+            .collect();
+        self.subscription_exchanges
+            .retain(|id, _| kept.contains(id.as_str()));
         self.bump_state();
         self.refresh_snapshot();
+        self.flush_due_subscriptions();
         Ok(HostedMutationResult::Applied {
             settings: self.current_settings(),
         })
@@ -4726,7 +5264,13 @@ impl Service {
                     submission,
                     watermark,
                 }) => {
-                    let _ = self.coordinator.submit_live(*submission, watermark);
+                    if let Err(error) = self.coordinator.submit_live(*submission, watermark) {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            ?error,
+                            "hot-path Live request was refused; its rows stay raw"
+                        );
+                    }
                 }
                 Ok(HotPathCommand::Barrier { reply }) => {
                     let _ = reply.send(());
@@ -4747,72 +5291,192 @@ impl Service {
                 .saturating_add(64)
         });
         if self.ledger_bytes.saturating_add(added) > MAX_SESSION_LEDGER_BYTES {
+            tracing::warn!(
+                target: "corti::hosted",
+                rows = rows.len(),
+                "hosted session ledger is full; new rows stay raw"
+            );
             self.ingress_incomplete.store(true, Ordering::Release);
             return;
         }
-        let watermark = match self.coordinator.observe_finalized_rows(&rows) {
-            Ok(watermark) => watermark,
-            Err(_) => {
-                self.ingress_incomplete.store(true, Ordering::Release);
-                return;
-            }
-        };
+        if let Err(error) = self.coordinator.observe_finalized_rows(&rows) {
+            tracing::warn!(
+                target: "corti::hosted",
+                ?error,
+                rows = rows.len(),
+                "coordinator refused finalized rows; they stay raw"
+            );
+            self.ingress_incomplete.store(true, Ordering::Release);
+            return;
+        }
         let old_len = self.ledger.len();
         self.ledger_bytes = self.ledger_bytes.saturating_add(added);
         self.ledger.extend(rows);
-        if let Some(submission) = self.build_live_submission(recording_id, old_len, watermark) {
-            let _ = self.coordinator.submit_live(submission, watermark);
+        if lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
+            let now = self.clock.monotonic_micros();
+            let items: Vec<(usize, usize)> = (old_len..self.ledger.len())
+                .map(|index| (index, self.ledger[index].text.len()))
+                .collect();
+            self.live_batcher.push(items, now);
+            self.flush_live_batches();
         }
-        if let Some(submission) = self.build_pinned_submission(recording_id, watermark) {
-            self.submit_pinned_candidate(submission, watermark);
+        self.flush_due_subscriptions();
+    }
+
+    /// Hand due batches to the coordinator. At most one Live batch is outstanding at a time; rows that
+    /// cannot be sent for a per-row reason are released as raw (loudly), rows that merely did not fit go
+    /// back to the front of the batcher, and a backlog that grows past the policy's bounds is released
+    /// from the oldest end so the live view never falls minutes behind.
+    fn flush_live_batches(&mut self) {
+        let Some(recording_id) = self.current_recording.clone() else {
+            return;
+        };
+        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
+            let unsent = self.live_batcher.drain_all();
+            if !unsent.is_empty() {
+                tracing::info!(
+                    target: "corti::hosted",
+                    rows = unsent.len(),
+                    "Live lane is off; pending rows stay raw"
+                );
+            }
+            return;
         }
+        let now = self.clock.monotonic_micros();
+        if let Some(released) = self.live_batcher.release_overdue(now) {
+            self.ingress_incomplete.store(true, Ordering::Release);
+            let arming = self.coordinator.live_call_is_arming();
+            tracing::warn!(
+                target: "corti::hosted",
+                rows = released.items.len(),
+                reason = ?released.reason,
+                waiting_on_credential = arming,
+                "Live cleanup is behind; releasing the oldest pending rows as raw"
+            );
+            self.live_backlog_released = true;
+        }
+        loop {
+            let outstanding = self.coordinator.live_work_pending();
+            let Some(batch) = self.live_batcher.take_due(now, outstanding) else {
+                break;
+            };
+            let watermark = self.coordinator.watermark();
+            match self.build_live_submission(&recording_id, &batch.items, watermark) {
+                LiveBuild::Submission {
+                    submission,
+                    leftover,
+                } => {
+                    self.give_back_rows(&leftover, batch.pushed_at_micros);
+                    match self.coordinator.submit_live(*submission, watermark) {
+                        Ok(()) => {}
+                        Err(
+                            error @ (crate::postprocess::SubmitError::DuplicateCall
+                            | crate::postprocess::SubmitError::StaleWatermark),
+                        ) => {
+                            // Transient: the same rows are resubmitted on the next flush.
+                            tracing::debug!(
+                                target: "corti::hosted",
+                                ?error,
+                                rows = batch.items.len(),
+                                "Live batch deferred"
+                            );
+                            self.give_back_rows(&batch.items, batch.pushed_at_micros);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "corti::hosted",
+                                ?error,
+                                rows = batch.items.len(),
+                                "Live batch refused by the coordinator; its rows stay raw"
+                            );
+                            self.ingress_incomplete.store(true, Ordering::Release);
+                        }
+                    }
+                    break;
+                }
+                LiveBuild::Rejected {
+                    released,
+                    leftover,
+                    reason,
+                } => {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        rows = released.len(),
+                        reason,
+                        "Live rows cannot be rewritten and stay raw"
+                    );
+                    self.ingress_incomplete.store(true, Ordering::Release);
+                    self.give_back_rows(&leftover, batch.pushed_at_micros);
+                }
+            }
+        }
+    }
+
+    fn give_back_rows(&mut self, indices: &[usize], pushed_at_micros: u64) {
+        if indices.is_empty() {
+            return;
+        }
+        let items: Vec<(usize, usize)> = indices
+            .iter()
+            .map(|index| {
+                (
+                    *index,
+                    self.ledger.get(*index).map_or(0, |row| row.text.len()),
+                )
+            })
+            .collect();
+        self.live_batcher.give_back(items, pushed_at_micros);
     }
 
     fn build_live_submission(
         &mut self,
         recording_id: &str,
-        old_len: usize,
+        indices: &[usize],
         watermark: TranscriptWatermark,
-    ) -> Option<RequestSubmission> {
-        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Live) {
-            return None;
-        }
+    ) -> LiveBuild {
         let input_token_budget = self.input_token_budget(LaneFamily::Live);
-        let mut bytes = 0usize;
         let mut tokens = 0u64;
         let mut targets = Vec::new();
-        let incoming = &self.ledger[old_len..];
-        for row in incoming {
+        let mut leftover = Vec::new();
+        for (position, index) in indices.iter().enumerate() {
+            let Some(row) = self.ledger.get(*index) else {
+                continue;
+            };
             let row_tokens = estimated_row_tokens(row);
-            let next_bytes = bytes.saturating_add(row.text.len());
-            let next_tokens = tokens.saturating_add(row_tokens);
-            if row_tokens > input_token_budget
-                || next_tokens > input_token_budget
-                || (!targets.is_empty()
-                    && (targets.len() >= MAX_LIVE_TARGET_ROWS
-                        || next_bytes > MAX_LIVE_TARGET_BYTES))
-            {
+            if targets.is_empty() && row_tokens > input_token_budget {
+                // One row the model cannot take stays raw and never blocks the rows behind it.
+                return LiveBuild::Rejected {
+                    released: vec![*index],
+                    leftover: indices[position + 1..].to_vec(),
+                    reason: "row exceeds the model input budget",
+                };
+            }
+            if tokens.saturating_add(row_tokens) > input_token_budget {
+                leftover = indices[position..].to_vec();
                 break;
             }
-            bytes = next_bytes;
-            tokens = next_tokens;
+            tokens = tokens.saturating_add(row_tokens);
             targets.push(row.clone());
         }
-        if targets.len() != incoming.len() {
-            // Never imply complete hosted coverage when a latency/model token budget omitted finalized rows.
-            // The raw UI remains complete and the stronger live final safely falls back to raw.
-            self.ingress_incomplete.store(true, Ordering::Release);
-        }
         if targets.is_empty() {
-            return None;
+            return LiveBuild::Rejected {
+                released: indices.to_vec(),
+                leftover: Vec::new(),
+                reason: "batch names no ledger rows",
+            };
         }
-        let context_start = old_len.saturating_sub(MAX_CONTEXT_ROWS);
+        let first_index = indices[0].min(self.ledger.len());
+        let context_start = first_index.saturating_sub(MAX_CONTEXT_ROWS);
         let context = bounded_rows_from_end(
-            &self.ledger[context_start..old_len],
+            &self.ledger[context_start..first_index],
             input_token_budget.saturating_sub(tokens),
         )
         .0;
-        self.build_submission(
+        let deadline = self
+            .clock
+            .monotonic_micros()
+            .saturating_add(self.coordinator.deadlines().live_terminal_micros);
+        match self.build_submission(
             recording_id,
             Lane::Live,
             targets,
@@ -4821,96 +5485,132 @@ impl Service {
             false,
             watermark,
             None,
-            self.clock
-                .monotonic_micros()
-                .saturating_add(crate::postprocess::LIVE_TERMINAL_DEADLINE_MICROS),
-        )
-        .ok()
-    }
-
-    fn sync_pinned_revision(&mut self) {
-        let revision = self.coordinator.control_snapshot().pinned_question_revision;
-        if revision == self.observed_pinned_revision {
-            return;
+            deadline,
+        ) {
+            Ok(submission) => LiveBuild::Submission {
+                submission: Box::new(submission),
+                leftover,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    ?error,
+                    "Live submission could not be built"
+                );
+                LiveBuild::Rejected {
+                    released: indices.to_vec(),
+                    leftover: Vec::new(),
+                    reason: "submission could not be built",
+                }
+            }
         }
-        self.observed_pinned_revision = revision;
-        self.schedule_pinned_from_current();
     }
 
-    fn schedule_pinned_from_current(&mut self) {
+    /// Build and submit every subscription the coordinator reports due. Scheduling is pull-based: the
+    /// coordinator owns thresholds, quiet periods, spacing and single-flight per subscription; the
+    /// Service only assembles the request (context window over the cleaned ledger, question text with
+    /// its layout instruction) when asked. A refused submission defers that subscription briefly so
+    /// it is not rebuilt every tick.
+    fn flush_due_subscriptions(&mut self) {
         let Some(recording_id) = self.current_recording.clone() else {
             return;
         };
-        let watermark = self.coordinator.watermark();
-        if let Some(submission) = self.build_pinned_submission(&recording_id, watermark) {
-            self.submit_pinned_candidate(submission, watermark);
+        let now = self.clock.monotonic_micros();
+        for id in self.coordinator.due_subscriptions(now) {
+            let Some(spec) = self.coordinator.subscription_spec(&id).cloned() else {
+                continue;
+            };
+            let watermark = self.coordinator.watermark();
+            let submission =
+                match self.build_subscription_submission(&recording_id, &spec, watermark) {
+                    Ok(submission) => submission,
+                    Err(code) => {
+                        tracing::warn!(
+                            target: "corti::hosted",
+                            subscription = %id.as_str(),
+                            ?code,
+                            "question subscription could not be built; retrying later"
+                        );
+                        self.coordinator
+                            .defer_subscription(&id, crate::postprocess::SUBSCRIPTION_RETRY_MICROS);
+                        continue;
+                    }
+                };
+            let call_id = submission.request.call_id.clone();
+            match self
+                .coordinator
+                .submit_subscription(&id, submission, watermark)
+            {
+                Ok(()) => {
+                    let previous_answer =
+                        self.subscription_exchanges
+                            .get(id.as_str())
+                            .and_then(|exchange| {
+                                exchange
+                                    .answer
+                                    .clone()
+                                    .or_else(|| exchange.previous_answer.clone())
+                            });
+                    self.subscription_exchanges.insert(
+                        id.as_str().to_owned(),
+                        AssistantExchangeDto {
+                            call_id,
+                            as_of_revision: watermark.transcript_revision,
+                            status: QuestionStatusDto::Queued,
+                            error: None,
+                            question: spec.effective_template(),
+                            answer: None,
+                            cost_label: None,
+                            format: spec.format.as_str().to_owned(),
+                            partial_answer: None,
+                            previous_answer,
+                        },
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "corti::hosted",
+                        subscription = %id.as_str(),
+                        ?error,
+                        "question subscription was refused by the coordinator; retrying later"
+                    );
+                    self.coordinator
+                        .defer_subscription(&id, crate::postprocess::SUBSCRIPTION_RETRY_MICROS);
+                }
+            }
         }
     }
 
-    fn submit_pinned_candidate(
-        &mut self,
-        submission: RequestSubmission,
-        watermark: TranscriptWatermark,
-    ) {
-        let call_id = submission.request.call_id.clone();
-        if self
-            .coordinator
-            .submit_pinned_snapshot(submission, watermark)
-            .is_ok()
-        {
-            let question = self
-                .preferences
-                .lock()
-                .unwrap()
-                .values()
-                .pinned_question_template
-                .clone();
-            self.pinned_exchange = Some(AssistantExchangeDto {
-                call_id,
-                as_of_revision: watermark.transcript_revision,
-                status: QuestionStatusDto::Queued,
-                error: None,
-                question,
-                answer: None,
-                cost_label: None,
-            });
-        }
-    }
-
-    fn build_pinned_submission(
+    fn build_subscription_submission(
         &mut self,
         recording_id: &str,
+        spec: &corti_chat::SubscriptionSpec,
         watermark: TranscriptWatermark,
-    ) -> Option<RequestSubmission> {
-        let template = self
-            .preferences
-            .lock()
-            .unwrap()
-            .values()
-            .pinned_question_template
-            .clone();
-        if template.trim().is_empty()
-            || !self.coordinator.control_snapshot().pinned_auto_enabled
-            || !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Question)
-        {
-            return None;
+    ) -> Result<RequestSubmission, ErrorCode> {
+        if !lane_enabled(self.coordinator.control_snapshot(), LaneFamily::Question) {
+            return Err(ErrorCode::PolicyBlocked);
         }
+        let window = spec.context.select(&self.ledger);
         let (context, context_truncated) =
-            bounded_question_context(&self.ledger, self.input_token_budget(LaneFamily::Question));
+            bounded_question_context(window, self.input_token_budget(LaneFamily::Question));
+        let question = spec.question_text();
+        let group_id = self.next_group_id("subscription")?;
+        let target_id = TargetId::new(spec.id.as_str()).map_err(|_| ErrorCode::Internal)?;
+        let deadline = self
+            .clock
+            .monotonic_micros()
+            .saturating_add(self.coordinator.deadlines().question_micros);
         self.build_submission(
             recording_id,
             Lane::PinnedQuestion,
             Vec::new(),
             context,
-            Some(&template),
+            Some(&question),
             context_truncated,
             watermark,
-            None,
-            self.clock
-                .monotonic_micros()
-                .saturating_add(crate::postprocess::QUESTION_DEADLINE_MICROS),
+            Some((group_id, Some(target_id))),
+            deadline,
         )
-        .ok()
     }
 
     fn submit_ad_hoc(&mut self, question: String) -> Result<CallId, ErrorCode> {
@@ -4932,7 +5632,7 @@ impl Service {
             None,
             self.clock
                 .monotonic_micros()
-                .saturating_add(crate::postprocess::QUESTION_DEADLINE_MICROS),
+                .saturating_add(self.coordinator.deadlines().question_micros),
         )?;
         let call_id = submission.request.call_id.clone();
         self.coordinator
@@ -4948,6 +5648,9 @@ impl Service {
             .into_iter()
             .filter_map(|summary| {
                 let content = self.coordinator.question_content(&summary.call_id)?;
+                let partial_answer = (summary.status == QuestionStatusDto::Running)
+                    .then(|| self.coordinator.partial_answer(&summary.call_id))
+                    .flatten();
                 Some(AssistantExchangeDto {
                     call_id: summary.call_id,
                     as_of_revision: summary.as_of_revision,
@@ -4956,12 +5659,39 @@ impl Service {
                     question: content.question.to_owned(),
                     answer: content.answer.map(str::to_owned),
                     cost_label: summary.cost.as_ref().map(CostEstimate::render),
+                    format: "paragraph".to_owned(),
+                    partial_answer,
+                    previous_answer: None,
                 })
             })
             .collect();
+        let statuses = self.coordinator.subscription_statuses();
+        let subscriptions = self
+            .coordinator
+            .subscription_specs()
+            .map(|spec| {
+                let status = statuses.iter().find(|status| status.id == spec.id);
+                let mut exchange = self.subscription_exchanges.get(spec.id.as_str()).cloned();
+                if let Some(exchange) = exchange.as_mut()
+                    && exchange.status == QuestionStatusDto::Running
+                {
+                    exchange.partial_answer = self.coordinator.partial_answer(&exchange.call_id);
+                }
+                AssistantSubscriptionDto {
+                    id: spec.id.as_str().to_owned(),
+                    title: spec.title.clone(),
+                    preset: spec.preset.as_str().to_owned(),
+                    format: spec.format.as_str().to_owned(),
+                    enabled: spec.enabled,
+                    run_count: status.map_or(0, |status| status.run_count),
+                    in_flight: status.is_some_and(|status| status.in_flight),
+                    pending: status.is_some_and(|status| status.pending),
+                    exchange,
+                }
+            })
+            .collect();
         AssistantSnapshotDto {
-            pinned_run_count: self.coordinator.pinned_run_count(),
-            pinned: self.pinned_exchange.clone(),
+            subscriptions,
             exchanges,
         }
     }
@@ -5225,15 +5955,22 @@ impl Service {
         let scope = self.scope_for(&provider, &transport)?;
         let steering = self.effective_steering();
         let prompt = if lane.is_question() {
-            CanonicalPrompt::question(
+            CanonicalPrompt::question_with_corrections(
                 &self.word_bank,
+                &self.lexicon_corrections,
                 &steering,
                 &context,
                 question.ok_or(ErrorCode::PolicyBlocked)?,
                 context_truncated,
             )
         } else {
-            CanonicalPrompt::rewrite(&self.word_bank, &steering, &context, &targets)
+            CanonicalPrompt::rewrite_with_corrections(
+                &self.word_bank,
+                &self.lexicon_corrections,
+                &steering,
+                &context,
+                &targets,
+            )
         };
         let (group_id, target_id) = match identity {
             Some(value) => value,
@@ -5272,6 +6009,7 @@ impl Service {
                         },
                         provider_cache_mode: lane_control.selection.cache_policy.provider,
                         word_bank_canonical_digest: self.word_bank.content_digest(),
+                        lexicon_canonical_digest: self.lexicon.digest(),
                     },
                 )
             });
@@ -5309,6 +6047,7 @@ impl Service {
                 billing_basis: descriptor.billing_basis,
                 cache_policy: request.cache_policy,
                 word_bank_canonical_digest: self.word_bank.content_digest(),
+                lexicon_canonical_digest: self.lexicon.digest(),
                 effective_steering: &steering,
                 targets: &request.targets,
                 context: &request.context,
@@ -5831,20 +6570,25 @@ impl Service {
         match apply.lane {
             Lane::Live => {
                 let result = match (
-                    self.current_recording.as_deref(),
+                    self.current_recording.clone(),
                     apply.output.rewritten_rows(),
                 ) {
                     (Some(recording_id), Some(rows)) => match self.live_view.apply_hosted_rows(
-                        recording_id,
+                        &recording_id,
                         rows,
                         apply.fence.transcript_revision,
                     ) {
-                        crate::live_view::HostedRowsApplyOutcome::Applied { .. } => Ok(()),
+                        crate::live_view::HostedRowsApplyOutcome::Applied { .. } => {
+                            // Questions and later Live context read the ledger, so accepted clean text
+                            // replaces the raw text there too (the live view keeps raw immutable).
+                            self.absorb_clean_rows(rows);
+                            Ok(())
+                        }
                         crate::live_view::HostedRowsApplyOutcome::Stale => {
                             tracing::warn!(
                                 target: "corti::hosted",
                                 call_id = %apply.call_id,
-                                "discarded a hosted Live result at the final transcript application fence"
+                                "discarded a hosted Live result: a target row is no longer in the live transcript"
                             );
                             Err(ErrorCode::Superseded)
                         }
@@ -5878,12 +6622,16 @@ impl Service {
                 }
             }
             Lane::PinnedQuestion => {
-                if let Some(exchange) = self.pinned_exchange.as_mut()
-                    && exchange.call_id == apply.call_id
+                if let Some(exchange) = self
+                    .subscription_exchanges
+                    .values_mut()
+                    .find(|exchange| exchange.call_id == apply.call_id)
                 {
                     exchange.status = QuestionStatusDto::Completed;
                     exchange.error = None;
                     exchange.answer = apply.output.answer().map(str::to_owned);
+                    exchange.partial_answer = None;
+                    exchange.previous_answer = None;
                 }
             }
             Lane::AdHocQuestion => {}
@@ -6025,11 +6773,14 @@ impl Service {
             let CoordinatorEventDto::Terminal(telemetry) = event else {
                 continue;
             };
-            if let Some(exchange) = self.pinned_exchange.as_mut()
-                && exchange.call_id == telemetry.call_id
+            if let Some(exchange) = self
+                .subscription_exchanges
+                .values_mut()
+                .find(|exchange| exchange.call_id == telemetry.call_id)
             {
                 exchange.cost_label = Some(telemetry.cost.render());
                 if telemetry.outcome != TerminalOutcomeDto::Completed {
+                    exchange.partial_answer = None;
                     exchange.status = if matches!(
                         telemetry.outcome,
                         TerminalOutcomeDto::Canceled | TerminalOutcomeDto::Superseded
@@ -6098,6 +6849,7 @@ impl Service {
             &providers,
             chatgpt_scope_configured(&self.coordinator),
             self.secret_presence.as_ref(),
+            self.preferences_load_error.as_deref(),
         );
     }
 
@@ -6138,6 +6890,7 @@ impl TryFrom<HostedSelectionInput> for LaneSelectionDto {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn settings_snapshot(
     state_revision: u64,
     preferences: &HostedPreferences,
@@ -6146,8 +6899,17 @@ fn settings_snapshot(
     providers: &[ProviderStateDto],
     chatgpt_scope_configured: bool,
     secret_presence: &dyn Fn(SecretPurpose) -> bool,
+    preferences_load_error: Option<&str>,
 ) -> HostedSettingsDto {
     let values = preferences.values();
+    let provider_cache_acknowledged = ["openai", "anthropic", "google", "amazon"]
+        .into_iter()
+        .map(|provider| ProviderAcknowledgementDto {
+            provider: provider.to_owned(),
+            acknowledged: values.provider_cache_acknowledged(provider),
+        })
+        .collect();
+    let blocked_lanes = blocked_lanes(values, control, providers);
     let mut providers = providers.to_vec();
     providers.sort_by(|left, right| {
         (
@@ -6200,7 +6962,164 @@ fn settings_snapshot(
         final_deadline_seconds: values.final_deadline_seconds,
         show_history_diagnostics: values.show_history_diagnostics,
         show_live_metrics_by_default: values.show_live_metrics_by_default,
+        provider_cache_acknowledged,
+        blocked_lanes,
+        preferences_load_error: preferences_load_error.map(str::to_owned),
+        deadlines: HostedDeadlinesDto {
+            live_first_text_seconds: values.live_first_text_seconds,
+            live_deadline_seconds: values.live_deadline_seconds,
+            question_deadline_seconds: values.question_deadline_seconds,
+        },
+        lexicon_enabled: values.lexicon_enabled,
+        subscriptions: values.subscriptions.clone(),
     }
+}
+
+/// The lexicon's rules as prompt corrections, in application order.
+fn prompt_corrections(lexicon: &corti_lexicon::CompiledLexicon) -> Vec<PromptCorrection> {
+    lexicon
+        .corrections()
+        .into_iter()
+        .map(|correction| PromptCorrection {
+            from: correction.from,
+            to: correction.to,
+        })
+        .collect()
+}
+
+/// The saved subscriptions as coordinator specs; entries the coordinator cannot represent are skipped
+/// with a warning rather than blocking every other subscription (the document validator already
+/// bounds them, so this only guards a hand-edited file).
+fn subscription_specs(
+    values: &crate::postprocess_config::HostedPreferenceValues,
+) -> Vec<corti_chat::SubscriptionSpec> {
+    values
+        .subscriptions
+        .iter()
+        .filter_map(|saved| match subscription_spec(saved) {
+            Ok(spec) => Some(spec),
+            Err(error) => {
+                tracing::warn!(
+                    target: "corti::hosted",
+                    id = %saved.id,
+                    ?error,
+                    "saved question subscription is not usable and is skipped"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Like `subscription_specs` but refuses the whole set on the first bad entry (for edits).
+fn subscription_specs_strict(
+    saved: &[QuestionSubscriptionPreferences],
+) -> Result<Vec<corti_chat::SubscriptionSpec>, ErrorCode> {
+    saved
+        .iter()
+        .map(|entry| subscription_spec(entry).map_err(|_| ErrorCode::PolicyBlocked))
+        .collect()
+}
+
+fn subscription_spec(
+    saved: &QuestionSubscriptionPreferences,
+) -> Result<corti_chat::SubscriptionSpec, corti_chat::SubscriptionError> {
+    use corti_chat::{
+        AnswerFormat, ContextWindow, SpeakerFilter, SubscriptionId, SubscriptionPreset,
+        SubscriptionSpec, TriggerPolicy,
+    };
+    let preset = SubscriptionPreset::parse(&saved.preset)?;
+    let format = match saved.output.as_str() {
+        // `json_questions` is reserved in the document; bullets are its presentation for now.
+        "json_questions" => AnswerFormat::Bullets,
+        other => AnswerFormat::parse(other)?,
+    };
+    let spec = SubscriptionSpec {
+        id: SubscriptionId::new(saved.id.clone())?,
+        title: if saved.title.trim().is_empty() {
+            corti_chat::preset_title(preset).to_owned()
+        } else {
+            saved.title.clone()
+        },
+        template: saved.template.clone(),
+        enabled: saved.enabled,
+        preset,
+        format,
+        trigger: TriggerPolicy {
+            quiet_micros: saved.trigger.quiet_ms.saturating_mul(1_000),
+            min_new_words: saved.trigger.min_new_words,
+            min_new_speech_ms: saved.trigger.min_new_speech_ms,
+            min_interval_micros: saved.trigger.min_interval_ms.saturating_mul(1_000),
+            on_speakers: SpeakerFilter::parse(&saved.trigger.on_speakers)?,
+        },
+        context: ContextWindow::parse(
+            &saved.context.window,
+            saved.context.minutes,
+            saved.context.rows,
+        )?,
+        name_hints: saved.name_hints.clone(),
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+/// Lanes whose saved selection cannot dispatch as saved: the model needs an acknowledgement the owner
+/// has not given, or the saved cache policy no longer matches what the model needs. Settings shows
+/// these instead of the lane failing later with a bare `PolicyBlocked`.
+fn blocked_lanes(
+    values: &crate::postprocess_config::HostedPreferenceValues,
+    control: &ControlSnapshotDto,
+    providers: &[ProviderStateDto],
+) -> Vec<BlockedLaneDto> {
+    let lanes = [
+        ("live", &control.live),
+        ("final", &control.final_lane),
+        ("question", &control.questions),
+    ];
+    let mut blocked = Vec::new();
+    for (name, lane) in lanes {
+        let selection = &lane.selection;
+        let (Some(provider), Some(transport), Some(model_id)) = (
+            selection.provider.as_ref(),
+            selection.transport.as_ref(),
+            selection.model.as_ref(),
+        ) else {
+            continue;
+        };
+        let Some(model) = providers
+            .iter()
+            .filter(|state| {
+                &state.descriptor.provider == provider && &state.descriptor.transport == transport
+            })
+            .flat_map(|state| state.models.iter())
+            .find(|candidate| &candidate.exact_model_id == model_id)
+        else {
+            continue;
+        };
+        let acknowledged = values.provider_cache_acknowledged(provider.as_str());
+        let reason = match corti_chat::effective_provider_cache(model, acknowledged) {
+            Err(corti_chat::CachePolicyBlock::AcknowledgementRequired { .. }) => {
+                "acknowledgement_required"
+            }
+            Ok(_)
+                if !corti_chat::stored_policy_is_acceptable(
+                    model,
+                    selection.cache_policy.provider,
+                    acknowledged,
+                ) =>
+            {
+                "policy_mismatch"
+            }
+            Ok(_) => continue,
+        };
+        blocked.push(BlockedLaneDto {
+            lane: name.to_owned(),
+            provider: provider.as_str().to_owned(),
+            model: model_id.as_str().to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    blocked
 }
 
 fn scope_dto(
@@ -6675,7 +7594,7 @@ fn submit_error_code(error: SubmitError) -> ErrorCode {
         | SubmitError::WrongLane
         | SubmitError::SelectionChanged
         | SubmitError::ProviderBlocked
-        | SubmitError::NoPinnedTemplate => ErrorCode::PolicyBlocked,
+        | SubmitError::UnknownSubscription => ErrorCode::PolicyBlocked,
         SubmitError::StaleWatermark | SubmitError::DuplicateCall => ErrorCode::Superseded,
         SubmitError::Deadline => ErrorCode::Timeout,
         SubmitError::AdHocQueueFull | SubmitError::InvalidQuestion => ErrorCode::RateLimited,
@@ -6855,7 +7774,19 @@ mod tests {
         }
     }
 
-    impl ProviderAccess for Arc<BlockingPrepareProviders> {
+    /// `ProviderAccess` lives in `corti-chat` now, so the orphan rule forbids implementing it for
+    /// `Arc<_>` directly; this local wrapper derefs to the shared fixture.
+    struct SharedBlockingProviders(Arc<BlockingPrepareProviders>);
+
+    impl std::ops::Deref for SharedBlockingProviders {
+        type Target = BlockingPrepareProviders;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl ProviderAccess for SharedBlockingProviders {
         fn descriptor(
             &self,
             provider: &ProviderId,
@@ -7806,6 +8737,7 @@ mod tests {
                     provider: ProviderCacheMode::Off,
                 },
                 word_bank_canonical_digest: "fixture-bank",
+                lexicon_canonical_digest: "",
                 effective_steering: "",
                 targets: &targets,
                 context: &[],
@@ -8066,6 +8998,7 @@ mod tests {
                         provider: ProviderCacheMode::ExplicitStablePrefix,
                     },
                     word_bank_canonical_digest: "bank",
+                    lexicon_canonical_digest: "",
                     effective_steering: "",
                     targets: &targets,
                     context: &[],
@@ -8090,6 +9023,7 @@ mod tests {
                     prompt_task: PromptTask::Rewrite,
                     provider_cache_mode: ProviderCacheMode::ExplicitStablePrefix,
                     word_bank_canonical_digest: "bank",
+                    lexicon_canonical_digest: "",
                 },
             )
         };
@@ -8171,7 +9105,7 @@ mod tests {
             pipeline_tx,
             outbox,
             Arc::new(DenyExecutor),
-            Box::new(providers.clone()),
+            Box::new(SharedBlockingProviders(providers.clone())),
             Arc::new(NoPricing),
             Arc::new(UnarmedVertex),
             Arc::new(|_| {}),
@@ -8931,6 +9865,7 @@ mod tests {
                     provider: ProviderCacheMode::Off,
                 },
                 word_bank_canonical_digest: "fixture-bank",
+                lexicon_canonical_digest: "",
                 effective_steering: "",
                 targets: &[],
                 context: &[],
@@ -9345,12 +10280,22 @@ mod tests {
         }
 
         let (reply, receive) = std::sync::mpsc::channel();
-        let before_pinned = handle.snapshot();
+        let before_subscriptions = handle.snapshot();
         handle
-            .send(ServiceCommand::SetPinnedTemplate {
-                request: PinnedQuestionUpdateRequest {
-                    observed_state_revision: before_pinned.state_revision,
-                    template: "fixture pinned question".into(),
+            .send(ServiceCommand::SetSubscriptions {
+                request: SubscriptionsUpdateRequest {
+                    observed_state_revision: before_subscriptions.state_revision,
+                    subscriptions: vec![SubscriptionInput {
+                        id: "custom".into(),
+                        title: "Fixture question".into(),
+                        template: Some("fixture pinned question".into()),
+                        enabled: true,
+                        preset: "none".into(),
+                        output: "paragraph".into(),
+                        trigger: None,
+                        context: None,
+                        name_hints: Vec::new(),
+                    }],
                 },
                 reply,
             })
@@ -9359,10 +10304,15 @@ mod tests {
             receive.recv().unwrap().unwrap(),
             HostedMutationResult::Applied { .. }
         ));
-        // Let the revision observer see the saved template while auto-run is still off. Enabling auto later
-        // must reconsider existing context rather than relying on a lucky same-tick ordering.
-        std::thread::sleep(Duration::from_millis(30));
         let settings = handle.snapshot();
+        assert_eq!(settings.subscriptions.len(), 1);
+        assert_eq!(
+            settings.subscriptions[0].template,
+            "fixture pinned question"
+        );
+        // Saving while auto-run is still off must not run anything; enabling auto later must reconsider
+        // the context already present rather than relying on a lucky same-tick ordering.
+        std::thread::sleep(Duration::from_millis(30));
         handle
             .patch_for_test(HostedPatchRequest {
                 observed_state_revision: settings.state_revision,
@@ -9372,19 +10322,29 @@ mod tests {
                 },
             })
             .unwrap();
-        // Saving the template after substantial speech should schedule its initial answer from the transcript
-        // already present; requiring another threshold made late onboarding appear to do nothing.
+        // Saving a subscription after substantial speech should schedule its initial answer from the
+        // transcript already present; requiring another threshold made late onboarding appear to do nothing.
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let snapshot = assistant(&handle);
-            if snapshot.pinned.as_ref().is_some_and(|exchange| {
-                exchange.status == QuestionStatusDto::Completed
-                    && exchange.answer.as_deref() == Some("fixture grounded answer")
-            }) {
-                assert_eq!(snapshot.pinned_run_count, 1);
+            let custom = snapshot
+                .subscriptions
+                .iter()
+                .find(|subscription| subscription.id == "custom");
+            if let Some(custom) = custom
+                && custom.exchange.as_ref().is_some_and(|exchange| {
+                    exchange.status == QuestionStatusDto::Completed
+                        && exchange.answer.as_deref() == Some("fixture grounded answer")
+                })
+            {
+                assert_eq!(custom.run_count, 1);
+                assert_eq!(custom.exchange.as_ref().unwrap().format, "paragraph");
                 break;
             }
-            assert!(Instant::now() < deadline, "pinned answer did not settle");
+            assert!(
+                Instant::now() < deadline,
+                "subscription answer did not settle"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         handle.end_live_session(&recording_id).unwrap();
@@ -9415,10 +10375,15 @@ mod tests {
                 question: "fixture private question".into(),
                 answer: Some("fixture private answer".into()),
                 cost_label: None,
+                format: "bullets".into(),
+                partial_answer: Some("fixture private partial".into()),
+                previous_answer: Some("fixture private previous".into()),
             }
         );
         assert!(!assistant_debug.contains("private question"));
         assert!(!assistant_debug.contains("private answer"));
+        assert!(!assistant_debug.contains("private partial"));
+        assert!(!assistant_debug.contains("private previous"));
         for forbidden in [
             "fixture-secret-value",
             "bearer ",
@@ -9461,6 +10426,7 @@ mod tests {
             &initial_provider_states(),
             false,
             &|_| false,
+            None,
         )));
         let handle = HostedHandle {
             command_tx,
@@ -9658,7 +10624,7 @@ mod tests {
     }
 
     #[test]
-    fn vertex_unarmed_event_and_app_catch_up_dispatch_only_the_newest_live_snapshot() {
+    fn vertex_unarmed_event_and_app_catch_up_dispatch_the_oldest_pending_live_batch_first() {
         let path = dir("vertex-catch-up");
         let outbox = Arc::new(TelemetryOutbox::open(path.join("postprocess-outbox.json")).unwrap());
         let (pipeline_tx, _pipeline_rx) = std::sync::mpsc::channel();
@@ -9729,7 +10695,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let calls = executor.target_texts.lock().unwrap().clone();
-        assert_eq!(calls, vec![vec!["newest snapshot".to_string()]]);
+        // The first batch was parked while Vertex was unarmed and dispatches on arming; the rows that
+        // arrived meanwhile accumulated behind it instead of replacing it, and follow as the next batch.
+        assert_eq!(calls[0], vec!["old snapshot".to_string()]);
         assert_eq!(resolver.0.load(Ordering::SeqCst), 2);
         let notices: Vec<_> = events
             .lock()

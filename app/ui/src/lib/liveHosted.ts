@@ -255,7 +255,7 @@ export function callLaneLabel(lane: HostedCallLane): string {
     case "ad_hoc_question":
       return "Question";
     case "pinned_question":
-      return "Pinned";
+      return "Subscription";
   }
 }
 

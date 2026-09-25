@@ -29,6 +29,8 @@ mod console;
 #[cfg(target_os = "macos")]
 mod jobs;
 #[cfg(target_os = "macos")]
+mod lexicon;
+#[cfg(target_os = "macos")]
 mod live;
 #[cfg(target_os = "macos")]
 mod live_test;
@@ -314,7 +316,8 @@ pub(crate) mod imp {
                 crate::postprocess_app::refresh_hosted_provider,
                 crate::postprocess_app::submit_hosted_question,
                 crate::postprocess_app::cancel_hosted_question,
-                crate::postprocess_app::set_hosted_pinned_question,
+                crate::postprocess_app::set_hosted_subscriptions,
+                crate::postprocess_app::run_hosted_subscription_now,
                 crate::postprocess_app::get_hosted_assistant,
                 crate::postprocess_app::list_aws_credential_options,
                 crate::postprocess_app::save_bedrock_setup,

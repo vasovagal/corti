@@ -36,6 +36,51 @@ impl Default for DirectAdapterOptions {
     }
 }
 
+/// Whether a served model id may stand in for the requested one.
+///
+/// Providers echo dated or numbered snapshots of an alias (`gpt-5-2025-08-07`, `gemini-2.5-flash@001`,
+/// `claude-sonnet-4-5-20250929`): the same model, so they are accepted. Anything else — including a
+/// sibling such as `gpt-5-mini` for `gpt-5` or `gemini-2.5-flash-lite` for `gemini-2.5-flash` — is a
+/// substitution and is refused; pricing and telemetry stay keyed by the requested id.
+pub fn served_model_matches(served: &str, requested: &str) -> bool {
+    if served == requested {
+        return true;
+    }
+    let Some(suffix) = served.strip_prefix(requested) else {
+        return false;
+    };
+    let mut chars = suffix.chars();
+    let separator = chars.next();
+    let version = chars.as_str();
+    matches!(separator, Some('@' | '-')) && is_version_token(version)
+}
+
+fn is_version_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16
+        && value.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        && value.starts_with(|c: char| c.is_ascii_digit())
+        && !value.ends_with('-')
+        && !value.contains("--")
+}
+
+/// A provider error `code`/`status`/`param` is safe to log only when it is a short identifier; anything
+/// longer or with other characters could be free-form text and is replaced by `-`.
+pub(crate) fn sanitized_identifier(value: Option<&str>) -> &str {
+    match value {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')) =>
+        {
+            value
+        }
+        _ => "-",
+    }
+}
+
 impl DirectAdapterOptions {
     pub(crate) fn validate(self) -> Result<Self, PostprocessError> {
         if self.max_output_tokens == 0

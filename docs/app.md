@@ -203,7 +203,15 @@ get_live_transcript · get_live_test_window_generation · start_live_test · sto
 get_hosted_settings · patch_hosted_settings · refresh_hosted_provider ·
 start_chatgpt_device_login · cancel_chatgpt_device_login ·
 sign_out_chatgpt_subscription · open_chatgpt_device_login             ← Hosted Preferences (#130)
+submit_hosted_question · cancel_hosted_question · get_hosted_assistant ·
+set_hosted_subscriptions · run_hosted_subscription_now                  ← Assistant / subscriptions (#158)
 ```
+
+The hosted coordinator itself lives in the platform-independent `corti-chat` crate (ADR 0017); the app's
+`postprocess_app.rs` Service is the glue: it batches finalized rows into Live requests, builds the request
+for each subscription the coordinator reports due, copies accepted clean text into the session ledger, and
+re-reads the word bank and the learned lexicon at every session begin. The headless CLI grew
+`corti --review <note.md>…` and `corti --lexicon list|add|remove|test` for that lexicon.
 
 The Diagnostics console polls `get_stats` on a 1 s `setInterval` (`Console.tsx:113,148`); the How
 window polls `get_pipeline_activity` (`app/src/activity.rs:23`) the same way. The Recording Queue

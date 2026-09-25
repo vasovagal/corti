@@ -208,13 +208,23 @@ fn turn_distance(t: f64, turn: &SpeakerTurn) -> f64 {
 //    over the other side's speech add nothing to a transcript.
 //
 // Everything here is deterministic text/timing arithmetic — no audio, no model, no confidence score (the
-// local backend exposes none). Filler words and stutters are deliberately out of scope: they belong to the
-// decoder, not to segmentation.
+// local backend exposes none). Filler and stutter removal (#154) is a per-segment token walk, and the
+// learned lexicon is applied through the [`TextRule`] seam so this crate never depends on it.
 
 /// Version of the [`cleanup`] rule set, recorded in a note's `corti.configuration.segment_cleanup`
 /// provenance. Bump it whenever a pass's behavior changes, so an old note is never read as if it had
 /// today's rules; the individual thresholds are recorded alongside it and are not part of this number.
-pub const CLEANUP_RULES_VERSION: u32 = 2;
+///
+/// - 2: echo → merge → backchannel.
+/// - 3: sort by start first (#157), then echo → merge → backchannel → fillers/stutters (#154) → lexicon.
+pub const CLEANUP_RULES_VERSION: u32 = 3;
+
+/// A deterministic text substitution applied to every surviving segment after the structural passes —
+/// the learned correction lexicon in practice. Implementations return `Some(new_text)` only when
+/// something changed, and must be idempotent (applying the result again changes nothing).
+pub trait TextRule {
+    fn apply(&self, text: &str) -> Option<String>;
+}
 
 /// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
 /// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
@@ -237,6 +247,10 @@ pub struct CleanupConfig {
     /// [`AudioEvidence`] accessor; a very negative value switches the audio rule off without disturbing the
     /// text rules.
     pub echo_audio_margin_db: f32,
+    /// Strip filler noises (`um`, `uh`, `ah`, `er`, `hmm`) and collapse repeated words and bigrams
+    /// (`the the` → `the`, `I think I think` → `I think`) in every surviving segment, repairing the
+    /// sentence start and a dangling comma afterwards (#154). A segment left empty is dropped.
+    pub strip_fillers: bool,
 }
 
 impl Default for CleanupConfig {
@@ -255,16 +269,20 @@ impl Default for CleanupConfig {
             // but residual echo sits *below* the echo estimate, not above it. +3 dB leaves room for the
             // estimate being one block stale without admitting a span that carries real near-end speech.
             echo_audio_margin_db: 3.0,
+            // The largest single noise source in the corpus (#154: ~30 fillers and ~15 stutters per
+            // thousand words) and the cheapest rule to apply, so it ships on.
+            strip_fillers: true,
         }
     }
 }
 
 impl CleanupConfig {
     /// True when no pass would run, so callers can skip [`cleanup`] entirely and record `"off"` in
-    /// provenance rather than a set of inert knobs.
+    /// provenance rather than a set of inert knobs. A [`TextRule`] handed to [`cleanup_with_rules`]
+    /// still runs regardless.
     pub fn is_noop(&self) -> bool {
         let merge_off = self.merge_gap_seconds <= 0.0 || self.merge_gap_seconds.is_nan();
-        !self.echo_drop && !self.drop_backchannels && merge_off
+        !self.echo_drop && !self.drop_backchannels && merge_off && !self.strip_fillers
     }
 }
 
@@ -285,16 +303,27 @@ pub struct CleanupStats {
     /// which the text rules would have kept some. A subset of nothing else: these are counted here and not
     /// in [`echo_dropped_me`](Self::echo_dropped_me), so the two signals stay separable in a sweep.
     pub echo_dropped_audio: usize,
+    /// Filler tokens removed by the filler pass (#154); a segment emptied by it counts its tokens here
+    /// and is dropped.
+    pub fillers_removed: usize,
+    /// Repeated words and bigrams collapsed by the filler pass.
+    pub stutters_collapsed: usize,
+    /// Segments changed by the [`TextRule`] (the lexicon).
+    pub lexicon_applied: usize,
 }
 
 impl CleanupStats {
-    /// Total segments removed or absorbed — zero means the transcript came through untouched.
+    /// Total segments removed or absorbed plus tokens and rows rewritten — zero means the transcript
+    /// came through untouched.
     pub fn changed(&self) -> usize {
         self.echo_dropped_me
             + self.echo_dropped_them
             + self.merged
             + self.backchannels_dropped
             + self.echo_dropped_audio
+            + self.fillers_removed
+            + self.stutters_collapsed
+            + self.lexicon_applied
     }
 }
 
@@ -331,10 +360,12 @@ pub type AudioEvidence<'a> = &'a dyn Fn(f64, f64) -> Option<SpanEvidence>;
 /// near-end speech, which is precisely the case in which a `Me` segment must be kept.
 const AUDIO_DOUBLE_TALK_LIMIT: f32 = 0.5;
 
-/// Clean one **time-sorted** timeline (the output of [`merge_by_time`]) in three passes, in this order:
-/// echo → merge → backchannel. The order matters: dropping an echo first stops it from being merged into a
-/// real turn, and merging before the backchannel pass protects a "Yeah." that is really the opening of a
-/// longer sentence.
+/// Clean one timeline in this order: sort by start (#157: the live path splices `Me` batches into the
+/// `Them` stream, and every rule below assumes neighbours in sequence are neighbours in time) → echo →
+/// merge → backchannel → fillers/stutters → lexicon. The order matters: dropping an echo first stops it
+/// from being merged into a real turn, merging before the backchannel pass protects a "Yeah." that is
+/// really the opening of a longer sentence, and the text rewrites run last so the structural passes
+/// compare what was actually said.
 ///
 /// `carry` is a read-only set of segments from the previous live window. They are only ever consulted as
 /// echo *sources*, never mutated, and never appear in the output — that is how the live path catches an
@@ -347,7 +378,7 @@ pub fn cleanup(
     cfg: &CleanupConfig,
     carry: &[TranscriptSegment],
 ) -> (Vec<TranscriptSegment>, CleanupStats) {
-    cleanup_with_evidence(segments, cfg, carry, None)
+    cleanup_with_rules(segments, cfg, carry, None, None)
 }
 
 /// [`cleanup`] with the acoustic canceller's per-block record available to the echo pass.
@@ -375,8 +406,21 @@ pub fn cleanup_with_evidence(
     carry: &[TranscriptSegment],
     evidence: Option<AudioEvidence<'_>>,
 ) -> (Vec<TranscriptSegment>, CleanupStats) {
+    cleanup_with_rules(segments, cfg, carry, evidence, None)
+}
+
+/// [`cleanup_with_evidence`] plus a [`TextRule`] (the learned lexicon) applied to every surviving segment
+/// as the last pass. The rule runs even when `cfg.is_noop()`; callers that want nothing at all simply
+/// pass `None`.
+pub fn cleanup_with_rules(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+) -> (Vec<TranscriptSegment>, CleanupStats) {
     let mut stats = CleanupStats::default();
-    let mut segments = segments;
+    let mut segments = merge_by_time(segments);
     if cfg.echo_drop {
         segments = drop_echoes(segments, cfg, carry, evidence, &mut stats);
     }
@@ -386,6 +430,17 @@ pub fn cleanup_with_evidence(
     if cfg.drop_backchannels {
         segments = drop_backchannel_turns(segments, &mut stats);
     }
+    if cfg.strip_fillers {
+        segments = strip_fillers_pass(segments, &mut stats);
+    }
+    if let Some(rule) = rule {
+        for segment in &mut segments {
+            if let Some(text) = rule.apply(&segment.text) {
+                segment.text = text;
+                stats.lexicon_applied += 1;
+            }
+        }
+    }
     (segments, stats)
 }
 
@@ -394,6 +449,129 @@ pub fn cleanup_with_evidence(
 const FILLERS: &[&str] = &[
     "um", "umm", "uh", "uhh", "ah", "aah", "er", "erm", "hm", "hmm", "mm", "mmm", "mhm", "huh",
 ];
+
+/// The fillers the [`CleanupConfig::strip_fillers`] pass deletes from text. Deliberately narrower than
+/// [`FILLERS`]: `mm`/`mhm`/`huh` can be a whole (affirmative or questioning) turn, and a backchannel
+/// row is the backchannel pass's business, not this one's.
+const STRIP_FILLERS: &[&str] = &[
+    "um", "umm", "ummm", "uh", "uhh", "uhhh", "ah", "aah", "er", "erm", "hm", "hmm", "hmmm",
+];
+
+/// Strip fillers and collapse stutters in one segment's text (#154). Returns the new text (possibly
+/// empty) and how many filler tokens and repeated words/bigrams went. The walk is token-by-token so
+/// punctuation glued to a filler is not lost: a filler's sentence-ending mark moves to the word before
+/// it, a comma before a filler is dropped so "I was, uh, thinking" reads "I was thinking", the sentence
+/// start is re-capitalised when the opening filler went, and a capital the decoder left on the word
+/// after a mid-sentence filler ("I think, um, We should") is lowered.
+pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
+    let mut kept: Vec<String> = Vec::new();
+    let mut kept_norm: Vec<String> = Vec::new();
+    let mut fillers = 0usize;
+    let mut stutters = 0usize;
+    let mut after_filler = false;
+    for raw in text.split_whitespace() {
+        let norm = normalize_token(raw);
+        if STRIP_FILLERS.contains(&norm.as_str()) {
+            fillers += 1;
+            let trailing = raw.chars().last().filter(|c| matches!(c, '.' | '?' | '!'));
+            if let Some(previous) = kept.last_mut() {
+                if previous.ends_with(',') {
+                    previous.pop();
+                }
+                if let Some(mark) = trailing
+                    && !previous.ends_with(['.', '?', '!', ';', ':'])
+                {
+                    previous.push(mark);
+                }
+            }
+            after_filler = true;
+            continue;
+        }
+        let mut token = raw.to_string();
+        if !norm.is_empty() {
+            if kept_norm.last().is_some_and(|previous| previous == &norm) {
+                stutters += 1;
+                // "we, we roll" keeps the later copy so the stutter's comma goes with it.
+                if let Some(previous) = kept.last_mut()
+                    && previous.ends_with(',')
+                {
+                    *previous = raw.to_string();
+                }
+                continue;
+            }
+            let n = kept_norm.len();
+            if n >= 3 && kept_norm[n - 3] == kept_norm[n - 1] && kept_norm[n - 2] == norm {
+                kept.pop();
+                kept_norm.pop();
+                stutters += 1;
+                continue;
+            }
+            if after_filler
+                && let Some(previous) = kept.last()
+                && !previous.ends_with(['.', '?', '!'])
+                && norm != "i"
+                && is_capitalised_word(&token)
+            {
+                token = lower_first(&token);
+            }
+        }
+        after_filler = false;
+        kept.push(token);
+        kept_norm.push(norm);
+    }
+    let mut out = kept.join(" ");
+    if fillers > 0
+        && text.chars().next().is_some_and(char::is_uppercase)
+        && out.chars().next().is_some_and(char::is_lowercase)
+    {
+        out = upper_first(&out);
+    }
+    (out, fillers, stutters)
+}
+
+fn is_capitalised_word(token: &str) -> bool {
+    let mut chars = token.chars();
+    let first_upper = chars.next().is_some_and(char::is_uppercase);
+    let rest_lower = chars.all(|c| !c.is_uppercase());
+    first_upper && rest_lower && token.chars().filter(|c| c.is_alphabetic()).count() > 1
+}
+
+fn lower_first(token: &str) -> String {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+fn upper_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The filler pass over a whole timeline: rewrite every segment, drop the ones it empties.
+fn strip_fillers_pass(
+    segments: Vec<TranscriptSegment>,
+    stats: &mut CleanupStats,
+) -> Vec<TranscriptSegment> {
+    let mut out = Vec::with_capacity(segments.len());
+    for mut segment in segments {
+        let (text, fillers, stutters) = strip_fillers_text(&segment.text);
+        stats.fillers_removed += fillers;
+        stats.stutters_collapsed += stutters;
+        if text.trim().is_empty() {
+            continue;
+        }
+        if fillers > 0 || stutters > 0 {
+            segment.text = text;
+        }
+        out.push(segment);
+    }
+    out
+}
 
 /// Single-word backchannels. They are both excluded from content tokens (they carry no information, so
 /// they must not prop up a containment score) and used to recognize a whole backchannel turn.
@@ -894,6 +1072,7 @@ mod tests {
         CleanupConfig {
             merge_gap_seconds: 0.0,
             drop_backchannels: false,
+            strip_fillers: false,
             ..CleanupConfig::default()
         }
     }
@@ -903,6 +1082,15 @@ mod tests {
         CleanupConfig {
             echo_drop: false,
             drop_backchannels: false,
+            strip_fillers: false,
+            ..CleanupConfig::default()
+        }
+    }
+
+    /// The structural passes without the filler pass, for fixtures whose wording is the assertion.
+    fn structural() -> CleanupConfig {
+        CleanupConfig {
+            strip_fillers: false,
             ..CleanupConfig::default()
         }
     }
@@ -1136,7 +1324,7 @@ mod tests {
             me(40.0, 41.0, "I will send the summary"),
             me(42.5, 43.5, "after this call."),
         ];
-        let (out, stats) = cleanup(segments, &CleanupConfig::default(), &[]);
+        let (out, stats) = cleanup(segments, &structural(), &[]);
         assert_eq!(
             stats,
             CleanupStats {
@@ -1145,6 +1333,9 @@ mod tests {
                 merged: 1,
                 backchannels_dropped: 1,
                 echo_dropped_audio: 0,
+                fillers_removed: 0,
+                stutters_collapsed: 0,
+                lexicon_applied: 0,
             }
         );
         assert_eq!(
@@ -1163,10 +1354,19 @@ mod tests {
             echo_drop: false,
             merge_gap_seconds: 0.0,
             drop_backchannels: false,
+            strip_fillers: false,
             ..CleanupConfig::default()
         };
         assert!(off.is_noop());
         assert!(!CleanupConfig::default().is_noop());
+        assert!(
+            !CleanupConfig {
+                strip_fillers: true,
+                ..off.clone()
+            }
+            .is_noop(),
+            "the filler pass alone is still a pass"
+        );
 
         let segments = vec![
             them(
@@ -1190,9 +1390,147 @@ mod tests {
             me(f64::NAN, f64::NAN, "Gateway."),
             me(0.0, 1.0, "Gateway."),
         ];
-        let (out, stats) = cleanup(segments, &CleanupConfig::default(), &[]);
+        let (out, stats) = cleanup(segments, &structural(), &[]);
         assert_eq!(out.len(), 3, "no comparison against NaN can succeed");
         assert_eq!(stats.changed(), 0);
+    }
+
+    #[test]
+    fn segments_are_sorted_by_start_before_any_pass_so_spliced_batches_see_true_adjacency() {
+        // #157: the live path emits `Me` in batches spliced into the `Them` stream, so file order is
+        // not time order and an echo pair may not be adjacent in the input.
+        let segments = vec![
+            them(
+                20.0,
+                30.0,
+                "The gateway is what times out when the queue backs up.",
+            ),
+            me(60.0, 61.0, "I will send the summary"),
+            me(22.0, 22.4, "Gateway."),
+            me(62.5, 63.5, "after this call."),
+            them(5.0, 6.0, "Let's start."),
+        ];
+        let (out, stats) = cleanup(segments, &structural(), &[]);
+        assert_eq!(
+            stats.echo_dropped_me, 1,
+            "the out-of-order echo is still caught"
+        );
+        assert_eq!(stats.merged, 1, "the out-of-order fragments still merge");
+        assert_eq!(
+            texts(&out),
+            vec![
+                "Let's start.",
+                "The gateway is what times out when the queue backs up.",
+                "I will send the summary after this call.",
+            ]
+        );
+        let starts: Vec<f64> = out.iter().map(|s| s.start).collect();
+        assert_eq!(starts, vec![5.0, 20.0, 60.0]);
+    }
+
+    #[test]
+    fn fillers_and_stutters_are_stripped_with_sentence_repairs() {
+        for (input, expected, fillers, stutters) in [
+            ("Um, the gateway is down.", "The gateway is down.", 1, 0),
+            ("the the gateway", "the gateway", 0, 1),
+            (
+                "I think I think we should ship",
+                "I think we should ship",
+                0,
+                1,
+            ),
+            (
+                "I was, uh, thinking about it.",
+                "I was thinking about it.",
+                1,
+                0,
+            ),
+            ("I think, um. We should go.", "I think. We should go.", 1, 0),
+            ("I think, um, We should go.", "I think we should go.", 1, 0),
+            ("So um, uh, yeah the queue.", "So yeah the queue.", 2, 0),
+            ("Hmm.", "", 1, 0),
+            ("No fillers here.", "No fillers here.", 0, 0),
+            ("Uh, I, I mean it.", "I mean it.", 1, 1),
+            ("Mm-hmm, right.", "Mm-hmm, right.", 0, 0),
+        ] {
+            let (out, f, s) = strip_fillers_text(input);
+            assert_eq!(out, expected, "{input:?}");
+            assert_eq!((f, s), (fillers, stutters), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn filler_pass_drops_emptied_rows_and_reports_counts_and_the_knob_switches_it_off() {
+        let segments = vec![
+            me(0.0, 1.0, "Um, the the gateway is down."),
+            them(2.0, 2.5, "Uh."),
+            them(3.0, 5.0, "Right, so we, we roll back."),
+        ];
+        let (out, stats) = cleanup(
+            segments.clone(),
+            &CleanupConfig {
+                echo_drop: false,
+                merge_gap_seconds: 0.0,
+                drop_backchannels: false,
+                ..CleanupConfig::default()
+            },
+            &[],
+        );
+        assert_eq!(
+            texts(&out),
+            vec!["The gateway is down.", "Right, so we roll back."]
+        );
+        assert_eq!(stats.fillers_removed, 2);
+        assert_eq!(stats.stutters_collapsed, 2);
+
+        let (untouched, stats) = cleanup(
+            segments.clone(),
+            &CleanupConfig {
+                echo_drop: false,
+                merge_gap_seconds: 0.0,
+                drop_backchannels: false,
+                strip_fillers: false,
+                ..CleanupConfig::default()
+            },
+            &[],
+        );
+        assert_eq!(texts(&untouched), texts(&segments));
+        assert_eq!(stats.fillers_removed + stats.stutters_collapsed, 0);
+    }
+
+    struct Upper;
+
+    impl TextRule for Upper {
+        fn apply(&self, text: &str) -> Option<String> {
+            text.contains("widget")
+                .then(|| text.replace("widget", "Widget"))
+        }
+    }
+
+    #[test]
+    fn a_text_rule_runs_last_on_every_surviving_row_and_is_counted() {
+        let segments = vec![
+            them(0.0, 5.0, "The widget calibration drifted."),
+            me(3.0, 3.5, "Yeah."),
+            me(10.0, 12.0, "Um, ship the widget fix."),
+        ];
+        let (out, stats) = cleanup_with_rules(
+            segments,
+            &CleanupConfig {
+                echo_drop: false,
+                merge_gap_seconds: 0.0,
+                ..CleanupConfig::default()
+            },
+            &[],
+            None,
+            Some(&Upper),
+        );
+        assert_eq!(
+            texts(&out),
+            vec!["The Widget calibration drifted.", "Ship the Widget fix."]
+        );
+        assert_eq!(stats.lexicon_applied, 2);
+        assert_eq!(stats.backchannels_dropped, 1);
     }
 
     #[test]

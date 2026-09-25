@@ -462,6 +462,9 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
         "merge_gap_seconds": cleanup.merge_gap_seconds,
         "drop_backchannels": cleanup.drop_backchannels,
         "echo_audio_margin_db": cleanup.echo_audio_margin_db,
+        "strip_fillers": cleanup.strip_fillers,
+        // `corti-tap` has no lexicon file; the app's review tool owns that.
+        "lexicon": serde_json::Value::Null,
         // This CLI always files a completed recording, so there is no live publication to be early for.
         "live_early_drop": false,
         // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult:
@@ -481,8 +484,13 @@ fn clean_segments(
         corti_transcribe::segment::cleanup(std::mem::take(&mut transcript.segments), cleanup, &[]);
     transcript.segments = segments;
     eprintln!(
-        "segment cleanup: {} echo (me) / {} echo (them) / {} merged / {} backchannel",
-        stats.echo_dropped_me, stats.echo_dropped_them, stats.merged, stats.backchannels_dropped
+        "segment cleanup: {} echo (me) / {} echo (them) / {} merged / {} backchannel / {} fillers / {} stutters",
+        stats.echo_dropped_me,
+        stats.echo_dropped_them,
+        stats.merged,
+        stats.backchannels_dropped,
+        stats.fillers_removed,
+        stats.stutters_collapsed
     );
 }
 

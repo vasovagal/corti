@@ -12,7 +12,7 @@ use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
-use corti_transcribe::segment::{CleanupConfig, SpanEvidence, cleanup, cleanup_with_evidence};
+use corti_transcribe::segment::{CleanupConfig, SpanEvidence, TextRule, cleanup_with_rules};
 
 use crate::config::{AppConfig, BackendChoice};
 
@@ -459,15 +459,19 @@ pub fn transcribe_recording(
         .flatten();
     let audio_evidence = blocks.is_some();
     let cleanup_cfg = backend.cleanup_config();
-    if !cleanup_cfg.is_noop() {
+    // The learned lexicon is the last pass (`corti --review` grows it); it runs even when every
+    // structural knob is off, so a hand-disabled cleanup still applies the owner's corrections.
+    let lexicon = crate::lexicon::load_compiled();
+    if !cleanup_cfg.is_noop() || lexicon.is_some() {
         let segments_in = transcript.segments.len();
         let segments_taken = std::mem::take(&mut transcript.segments);
+        let rule = lexicon.as_ref().map(|lexicon| lexicon as &dyn TextRule);
         let (segments, stats) = match blocks.as_deref() {
             Some(blocks) => {
                 let evidence = |start: f64, end: f64| span_evidence(blocks, start, end);
-                cleanup_with_evidence(segments_taken, &cleanup_cfg, &[], Some(&evidence))
+                cleanup_with_rules(segments_taken, &cleanup_cfg, &[], Some(&evidence), rule)
             }
-            None => cleanup(segments_taken, &cleanup_cfg, &[]),
+            None => cleanup_with_rules(segments_taken, &cleanup_cfg, &[], None, rule),
         };
         transcript.segments = segments;
         info!(
@@ -481,6 +485,9 @@ pub fn transcribe_recording(
             echo_dropped_audio = stats.echo_dropped_audio,
             merged = stats.merged,
             backchannels_dropped = stats.backchannels_dropped,
+            fillers_removed = stats.fillers_removed,
+            stutters_collapsed = stats.stutters_collapsed,
+            lexicon_applied = stats.lexicon_applied,
             "segment cleanup applied"
         );
     }

@@ -54,7 +54,7 @@ test.beforeEach(async ({ page }, testInfo) => {
         get_live_transcript: syntheticUnconfiguredLiveTranscript,
         get_hosted_settings: syntheticUnconfiguredSettings,
         patch_hosted_settings: { status: "unchanged", settings: syntheticUnconfiguredSettings },
-        get_hosted_assistant: { pinned_run_count: 0, pinned: null, exchanges: [] },
+        get_hosted_assistant: { subscriptions: [], exchanges: [] },
       }
     : testInfo.title === "policy-blocked question explains the repair path"
       ? {
@@ -65,7 +65,7 @@ test.beforeEach(async ({ page }, testInfo) => {
         ? {
             ...syntheticLiveOverrides,
             get_hosted_settings: syntheticPinnedWaitingSettings,
-            get_hosted_assistant: { pinned_run_count: 0, pinned: null, exchanges: [] },
+            get_hosted_assistant: { subscriptions: [], exchanges: [] },
           }
         : liveExperience
         ? syntheticLiveOverrides

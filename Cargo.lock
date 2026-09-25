@@ -1393,9 +1393,11 @@ dependencies = [
  "chrono",
  "corti-aec",
  "corti-capture",
+ "corti-chat",
  "corti-core",
  "corti-detect",
  "corti-jobs",
+ "corti-lexicon",
  "corti-postprocess",
  "corti-postprocess-providers",
  "corti-queue",
@@ -1465,6 +1467,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "corti-chat"
+version = "0.17.0"
+dependencies = [
+ "corti-postprocess",
+ "corti-postprocess-providers",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "corti-core"
 version = "0.17.0"
 dependencies = [
@@ -1508,6 +1524,20 @@ dependencies = [
  "chrono",
  "rusqlite",
  "serde_json",
+]
+
+[[package]]
+name = "corti-lexicon"
+version = "0.17.0"
+dependencies = [
+ "corti-core",
+ "corti-transcribe",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]

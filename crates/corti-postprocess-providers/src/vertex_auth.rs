@@ -249,6 +249,22 @@ pub struct VertexCredentialResolver {
     live_pending: Option<VertexAutoPending>,
     final_pending: Option<VertexAutoPending>,
     pinned_pending: Option<VertexAutoPending>,
+    /// While `Rejected`/`Error`, the monotonic instant after which the resolver re-arms itself into a fresh
+    /// unarmed episode and polls again. Without this a transient token-endpoint failure or a revoked login
+    /// was permanent for the process.
+    blocked_until_micros: Option<u64>,
+    /// Consecutive rejected/error outcomes, driving the re-arm backoff (30 s → 10 min).
+    failure_streak: u32,
+}
+
+/// First re-arm delay after a rejected/error resolution; doubles per consecutive failure.
+pub const VERTEX_ERROR_RETRY_BASE_MICROS: u64 = 30_000_000;
+/// Longest re-arm delay.
+pub const VERTEX_ERROR_RETRY_MAX_MICROS: u64 = 600_000_000;
+
+fn error_retry_backoff_micros(failure_streak: u32) -> u64 {
+    let exponent = failure_streak.saturating_sub(1).min(5);
+    (VERTEX_ERROR_RETRY_BASE_MICROS << exponent).min(VERTEX_ERROR_RETRY_MAX_MICROS)
 }
 
 impl VertexCredentialResolver {
@@ -265,6 +281,8 @@ impl VertexCredentialResolver {
             live_pending: None,
             final_pending: None,
             pinned_pending: None,
+            blocked_until_micros: None,
+            failure_streak: 0,
         }
     }
 
@@ -272,9 +290,25 @@ impl VertexCredentialResolver {
         self.state
     }
 
+    /// The monotonic instant at which a rejected/error credential re-arms, if it is currently blocked.
+    pub const fn blocked_until_micros(&self) -> Option<u64> {
+        self.blocked_until_micros
+    }
+
     /// Starts a due unarmed resolution attempt. At 4.999 seconds after the last start this returns `None`;
     /// at exactly 5.000 seconds it returns one attempt. It never starts while another attempt is outstanding.
+    /// A rejected/error state whose backoff has elapsed first re-arms into a fresh unarmed episode.
     pub fn drive(&mut self) -> Option<VertexResolutionAttempt> {
+        if let Some(blocked_until) = self.blocked_until_micros
+            && matches!(
+                self.state,
+                VertexCredentialState::Rejected { .. } | VertexCredentialState::Error { .. }
+            )
+            && self.clock.monotonic_micros() >= blocked_until
+        {
+            self.blocked_until_micros = None;
+            self.mark_token_lost();
+        }
         let VertexCredentialState::Unarmed {
             episode,
             next_poll_at_micros,
@@ -384,6 +418,8 @@ impl VertexCredentialResolver {
                     episode: attempt.episode,
                     expires_at_unix_ms,
                 };
+                self.failure_streak = 0;
+                self.blocked_until_micros = None;
                 let now = self.clock.monotonic_micros();
                 catch_up = self.take_valid_pending(now);
             }
@@ -407,12 +443,14 @@ impl VertexCredentialResolver {
                 self.state = VertexCredentialState::Rejected {
                     episode: attempt.episode,
                 };
+                self.schedule_error_retry();
             }
             VertexResolutionOutcome::Error { code } => {
                 self.state = VertexCredentialState::Error {
                     episode: attempt.episode,
                     code,
                 };
+                self.schedule_error_retry();
             }
         }
         Ok(VertexResolutionUpdate {
@@ -443,6 +481,15 @@ impl VertexCredentialResolver {
         self.live_pending = None;
         self.final_pending = None;
         self.pinned_pending = None;
+    }
+
+    fn schedule_error_retry(&mut self) {
+        self.failure_streak = self.failure_streak.saturating_add(1);
+        self.blocked_until_micros = Some(
+            self.clock
+                .monotonic_micros()
+                .saturating_add(error_retry_backoff_micros(self.failure_streak)),
+        );
     }
 
     fn new_attempt(
@@ -667,6 +714,73 @@ mod tests {
             [(Lane::Live, 9), (Lane::PinnedQuestion, 4)]
         );
         assert!(matches!(update.state, VertexCredentialState::Ready { .. }));
+    }
+
+    #[test]
+    fn rejected_or_errored_credential_re_arms_after_backoff() {
+        let clock = ExactClock::new(0);
+        let mut resolver = VertexCredentialResolver::new(Box::new(clock.clone()));
+        let attempt = resolver.drive().unwrap();
+        resolver
+            .complete(attempt, VertexResolutionOutcome::Rejected)
+            .unwrap();
+        let first_episode = resolver.state().episode();
+        assert!(matches!(
+            resolver.state(),
+            VertexCredentialState::Rejected { .. }
+        ));
+        assert_eq!(
+            resolver.blocked_until_micros(),
+            Some(VERTEX_ERROR_RETRY_BASE_MICROS)
+        );
+
+        clock.set(VERTEX_ERROR_RETRY_BASE_MICROS - 1);
+        assert!(resolver.drive().is_none(), "still blocked during backoff");
+        assert!(matches!(
+            resolver.state(),
+            VertexCredentialState::Rejected { .. }
+        ));
+
+        clock.set(VERTEX_ERROR_RETRY_BASE_MICROS);
+        let retry = resolver.drive().unwrap();
+        assert!(matches!(
+            resolver.state(),
+            VertexCredentialState::Resolving { .. }
+        ));
+        assert_ne!(resolver.state().episode(), first_episode);
+        resolver
+            .complete(
+                retry,
+                VertexResolutionOutcome::Error {
+                    code: ErrorCode::Network,
+                },
+            )
+            .unwrap();
+        // Second consecutive failure doubles the backoff, measured from now.
+        assert_eq!(
+            resolver.blocked_until_micros(),
+            Some(VERTEX_ERROR_RETRY_BASE_MICROS + 2 * VERTEX_ERROR_RETRY_BASE_MICROS)
+        );
+
+        clock.set(3 * VERTEX_ERROR_RETRY_BASE_MICROS);
+        let recovered = resolver.drive().unwrap();
+        resolver
+            .complete(
+                recovered,
+                VertexResolutionOutcome::Ready {
+                    expires_at_unix_ms: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            resolver.state(),
+            VertexCredentialState::Ready { .. }
+        ));
+        assert_eq!(resolver.blocked_until_micros(), None);
+        assert!(
+            resolver.observe_dispatch_intent().is_none(),
+            "ready state has no warning to raise"
+        );
     }
 
     #[test]
