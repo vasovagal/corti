@@ -20,7 +20,6 @@
 //! failure is explicitly marked and fails open to raw rather than losing the call. The filter lives in `corti-capture` (over
 //! `corti_aec::StreamingAec`); this crate only owns the trait and the writer-thread plumbing.
 
-use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::os::raw::c_void;
@@ -29,7 +28,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use core_foundation::array::CFArray;
@@ -44,6 +42,20 @@ use objc2_foundation::{NSArray, NSNumber};
 
 use crate::listener;
 use crate::property;
+
+#[path = "capture_format.rs"]
+mod capture_format;
+#[path = "capture_transport.rs"]
+mod capture_transport;
+#[path = "capture_microphone.rs"]
+mod ordered_microphone;
+#[path = "capture_writer.rs"]
+mod ordered_writer;
+use capture_format::FormatObserver;
+use capture_transport::{Cap, io_proc};
+#[cfg(test)]
+use corti_core::capture_accounting::CaptureDescriptor;
+use corti_core::capture_accounting::HAL_DESCRIPTOR_CAPACITY;
 
 // CoreAudio process-tap API (macOS 14.2+), absent from coreaudio-sys.
 #[link(name = "CoreAudio", kind = "framework")]
@@ -82,6 +94,11 @@ const TEE_FRAMES_PER_CHUNK: usize = 4096;
 pub struct CaptureChunk {
     pub mic: Vec<f32>,
     pub tap: Vec<f32>,
+    /// Frame-aligned source unavailability from the ordered capture descriptors. Empty means every
+    /// frame is available; otherwise this has exactly `max(mic.len(), tap.len())` entries. The writer
+    /// emits at most 4096 frames per chunk, so the bitmap stays bounded independently of call length.
+    /// Consumers must reapply it after any stateful filter, including its delayed tail.
+    pub unavailable: Vec<bool>,
 }
 
 /// A **bounded, lossy** tee of the downmixed capture stream, for live consumers (AEC / transcription).
@@ -251,6 +268,7 @@ pub enum CaptureFilterDisposition {
 struct WriterOutcome {
     frames: u64,
     filter: CaptureFilterDisposition,
+    quality: corti_core::QualityRecord,
 }
 
 /// Metadata about a finished, streamed recording — the samples are already on disk. Replaces the old
@@ -271,6 +289,10 @@ pub struct RecordingHandle {
     /// Samples dropped because the writer couldn't keep up (ring overflow). Should be 0; a non-zero value
     /// means the disk stalled and the recording may have gaps.
     pub dropped_samples: u64,
+    /// Source frames rejected by capture, distinct from interleaved sample count.
+    pub dropped_frames: u64,
+    /// Content-free capture timeline authority, also durable beside the WAV.
+    pub quality: corti_core::QualityRecord,
     /// Live-tee chunks dropped because the consumer fell behind (bounded, lossy by design — never affects the
     /// on-disk WAV). 0 when no [`CaptureTee`] was attached.
     pub tee_dropped_chunks: u64,
@@ -358,9 +380,11 @@ pub struct CaptureSession {
     tap_id: ca::AudioObjectID,
     proc_id: ca::AudioDeviceIOProcID,
     state: *mut Cap,
+    format_observer: Option<FormatObserver>,
     sample_rate: u32,
     /// The streaming writer thread; joined on `stop`/`Drop` so the file is flushed and finalized.
     writer: Option<JoinHandle<Result<WriterOutcome>>>,
+    completion: ordered_writer::CompletionIntent,
     out: PathBuf,
     /// The live-tee dropped-chunk counter, shared with the writer thread; read into [`RecordingHandle`] at
     /// `stop`. `None` when no tee was attached.
@@ -499,9 +523,8 @@ impl CaptureSession {
         let agg_id = create_aggregate(&clock_uid, &tap_uid)?;
         let agg_guard = AggregateGuard(agg_id);
 
-        let sample_rate = unsafe { aggregate_input_format(agg_id) }
-            .map(|f| f.mSampleRate as u32)
-            .unwrap_or(48_000);
+        let mut format_observer = FormatObserver::new(agg_id)?;
+        let sample_rate = format_observer.initial_rate();
 
         // 4. Shared state + ring + writer thread. The IO proc pushes into `producer`; the writer drains
         //    `consumer` to disk. Layout (channel counts) is discovered on the first callback via `shared`.
@@ -513,10 +536,14 @@ impl CaptureSession {
             has_mic: capture_mic,
         });
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity(sample_rate));
-        let state = Box::into_raw(Box::new(Cap {
-            producer: UnsafeCell::new(producer),
-            shared: shared.clone(),
-        }));
+        let (descriptors, descriptor_reader) = rtrb::RingBuffer::new(HAL_DESCRIPTOR_CAPACITY);
+        let state = Box::into_raw(Box::new(Cap::new(
+            producer,
+            descriptors,
+            shared,
+            format_observer.state(),
+            false,
+        )?));
 
         // 5. IO proc.
         let mut proc_id: ca::AudioDeviceIOProcID = None;
@@ -524,26 +551,85 @@ impl CaptureSession {
             ca::AudioDeviceCreateIOProcID(agg_id, Some(io_proc), state as *mut c_void, &mut proc_id)
         };
         if st != 0 {
+            unsafe { (&*state).disable_capture() };
+            if proc_id.is_some() && unsafe { ca::AudioDeviceDestroyIOProcID(agg_id, proc_id) } != 0
+            {
+                // A failed destroy cannot establish that HAL released the callback pointer.
+                std::mem::forget(format_observer);
+                std::mem::forget(tap_guard);
+                std::mem::forget(agg_guard);
+                bail!("capture IO creation teardown failed");
+            }
             drop(unsafe { Box::from_raw(state) });
+            if format_observer.stop().is_err() {
+                std::mem::forget(format_observer);
+                std::mem::forget(tap_guard);
+                std::mem::forget(agg_guard);
+                bail!("capture format listener teardown failed");
+            }
             bail!("AudioDeviceCreateIOProcID failed: OSStatus {st}");
         }
         let st = unsafe { ca::AudioDeviceStart(agg_id, proc_id) };
         if st != 0 {
-            unsafe { ca::AudioDeviceDestroyIOProcID(agg_id, proc_id) };
+            unsafe { (&*state).disable_capture() };
+            unsafe { ca::AudioDeviceStop(agg_id, proc_id) };
+            if unsafe { ca::AudioDeviceDestroyIOProcID(agg_id, proc_id) } != 0 {
+                std::mem::forget(format_observer);
+                std::mem::forget(tap_guard);
+                std::mem::forget(agg_guard);
+                bail!("capture IO start teardown failed");
+            }
             drop(unsafe { Box::from_raw(state) });
+            if format_observer.stop().is_err() {
+                std::mem::forget(format_observer);
+                std::mem::forget(tap_guard);
+                std::mem::forget(agg_guard);
+                bail!("capture format listener teardown failed");
+            }
             bail!("AudioDeviceStart failed: OSStatus {st}");
         }
 
         // 6. Writer thread. Spawned last — there are no fallible steps after this, so it never needs an
         //    error-path teardown of its own.
         let tee_dropped = tee.as_ref().map(|t| t.dropped.clone());
+        let completion = ordered_writer::CompletionIntent::default();
         let writer = {
-            let shared = shared.clone();
             let out = out.clone();
-            std::thread::Builder::new()
+            let writer_completion = completion.clone();
+            match std::thread::Builder::new()
                 .name("corti-capture-writer".into())
-                .spawn(move || run_writer(consumer, shared, out, layout, sample_rate, tee, filter))
-                .context("spawning capture writer thread")?
+                .spawn(move || {
+                    ordered_writer::run_writer_with_intent(
+                        consumer,
+                        descriptor_reader,
+                        out,
+                        layout,
+                        sample_rate,
+                        tee,
+                        filter,
+                        writer_completion,
+                    )
+                }) {
+                Ok(writer) => writer,
+                Err(error) => {
+                    unsafe { (&*state).disable_capture() };
+                    unsafe { ca::AudioDeviceStop(agg_id, proc_id) };
+                    if unsafe { ca::AudioDeviceDestroyIOProcID(agg_id, proc_id) } != 0 {
+                        std::mem::forget(format_observer);
+                        std::mem::forget(tap_guard);
+                        std::mem::forget(agg_guard);
+                        bail!("capture writer startup teardown failed");
+                    }
+                    unsafe { drop(Box::from_raw(state)) };
+                    if format_observer.stop().is_err() {
+                        std::mem::forget(format_observer);
+                        std::mem::forget(tap_guard);
+                        std::mem::forget(agg_guard);
+                        bail!("capture format listener teardown failed");
+                    }
+                    return Err(error).context("spawning capture writer thread");
+                }
+            }
         };
 
         // Ownership transfers to the session; defuse the RAII guards.
@@ -554,15 +640,17 @@ impl CaptureSession {
             tap_id,
             proc_id,
             state,
+            format_observer: Some(format_observer),
             sample_rate,
             writer: Some(writer),
+            completion,
             out,
             tee_dropped,
         })
     }
 
-    /// The capture sample rate (read from the aggregate's input format, default 48 kHz). Available before
-    /// `stop` so a live consumer can build its resampler / AEC at the right rate.
+    /// The fixed retained sample rate from the initial valid control-side format observation. Later
+    /// source-rate epochs are normalized to this rate off HAL before WAV and tee delivery.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -570,16 +658,28 @@ impl CaptureSession {
     /// Stop capturing, flush the writer, and return the recording's metadata. Errors if the writer hit an
     /// I/O error (disk full, etc.); the CoreAudio objects are always torn down first.
     pub fn stop(mut self) -> Result<RecordingHandle> {
-        unsafe { ca::AudioDeviceStop(self.agg_id, self.proc_id) };
-        unsafe { ca::AudioDeviceDestroyIOProcID(self.agg_id, self.proc_id) };
-        // The IO proc can no longer fire, so the shared atomics are final — read them straight off `Cap`
-        // before freeing it (no `Arc` is kept on the session, so `forget(self)` below leaks nothing).
-        let cap = unsafe { &*self.state };
+        unsafe { (&*self.state).disable_capture() };
+        let stopped = unsafe { ca::AudioDeviceStop(self.agg_id, self.proc_id) } == 0;
+        if unsafe { ca::AudioDeviceDestroyIOProcID(self.agg_id, self.proc_id) } != 0 {
+            self.retain_live_io();
+            bail!("capture IO destruction failed");
+        }
+        self.proc_id = None;
+        // Successful IO destruction is the ownership barrier. No callback can race terminal
+        // accounting, producer closure, listener removal or the final metadata reads below.
+        let cap = unsafe { &mut *self.state };
+        let terminal = cap.finish();
+        let dropped_counts = terminal.as_ref().copied().unwrap_or_default();
         let total = cap.shared.total_channels.load(Ordering::Acquire);
         let mic = cap.shared.mic_channels.load(Ordering::Acquire).min(total);
         let callbacks = cap.shared.callbacks.load(Ordering::Acquire);
         let dropped = cap.shared.dropped.load(Ordering::Acquire);
-        // Drop `Cap` (and with it the ring producer) so the writer sees end-of-stream, drains, and finalizes.
+        let devices = self.release_devices();
+        if stopped && terminal.is_ok() && devices.is_ok() {
+            self.completion.authorize_complete();
+        }
+        // Even on a stop/listener/device/terminal failure, IO destruction permits a safe abort:
+        // close both producers and join the writer, which retains an in-progress recovery snapshot.
         unsafe { drop(Box::from_raw(self.state)) };
         self.state = std::ptr::null_mut();
         let writer_result = match self.writer.take() {
@@ -587,15 +687,10 @@ impl CaptureSession {
             None => Ok(Ok(WriterOutcome {
                 frames: 0,
                 filter: CaptureFilterDisposition::NotRequested,
+                quality: corti_core::QualityRecord::default(),
             })),
         };
-        // Tear down the CoreAudio objects regardless of the writer's fate.
-        unsafe {
-            ca::AudioHardwareDestroyAggregateDevice(self.agg_id);
-            AudioHardwareDestroyProcessTap(self.tap_id);
-        }
-
-        // The writer has joined, so the tee counter is final. Read it before forgetting `self`.
+        // The writer has joined, so the tee counter is final.
         let tee_dropped_chunks = self
             .tee_dropped
             .as_ref()
@@ -604,8 +699,13 @@ impl CaptureSession {
 
         let out = std::mem::take(&mut self.out);
         let sample_rate = self.sample_rate;
-        std::mem::forget(self);
-
+        if !stopped {
+            bail!("capture device stop failed");
+        }
+        if terminal.is_err() {
+            bail!("capture terminal accounting failed");
+        }
+        devices?;
         let writer = writer_result
             .map_err(|_| anyhow!("capture writer thread panicked"))?
             .context("streaming recording to disk")?;
@@ -617,21 +717,67 @@ impl CaptureSession {
             tap_channels: total - mic,
             callbacks,
             dropped_samples: dropped,
+            dropped_frames: dropped_counts.frames,
+            quality: writer.quality,
             tee_dropped_chunks,
             filter_disposition: writer.filter,
         })
+    }
+
+    /// If IO destruction fails, HAL may still own every callback pointer. Retain those allocations
+    /// and devices rather than freeing live state. Detach the writer: joining a deliberately retained
+    /// producer could wait forever. Its completion intent remains abort and can never be promoted.
+    fn retain_live_io(&mut self) {
+        self.state = std::ptr::null_mut();
+        self.proc_id = None;
+        if let Some(observer) = self.format_observer.take() {
+            std::mem::forget(observer);
+        }
+        self.agg_id = 0;
+        self.tap_id = 0;
+        self.writer.take();
+    }
+
+    fn release_devices(&mut self) -> Result<()> {
+        if let Some(observer) = self.format_observer.as_mut()
+            && observer.stop().is_err()
+        {
+            // Remaining native listeners can still reference the observer and device. Keep their
+            // ownership together; IO has already been destroyed, so the audio writer can abort.
+            if let Some(observer) = self.format_observer.take() {
+                std::mem::forget(observer);
+            }
+            self.agg_id = 0;
+            self.tap_id = 0;
+            bail!("capture format listener teardown failed");
+        }
+        self.format_observer.take();
+        let aggregate = std::mem::take(&mut self.agg_id);
+        let tap = std::mem::take(&mut self.tap_id);
+        let aggregate_ok =
+            aggregate == 0 || unsafe { ca::AudioHardwareDestroyAggregateDevice(aggregate) } == 0;
+        let tap_ok = tap == 0 || unsafe { AudioHardwareDestroyProcessTap(tap) } == 0;
+        if !aggregate_ok || !tap_ok {
+            bail!("capture device teardown failed");
+        }
+        Ok(())
     }
 }
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
-        // Only runs if the session is dropped without `stop()` (e.g. an early `?` or a discard). `stop()`
-        // forgets self. Tear down like `stop` but keep no handle; the writer finalizes whatever partial file
-        // exists (a finalized partial is recoverable — the higher-level discard path deletes it explicitly).
-        unsafe {
-            ca::AudioDeviceStop(self.agg_id, self.proc_id);
-            ca::AudioDeviceDestroyIOProcID(self.agg_id, self.proc_id);
-            if !self.state.is_null() {
+        // Drop closes a recoverable prefix but never grants completion intent. A successful stop
+        // has already cleared these fields; error paths likewise cannot accidentally retry teardown.
+        if !self.state.is_null() {
+            unsafe { (&*self.state).disable_capture() };
+            unsafe { ca::AudioDeviceStop(self.agg_id, self.proc_id) };
+            if unsafe { ca::AudioDeviceDestroyIOProcID(self.agg_id, self.proc_id) } != 0 {
+                self.retain_live_io();
+                return;
+            }
+            self.proc_id = None;
+            unsafe {
+                let _ = (&mut *self.state).finish();
                 drop(Box::from_raw(self.state));
                 self.state = std::ptr::null_mut();
             }
@@ -639,10 +785,7 @@ impl Drop for CaptureSession {
         if let Some(h) = self.writer.take() {
             let _ = h.join();
         }
-        unsafe {
-            ca::AudioHardwareDestroyAggregateDevice(self.agg_id);
-            AudioHardwareDestroyProcessTap(self.tap_id);
-        }
+        let _ = self.release_devices();
     }
 }
 
@@ -654,8 +797,9 @@ pub struct MicrophoneCapture {
     device_id: ca::AudioObjectID,
     proc_id: ca::AudioDeviceIOProcID,
     state: *mut Cap,
+    format_observer: Option<FormatObserver>,
     sample_rate: u32,
-    worker: Option<JoinHandle<u64>>,
+    worker: Option<JoinHandle<Result<ordered_microphone::MicrophoneOutcome>>>,
     tee_dropped: Arc<AtomicU64>,
 }
 
@@ -664,24 +808,24 @@ pub struct MicrophoneCapture {
 unsafe impl Send for MicrophoneCapture {}
 
 /// Final bounded-capture counters from [`MicrophoneCapture::stop`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MicrophoneCaptureHandle {
     pub frames: u64,
     pub sample_rate: u32,
     pub callbacks: u32,
     pub dropped_samples: u64,
+    pub dropped_frames: u64,
+    pub quality: corti_core::QualityRecord,
     pub tee_dropped_chunks: u64,
 }
 
 impl MicrophoneCapture {
     /// Open the default microphone and begin bounded mono tee delivery. Returns after the IO proc and worker
-    /// are both running. Every fallible start path tears down the proc/state before returning.
+    /// are both running. Failed IO destruction retains callback-owned state instead of freeing live pointers.
     pub fn start(tee: CaptureTee) -> Result<Self> {
         let device_id = listener::default_input_device().context("default input device")?;
-        let sample_rate = unsafe { aggregate_input_format(device_id) }
-            .map(|format| format.mSampleRate as u32)
-            .unwrap_or(48_000)
-            .max(1);
+        let format_observer = FormatObserver::new(device_id)?;
+        let sample_rate = format_observer.initial_rate();
         let shared = Arc::new(Shared {
             total_channels: AtomicU32::new(0),
             mic_channels: AtomicU32::new(0),
@@ -690,40 +834,43 @@ impl MicrophoneCapture {
             has_mic: true,
         });
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(ring_capacity(sample_rate));
-        let state = Box::into_raw(Box::new(Cap {
-            producer: UnsafeCell::new(producer),
-            shared: shared.clone(),
-        }));
+        let (descriptors, descriptor_reader) = rtrb::RingBuffer::new(HAL_DESCRIPTOR_CAPACITY);
+        let state = Box::into_raw(Box::new(Cap::new(
+            producer,
+            descriptors,
+            shared,
+            format_observer.state(),
+            true,
+        )?));
 
         let mut proc_id: ca::AudioDeviceIOProcID = None;
         let status = unsafe {
             ca::AudioDeviceCreateIOProcID(device_id, Some(io_proc), state.cast(), &mut proc_id)
         };
         if status != 0 {
-            unsafe { drop(Box::from_raw(state)) };
+            Self::abort_start(device_id, proc_id, state, format_observer)?;
             bail!("AudioDeviceCreateIOProcID(microphone) failed: OSStatus {status}");
         }
         let status = unsafe { ca::AudioDeviceStart(device_id, proc_id) };
         if status != 0 {
-            unsafe {
-                ca::AudioDeviceDestroyIOProcID(device_id, proc_id);
-                drop(Box::from_raw(state));
-            }
+            Self::abort_start(device_id, proc_id, state, format_observer)?;
             bail!("AudioDeviceStart(microphone) failed: OSStatus {status}");
         }
 
         let tee_dropped = tee.dropped.clone();
         let worker = match std::thread::Builder::new()
             .name("corti-mic-test-capture".into())
-            .spawn(move || run_microphone_tee(consumer, shared, tee))
-        {
+            .spawn(move || {
+                ordered_microphone::run_microphone_tee(
+                    consumer,
+                    descriptor_reader,
+                    sample_rate,
+                    tee,
+                )
+            }) {
             Ok(worker) => worker,
             Err(error) => {
-                unsafe {
-                    ca::AudioDeviceStop(device_id, proc_id);
-                    ca::AudioDeviceDestroyIOProcID(device_id, proc_id);
-                    drop(Box::from_raw(state));
-                }
+                Self::abort_start(device_id, proc_id, state, format_observer)?;
                 return Err(error).context("spawning microphone capture worker");
             }
         };
@@ -732,6 +879,7 @@ impl MicrophoneCapture {
             device_id,
             proc_id,
             state,
+            format_observer: Some(format_observer),
             sample_rate,
             worker: Some(worker),
             tee_dropped,
@@ -744,40 +892,109 @@ impl MicrophoneCapture {
 
     /// Stop the IO proc, drain and close the tee, and return final quality counters.
     pub fn stop(mut self) -> Result<MicrophoneCaptureHandle> {
-        unsafe {
-            ca::AudioDeviceStop(self.device_id, self.proc_id);
-            ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id);
+        unsafe { (&*self.state).disable_capture() };
+        let stopped = unsafe { ca::AudioDeviceStop(self.device_id, self.proc_id) } == 0;
+        if unsafe { ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id) } != 0 {
+            self.retain_live_io();
+            bail!("microphone IO destruction failed");
         }
-        let cap = unsafe { &*self.state };
+        self.proc_id = None;
+        let cap = unsafe { &mut *self.state };
+        let terminal = cap.finish();
+        let dropped_counts = terminal.as_ref().copied().unwrap_or_default();
         let callbacks = cap.shared.callbacks.load(Ordering::Acquire);
         let dropped_samples = cap.shared.dropped.load(Ordering::Acquire);
+        let observer = self.stop_observer();
+        // The IO destruction barrier permits producer closure even when stop, terminal accounting
+        // or listener removal failed. Always finish joining before reporting any such failure.
         unsafe { drop(Box::from_raw(self.state)) };
         self.state = std::ptr::null_mut();
-        let frames = match self.worker.take() {
-            Some(worker) => worker
-                .join()
-                .map_err(|_| anyhow!("microphone capture worker panicked")),
-            None => Ok(0),
+        let outcome = match self.worker.take() {
+            Some(worker) => worker.join(),
+            None => Ok(Ok(ordered_microphone::MicrophoneOutcome {
+                frames: 0,
+                quality: corti_core::QualityRecord::default(),
+            })),
         };
         let tee_dropped_chunks = self.tee_dropped.load(Ordering::Acquire);
         let sample_rate = self.sample_rate;
-        std::mem::forget(self);
+        if !stopped {
+            bail!("microphone device stop failed");
+        }
+        if terminal.is_err() {
+            bail!("microphone terminal accounting failed");
+        }
+        observer?;
+        let outcome = outcome.map_err(|_| anyhow!("microphone capture worker panicked"))??;
         Ok(MicrophoneCaptureHandle {
-            frames: frames?,
+            frames: outcome.frames,
             sample_rate,
             callbacks,
             dropped_samples,
+            dropped_frames: dropped_counts.frames,
+            quality: outcome.quality,
             tee_dropped_chunks,
         })
+    }
+
+    /// The default input device is externally owned. Tear down only our proc, callback state and
+    /// listeners; never destroy the user's device. All startup error branches share this barrier.
+    fn abort_start(
+        device_id: ca::AudioObjectID,
+        proc_id: ca::AudioDeviceIOProcID,
+        state: *mut Cap,
+        mut observer: FormatObserver,
+    ) -> Result<()> {
+        unsafe { (&*state).disable_capture() };
+        if proc_id.is_some() {
+            unsafe { ca::AudioDeviceStop(device_id, proc_id) };
+            if unsafe { ca::AudioDeviceDestroyIOProcID(device_id, proc_id) } != 0 {
+                std::mem::forget(observer);
+                bail!("microphone IO startup teardown failed");
+            }
+        }
+        unsafe { drop(Box::from_raw(state)) };
+        if observer.stop().is_err() {
+            std::mem::forget(observer);
+            bail!("microphone format listener teardown failed");
+        }
+        Ok(())
+    }
+
+    fn retain_live_io(&mut self) {
+        // HAL may still use the raw Cap pointer and its format state. Keep both allocations alive
+        // and detach the worker rather than joining a producer that cannot safely be closed yet.
+        self.state = std::ptr::null_mut();
+        self.proc_id = None;
+        if let Some(observer) = self.format_observer.take() {
+            std::mem::forget(observer);
+        }
+        self.worker.take();
+    }
+
+    fn stop_observer(&mut self) -> Result<()> {
+        if let Some(mut observer) = self.format_observer.take()
+            && observer.stop().is_err()
+        {
+            std::mem::forget(observer);
+            bail!("microphone format listener teardown failed");
+        }
+        Ok(())
     }
 }
 
 impl Drop for MicrophoneCapture {
     fn drop(&mut self) {
-        unsafe {
-            ca::AudioDeviceStop(self.device_id, self.proc_id);
-            ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id);
-            if !self.state.is_null() {
+        if !self.state.is_null() {
+            unsafe { (&*self.state).disable_capture() };
+            unsafe { ca::AudioDeviceStop(self.device_id, self.proc_id) };
+            if unsafe { ca::AudioDeviceDestroyIOProcID(self.device_id, self.proc_id) } != 0 {
+                self.retain_live_io();
+                return;
+            }
+            self.proc_id = None;
+            unsafe {
+                let _ = (&mut *self.state).finish();
                 drop(Box::from_raw(self.state));
                 self.state = std::ptr::null_mut();
             }
@@ -785,6 +1002,7 @@ impl Drop for MicrophoneCapture {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        let _ = self.stop_observer();
     }
 }
 
@@ -798,174 +1016,6 @@ struct Shared {
     /// Whether the aggregate has a mic sub-device. Set once at construction, read-only in the proc. When
     /// false (tap-only), buffer 0 is the tap — not the mic — so the mic-channel count is 0.
     has_mic: bool,
-}
-
-/// Capture buffer state handed to the IO proc by raw pointer. The ring `producer` is touched **only** by the
-/// single IO-proc thread (single-producer); `shared` is atomic, read-only after start.
-struct Cap {
-    producer: UnsafeCell<rtrb::Producer<f32>>,
-    shared: Arc<Shared>,
-}
-
-/// IO proc: interleave every input buffer's channels into one frame-major float stream and push it into the
-/// ring **without locking or allocating** (guardrail 9). In mic+tap mode the aggregate presents one buffer
-/// per sub-stream (buffer 0 = mic, the rest = tap), so the first buffer's channel count is the mic-channel
-/// count. In tap-only mode the clock sub-device is an input-less output device, contributing no input
-/// channels, so the mic-channel count is 0 and every channel is tap.
-unsafe extern "C" fn io_proc(
-    _device: ca::AudioObjectID,
-    _now: *const ca::AudioTimeStamp,
-    input: *const ca::AudioBufferList,
-    _input_time: *const ca::AudioTimeStamp,
-    _out: *mut ca::AudioBufferList,
-    _out_time: *const ca::AudioTimeStamp,
-    client: *mut c_void,
-) -> ca::OSStatus {
-    if input.is_null() || client.is_null() {
-        return 0;
-    }
-    let cap = unsafe { &*(client as *const Cap) };
-    cap.shared.callbacks.fetch_add(1, Ordering::Relaxed);
-    let list = unsafe { &*input };
-    let nbuf = list.mNumberBuffers as usize;
-    if nbuf == 0 {
-        return 0;
-    }
-    let buffers = unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), nbuf) };
-
-    let total_channels: u32 = buffers.iter().map(|b| b.mNumberChannels).sum();
-    let mic = if cap.shared.has_mic {
-        buffers[0].mNumberChannels
-    } else {
-        0
-    };
-    cap.shared.mic_channels.store(mic, Ordering::Relaxed);
-    // Release, stored last: pairs with the writer's Acquire load of `total_channels`, publishing
-    // `mic_channels` to the writer once it observes a non-zero channel count (it gates on that).
-    cap.shared
-        .total_channels
-        .store(total_channels, Ordering::Release);
-
-    // Derive the frame count from a buffer that actually carries channels: a tap-only aggregate's clock
-    // sub-device (the default output) can present a 0-channel input buffer that must not zero the count.
-    let frame_buf = buffers
-        .iter()
-        .find(|b| b.mNumberChannels > 0)
-        .unwrap_or(&buffers[0]);
-    let ch0 = frame_buf.mNumberChannels.max(1) as usize;
-    let frames = frame_buf.mDataByteSize as usize / (4 * ch0);
-
-    let total = total_channels as usize;
-    if total == 0 || frames == 0 {
-        return 0;
-    }
-    let needed = frames * total;
-
-    // Single producer (this thread only): take a write chunk and fill it in interleaved order. If the ring
-    // is full (the writer/disk fell behind) drop this callback whole — never block the real-time thread and
-    // never desync mid-frame — and count it so the gap is reported, not silent.
-    let producer = unsafe { &mut *cap.producer.get() };
-    match producer.write_chunk_uninit(needed) {
-        Ok(mut chunk) => {
-            let (head, tail) = chunk.as_mut_slices();
-            let mut slots = head.iter_mut().chain(tail.iter_mut());
-            for f in 0..frames {
-                for b in buffers {
-                    let ch = b.mNumberChannels as usize;
-                    let n = b.mDataByteSize as usize / 4;
-                    let data = b.mData as *const f32;
-                    for c in 0..ch {
-                        let idx = f * ch + c;
-                        let v = if !data.is_null() && idx < n {
-                            unsafe { *data.add(idx) }
-                        } else {
-                            0.0
-                        };
-                        if let Some(slot) = slots.next() {
-                            slot.write(v);
-                        }
-                    }
-                }
-            }
-            // SAFETY: the loops above wrote exactly `needed` values (frames × total_channels), initializing
-            // every slot of the chunk.
-            unsafe { chunk.commit_all() };
-        }
-        Err(_) => {
-            cap.shared
-                .dropped
-                .fetch_add(needed as u64, Ordering::Relaxed);
-        }
-    }
-    0
-}
-
-/// Drain a direct microphone device into bounded mono tee chunks. No file is created and no sample vector
-/// grows past one HAL frame plus [`TEE_FRAMES_PER_CHUNK`].
-fn run_microphone_tee(
-    mut consumer: rtrb::Consumer<f32>,
-    shared: Arc<Shared>,
-    tee: CaptureTee,
-) -> u64 {
-    let total = loop {
-        let channels = shared.total_channels.load(Ordering::Acquire) as usize;
-        if channels > 0 {
-            break channels;
-        }
-        if consumer.is_abandoned() {
-            return 0;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-
-    let mut frame = Vec::with_capacity(total);
-    let mut mono = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
-    let mut frames = 0u64;
-    loop {
-        let available = consumer.slots();
-        if available == 0 {
-            if consumer.is_abandoned() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-        let chunk = match consumer.read_chunk(available) {
-            Ok(chunk) => chunk,
-            Err(_) => break,
-        };
-        let (head, tail) = chunk.as_slices();
-        for &sample in head.iter().chain(tail.iter()) {
-            frame.push(sample);
-            if frame.len() == total {
-                mono.push(frame_mean(&frame, 0, total));
-                frame.clear();
-                frames = frames.saturating_add(1);
-                if mono.len() >= TEE_FRAMES_PER_CHUNK {
-                    send_microphone_chunk(&tee, &mut mono);
-                }
-            }
-        }
-        chunk.commit_all();
-    }
-    send_microphone_chunk(&tee, &mut mono);
-    frames
-}
-
-/// Non-blocking mic-only counterpart to [`send_tee_chunk`]. `tap` is intentionally empty so a consumer
-/// cannot mistake the test for far-end/system audio.
-fn send_microphone_chunk(tee: &CaptureTee, mic: &mut Vec<f32>) {
-    if mic.is_empty() {
-        return;
-    }
-    let chunk = CaptureChunk {
-        mic: std::mem::take(mic),
-        tap: Vec::new(),
-    };
-    *mic = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
-    if tee.tx.try_send(chunk).is_err() {
-        tee.dropped.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// Writer-thread state for the in-flight mic filter (#74): the block being staged for the next
@@ -986,6 +1036,8 @@ struct FilterStage {
     /// Raw mic, queued in lockstep with `tap_pending`. Read only after degradation: the filter's withheld
     /// state dies with it, so this mirror lets those frames be written raw instead of lost.
     mic_pending: VecDeque<f32>,
+    /// Availability travels with delayed output; predictor state cannot synthesize a missing frame.
+    unavailable_pending: VecDeque<bool>,
     /// Declared filter lag, clamped to a hard 35-second ceiling. Checked after every bounded push.
     max_pending: usize,
     degraded: bool,
@@ -1013,6 +1065,7 @@ impl FilterStage {
             far: Vec::with_capacity(FILTER_FRAMES_PER_CHUNK),
             tap_pending: VecDeque::new(),
             mic_pending: VecDeque::new(),
+            unavailable_pending: VecDeque::new(),
             max_pending,
             degraded: false,
             clean_frames: 0,
@@ -1022,11 +1075,12 @@ impl FilterStage {
 
     /// Stage one downmixed frame. `them` is both the echo reference and the passthrough ch1 (ADR 0007
     /// Decision 2: only `me` is cleaned).
-    fn stage(&mut self, me: f32, them: f32) {
+    fn stage_with_availability(&mut self, me: f32, them: f32, unavailable: bool) {
         self.mic.push(me);
         self.far.push(them);
         self.tap_pending.push_back(them);
         self.mic_pending.push_back(me);
+        self.unavailable_pending.push_back(unavailable);
     }
 
     fn is_full(&self) -> bool {
@@ -1060,8 +1114,9 @@ impl FilterStage {
                 break;
             };
             self.mic_pending.pop_front();
-            writer.write_sample(me)?; // ch0 = cleaned me
-            writer.write_sample(them)?; // ch1 = them, untouched
+            let unavailable = self.unavailable_pending.pop_front().unwrap_or(true);
+            writer.write_sample(if unavailable { 0.0 } else { me })?;
+            writer.write_sample(if unavailable { 0.0 } else { them })?;
             frames += 1;
         }
         self.clean_frames += frames;
@@ -1075,8 +1130,10 @@ impl FilterStage {
     ) -> Result<u64, hound::Error> {
         let mut frames = 0;
         while let Some(them) = self.tap_pending.pop_front() {
-            writer.write_sample(self.mic_pending.pop_front().unwrap_or(0.0))?;
-            writer.write_sample(them)?;
+            let me = self.mic_pending.pop_front().unwrap_or(0.0);
+            let unavailable = self.unavailable_pending.pop_front().unwrap_or(true);
+            writer.write_sample(if unavailable { 0.0 } else { me })?;
+            writer.write_sample(if unavailable { 0.0 } else { them })?;
             frames += 1;
         }
         Ok(frames)
@@ -1164,179 +1221,6 @@ impl FilterStage {
             CaptureFilterDisposition::Degraded
         };
         Ok((frames, disposition))
-    }
-}
-
-/// The streaming writer thread: drain the ring, downmix each interleaved frame per `layout`, and write it to
-/// `out` incrementally — lossless 32-bit float for the 2-track recording, 16-bit PCM for the tap-only /
-/// diagnostic layouts. Returns the number of output frames written. Creates the file lazily — only
-/// once the first callback has revealed the channel layout — so a permission-denied run (no callbacks) leaves
-/// no file behind.
-///
-/// With a `filter` (#74) the mic is echo-cancelled here, block by block, and only the cleaned 2-track is
-/// encoded. Nothing on this thread is sized by recording length; a filter failure is dropped and pending/
-/// later audio is written uncancelled with a durable raw/degraded disposition — never silently lost.
-fn run_writer(
-    mut consumer: rtrb::Consumer<f32>,
-    shared: Arc<Shared>,
-    out: PathBuf,
-    layout: OutputLayout,
-    sample_rate: u32,
-    tee: Option<CaptureTee>,
-    filter: Option<CaptureFilterFactory>,
-) -> Result<WriterOutcome> {
-    // Wait for the first callback to publish the channel layout (Acquire pairs with the io proc's Release
-    // store of `total_channels`), or for end-of-stream (producer dropped ⇒ no audio ⇒ no file).
-    let total = loop {
-        let t = shared.total_channels.load(Ordering::Acquire) as usize;
-        if t > 0 {
-            break t;
-        }
-        if consumer.is_abandoned() {
-            return Ok(WriterOutcome {
-                frames: 0,
-                filter: CaptureFilterDisposition::NotRequested,
-            }); // no audio ever delivered — no file
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let mic = shared.mic_channels.load(Ordering::Acquire) as usize;
-    let tap = total.saturating_sub(mic);
-    let out_channels = layout.out_channels(mic as u32, tap as u32);
-
-    // Only the 2-track layout has a mic to clean and a far end to clean it against (ADR 0007 §2). Factory
-    // construction is contained too: configuration/FFT setup must fail open just like push/finish.
-    let mut filter_disposition = CaptureFilterDisposition::NotRequested;
-    let mut filter_stage = match filter {
-        Some(make) if matches!(layout, OutputLayout::TwoTrack) && mic > 0 => {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                FilterStage::new(make(sample_rate), sample_rate)
-            })) {
-                Ok(stage) => Some(stage),
-                Err(_) => {
-                    eprintln!(
-                        "corti-capture: capture filter panicked during construction — recording raw"
-                    );
-                    filter_disposition = CaptureFilterDisposition::RawFallback;
-                    None
-                }
-            }
-        }
-        Some(_) => {
-            eprintln!("corti-capture: ignoring capture filter — layout carries no mic");
-            None
-        }
-        None => None,
-    };
-
-    // The 2-track recording carries the mic (ADR 0007 §1/§2). Writing it as 32-bit float preserves the
-    // bit-exact mic + mono echo reference the adaptive filter needs — quantizing before the filter would
-    // impose an ERLE ceiling (ADR 0007 Context), and quantizing after would lose cleaned-signal headroom.
-    // The tap-only / diagnostic layouts carry no mic, so they are never filtered and stay compact 16-bit.
-    let (bits_per_sample, sample_format) = match layout {
-        OutputLayout::TwoTrack => (32, hound::SampleFormat::Float),
-        OutputLayout::TapOnlyMono | OutputLayout::AllChannels => (16, hound::SampleFormat::Int),
-    };
-    let spec = hound::WavSpec {
-        channels: out_channels as u16,
-        sample_rate,
-        bits_per_sample,
-        sample_format,
-    };
-    let mut writer = hound::WavWriter::create(&out, spec)
-        .map_err(|e| anyhow!("creating {}: {e}", out.display()))?;
-
-    let mut frame: Vec<f32> = Vec::with_capacity(total);
-    let mut frames_written: u64 = 0;
-    // Live-tee accumulators: downmixed mono mic + tap, flushed to the consumer every TEE_FRAMES_PER_CHUNK
-    // frames. Only touched when a tee is attached — the default path is byte-identical.
-    let mut tee_mic: Vec<f32> = Vec::new();
-    let mut tee_tap: Vec<f32> = Vec::new();
-    loop {
-        let avail = consumer.slots();
-        if avail == 0 {
-            if consumer.is_abandoned() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-        let chunk = match consumer.read_chunk(avail) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let (a, b) = chunk.as_slices();
-        for &s in a.iter().chain(b.iter()) {
-            frame.push(s);
-            if frame.len() == total {
-                if let Some(stage) = &mut filter_stage {
-                    stage.stage(
-                        frame_mean(&frame, 0, mic),
-                        frame_mean(&frame, mic, total - mic),
-                    );
-                    if stage.is_full() {
-                        frames_written += stage
-                            .flush(&mut writer)
-                            .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
-                    }
-                } else {
-                    write_frame(&mut writer, &frame, layout, mic, total)
-                        .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
-                    frames_written += 1;
-                }
-                // The tee carries the **raw** downmix regardless: its consumer runs its own processing.
-                if let Some(t) = &tee {
-                    if mic > 0 {
-                        tee_mic.push(frame_mean(&frame, 0, mic));
-                    }
-                    tee_tap.push(frame_mean(&frame, mic, total - mic));
-                    if tee_tap.len() >= TEE_FRAMES_PER_CHUNK {
-                        send_tee_chunk(t, &mut tee_mic, &mut tee_tap);
-                    }
-                }
-                frame.clear();
-            }
-        }
-        chunk.commit_all();
-    }
-    // Flush a trailing partial tee chunk (the WAV drops its partial frame, but a short live chunk is fine).
-    if let Some(t) = &tee {
-        send_tee_chunk(t, &mut tee_mic, &mut tee_tap);
-    }
-    // Drain the filter's lookahead/tail so the file holds every captured frame.
-    if let Some(stage) = filter_stage.take() {
-        let (frames, disposition) = stage
-            .finish(&mut writer)
-            .map_err(|e| anyhow!("writing to {}: {e}", out.display()))?;
-        frames_written += frames;
-        filter_disposition = disposition;
-    }
-    // A trailing partial frame (incomplete) is discarded.
-    writer
-        .finalize()
-        .map_err(|e| anyhow!("finalizing {}: {e}", out.display()))?;
-    Ok(WriterOutcome {
-        frames: frames_written,
-        filter: filter_disposition,
-    })
-}
-
-/// Hand the accumulated downmixed chunk to the tee consumer, non-blocking. On a full or hung-up channel the
-/// chunk is dropped and counted — capture never stalls on a slow live consumer (ADR 0009).
-fn send_tee_chunk(tee: &CaptureTee, mic: &mut Vec<f32>, tap: &mut Vec<f32>) {
-    if tap.is_empty() {
-        return;
-    }
-    let chunk = CaptureChunk {
-        mic: std::mem::take(mic),
-        tap: std::mem::take(tap),
-    };
-    // `mem::take` left both Vecs at capacity 0; re-reserve so the next chunk doesn't re-grow by repeated
-    // reallocation on the writer thread.
-    *mic = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
-    *tap = Vec::with_capacity(TEE_FRAMES_PER_CHUNK);
-    if tee.tx.try_send(chunk).is_err() {
-        tee.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1561,6 +1445,79 @@ impl Drop for AggregateGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing sample/filter tests now exercise the ordered writer through one explicit epoch and
+    // audio descriptor. Their fixtures and sample assertions remain unchanged.
+    fn fixture_descriptors(
+        samples: usize,
+        shared: &Shared,
+        rate: u32,
+    ) -> rtrb::Consumer<CaptureDescriptor> {
+        use corti_core::capture_accounting::{
+            CallbackInput, CaptureFormat, CaptureTimeline, CaptureTimestamp,
+        };
+        let (mut producer, consumer) = rtrb::RingBuffer::new(HAL_DESCRIPTOR_CAPACITY);
+        let total = shared.total_channels.load(Ordering::Acquire);
+        let mic = shared.mic_channels.load(Ordering::Acquire);
+        if samples > 0 {
+            assert!(total > 0 && samples.is_multiple_of(total as usize));
+            let mut timeline = CaptureTimeline::<64>::new().unwrap();
+            let admission = timeline
+                .plan_callback(
+                    CallbackInput {
+                        frames: (samples / total as usize) as u64,
+                        format: CaptureFormat {
+                            generation: 1,
+                            source_rate_hz: rate,
+                            mic_channels: mic,
+                            tap_channels: total - mic,
+                        },
+                        timestamp: CaptureTimestamp {
+                            sample_time: 0.0,
+                            sample_time_valid: true,
+                            source_offset_ns: 0,
+                            host_time_valid: true,
+                        },
+                    },
+                    samples,
+                    HAL_DESCRIPTOR_CAPACITY,
+                )
+                .unwrap();
+            assert!(admission.accepted());
+            for descriptor in admission {
+                producer.push(descriptor).unwrap();
+            }
+            for descriptor in timeline.finish().unwrap() {
+                producer.push(descriptor).unwrap();
+            }
+        }
+        drop(producer);
+        consumer
+    }
+
+    fn run_writer(
+        consumer: rtrb::Consumer<f32>,
+        shared: Arc<Shared>,
+        out: PathBuf,
+        layout: OutputLayout,
+        sample_rate: u32,
+        tee: Option<CaptureTee>,
+        filter: Option<CaptureFilterFactory>,
+    ) -> Result<WriterOutcome> {
+        let descriptors = fixture_descriptors(consumer.slots(), &shared, sample_rate);
+        ordered_writer::run_writer(consumer, descriptors, out, layout, sample_rate, tee, filter)
+    }
+
+    fn run_microphone_tee(
+        consumer: rtrb::Consumer<f32>,
+        shared: Arc<Shared>,
+        tee: CaptureTee,
+    ) -> u64 {
+        let descriptors = fixture_descriptors(consumer.slots(), &shared, 48_000);
+        ordered_microphone::run_microphone_tee(consumer, descriptors, 48_000, tee)
+            .unwrap()
+            .frames
+    }
 
     /// A tap-only capture (no mic sub-device) reports `mic_channels == 0`, so the whole interleaved stream
     /// is the tap: `mic_mono()` is empty and `tap_mono()` averages every channel. This is the split

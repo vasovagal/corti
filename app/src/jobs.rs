@@ -24,9 +24,14 @@ pub(crate) const CLEANUP_AWS_STAGING: &str = "cleanup_aws_staging";
 /// The hourly retention sweep (periodic singleton; also fires at startup).
 pub(crate) const SWEEP_EXPIRED: &str = "sweep_expired";
 
-/// Attempts a recording gets via the retry job before it is terminally failed (the live-path failure
-/// that scheduled the job was attempt zero).
+/// Retries after the original batch attempt before a recording is terminally failed.
 pub(crate) const RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// Moving the first batch call into the durable job preserves its attempt plus five retries for both
+/// fresh recordings and live fallback. This budget does not grant fresh-backend or hosted permission.
+pub(crate) fn initial_batch_attempts(fresh_batch: bool, had_live_session: bool) -> u32 {
+    RETRY_MAX_ATTEMPTS + u32::from(fresh_batch || had_live_session)
+}
 
 pub(crate) const SWEEP_PERIOD: Duration = Duration::from_secs(3600);
 /// Minimum terminal-row lifetime. The actual horizon is the maximum of this and configured audio
@@ -36,13 +41,60 @@ const MIN_ROW_RETENTION_DAYS: i64 = 90;
 const FAILED_JOB_ROW_RETENTION_DAYS: i64 = 30;
 
 pub(crate) fn retry_payload(id: &str, preferred_note: Option<&OwnedNote>) -> serde_json::Value {
-    match preferred_note {
+    retry_payload_with_origin(id, preferred_note, None)
+}
+
+pub(crate) fn retry_payload_with_origin(
+    id: &str,
+    preferred_note: Option<&OwnedNote>,
+    original_backend: Option<crate::transcribe::FirstAsrBackend>,
+) -> serde_json::Value {
+    let mut payload = match preferred_note {
         Some(note) => serde_json::json!({
             "id": id,
             "preferred_note": note.path.to_string_lossy(),
             "note_canonical": note.canonical,
         }),
         None => serde_json::json!({ "id": id }),
+    };
+    if let Some(original_backend) = original_backend {
+        payload["original_backend"] = serde_json::json!(original_backend);
+    }
+    payload
+}
+
+pub(crate) fn original_backend(
+    payload: &serde_json::Value,
+) -> Option<crate::transcribe::FirstAsrBackend> {
+    serde_json::from_value(payload.get("original_backend")?.clone()).ok()
+}
+
+/// Original backend from existing durable authorities. An unreadable/newer checkpoint fails closed;
+/// it cannot silently authorize a backend based on current Settings or an older retry payload.
+pub(crate) fn durable_original_backend(
+    queue: &Queue,
+    id: &str,
+    audio: &Path,
+) -> Result<Option<crate::transcribe::FirstAsrBackend>> {
+    if crate::checkpoint::path_for(audio).exists() {
+        return Ok(FilingCheckpoint::load(audio)?.original_backend);
+    }
+    Ok(queue
+        .jobs()
+        .recording_payload(RETRY_TRANSCRIPTION, id)?
+        .as_ref()
+        .and_then(original_backend))
+}
+
+fn claimed_origin(job: &ClaimedJob) -> crate::transcribe::RetryOrigin {
+    let origin = original_backend(&job.payload);
+    if job.attempts == 1
+        && job.payload["first_batch"].as_bool() == Some(true)
+        && let Some(origin) = origin
+    {
+        crate::transcribe::RetryOrigin::RecordedFirst(origin)
+    } else {
+        crate::transcribe::RetryOrigin::Retry(origin)
     }
 }
 
@@ -182,9 +234,16 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
     let id = job.payload["id"]
         .as_str()
         .context("payload missing recording id")?;
-    let Some(row) = ctx.queue.get(id)? else {
+    let Some(mut row) = ctx.queue.get(id)? else {
         return Ok(()); // row deleted meanwhile — nothing to retry
     };
+    if row.status == JobStatus::Recording && job.payload["capture_finished"].as_bool() == Some(true)
+    {
+        // Process durably armed this exact finished capture before ASR. Repair a live-created Recording
+        // row here; a failed update leaves the already-claimed origin/attempt available to normal retry.
+        ctx.queue.set_status(id, JobStatus::PendingTranscription)?;
+        row.status = JobStatus::PendingTranscription;
+    }
     let meta = row.meta();
     let checkpoint_path = crate::checkpoint::path_for(&row.audio_path);
     let checkpoint = FilingCheckpoint::load(&row.audio_path).ok();
@@ -263,11 +322,23 @@ fn retry_transcription(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
                     },
                 )
                 .context("persisting legacy recovery attempt name")?;
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
+            pipeline::transcribe_and_file(
+                ctx,
+                id,
+                &meta,
+                &row.audio_path,
+                owned_note.as_ref(),
+                claimed_origin(job),
+            )
         }
-        RetryAction::Transcribe => {
-            pipeline::transcribe_and_file(ctx, id, &meta, &row.audio_path, owned_note.as_ref())
-        }
+        RetryAction::Transcribe => pipeline::transcribe_and_file(
+            ctx,
+            id,
+            &meta,
+            &row.audio_path,
+            owned_note.as_ref(),
+            claimed_origin(job),
+        ),
         RetryAction::MissingAudio => pipeline::fail_with_note(
             ctx,
             id,
@@ -393,6 +464,16 @@ fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
         crate::checkpoint::aws_staging_path_for(audio),
     ];
     let mut all_absent = true;
+    match (
+        corti_core::quality_store::quality_sidecar_path(audio),
+        corti_core::quality_store::quality_temporary_paths(audio),
+    ) {
+        (Ok(sidecar), Ok(temps)) => {
+            paths.push(sidecar);
+            paths.extend(temps);
+        }
+        _ => all_absent = false,
+    }
     match crate::checkpoint::temporary_paths(audio) {
         Ok(temps) => paths.extend(temps),
         Err(err) => {
@@ -580,6 +661,319 @@ mod tests {
         let payload = retry_payload("recording", Some(&canonical));
         assert_eq!(preferred_note(&payload), Some(canonical));
         assert_eq!(preferred_note(&id_payload("recording")), None);
+    }
+
+    #[test]
+    fn retry_payload_preserves_origin_and_legacy_payload_cannot_authorize_egress() {
+        let payload = retry_payload_with_origin(
+            "recording",
+            None,
+            Some(crate::transcribe::FirstAsrBackend::Local),
+        );
+        let encoded = serde_json::to_vec(&payload).unwrap();
+        let restored = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            original_backend(&restored),
+            Some(crate::transcribe::FirstAsrBackend::Local)
+        );
+        assert_eq!(original_backend(&id_payload("recording")), None);
+        assert!(
+            crate::transcribe::RetryOrigin::Retry(original_backend(&restored))
+                .selected_backend(crate::transcribe::FirstAsrBackend::Aws)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn first_live_fallback_retains_six_durable_batch_attempts_without_fresh_egress() {
+        use crate::transcribe::FirstAsrBackend::{Aws, Local};
+        use crate::transcribe::RetryOrigin;
+        use corti_jobs::{Backoff, FailOutcome};
+
+        for (fresh_batch, had_live_session, expected_attempts) in
+            [(true, false, 6), (false, true, 6), (false, false, 5)]
+        {
+            let dir = test_dir(&format!("batch-budget-{fresh_batch}-{had_live_session}"));
+            let database = dir.join("queue.db");
+            let queue = Queue::open_at(&database).unwrap();
+            let id = queue.enqueue(&meta(dir.join("recording.wav"))).unwrap();
+            let mut payload = retry_payload_with_origin(&id, None, Some(Local));
+            payload["capture_finished"] = serde_json::json!(true);
+            if fresh_batch {
+                payload["first_batch"] = serde_json::json!(true);
+            }
+            queue
+                .jobs()
+                .enqueue_recording(
+                    RETRY_TRANSCRIPTION,
+                    &payload,
+                    initial_batch_attempts(fresh_batch, had_live_session),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(queue);
+
+            let backoff = Backoff {
+                base: Duration::from_secs(30),
+                cap: Duration::from_secs(3600),
+            };
+            for expected in 1..=expected_attempts {
+                let queue = Queue::open_at(&database).unwrap();
+                let claimed = queue
+                    .jobs()
+                    .claim_due(Utc::now() + chrono::Duration::days(1))
+                    .unwrap()
+                    .expect("each original batch attempt must remain durable");
+                assert_eq!(claimed.attempts, expected);
+                let origin = claimed_origin(&claimed);
+                assert_eq!(
+                    origin,
+                    if fresh_batch && expected == 1 {
+                        RetryOrigin::RecordedFirst(Local)
+                    } else {
+                        RetryOrigin::Retry(Some(Local))
+                    }
+                );
+                assert_eq!(
+                    origin.permits_hosted_final(Local),
+                    fresh_batch && expected == 1,
+                    "live fallback's first batch is still local recovery"
+                );
+                let mut decoded = false;
+                origin
+                    .dispatch(Local, || {
+                        decoded = true;
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(decoded);
+                let mut staged = false;
+                assert!(
+                    origin
+                        .dispatch(Aws, || {
+                            staged = true;
+                            Ok(())
+                        })
+                        .is_err()
+                );
+                assert!(!staged);
+                let outcome = queue
+                    .jobs()
+                    .fail(&claimed, "synthetic batch failure", &backoff)
+                    .unwrap();
+                assert_eq!(
+                    matches!(outcome, FailOutcome::Exhausted),
+                    expected == expected_attempts,
+                    "fresh={fresh_batch}, live={had_live_session}, attempt={expected}"
+                );
+            }
+            let queue = Queue::open_at(&database).unwrap();
+            assert!(
+                queue
+                    .jobs()
+                    .claim_due(Utc::now() + chrono::Duration::days(2))
+                    .unwrap()
+                    .is_none(),
+                "exhaustion must not add an extra attempt"
+            );
+            drop(queue);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_process_cannot_raise_recovery_budget_or_authorize_first_batch() {
+        use crate::transcribe::FirstAsrBackend::{Aws, Local};
+        use crate::transcribe::RetryOrigin;
+        use corti_jobs::{Backoff, FailOutcome};
+
+        for existing_budget in [5, 6] {
+            let dir = test_dir(&format!("duplicate-batch-budget-{existing_budget}"));
+            let database = dir.join("queue.db");
+            let queue = Queue::open_at(&database).unwrap();
+            let id = queue.enqueue(&meta(dir.join("recording.wav"))).unwrap();
+            let payload = retry_payload_with_origin(&id, None, Some(Local));
+            let due = Utc::now() + chrono::Duration::hours(1);
+            queue
+                .jobs()
+                .enqueue_recording(RETRY_TRANSCRIPTION, &payload, existing_budget, due)
+                .unwrap();
+            let mut duplicate = retry_payload_with_origin(&id, None, Some(Aws));
+            duplicate["first_batch"] = serde_json::json!(true);
+            duplicate["capture_finished"] = serde_json::json!(true);
+            let enqueue_duplicate = |queue: &Queue| {
+                assert!(
+                    queue
+                        .jobs()
+                        .enqueue_recording(
+                            RETRY_TRANSCRIPTION,
+                            &duplicate,
+                            initial_batch_attempts(true, false),
+                            Utc::now(),
+                        )
+                        .unwrap()
+                        .is_none()
+                );
+            };
+            let original_due = queue.jobs().next_due_at().unwrap();
+            enqueue_duplicate(&queue);
+            assert_eq!(queue.jobs().next_due_at().unwrap(), original_due);
+            assert!(queue.jobs().claim_due(Utc::now()).unwrap().is_none());
+            let claimed = queue
+                .jobs()
+                .claim_due(due + chrono::Duration::seconds(1))
+                .unwrap()
+                .unwrap();
+            enqueue_duplicate(&queue);
+            assert!(
+                queue
+                    .jobs()
+                    .claim_due(due + chrono::Duration::days(1))
+                    .unwrap()
+                    .is_none(),
+                "a duplicate must not release the running claim"
+            );
+            let backoff = Backoff {
+                base: Duration::from_secs(30),
+                cap: Duration::from_secs(3600),
+            };
+            let FailOutcome::Rescheduled { next_run_at } = queue
+                .jobs()
+                .fail(&claimed, "synthetic batch failure", &backoff)
+                .unwrap()
+            else {
+                panic!("first batch failure should retain its remaining attempts")
+            };
+            let retry_due = queue.jobs().next_due_at().unwrap();
+            enqueue_duplicate(&queue);
+            assert_eq!(queue.jobs().next_due_at().unwrap(), retry_due);
+            drop(queue);
+
+            let queue = Queue::open_at(&database).unwrap();
+            let retried = queue
+                .jobs()
+                .claim_due(next_run_at + chrono::Duration::seconds(1))
+                .unwrap()
+                .unwrap();
+            assert_eq!(retried.id, claimed.id);
+            assert_eq!(retried.attempts, 2);
+            assert_eq!(retried.max_attempts, existing_budget);
+            assert!(retried.payload.get("first_batch").is_none());
+            for job in [&claimed, &retried] {
+                let origin = claimed_origin(job);
+                assert_eq!(origin, RetryOrigin::Retry(Some(Local)));
+                assert!(!origin.permits_hosted_final(Local));
+                let mut invoked = false;
+                assert!(
+                    origin
+                        .dispatch(Aws, || {
+                            invoked = true;
+                            Ok(())
+                        })
+                        .is_err()
+                );
+                assert!(!invoked);
+            }
+            drop(queue);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn crash_before_checkpoint_preserves_backend_and_gates_the_callable_sequence() {
+        use crate::transcribe::FirstAsrBackend::{Aws, Local};
+        for original in [None, Some(Local), Some(Aws)] {
+            for claimed_before_crash in [false, true] {
+                let dir = test_dir(&format!("origin-crash-{original:?}-{claimed_before_crash}"));
+                let audio = dir.join("recording.wav");
+                let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+                let id = queue.enqueue(&meta(audio.clone())).unwrap();
+                let mut payload = retry_payload_with_origin(&id, None, original);
+                if original.is_some() {
+                    payload["first_batch"] = serde_json::json!(true);
+                }
+                queue
+                    .jobs()
+                    .enqueue_recording(RETRY_TRANSCRIPTION, &payload, 6, Utc::now())
+                    .unwrap();
+                if claimed_before_crash {
+                    assert_eq!(
+                        queue
+                            .jobs()
+                            .claim_due(Utc::now() + chrono::Duration::seconds(1))
+                            .unwrap()
+                            .unwrap()
+                            .attempts,
+                        1
+                    );
+                }
+                drop(queue);
+
+                let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+                queue.jobs().recover_running().unwrap();
+                assert!(!crate::checkpoint::path_for(&audio).exists());
+                assert_eq!(
+                    durable_original_backend(&queue, &id, &audio).unwrap(),
+                    original
+                );
+                let job = queue
+                    .jobs()
+                    .claim_due(Utc::now() + chrono::Duration::seconds(1))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(job.attempts, if claimed_before_crash { 2 } else { 1 });
+                let origin = claimed_origin(&job);
+                for configured in [Local, Aws] {
+                    let (mut staged, mut decoded, mut hosted) = (0, 0, 0);
+                    let result = origin.dispatch(configured, || {
+                        staged += usize::from(configured == Aws);
+                        decoded += 1;
+                        hosted += usize::from(origin.permits_hosted_final(configured));
+                        Ok(())
+                    });
+                    let authorized = original == Some(configured);
+                    assert_eq!(result.is_ok(), authorized);
+                    assert_eq!(decoded, usize::from(authorized));
+                    if !authorized {
+                        assert_eq!((staged, hosted), (0, 0));
+                    }
+                    if claimed_before_crash && original == Some(Local) {
+                        assert_eq!(
+                            hosted, 0,
+                            "local recovery cannot introduce hosted finalization"
+                        );
+                    }
+                }
+                drop(queue);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn recording_expiry_removes_mandatory_quality_and_registered_transaction_files() {
+        let dir = test_dir("quality-retention");
+        let audio = dir.join("recording.wav");
+        std::fs::write(&audio, b"synthetic").unwrap();
+        let quality = corti_core::quality_store::quality_sidecar_path(&audio).unwrap();
+        let temps = corti_core::quality_store::quality_temporary_paths(&audio).unwrap();
+        for path in std::iter::once(&quality).chain(&temps) {
+            std::fs::write(path, b"synthetic").unwrap();
+        }
+        // Nonterminal sweep only touches transcript-checkpoint temps, never capture authority.
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let id = queue.enqueue(&meta(audio.clone())).unwrap();
+        let future = Local::now() + chrono::Duration::days(366);
+        sweep_recordings(&queue, 1, future).unwrap();
+        assert!(quality.exists());
+        assert!(temps.iter().all(|path| path.exists()));
+        queue.set_status(&id, JobStatus::Done).unwrap();
+        sweep_recordings(&queue, 1, future).unwrap();
+        assert!(!audio.exists());
+        assert!(!quality.exists());
+        assert!(temps.iter().all(|path| !path.exists()));
+        drop(queue);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

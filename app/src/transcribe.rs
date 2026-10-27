@@ -37,6 +37,13 @@ enum BackendKind {
 }
 
 impl Backend {
+    pub(crate) fn identity(&self) -> FirstAsrBackend {
+        match self.cfg.transcribe_backend {
+            BackendChoice::Local => FirstAsrBackend::Local,
+            BackendChoice::Aws => FirstAsrBackend::Aws,
+        }
+    }
+
     pub fn init(cfg: AppConfig) -> Self {
         let kind = match cfg.transcribe_backend {
             #[cfg(feature = "aws")]
@@ -222,6 +229,7 @@ impl Backend {
 pub struct TranscriptionAttempt<'a> {
     id: &'a str,
     aws_job_name: Option<&'a str>,
+    quality: Option<&'a corti_core::QualityRecord>,
 }
 
 impl<'a> TranscriptionAttempt<'a> {
@@ -232,6 +240,7 @@ impl<'a> TranscriptionAttempt<'a> {
         Self {
             id,
             aws_job_name: Some(aws_job_name),
+            quality: None,
         }
     }
 
@@ -240,7 +249,13 @@ impl<'a> TranscriptionAttempt<'a> {
         Self {
             id,
             aws_job_name: None,
+            quality: None,
         }
+    }
+
+    pub fn with_quality(mut self, quality: &'a corti_core::QualityRecord) -> Self {
+        self.quality = Some(quality);
+        self
     }
 }
 
@@ -269,6 +284,161 @@ pub enum OfflineAecOutcome {
     Failed,
 }
 
+/// Recording-scoped ASR origin, carried in existing retry JSON and the filing checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FirstAsrBackend {
+    Local,
+    Aws,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryOrigin {
+    Fresh,
+    RecordedFirst(FirstAsrBackend),
+    Retry(Option<FirstAsrBackend>),
+}
+
+impl RetryOrigin {
+    pub(crate) fn first_backend(self, configured: FirstAsrBackend) -> Option<FirstAsrBackend> {
+        match self {
+            Self::Fresh => Some(configured),
+            Self::RecordedFirst(origin) => Some(origin),
+            Self::Retry(origin) => origin,
+        }
+    }
+
+    /// An unknown automatic retry cannot authorize a backend transition, including a local decode.
+    /// A changed configuration leaves a partial note with the explicit local redo path.
+    pub(crate) fn selected_backend(self, configured: FirstAsrBackend) -> Result<FirstAsrBackend> {
+        match (self, configured) {
+            (Self::Fresh, backend) => Ok(backend),
+            (Self::RecordedFirst(origin), backend) if origin == backend => Ok(backend),
+            (Self::Retry(Some(FirstAsrBackend::Local)), FirstAsrBackend::Local) => {
+                Ok(FirstAsrBackend::Local)
+            }
+            (Self::Retry(Some(FirstAsrBackend::Aws)), FirstAsrBackend::Aws) => {
+                Ok(FirstAsrBackend::Aws)
+            }
+            _ => anyhow::bail!("retry_backend_not_authorized"),
+        }
+    }
+
+    pub(crate) fn permits_hosted_final(self, selected: FirstAsrBackend) -> bool {
+        matches!(self, Self::Fresh)
+            || matches!(self, Self::RecordedFirst(origin) if origin == selected)
+            || matches!(self, Self::Retry(Some(FirstAsrBackend::Aws)))
+                && selected == FirstAsrBackend::Aws
+    }
+
+    /// One callable gate around the complete staging/ASR/hosted sequence. Synthetic callers can verify
+    /// that refused origins never invoke any side effect without models or network access.
+    pub(crate) fn dispatch<T>(
+        self,
+        configured: FirstAsrBackend,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.selected_backend(configured)?;
+        operation()
+    }
+}
+
+/// Storage status is separate from the frozen quality model: a finalized header alone is not a
+/// successful capture publication, and batch decoding cannot repair that storage uncertainty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordingStorageStatus {
+    LegacyUnknown,
+    InProgress,
+    Finalizing,
+    AudioUnverified,
+    FrameCountMismatch,
+    InterruptedPublication,
+    AudioDurable,
+}
+
+pub(crate) struct RecordingQuality {
+    pub(crate) quality: corti_core::QualityRecord,
+    pub(crate) storage_status: RecordingStorageStatus,
+}
+
+impl RecordingQuality {
+    pub(crate) fn storage_complete(&self) -> bool {
+        self.storage_status == RecordingStorageStatus::AudioDurable
+    }
+}
+
+/// Count validated PCM samples, rather than trusting the WAV header's declared duration. Memory use
+/// stays constant even for a long recording; a truncated sample is a failed validation.
+fn validated_wav_frames(audio: &Path) -> Result<u64> {
+    let mut reader = hound::WavReader::open(audio).context("opening capture WAV for validation")?;
+    let spec = reader.spec();
+    anyhow::ensure!(
+        spec.channels > 0 && spec.sample_rate > 0,
+        "invalid capture WAV format"
+    );
+    let expected = u64::from(reader.len());
+    anyhow::ensure!(
+        expected % u64::from(spec.channels) == 0,
+        "unaligned capture WAV"
+    );
+    let actual = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .try_fold(0u64, |count, sample| sample.map(|_| count + 1))?,
+        hound::SampleFormat::Int => reader
+            .samples::<i32>()
+            .try_fold(0u64, |count, sample| sample.map(|_| count + 1))?,
+    };
+    anyhow::ensure!(actual == expected, "incomplete capture WAV data");
+    Ok(actual / u64::from(spec.channels))
+}
+
+/// Read mandatory capture authority before every batch/retry/redo. The queue copy is immutable capture
+/// provenance; settlement happens on this separate record and never overwrites that JSON column.
+pub(crate) fn load_recording_quality(
+    id: &str,
+    audio: &Path,
+    capture: Option<&corti_capture::CaptureProcessing>,
+) -> Result<RecordingQuality> {
+    use corti_core::quality_store::{QualityReadStatus, load_quality};
+    let frames = validated_wav_frames(audio).ok();
+    // A retained clean derivative has the same frame timeline, but the mandatory authority is bound
+    // to the original WAV name. Resolve only this recording's exact conventional derivative; never
+    // discover siblings or borrow a similarly named recording's identity.
+    let authority_audio = if audio.file_name().and_then(|name| name.to_str())
+        == Some(format!("{id}-clean.wav").as_str())
+    {
+        audio.with_file_name(format!("{id}.wav"))
+    } else {
+        audio.to_path_buf()
+    };
+    let readout =
+        load_quality(&authority_audio, id, frames).context("loading durable capture quality")?;
+    let storage_status = match readout.status {
+        QualityReadStatus::LegacyUnknown => RecordingStorageStatus::LegacyUnknown,
+        QualityReadStatus::InProgress => RecordingStorageStatus::InProgress,
+        QualityReadStatus::Finalizing => RecordingStorageStatus::Finalizing,
+        QualityReadStatus::AudioUnverified => RecordingStorageStatus::AudioUnverified,
+        QualityReadStatus::FrameCountMismatch => RecordingStorageStatus::FrameCountMismatch,
+        QualityReadStatus::InterruptedPublication => RecordingStorageStatus::InterruptedPublication,
+        QualityReadStatus::AudioDurable => RecordingStorageStatus::AudioDurable,
+    };
+    let mut quality = readout.quality().cloned().unwrap_or_default();
+    if let Some(captured) = capture.and_then(|processing| processing.quality.as_ref()) {
+        quality
+            .merge_snapshot(captured)
+            .context("conflicting capture quality histories")?;
+    }
+    if !readout.permits_completion() {
+        quality.coverage = corti_core::QualityCoverage::LegacyUnknown;
+    }
+    Ok(RecordingQuality {
+        quality,
+        storage_status,
+    })
+}
+
 /// Parse and validate a queue row's versioned capture-processing record. `None` is a legacy pre-marker row.
 pub fn decode_capture_processing(
     raw: Option<&str>,
@@ -277,7 +447,7 @@ pub fn decode_capture_processing(
         return Ok(None);
     };
     let processing: corti_capture::CaptureProcessing =
-        serde_json::from_str(raw).context("parsing capture-processing record")?;
+        serde_json::from_str(raw).map_err(|_| anyhow::anyhow!("invalid_capture_processing"))?;
     processing.validate()?;
     Ok(Some(processing))
 }
@@ -399,11 +569,12 @@ pub fn transcribe_recording(
         // Ask for the per-block record while we are running the filter anyway: it is the only chance this
         // path gets, and it is what lets the echo pass tell a residual-bleed row from a coincidence
         // (#149 phase 3b). The cleaned WAV is byte-identical either way.
-        match corti_capture::write_clean_wav_with_options(
+        match corti_capture::write_clean_wav_with_quality(
             raw_audio,
             &aec.config,
             aec.lookahead_seconds,
             corti_capture::AecStatsSidecar::Write,
+            attempt.quality,
         ) {
             Ok(Some(clean)) => {
                 info!(
@@ -567,9 +738,220 @@ fn build_sdk_config_for_region(
 mod tests {
     use super::*;
 
+    #[test]
+    fn retry_backend_guard_precedes_audio_and_text_egress() {
+        use FirstAsrBackend::{Aws, Local};
+        for backend in [Aws, Local] {
+            assert_eq!(
+                RetryOrigin::Fresh.selected_backend(backend).unwrap(),
+                backend
+            );
+            assert_eq!(
+                RetryOrigin::Retry(Some(backend))
+                    .selected_backend(backend)
+                    .unwrap(),
+                backend
+            );
+        }
+        assert!(
+            RetryOrigin::Retry(Some(Local))
+                .selected_backend(Aws)
+                .is_err()
+        );
+        assert!(
+            RetryOrigin::Retry(Some(Aws))
+                .selected_backend(Local)
+                .is_err()
+        );
+        assert!(RetryOrigin::Retry(None).selected_backend(Aws).is_err());
+        assert!(RetryOrigin::Retry(None).selected_backend(Local).is_err());
+        assert!(!RetryOrigin::Retry(None).permits_hosted_final(Local));
+        assert!(!RetryOrigin::Retry(Some(Local)).permits_hosted_final(Local));
+    }
+
+    #[test]
+    fn malformed_capture_carriers_never_echo_untrusted_values_in_error_chains() {
+        for raw in [
+            r#"{"schema_version":1,"aec":{"state":"SYNTHETIC_PRIVATE_SENTINEL"}}"#,
+            r#"{"schema_version":1,"aec":{"state":"disabled"},"quality":{"coverage":"SYNTHETIC_PRIVATE_SENTINEL"}}"#,
+            r#"{"schema_version":"SYNTHETIC_PRIVATE_SENTINEL","aec":{"state":"disabled"}}"#,
+        ] {
+            let error = decode_capture_processing(Some(raw)).unwrap_err();
+            assert_eq!(format!("{error:#}"), "invalid_capture_processing");
+        }
+    }
+
+    fn quality_fixture() -> corti_core::QualityRecord {
+        use corti_core::{
+            CaptureEpoch, CaptureEpochReason, QualityCause, QualityClass, QualityRecord,
+            QualityResolution, QualitySpan, QualityStage, QualityTrack,
+        };
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        quality
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 2,
+                end_frame: 4,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(90_000_000_000),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 8,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::HostDiscontinuity,
+            })
+            .unwrap();
+        quality
+    }
+
+    fn synthetic_wav(audio: &Path, frames: u32) {
+        let mut writer = hound::WavWriter::create(
+            audio,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: 16_000,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for frame in 0..frames {
+            writer.write_sample(frame as f32 / 100.0).unwrap();
+            writer.write_sample(-(frame as f32) / 100.0).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn recovery_loads_exact_source_history_before_and_after_durable_publication() {
+        use corti_core::quality_store::QualityStore;
+        use corti_core::{BatchRecoveryOutcome, SourceCompleteness};
+        let dir =
+            std::env::temp_dir().join(format!("corti-quality-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("recording.wav");
+        let captured = quality_fixture();
+        let mut store = QualityStore::begin(&audio, "recording", &captured).unwrap();
+        synthetic_wav(&audio, 16);
+        store.prepare_finalization(&captured, 16).unwrap();
+        let before = load_recording_quality("recording", &audio, None).unwrap();
+        assert_eq!(before.storage_status, RecordingStorageStatus::Finalizing);
+        assert!(!before.storage_complete());
+        assert_eq!(before.quality.epochs, captured.epochs);
+        assert_eq!(before.quality.spans, captured.spans);
+        store.complete_after_audio_sync(16).unwrap();
+        let mut recovered = load_recording_quality("recording", &audio, None).unwrap();
+        assert!(recovered.storage_complete());
+        assert_eq!(recovered.quality, captured);
+        recovered
+            .quality
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        assert_eq!(
+            recovered.quality.source_completeness(),
+            SourceCompleteness::Incomplete
+        );
+        assert_eq!(
+            recovered.quality.epochs[1].source_start_ns,
+            Some(90_000_000_000)
+        );
+        assert!(load_recording_quality("another-recording", &audio, None).is_err());
+        synthetic_wav(&audio, 15);
+        let mismatch = load_recording_quality("recording", &audio, None).unwrap();
+        assert_eq!(
+            mismatch.storage_status,
+            RecordingStorageStatus::FrameCountMismatch
+        );
+        assert!(!mismatch.storage_complete());
+        assert_eq!(mismatch.quality.spans, captured.spans);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wav_validation_detects_physical_truncation_and_missing_authority_stays_unknown() {
+        let dir =
+            std::env::temp_dir().join(format!("corti-quality-truncated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("recording.wav");
+        synthetic_wav(&audio, 16);
+        assert_eq!(validated_wav_frames(&audio).unwrap(), 16);
+        let missing = load_recording_quality("recording", &audio, None).unwrap();
+        assert_eq!(
+            missing.quality.source_completeness(),
+            corti_core::SourceCompleteness::Unknown
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&audio)
+            .unwrap();
+        file.set_len(file.metadata().unwrap().len() - 4).unwrap();
+        assert!(validated_wav_frames(&audio).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn known_clean_derivative_validates_against_original_quality_binding_after_raw_expiry() {
+        let dir = std::env::temp_dir().join(format!("corti-quality-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("recording.wav");
+        let clean = corti_capture::clean_wav_path(&raw);
+        let quality = quality_fixture();
+        let mut store =
+            corti_core::quality_store::QualityStore::begin(&raw, "recording", &quality).unwrap();
+        synthetic_wav(&raw, 16);
+        store.prepare_finalization(&quality, 16).unwrap();
+        store.complete_after_audio_sync(16).unwrap();
+        synthetic_wav(&clean, 16);
+        std::fs::remove_file(&raw).unwrap();
+        let recovered = load_recording_quality("recording", &clean, None).unwrap();
+        assert!(recovered.storage_complete());
+        assert_eq!(recovered.quality, quality);
+        synthetic_wav(&clean, 15);
+        assert_eq!(
+            load_recording_quality("recording", &clean, None)
+                .unwrap()
+                .storage_status,
+            RecordingStorageStatus::FrameCountMismatch
+        );
+        assert!(
+            !load_recording_quality("another", &clean, None)
+                .unwrap()
+                .storage_complete()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn applied(config: corti_aec::AecConfig) -> corti_capture::CaptureProcessing {
         corti_capture::CaptureProcessing {
             schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            quality: None,
             aec: corti_capture::CaptureAecState::Applied {
                 config,
                 lookahead_seconds: 7.0,
@@ -594,6 +976,7 @@ mod tests {
         ] {
             let processing = corti_capture::CaptureProcessing {
                 schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+                quality: None,
                 aec,
             };
             assert!(recording_aec_plan(Some(&processing), true, &cfg, false).is_none());
@@ -607,6 +990,7 @@ mod tests {
         captured.filter_len = 4_096;
         let processing = corti_capture::CaptureProcessing {
             schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            quality: None,
             aec: corti_capture::CaptureAecState::RawFallback {
                 config: captured.clone(),
                 lookahead_seconds: 9.0,

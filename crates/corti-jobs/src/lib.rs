@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -114,6 +114,102 @@ impl<'c> Jobs<'c> {
             )
             .context("enqueueing job")?;
         Ok((n == 1).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Arm existing recording work before its first side effect. Unlike generic [`Self::enqueue`],
+    /// identity is `(kind, payload.id)`, so adding origin/note metadata never creates a second active
+    /// retry. An existing origin (including its absence), first-attempt flag, claim, budget and due time
+    /// are immutable here. Only missing note ownership or a partial-to-canonical promotion is merged.
+    pub fn enqueue_recording(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        let recording_id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("recording job requires an identity")?;
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting recording enqueue")?;
+        let existing = {
+            let mut statement = transaction.prepare("SELECT id, payload FROM jobs WHERE kind = ?1 AND state IN ('pending','running') ORDER BY id")?;
+            let mut rows = statement.query(params![kind])?;
+            let mut found = None;
+            while let Some(row) = rows.next()? {
+                let raw: String = row.get(1)?;
+                let candidate: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+                if candidate.get("id").and_then(serde_json::Value::as_str) == Some(recording_id) {
+                    ensure!(found.is_none(), "conflicting_active_recording_jobs");
+                    found = Some((row.get::<_, i64>(0)?, candidate));
+                }
+            }
+            found
+        };
+        let inserted = if let Some((job_id, mut existing)) = existing {
+            let promote_note = payload
+                .get("preferred_note")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+                && (existing
+                    .get("preferred_note")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                    || payload
+                        .get("note_canonical")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && existing
+                            .get("note_canonical")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(true));
+            if promote_note {
+                existing["preferred_note"] = payload["preferred_note"].clone();
+                existing["note_canonical"] =
+                    serde_json::Value::Bool(payload["note_canonical"].as_bool().unwrap_or(false));
+                transaction.execute(
+                    "UPDATE jobs SET payload = ?2 WHERE id = ?1",
+                    params![job_id, existing.to_string()],
+                )?;
+            }
+            None
+        } else {
+            let now = fmt_utc(Utc::now());
+            transaction.execute(
+                "INSERT INTO jobs (kind, payload, max_attempts, next_run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![kind, payload.to_string(), max_attempts, fmt_utc(run_at), now],
+            ).context("arming recording job")?;
+            Some(transaction.last_insert_rowid())
+        };
+        transaction
+            .commit()
+            .context("persisting recording job origin")?;
+        Ok(inserted)
+    }
+
+    /// Read the durable recording payload without changing its claim/backoff. Active ownership takes
+    /// precedence over failed history; completed one-shot jobs retain their normal deletion behavior.
+    pub fn recording_payload(
+        &self,
+        kind: &str,
+        recording_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut statement = self.conn.prepare("SELECT payload FROM jobs WHERE kind = ?1 AND state IN ('pending','running','failed') ORDER BY CASE WHEN state = 'failed' THEN 1 ELSE 0 END, id DESC")?;
+        let mut rows = statement.query(params![kind])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let payload: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+            if payload.get("id").and_then(serde_json::Value::as_str) == Some(recording_id) {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
     }
 
     /// Ensure the per-kind periodic singleton exists, due **now** (so it also fires at startup), with
@@ -417,6 +513,159 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn recording_enqueue_preserves_origin_claim_budget_and_backoff() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        let now = Utc::now();
+        let original = json!({"id":"recording","original_backend":"local","first_batch":true,"preferred_note":"partial.md","note_canonical":false});
+        jobs.enqueue_recording("retry", &original, 6, now).unwrap();
+        let changed = json!({"id":"recording","original_backend":"aws","first_batch":false,"preferred_note":"canonical.md","note_canonical":true});
+        assert!(
+            jobs.enqueue_recording("retry", &changed, 99, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(jobs.active_for("retry").unwrap().len(), 1);
+        let claimed = jobs
+            .claim_due(now + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.payload["original_backend"], "local");
+        assert_eq!(claimed.payload["first_batch"], true);
+        assert_eq!(claimed.payload["preferred_note"], "canonical.md");
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.max_attempts, 6);
+        assert!(
+            jobs.enqueue_recording("retry", &changed, 100, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.claim_due(now + chrono::Duration::hours(1))
+                .unwrap()
+                .is_none(),
+            "claimed ownership must not reset"
+        );
+        let FailOutcome::Rescheduled { next_run_at } =
+            jobs.fail(&claimed, "synthetic failure", &BACKOFF).unwrap()
+        else {
+            panic!("first attempt should back off")
+        };
+        jobs.enqueue_recording("retry", &changed, 101, now).unwrap();
+        assert_eq!(
+            jobs.next_due_at().unwrap(),
+            Some(
+                DateTime::parse_from_rfc3339(&fmt_utc(next_run_at))
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        let retried = jobs
+            .claim_due(next_run_at + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.id, claimed.id);
+        assert_eq!(retried.attempts, 2);
+        assert_eq!(retried.max_attempts, 6);
+        assert_eq!(retried.payload["original_backend"], "local");
+    }
+
+    #[test]
+    fn recording_enqueue_cannot_authorize_an_unknown_existing_origin() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        jobs.enqueue("retry", &json!({"id":"legacy"}), 5, Utc::now())
+            .unwrap();
+        jobs.enqueue_recording(
+            "retry",
+            &json!({"id":"legacy","original_backend":"aws","first_batch":true}),
+            6,
+            Utc::now(),
+        )
+        .unwrap();
+        let payload = jobs.recording_payload("retry", "legacy").unwrap().unwrap();
+        assert!(payload.get("original_backend").is_none());
+        assert!(payload.get("first_batch").is_none());
+        assert_eq!(jobs.active_for("retry").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recording_origin_survives_reopening_before_and_after_claim() {
+        let dir = std::env::temp_dir().join(format!("corti-jobs-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jobs.db");
+        let conn = Connection::open(&path).unwrap();
+        Jobs::ensure_schema(&conn).unwrap();
+        Jobs::new(&conn)
+            .enqueue_recording(
+                "retry",
+                &json!({"id":"recording","original_backend":"aws","first_batch":true}),
+                6,
+                Utc::now(),
+            )
+            .unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let first = Jobs::new(&conn)
+            .claim_due(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.payload["original_backend"], "aws");
+        assert_eq!(first.attempts, 1);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let jobs = Jobs::new(&conn);
+        assert_eq!(jobs.recover_running().unwrap(), 1);
+        let resumed = jobs
+            .claim_due(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.id, first.id);
+        assert_eq!(resumed.attempts, 2);
+        assert_eq!(resumed.max_attempts, 6);
+        assert_eq!(resumed.payload["original_backend"], "aws");
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_budgets_allow_exactly_first_plus_five_or_existing_five_attempts() {
+        for budget in [5_u32, 6] {
+            let conn = jobs_conn();
+            let jobs = Jobs::new(&conn);
+            let payload = json!({"id":"recording","original_backend":"local"});
+            jobs.enqueue_recording("retry", &payload, budget, Utc::now())
+                .unwrap();
+            for expected in 1..=budget {
+                let claimed = jobs
+                    .claim_due(Utc::now() + chrono::Duration::days(1))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claimed.attempts, expected);
+                jobs.enqueue_recording("retry", &payload, 99, Utc::now())
+                    .unwrap();
+                let outcome = jobs.fail(&claimed, "synthetic failure", &BACKOFF).unwrap();
+                assert_eq!(
+                    matches!(outcome, FailOutcome::Exhausted),
+                    expected == budget
+                );
+            }
+            assert!(
+                jobs.claim_due(Utc::now() + chrono::Duration::days(2))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                jobs.recording_payload("retry", "recording")
+                    .unwrap()
+                    .unwrap()["original_backend"],
+                "local"
+            );
+        }
     }
 
     #[test]

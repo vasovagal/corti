@@ -5,9 +5,19 @@
 //! stay decoupled and free of cycles.
 
 mod app;
+pub mod capture_accounting;
+pub mod capture_normalizer;
+pub mod quality;
+pub mod quality_store;
 mod recording;
 mod transcript;
 
 pub use app::{OwningApp, is_known_conferencing_app};
+pub use quality::{
+    BatchRecoveryOutcome, CaptureEpoch, CaptureEpochReason, MAX_QUALITY_EPOCHS, MAX_QUALITY_SPANS,
+    QUALITY_SCHEMA_VERSION, QualityCause, QualityClass, QualityCoverage, QualityError,
+    QualityOverflow, QualityRecord, QualityResolution, QualitySpan, QualityStage, QualityTrack,
+    SourceCompleteness,
+};
 pub use recording::{JobStatus, RecordingMeta, RecordingMode, WEBINAR_NAME};
 pub use transcript::{DiarizedTranscript, Speaker, TranscriptSegment};

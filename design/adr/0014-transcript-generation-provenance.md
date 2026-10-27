@@ -70,6 +70,54 @@ flag would make staggered upgrades destructive because an older Vagus rejects un
    standalone `--input --output`, `corti-tap --inbox`, and the integration example all supply provenance.
    The standalone renderer emits the exact same `corti: <JSON>` line as `corti-vagus`.
 
+## Capture-quality amendment (2026-10-27; #162)
+
+Capture completeness must be durable even when a live transcript exceeds its bounded canonical-text
+ledger, or recovery refuses a changed/unknown backend. These paths cannot safely reconstruct the body
+merely to publish quality metadata. `CurrentNote::refresh_provenance` therefore replaces/inserts only
+the current recording's producer-owned `corti:` field, retaining every existing body byte and the inode.
+It validates the complete replacement against a 64 KiB frontmatter-prefix bound before mutation and
+uses one 64 KiB buffer to shift the body in place. It returns no note text and grants no access to other
+paths. This narrowly precedes the later general provenance repair because #162 cannot certify or
+annotate capture quality without it. Failure prevents successful completion/state publication.
+
+The in-place operation is **not atomic**. A crash or write error during a shift can leave a damaged
+prefix/body, as with the existing same-inode rewrite. The mandatory content-free capture sidecar remains
+authoritative independently of the note; a successful same-backend fallback writes the canonical body
+from its durable checkpoint. A refused backend leaves the result incomplete rather than treating a
+possibly interrupted metadata update as success. No note copy, new scheduler, or startup discovery is
+introduced.
+
+The full schema-1 `QualityRecord` stays in the bounded 256 KiB mandatory sidecar and the existing
+checkpoint JSON. A valid at-capacity record can exceed the note-prefix limit. Frontmatter consequently
+uses a labelled projection of that **same record**, capped at 48 KiB: all retained epoch offsets remain;
+omitted spans contribute class/resolution-aware omission totals; full-record completeness is recorded
+separately from projection truncation. Body markers are rendered from the full authority, including every
+retained exact loss span. Oversized or malformed unrelated user metadata still fails closed. No queue schema
+version or competing quality model is added.
+
+Before the first batch ASR attempt, the existing `RETRY_TRANSCRIPTION` payload durably records the
+original backend. Recording-id-aware enqueue preserves existing origin, claim, backoff, and budget;
+the existing same-iteration job drain performs the attempt. Fresh batch work and a first live-to-batch
+fallback have six total attempts (the previous initial attempt plus five retries); existing active or
+claimed jobs keep their stored attempt budget, attempts, and backoff unchanged.
+Automatic recovery with unknown or changed origin refuses before staging, ASR, or hosted work. A live
+crash before a durable origin is available likewise refuses. Explicit `--redo --local` remains a separate
+user-authorized recovery choice; a completed redo with unavailable historical origin otherwise refuses.
+Final provenance retains known origin after successful job cleanup; existing checkpoints carry it until
+their normal successful removal.
+
+Successful explicit `--redo --local` (including `--backend local`) may resolve processing loss when
+normal Done cleanup has removed the historical backend authority. This is represented by the distinct,
+nonserialized `BatchRecoveryOutcome::ExplicitLocalWholeFileSuccess`, not by a claim that the backend
+matches an unknown historical origin. Only the explicit-local CLI path, after successful whole-file
+decode by the actual local backend and verified `audio_durable` storage, may select that outcome.
+Historical origin stays unknown; immutable capture metadata and the mandatory sidecar are not rewritten.
+Source loss, unknown source mapping, epoch omissions, and saturated accounting remain incomplete or
+unknown. Failed/partial decode and unverified/interrupted storage do not authorize processing recovery.
+Automatic origin matching and unknown-origin default/`--aws` redo refusal are unchanged; no note-read
+API or new durable origin retention is introduced.
+
 ## Consequences
 
 - A bad note is self-describing enough to group quality reports by Corti release, final path, model set, and

@@ -1,0 +1,1280 @@
+//! Mandatory capture-quality storage, independent of optional text evidence.
+//!
+//! This is an off-HAL, single-writer API. Call [`QualityStore::begin`] before creating the WAV,
+//! persist mappings before admitting their dependent PCM, and prepare the exact final snapshot
+//! before finalizing the WAV. Only an explicit successful completion call promotes storage state;
+//! dropping either this store or a WAV writer cannot do so. Storage durability never recovers loss.
+
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::QualityRecord;
+
+pub const QUALITY_STORE_VERSION: u32 = 1;
+pub const MAX_QUALITY_SIDECAR_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityStorageState {
+    InProgress,
+    Finalizing,
+    AudioDurable,
+}
+
+/// A storage envelope around the shared quality record, not another quality model.
+/// Fields are read-only so callers cannot manufacture a store phase transition.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualitySnapshot {
+    storage_version: u32,
+    recording_id: String,
+    audio_file_name: String,
+    state: QualityStorageState,
+    expected_retained_frames: u64,
+    quality: QualityRecord,
+}
+
+// Do not expose recording identifiers, file names, or serialized payloads through diagnostic output.
+impl fmt::Debug for QualitySnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QualitySnapshot")
+            .field("storage_version", &self.storage_version)
+            .field("state", &self.state)
+            .field("expected_retained_frames", &self.expected_retained_frames)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QualitySnapshot {
+    pub fn state(&self) -> QualityStorageState {
+        self.state
+    }
+
+    pub fn expected_retained_frames(&self) -> u64 {
+        self.expected_retained_frames
+    }
+
+    pub fn quality(&self) -> &QualityRecord {
+        &self.quality
+    }
+}
+
+/// Completion eligibility of a read. Partial states retain the exact known capture history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityReadStatus {
+    /// Absent older sidecar: unknown coverage, never a clean-capture certificate.
+    LegacyUnknown,
+    InProgress,
+    Finalizing,
+    AudioUnverified,
+    FrameCountMismatch,
+    InterruptedPublication,
+    AudioDurable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualityReadout {
+    pub status: QualityReadStatus,
+    pub snapshot: Option<QualitySnapshot>,
+}
+
+impl QualityReadout {
+    pub fn permits_completion(&self) -> bool {
+        self.status == QualityReadStatus::AudioDurable
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.state == QualityStorageState::AudioDurable)
+    }
+
+    pub fn quality(&self) -> Option<&QualityRecord> {
+        self.snapshot.as_ref().map(QualitySnapshot::quality)
+    }
+}
+
+/// Content-free categories. Underlying I/O/JSON messages and recording paths are not retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualityStoreError {
+    InvalidPath,
+    InvalidIdentity,
+    AlreadyExists,
+    InvalidQuality,
+    HistoryRegression,
+    InvalidTransition,
+    FrameCountMismatch,
+    BindingMismatch,
+    UnsupportedVersion,
+    TooLarge,
+    Corrupt,
+    Read,
+    Write,
+    FileSync,
+    Rename,
+    DirectorySync,
+    Remove,
+    InterruptedPublication,
+    Rollback,
+    AudioUnavailable,
+}
+
+impl fmt::Display for QualityStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPath => "invalid quality storage path",
+            Self::InvalidIdentity => "invalid quality recording identity",
+            Self::AlreadyExists => "quality storage already exists",
+            Self::InvalidQuality => "invalid quality snapshot",
+            Self::HistoryRegression => "quality history regression",
+            Self::InvalidTransition => "invalid quality storage transition",
+            Self::FrameCountMismatch => "quality frame count mismatch",
+            Self::BindingMismatch => "quality recording binding mismatch",
+            Self::UnsupportedVersion => "unsupported quality storage version",
+            Self::TooLarge => "quality storage size limit exceeded",
+            Self::Corrupt => "corrupt quality storage",
+            Self::Read => "quality storage read failed",
+            Self::Write => "quality storage write failed",
+            Self::FileSync => "quality storage file sync failed",
+            Self::Rename => "quality storage rename failed",
+            Self::DirectorySync => "quality storage directory sync failed",
+            Self::Remove => "quality storage removal failed",
+            Self::InterruptedPublication => "quality storage publication interrupted",
+            Self::Rollback => "quality storage rollback incomplete",
+            Self::AudioUnavailable => "quality storage audio unavailable",
+        })
+    }
+}
+
+impl std::error::Error for QualityStoreError {}
+
+struct StorePaths {
+    audio: PathBuf,
+    sidecar: PathBuf,
+    pending: PathBuf,
+    previous: PathBuf,
+    restore: PathBuf,
+    parent: PathBuf,
+    audio_file_name: String,
+}
+
+impl StorePaths {
+    fn new(audio: &Path) -> Result<Self, QualityStoreError> {
+        let audio_file_name = audio
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(QualityStoreError::InvalidPath)?;
+        let stem = audio
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or(QualityStoreError::InvalidPath)?;
+        let parent = audio
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let sidecar_name = format!("{stem}-quality.json");
+        Ok(Self {
+            audio: audio.to_path_buf(),
+            sidecar: parent.join(&sidecar_name),
+            pending: parent.join(format!("{sidecar_name}.pending")),
+            previous: parent.join(format!("{sidecar_name}.previous")),
+            restore: parent.join(format!("{sidecar_name}.restore")),
+            parent: parent.to_path_buf(),
+            audio_file_name: audio_file_name.to_owned(),
+        })
+    }
+
+    fn temporaries(&self) -> [&Path; 3] {
+        [&self.pending, &self.previous, &self.restore]
+    }
+
+    fn has_temporary(&self) -> Result<bool, QualityStoreError> {
+        for path in self.temporaries() {
+            if present(path)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The mandatory sidecar location. This API never consults optional evidence settings.
+pub fn quality_sidecar_path(audio: &Path) -> Result<PathBuf, QualityStoreError> {
+    Ok(StorePaths::new(audio)?.sidecar)
+}
+
+/// Exact registered transaction paths, also used by retention after a process restart.
+pub fn quality_temporary_paths(audio: &Path) -> Result<[PathBuf; 3], QualityStoreError> {
+    let paths = StorePaths::new(audio)?;
+    Ok([paths.pending, paths.previous, paths.restore])
+}
+
+/// Remove this recording's authority and registered transaction files during recording deletion.
+/// The caller must first stop its writer. Do not call this for evidence opt-out.
+pub fn remove_quality_files(audio: &Path) -> Result<(), QualityStoreError> {
+    let paths = StorePaths::new(audio)?;
+    let mut failed = false;
+    for path in [
+        &paths.sidecar,
+        &paths.pending,
+        &paths.previous,
+        &paths.restore,
+    ] {
+        if remove_if_present(path).is_err() {
+            failed = true;
+        }
+    }
+    sync_parent(&paths.parent)?;
+    if failed {
+        Err(QualityStoreError::Remove)
+    } else {
+        Ok(())
+    }
+}
+
+/// A live store cannot be reopened or promoted from a recovery snapshot. Recovery reads preserve
+/// incomplete storage state; they do not retroactively assert a successful capture handoff.
+pub struct QualityStore {
+    paths: StorePaths,
+    durable: QualitySnapshot,
+    failed: bool,
+    faults: Faults,
+}
+
+impl QualityStore {
+    /// Durably publish the initial zero-frame record before the caller creates the WAV.
+    /// The opaque ID is the existing recording/job identity, not an app or human-readable title.
+    pub fn begin(
+        audio: &Path,
+        recording_id: &str,
+        initial: &QualityRecord,
+    ) -> Result<Self, QualityStoreError> {
+        Self::begin_with_faults(audio, recording_id, initial, Faults::default())
+    }
+
+    fn begin_with_faults(
+        audio: &Path,
+        recording_id: &str,
+        initial: &QualityRecord,
+        mut faults: Faults,
+    ) -> Result<Self, QualityStoreError> {
+        validate_identity(recording_id)?;
+        initial
+            .validate()
+            .map_err(|_| QualityStoreError::InvalidQuality)?;
+        let paths = StorePaths::new(audio)?;
+        if present(&paths.audio)? || present(&paths.sidecar)? || paths.has_temporary()? {
+            return Err(QualityStoreError::AlreadyExists);
+        }
+        let durable = QualitySnapshot {
+            storage_version: QUALITY_STORE_VERSION,
+            recording_id: recording_id.to_owned(),
+            audio_file_name: paths.audio_file_name.clone(),
+            state: QualityStorageState::InProgress,
+            expected_retained_frames: 0,
+            quality: initial.clone(),
+        };
+        publish(&paths, &durable, false, &mut faults)?;
+        Ok(Self {
+            paths,
+            durable,
+            failed: false,
+            faults,
+        })
+    }
+
+    pub fn snapshot(&self) -> &QualitySnapshot {
+        &self.durable
+    }
+
+    /// Publish loss/epoch mappings before any dependent fill or later PCM is admitted. The count
+    /// describes the prefix accounted for by this snapshot; it becomes exact at finalization.
+    pub fn persist_before_audio(
+        &mut self,
+        quality: &QualityRecord,
+        expected_retained_frames: u64,
+    ) -> Result<(), QualityStoreError> {
+        self.require_state(QualityStorageState::InProgress)?;
+        self.publish_snapshot(
+            quality,
+            expected_retained_frames,
+            QualityStorageState::InProgress,
+        )
+    }
+
+    /// Call after terminal loss/filter-tail accounting and before invoking WAV finalization.
+    pub fn prepare_finalization(
+        &mut self,
+        quality: &QualityRecord,
+        exact_retained_frames: u64,
+    ) -> Result<(), QualityStoreError> {
+        self.require_state(QualityStorageState::InProgress)?;
+        self.publish_snapshot(
+            quality,
+            exact_retained_frames,
+            QualityStorageState::Finalizing,
+        )
+    }
+
+    /// After explicit successful WAV finalization, pass its independently verified frame count.
+    /// The caller owns WAV parsing/header validation. This repeats file and parent-directory sync
+    /// itself, then publishes `audio_durable` before the caller may deliver completion.
+    pub fn complete_after_audio_sync(
+        &mut self,
+        actual_retained_frames: u64,
+    ) -> Result<(), QualityStoreError> {
+        self.require_state(QualityStorageState::Finalizing)?;
+        if actual_retained_frames != self.durable.expected_retained_frames {
+            self.failed = true;
+            return Err(QualityStoreError::FrameCountMismatch);
+        }
+        let synced = (|| {
+            File::open(&self.paths.audio)
+                .map_err(|_| QualityStoreError::AudioUnavailable)?
+                .sync_all()
+                .map_err(|_| QualityStoreError::FileSync)?;
+            sync_parent(&self.paths.parent)
+        })();
+        if let Err(error) = synced {
+            self.failed = true;
+            return Err(error);
+        }
+        let quality = self.durable.quality.clone();
+        self.publish_snapshot(
+            &quality,
+            actual_retained_frames,
+            QualityStorageState::AudioDurable,
+        )
+    }
+
+    fn require_state(&self, state: QualityStorageState) -> Result<(), QualityStoreError> {
+        if self.failed || self.durable.state != state {
+            Err(QualityStoreError::InvalidTransition)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn publish_snapshot(
+        &mut self,
+        quality: &QualityRecord,
+        frames: u64,
+        state: QualityStorageState,
+    ) -> Result<(), QualityStoreError> {
+        quality
+            .validate()
+            .map_err(|_| QualityStoreError::InvalidQuality)?;
+        if frames < self.durable.expected_retained_frames {
+            return Err(QualityStoreError::FrameCountMismatch);
+        }
+        preserves_history(quality, &self.durable.quality)?;
+        let mut next = self.durable.clone();
+        next.quality = quality.clone();
+        next.expected_retained_frames = frames;
+        next.state = state;
+        match publish(&self.paths, &next, true, &mut self.faults) {
+            Ok(()) => {
+                self.durable = next;
+                Ok(())
+            }
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn preserves_history(
+    next: &QualityRecord,
+    previous: &QualityRecord,
+) -> Result<(), QualityStoreError> {
+    let mut merged = next.clone();
+    merged
+        .merge_snapshot(previous)
+        .map_err(|_| QualityStoreError::HistoryRegression)?;
+    if &merged != next {
+        Err(QualityStoreError::HistoryRegression)
+    } else {
+        Ok(())
+    }
+}
+
+/// Read recovery authority using the expected identity and a frame count from validated WAV data.
+/// `None` never certifies completion. Missing sidecars preserve legacy-unknown semantics; corrupt
+/// data/bindings return content-free errors. Surviving transaction files always fail closed, while
+/// a valid prior snapshot can still recover known gaps if the main sidecar is unavailable.
+pub fn load_quality(
+    audio: &Path,
+    recording_id: &str,
+    actual_retained_frames: Option<u64>,
+) -> Result<QualityReadout, QualityStoreError> {
+    validate_identity(recording_id)?;
+    let paths = StorePaths::new(audio)?;
+    let interrupted = paths.has_temporary()?;
+    let primary = read_snapshot(&paths.sidecar, &paths, recording_id);
+    let snapshot = if interrupted {
+        // Prefer the visible snapshot: it may contain additional known gaps even if publication
+        // failed. Fall back to the durable backup without silently discarding capture history.
+        let previous = read_snapshot(&paths.previous, &paths, recording_id);
+        match (primary, previous) {
+            (Ok(Some(current)), Ok(Some(prior))) => {
+                preserves_history(&current.quality, &prior.quality)?;
+                Some(current)
+            }
+            (Ok(Some(current)), _) => Some(current),
+            (_, Ok(Some(prior))) => Some(prior),
+            (Ok(None), Ok(None)) => read_snapshot(&paths.pending, &paths, recording_id)?,
+            (Err(error), _) | (_, Err(error)) => return Err(error),
+        }
+    } else {
+        primary?
+    };
+    let status = if interrupted {
+        QualityReadStatus::InterruptedPublication
+    } else if let Some(snapshot) = &snapshot {
+        match snapshot.state {
+            QualityStorageState::InProgress => QualityReadStatus::InProgress,
+            QualityStorageState::Finalizing => QualityReadStatus::Finalizing,
+            QualityStorageState::AudioDurable => match actual_retained_frames {
+                None => QualityReadStatus::AudioUnverified,
+                Some(frames) if frames != snapshot.expected_retained_frames => {
+                    QualityReadStatus::FrameCountMismatch
+                }
+                Some(_) => QualityReadStatus::AudioDurable,
+            },
+        }
+    } else {
+        QualityReadStatus::LegacyUnknown
+    };
+    Ok(QualityReadout { status, snapshot })
+}
+
+fn validate_identity(identity: &str) -> Result<(), QualityStoreError> {
+    // A recording ID is an opaque bounded identifier, not unbounded user text.
+    if identity.is_empty() || identity.len() > 1024 || identity.chars().any(char::is_control) {
+        Err(QualityStoreError::InvalidIdentity)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_snapshot(
+    path: &Path,
+    paths: &StorePaths,
+    recording_id: &str,
+) -> Result<Option<QualitySnapshot>, QualityStoreError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(QualityStoreError::Read),
+    };
+    if !file
+        .metadata()
+        .map_err(|_| QualityStoreError::Read)?
+        .is_file()
+    {
+        return Err(QualityStoreError::Read);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_QUALITY_SIDECAR_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| QualityStoreError::Read)?;
+    if bytes.len() > MAX_QUALITY_SIDECAR_BYTES {
+        return Err(QualityStoreError::TooLarge);
+    }
+    let snapshot: QualitySnapshot =
+        serde_json::from_slice(&bytes).map_err(|_| QualityStoreError::Corrupt)?;
+    if snapshot.storage_version != QUALITY_STORE_VERSION {
+        return Err(QualityStoreError::UnsupportedVersion);
+    }
+    if snapshot.recording_id != recording_id || snapshot.audio_file_name != paths.audio_file_name {
+        return Err(QualityStoreError::BindingMismatch);
+    }
+    Ok(Some(snapshot))
+}
+
+struct BoundedBytes(Vec<u8>);
+
+impl Write for BoundedBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_QUALITY_SIDECAR_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::other("quality storage size limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode(snapshot: &QualitySnapshot) -> Result<Vec<u8>, QualityStoreError> {
+    snapshot
+        .quality
+        .validate()
+        .map_err(|_| QualityStoreError::InvalidQuality)?;
+    let mut bytes = BoundedBytes(Vec::new());
+    serde_json::to_writer(&mut bytes, snapshot).map_err(|error| {
+        if error.is_io() {
+            QualityStoreError::TooLarge
+        } else {
+            QualityStoreError::InvalidQuality
+        }
+    })?;
+    Ok(bytes.0)
+}
+
+fn present(path: &Path) -> Result<bool, QualityStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(QualityStoreError::Read),
+    }
+}
+
+fn private_new(path: &Path) -> Result<File, QualityStoreError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|_| QualityStoreError::Write)
+}
+
+fn sync_parent(parent: &Path) -> Result<(), QualityStoreError> {
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| QualityStoreError::DirectorySync)
+}
+
+fn remove_if_present(path: &Path) -> Result<(), QualityStoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(QualityStoreError::Remove),
+    }
+}
+
+fn publish(
+    paths: &StorePaths,
+    snapshot: &QualitySnapshot,
+    has_prior: bool,
+    faults: &mut Faults,
+) -> Result<(), QualityStoreError> {
+    let bytes = encode(snapshot)?;
+    if paths.has_temporary()? {
+        return Err(QualityStoreError::InterruptedPublication);
+    }
+    // A durable prior inode remains independently reachable until publication/rollback is synced.
+    // Deterministic, exclusive temporary names make interrupted work discoverable for this recording.
+    if has_prior {
+        fs::hard_link(&paths.sidecar, &paths.previous).map_err(|_| QualityStoreError::Write)?;
+        if let Err(error) = sync_parent(&paths.parent) {
+            let _ = remove_if_present(&paths.previous);
+            return Err(error);
+        }
+    }
+    let mut renamed = false;
+    let mut pending_owned = false;
+    let result = (|| {
+        let mut file = private_new(&paths.pending)?;
+        pending_owned = true;
+        faults.check(FaultPoint::Write, QualityStoreError::Write)?;
+        file.write_all(&bytes)
+            .map_err(|_| QualityStoreError::Write)?;
+        faults.check(FaultPoint::FileSync, QualityStoreError::FileSync)?;
+        file.sync_all().map_err(|_| QualityStoreError::FileSync)?;
+        faults.check(FaultPoint::Rename, QualityStoreError::Rename)?;
+        fs::rename(&paths.pending, &paths.sidecar).map_err(|_| QualityStoreError::Rename)?;
+        pending_owned = false;
+        renamed = true;
+        faults.check(FaultPoint::DirectorySync, QualityStoreError::DirectorySync)?;
+        sync_parent(&paths.parent)
+    })();
+    if let Err(error) = result {
+        if renamed && rollback(paths, has_prior, faults).is_err() {
+            // Never remove the only recoverable prior snapshot or its completion barrier here.
+            return Err(QualityStoreError::Rollback);
+        }
+        if pending_owned {
+            let _ = remove_if_present(&paths.pending);
+        }
+        if has_prior {
+            let _ = remove_if_present(&paths.previous);
+        }
+        return Err(error);
+    }
+    // The new authority is already directory-synced. A backup unlink need not become durable to
+    // make that true: resurrection of a backup after a crash only causes a conservative incomplete
+    // read. A failed unlink leaves the barrier in place and prevents this call delivering completion.
+    if has_prior {
+        remove_if_present(&paths.previous)?;
+    }
+    Ok(())
+}
+
+fn rollback(
+    paths: &StorePaths,
+    has_prior: bool,
+    faults: &mut Faults,
+) -> Result<(), QualityStoreError> {
+    if has_prior {
+        // Keep `previous` until restoration's directory sync succeeds. Consuming it with a rename
+        // would lose the recovery barrier if that sync failed.
+        fs::hard_link(&paths.previous, &paths.restore).map_err(|_| QualityStoreError::Rollback)?;
+        faults.check(FaultPoint::RollbackRename, QualityStoreError::Rollback)?;
+        fs::rename(&paths.restore, &paths.sidecar).map_err(|_| QualityStoreError::Rollback)?;
+    } else {
+        remove_if_present(&paths.sidecar)?;
+    }
+    faults.check(
+        FaultPoint::RollbackDirectorySync,
+        QualityStoreError::Rollback,
+    )?;
+    sync_parent(&paths.parent)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FaultPoint {
+    Write,
+    FileSync,
+    Rename,
+    DirectorySync,
+    RollbackRename,
+    RollbackDirectorySync,
+}
+
+#[derive(Default)]
+struct Faults {
+    #[cfg(test)]
+    failures: Vec<FaultPoint>,
+}
+
+impl Faults {
+    fn check(
+        &mut self,
+        point: FaultPoint,
+        error: QualityStoreError,
+    ) -> Result<(), QualityStoreError> {
+        #[cfg(test)]
+        if self.failures.first() == Some(&point) {
+            self.failures.remove(0);
+            return Err(error);
+        }
+        let _ = (point, error);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CaptureEpoch, CaptureEpochReason, QualityCause, QualityClass, QualityResolution,
+        QualitySpan, QualityStage, QualityTrack, SourceCompleteness,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "corti-quality-store-{}-{}",
+                std::process::id(),
+                NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn audio(&self) -> PathBuf {
+            self.0.join("synthetic.wav")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn initial() -> QualityRecord {
+        let mut record = QualityRecord::observed();
+        record
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 48_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 48_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        record
+    }
+
+    fn with_loss() -> QualityRecord {
+        let mut record = initial();
+        record
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 2,
+                end_frame: 4,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        record
+    }
+
+    fn jumped_record() -> QualityRecord {
+        let mut record = with_loss();
+        record
+            .insert_epoch(CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(120_000_000_000),
+                source_rate_hz: 44_100,
+                source_frame_base: 5_760_000,
+                retained_start_frame: 8,
+                retained_rate_hz: 48_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::RateChange,
+            })
+            .unwrap();
+        record
+            .insert_span(QualitySpan {
+                epoch: 1,
+                start_frame: 5_760_000,
+                end_frame: 5_760_002,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        record
+            .record_omitted_spans(QualityClass::SourceLoss, QualityResolution::Outstanding, 3)
+            .unwrap();
+        record.record_omitted_epochs(2);
+        record
+    }
+
+    // A generated, valid 16-bit mono PCM WAV. The store deliberately delegates header parsing to
+    // the caller; no real recording, transcript, or private content enters these tests.
+    fn synthetic_wav(path: &Path, frames: u32) {
+        let data_bytes = frames.checked_mul(2).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&96_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        bytes.resize(44 + data_bytes as usize, 0);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn assert_no_temporary(audio: &Path) {
+        for path in quality_temporary_paths(audio).unwrap() {
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn initial_authority_precedes_audio_and_binds_existing_identity() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        assert!(!audio.exists());
+        assert_eq!(store.snapshot().state(), QualityStorageState::InProgress);
+        assert_eq!(store.snapshot().expected_retained_frames(), 0);
+        assert_eq!(
+            quality_sidecar_path(&audio).unwrap(),
+            fixture.0.join("synthetic-quality.json")
+        );
+        let read = load_quality(&audio, "synthetic-id", Some(0)).unwrap();
+        assert_eq!(read.status, QualityReadStatus::InProgress);
+        assert_eq!(read.quality(), Some(&initial()));
+        assert!(!read.permits_completion());
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(quality_sidecar_path(&audio).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(value["storage_version"], 1);
+        assert_eq!(value["recording_id"], "synthetic-id");
+        assert_eq!(value["audio_file_name"], "synthetic.wav");
+        assert_eq!(value["state"], "in_progress");
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
+    fn begin_refuses_existing_audio_authority_or_registered_temporary() {
+        for target in 0..5 {
+            let fixture = Fixture::new();
+            let audio = fixture.audio();
+            let paths = StorePaths::new(&audio).unwrap();
+            let path = [
+                paths.audio,
+                paths.sidecar,
+                paths.pending,
+                paths.previous,
+                paths.restore,
+            ]
+            .into_iter()
+            .nth(target)
+            .unwrap();
+            fs::write(&path, b"synthetic-existing").unwrap();
+            assert!(matches!(
+                QualityStore::begin(&audio, "synthetic-id", &initial()),
+                Err(QualityStoreError::AlreadyExists)
+            ));
+            assert_eq!(fs::read(path).unwrap(), b"synthetic-existing");
+        }
+    }
+
+    #[test]
+    fn restart_preserves_large_unfilled_jump_overflow_and_exact_final_snapshot() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        let record = jumped_record();
+        store.persist_before_audio(&record, 12).unwrap();
+        let in_progress = load_quality(&audio, "synthetic-id", Some(12)).unwrap();
+        assert_eq!(in_progress.status, QualityReadStatus::InProgress);
+        assert_eq!(in_progress.quality(), Some(&record));
+        store.prepare_finalization(&record, 12).unwrap();
+        // A complete-looking header, including one produced by a writer's Drop, cannot promote it.
+        synthetic_wav(&audio, 12);
+        let finalizing = load_quality(&audio, "synthetic-id", Some(12)).unwrap();
+        assert_eq!(finalizing.status, QualityReadStatus::Finalizing);
+        assert!(!finalizing.permits_completion());
+        assert_eq!(finalizing.quality(), Some(&record));
+        store.complete_after_audio_sync(12).unwrap();
+        drop(store);
+        let complete = load_quality(&audio, "synthetic-id", Some(12)).unwrap();
+        assert!(complete.permits_completion());
+        assert_eq!(complete.quality(), Some(&record));
+        let quality = complete.quality().unwrap();
+        assert_eq!(
+            quality.source_completeness(),
+            SourceCompleteness::Incomplete
+        );
+        assert_eq!(quality.epochs[1].retained_start_frame, 8);
+        assert_eq!(
+            quality.epochs[1].source_time_ns(5_804_100).unwrap(),
+            Some(121_000_000_000)
+        );
+        assert_eq!(quality.overflow.omitted_spans, [3, 0, 0]);
+        assert_eq!(quality.overflow.omitted_epochs, 2);
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
+    fn dropping_finalizing_store_never_promotes_complete_looking_wav() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        store.prepare_finalization(&with_loss(), 8).unwrap();
+        synthetic_wav(&audio, 8);
+        drop(store);
+        let read = load_quality(&audio, "synthetic-id", Some(8)).unwrap();
+        assert_eq!(read.status, QualityReadStatus::Finalizing);
+        assert_eq!(read.quality(), Some(&with_loss()));
+        assert!(!read.permits_completion());
+    }
+
+    #[test]
+    fn phase_skips_missing_audio_and_mismatches_cannot_promote() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        assert_eq!(
+            store.complete_after_audio_sync(0),
+            Err(QualityStoreError::InvalidTransition)
+        );
+        store.prepare_finalization(&initial(), 8).unwrap();
+        assert_eq!(
+            store.persist_before_audio(&initial(), 8),
+            Err(QualityStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store.prepare_finalization(&initial(), 8),
+            Err(QualityStoreError::InvalidTransition)
+        );
+        assert_eq!(
+            store.complete_after_audio_sync(8),
+            Err(QualityStoreError::AudioUnavailable)
+        );
+        assert_eq!(store.snapshot().state(), QualityStorageState::Finalizing);
+
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        store.prepare_finalization(&with_loss(), 8).unwrap();
+        synthetic_wav(&audio, 7);
+        assert_eq!(
+            store.complete_after_audio_sync(7),
+            Err(QualityStoreError::FrameCountMismatch)
+        );
+        assert_eq!(
+            store.complete_after_audio_sync(8),
+            Err(QualityStoreError::InvalidTransition)
+        );
+        let read = load_quality(&audio, "synthetic-id", Some(7)).unwrap();
+        assert_eq!(read.status, QualityReadStatus::Finalizing);
+        assert!(!read.permits_completion());
+    }
+
+    #[test]
+    fn absent_unverified_mismatched_or_wrong_binding_never_certifies_completion() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let missing = load_quality(&audio, "synthetic-id", Some(8)).unwrap();
+        assert_eq!(missing.status, QualityReadStatus::LegacyUnknown);
+        assert_eq!(missing.quality(), None);
+        assert!(!missing.permits_completion());
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        store.prepare_finalization(&initial(), 8).unwrap();
+        synthetic_wav(&audio, 8);
+        store.complete_after_audio_sync(8).unwrap();
+        assert_eq!(
+            load_quality(&audio, "synthetic-id", None).unwrap().status,
+            QualityReadStatus::AudioUnverified
+        );
+        let mismatched = load_quality(&audio, "synthetic-id", Some(7)).unwrap();
+        assert_eq!(mismatched.status, QualityReadStatus::FrameCountMismatch);
+        assert!(!mismatched.permits_completion());
+        assert_eq!(mismatched.quality(), Some(&initial()));
+        assert_eq!(
+            load_quality(&audio, "other-id", Some(8)),
+            Err(QualityStoreError::BindingMismatch)
+        );
+        let other_audio = fixture.0.join("other.wav");
+        fs::copy(
+            quality_sidecar_path(&audio).unwrap(),
+            quality_sidecar_path(&other_audio).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_quality(&other_audio, "synthetic-id", Some(8)),
+            Err(QualityStoreError::BindingMismatch)
+        );
+    }
+
+    #[test]
+    fn malformed_and_future_envelopes_fail_closed_without_payload_errors() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        let sidecar = quality_sidecar_path(&audio).unwrap();
+        for bytes in [b"{synthetic-private-sentinel".as_slice(), b"{}", b"null"] {
+            fs::write(&sidecar, bytes).unwrap();
+            assert_eq!(
+                load_quality(&audio, "synthetic-id", Some(0)),
+                Err(QualityStoreError::Corrupt)
+            );
+        }
+        let mut future = store.snapshot().clone();
+        future.storage_version += 1;
+        fs::write(&sidecar, encode(&future).unwrap()).unwrap();
+        assert_eq!(
+            load_quality(&audio, "synthetic-id", Some(0)),
+            Err(QualityStoreError::UnsupportedVersion)
+        );
+        let mut value = serde_json::to_value(store.snapshot()).unwrap();
+        value["quality"]["schema_version"] = serde_json::json!(2);
+        fs::write(&sidecar, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            load_quality(&audio, "synthetic-id", Some(0)),
+            Err(QualityStoreError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn write_sync_rename_and_directory_sync_faults_preserve_prior_atomic_bytes() {
+        for (point, expected) in [
+            (FaultPoint::Write, QualityStoreError::Write),
+            (FaultPoint::FileSync, QualityStoreError::FileSync),
+            (FaultPoint::Rename, QualityStoreError::Rename),
+            (FaultPoint::DirectorySync, QualityStoreError::DirectorySync),
+        ] {
+            let fixture = Fixture::new();
+            let audio = fixture.audio();
+            let mut store = QualityStore::begin(&audio, "synthetic-id", &with_loss()).unwrap();
+            let sidecar = quality_sidecar_path(&audio).unwrap();
+            let prior_bytes = fs::read(&sidecar).unwrap();
+            let prior = store.snapshot().clone();
+            store.faults.failures.push(point);
+            assert_eq!(
+                store.persist_before_audio(&jumped_record(), 12),
+                Err(expected)
+            );
+            assert_eq!(fs::read(&sidecar).unwrap(), prior_bytes);
+            assert_eq!(store.snapshot(), &prior);
+            assert_no_temporary(&audio);
+            assert!(!audio.exists());
+            assert_eq!(
+                store.persist_before_audio(&jumped_record(), 12),
+                Err(QualityStoreError::InvalidTransition)
+            );
+            assert_eq!(
+                load_quality(&audio, "synthetic-id", None)
+                    .unwrap()
+                    .quality(),
+                Some(&with_loss())
+            );
+        }
+    }
+
+    #[test]
+    fn initial_publication_faults_leave_no_authority_or_owned_temporary() {
+        for point in [
+            FaultPoint::Write,
+            FaultPoint::FileSync,
+            FaultPoint::Rename,
+            FaultPoint::DirectorySync,
+        ] {
+            let fixture = Fixture::new();
+            let audio = fixture.audio();
+            let faults = Faults {
+                failures: vec![point],
+            };
+            assert!(
+                QualityStore::begin_with_faults(&audio, "synthetic-id", &initial(), faults)
+                    .is_err()
+            );
+            assert!(!quality_sidecar_path(&audio).unwrap().exists());
+            assert!(!audio.exists());
+            assert_no_temporary(&audio);
+        }
+    }
+
+    #[test]
+    fn failed_rollback_keeps_prior_and_blocks_even_visible_audio_durable_state() {
+        for point in [
+            FaultPoint::RollbackRename,
+            FaultPoint::RollbackDirectorySync,
+        ] {
+            let fixture = Fixture::new();
+            let audio = fixture.audio();
+            let record = jumped_record();
+            let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+            store.prepare_finalization(&record, 12).unwrap();
+            let prior = fs::read(&store.paths.sidecar).unwrap();
+            synthetic_wav(&audio, 12);
+            store.faults.failures = vec![FaultPoint::DirectorySync, point];
+            assert_eq!(
+                store.complete_after_audio_sync(12),
+                Err(QualityStoreError::Rollback)
+            );
+            assert_eq!(fs::read(&store.paths.previous).unwrap(), prior);
+            let primary = read_snapshot(&store.paths.sidecar, &store.paths, "synthetic-id")
+                .unwrap()
+                .unwrap();
+            if point == FaultPoint::RollbackRename {
+                assert_eq!(primary.state(), QualityStorageState::AudioDurable);
+            }
+            drop(store);
+            let read = load_quality(&audio, "synthetic-id", Some(12)).unwrap();
+            assert_eq!(read.status, QualityReadStatus::InterruptedPublication);
+            assert_eq!(read.quality(), Some(&record));
+            assert!(!read.permits_completion());
+        }
+    }
+
+    #[test]
+    fn interrupted_publication_recovers_prior_when_main_is_missing_or_corrupt() {
+        for corrupt in [false, true] {
+            let fixture = Fixture::new();
+            let audio = fixture.audio();
+            let mut store = QualityStore::begin(&audio, "synthetic-id", &with_loss()).unwrap();
+            store.faults.failures = vec![FaultPoint::DirectorySync, FaultPoint::RollbackRename];
+            assert_eq!(
+                store.persist_before_audio(&jumped_record(), 12),
+                Err(QualityStoreError::Rollback)
+            );
+            if corrupt {
+                fs::write(&store.paths.sidecar, b"incomplete-synthetic-json").unwrap();
+            } else {
+                fs::remove_file(&store.paths.sidecar).unwrap();
+            }
+            let read = load_quality(&audio, "synthetic-id", Some(12)).unwrap();
+            assert_eq!(read.status, QualityReadStatus::InterruptedPublication);
+            assert_eq!(read.quality(), Some(&with_loss()));
+            assert!(!read.permits_completion());
+        }
+    }
+
+    #[test]
+    fn pending_initial_snapshot_retains_known_history_without_certifying() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let store = QualityStore::begin(&audio, "synthetic-id", &with_loss()).unwrap();
+        fs::rename(&store.paths.sidecar, &store.paths.pending).unwrap();
+        let read = load_quality(&audio, "synthetic-id", Some(0)).unwrap();
+        assert_eq!(read.status, QualityReadStatus::InterruptedPublication);
+        assert_eq!(read.quality(), Some(&with_loss()));
+        assert!(!read.permits_completion());
+    }
+
+    #[test]
+    fn history_loss_epoch_overflow_or_frame_regression_cannot_replace_snapshot() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        let record = jumped_record();
+        store.persist_before_audio(&record, 12).unwrap();
+        let prior = fs::read(&store.paths.sidecar).unwrap();
+        for change in 0..3 {
+            let mut regressed = record.clone();
+            match change {
+                0 => regressed.spans.clear(),
+                1 => {
+                    regressed.epochs.pop();
+                    regressed.spans.retain(|span| span.epoch == 0);
+                }
+                _ => regressed.overflow = Default::default(),
+            }
+            assert_eq!(
+                store.persist_before_audio(&regressed, 12),
+                Err(QualityStoreError::HistoryRegression)
+            );
+            assert_eq!(fs::read(&store.paths.sidecar).unwrap(), prior);
+        }
+        assert_eq!(
+            store.persist_before_audio(&record, 11),
+            Err(QualityStoreError::FrameCountMismatch)
+        );
+        assert_eq!(fs::read(&store.paths.sidecar).unwrap(), prior);
+    }
+
+    #[test]
+    fn read_and_serialization_caps_are_enforced_before_publication() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        let prior = fs::read(&store.paths.sidecar).unwrap();
+        let mut oversized = store.snapshot().clone();
+        oversized.recording_id = "x".repeat(MAX_QUALITY_SIDECAR_BYTES);
+        assert_eq!(encode(&oversized), Err(QualityStoreError::TooLarge));
+        assert_eq!(
+            publish(&store.paths, &oversized, true, &mut store.faults),
+            Err(QualityStoreError::TooLarge)
+        );
+        assert_eq!(fs::read(&store.paths.sidecar).unwrap(), prior);
+        assert_no_temporary(&audio);
+        let mut sink = BoundedBytes(Vec::new());
+        sink.write_all(&vec![b' '; MAX_QUALITY_SIDECAR_BYTES])
+            .unwrap();
+        assert!(sink.write_all(b"x").is_err());
+        assert_eq!(sink.0.len(), MAX_QUALITY_SIDECAR_BYTES);
+        fs::write(
+            &store.paths.sidecar,
+            vec![b' '; MAX_QUALITY_SIDECAR_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            load_quality(&audio, "synthetic-id", Some(0)),
+            Err(QualityStoreError::TooLarge)
+        );
+        assert!(matches!(
+            QualityStore::begin(&fixture.0.join("large.wav"), &"x".repeat(1025), &initial()),
+            Err(QualityStoreError::InvalidIdentity)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_and_registered_files_are_private_even_on_rollback_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        assert_eq!(
+            fs::metadata(&store.paths.sidecar)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        store.faults.failures = vec![FaultPoint::DirectorySync, FaultPoint::RollbackRename];
+        assert_eq!(
+            store.persist_before_audio(&with_loss(), 8),
+            Err(QualityStoreError::Rollback)
+        );
+        for path in [
+            &store.paths.sidecar,
+            &store.paths.previous,
+            &store.paths.restore,
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn recording_cleanup_removes_exact_registered_files_and_preserves_other_files() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let store = QualityStore::begin(&audio, "synthetic-id", &initial()).unwrap();
+        synthetic_wav(&audio, 0);
+        for path in quality_temporary_paths(&audio).unwrap() {
+            fs::write(path, b"synthetic-transaction").unwrap();
+        }
+        let unrelated = fixture.0.join("synthetic-quality.json.pending-unrelated");
+        let other = fixture.0.join("other-quality.json");
+        fs::write(&unrelated, b"synthetic-other").unwrap();
+        fs::write(&other, b"synthetic-other").unwrap();
+        drop(store);
+        remove_quality_files(&audio).unwrap();
+        assert!(!quality_sidecar_path(&audio).unwrap().exists());
+        assert_no_temporary(&audio);
+        assert!(audio.exists());
+        assert!(unrelated.exists());
+        assert!(other.exists());
+        remove_quality_files(&audio).unwrap();
+    }
+
+    #[test]
+    fn diagnostics_never_embed_identity_paths_or_json_payloads() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let store = QualityStore::begin(&audio, "SYNTHETIC-PRIVATE-SENTINEL", &initial()).unwrap();
+        let read = load_quality(&audio, "SYNTHETIC-PRIVATE-SENTINEL", None).unwrap();
+        let diagnostics = format!(
+            "{read:?} {:?} {}",
+            store.snapshot(),
+            QualityStoreError::Corrupt
+        );
+        assert!(!diagnostics.contains("SYNTHETIC-PRIVATE-SENTINEL"));
+        assert!(!diagnostics.contains("synthetic.wav"));
+        assert!(!diagnostics.contains("recording_id"));
+        assert!(!diagnostics.contains("source_start_ns"));
+    }
+}

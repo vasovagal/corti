@@ -652,7 +652,8 @@ pub(crate) mod imp {
         /// What `toggle` decided to do, computed under the lock and acted on after it's dropped.
         enum Next {
             Stopping {
-                recorder: Recorder,
+                // Only the cold stop handoff owns this larger native capture state.
+                recorder: Box<Recorder>,
                 started_at: DateTime<Local>,
                 tx: Sender<PipelineMsg>,
             },
@@ -667,7 +668,7 @@ pub(crate) mod imp {
                 // Stop: hand the recorder off to a worker thread (finish writes the whole WAV).
                 let started_at = w.started_at.take().unwrap_or_else(chrono::Local::now);
                 Next::Stopping {
-                    recorder,
+                    recorder: Box::new(recorder),
                     started_at,
                     tx: w.tx.clone(),
                 }
@@ -692,7 +693,7 @@ pub(crate) mod imp {
                 let app = app.clone();
                 std::thread::Builder::new()
                     .name("corti-webinar-finish".to_string())
-                    .spawn(move || finish_webinar(&app, recorder, started_at, tx))
+                    .spawn(move || finish_webinar(&app, *recorder, started_at, tx))
                     .expect("spawning webinar-finish thread");
             }
             Next::Busy => tray::set_status(

@@ -10,8 +10,46 @@ import sys
 
 
 def single_test_passed(output, returncode):
-    summaries = re.findall(r"(?m)^test result: ([a-z]+)\. (\d+) passed; (\d+) failed;.*$", output)
+    summaries = re.findall(r"(?m)^test result: ([A-Za-z]+)\. (\d+) passed; (\d+) failed;.*$", output)
     return returncode == 0 and summaries == [("ok", "1", "0")]
+
+
+CAPTURE_REQUIRED_TESTS = (
+    "small_pcm_ring_retains_a_gap_b_c_identically_in_wav_and_tee",
+    "restart_after_finalize_before_completion_preserves_exact_loss_and_large_epoch_mapping",
+    "explicit_stop_authorizes_completion_but_dropped_intent_keeps_exact_terminal_prefix_in_progress",
+    "native_notification_only_invalidates_until_control_side_refresh",
+    "disabled_callback_admission_keeps_pcm_descriptors_and_accounting_unchanged",
+    "exact_capture_quality_reaches_live_finish_before_the_completion_event",
+    "offline_aec_masks_primed_gap_and_tail_without_masking_compressed_epoch_audio",
+    "consume_and_finish_keep_availability_through_rolling_windows",
+    "crash_before_checkpoint_preserves_backend_and_gates_the_callable_sequence",
+    "first_live_fallback_retains_six_durable_batch_attempts_without_fresh_egress",
+    "explicit_local_redo_after_done_cleanup_resolves_tee_loss_without_inventing_origin",
+    "host_gap_with_invalid_sample_clock_preserves_later_source_time_and_unknown_loss",
+    "full_capacity_quality_uses_labelled_projection_without_losing_authoritative_facts",
+    "stranded_recording_retry_reloads_quality_without_a_queue_carrier",
+)
+
+
+def capture_suite_passed(output, returncode):
+    summaries = re.findall(r"(?m)^test result: ([A-Za-z]+)\. (\d+) passed; (\d+) failed;.*$", output)
+    return (returncode == 0 and bool(summaries)
+            and all(status == "ok" and failed == "0" for status, _, failed in summaries)
+            and all(re.search(r"(?m)^test [^\n]*::" + re.escape(name) + r" \.\.\. ok$", output)
+                    for name in CAPTURE_REQUIRED_TESTS))
+
+
+def capture_rate_receipt(output, returncode):
+    rows = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
+    measurements = [row for row in rows if row.get("type") == "throughput"]
+    verified = [row for row in rows if row.get("type") == "verified"]
+    if (returncode != 0 or len(measurements) != 90 or len(verified) != 1
+            or verified[0].get("measurements") != 90
+            or verified[0].get("exact_counts") is not True
+            or verified[0].get("chunk_and_repeat_checksums_match") is not True):
+        raise RuntimeError("capture-rate benchmark did not verify all 90 measurements")
+    return rows
 
 
 def main():
@@ -30,6 +68,7 @@ def main():
                CORTI_VERIFY_METAL_RESULT=str(result_path.resolve()))
     results = []
     resample_comparison = []
+    capture_rate = []
 
     def run_test(name, label, features=(), release=False):
         command = ["cargo", "test", "--locked", "--lib", "-p", "corti-transcribe-local"]
@@ -52,6 +91,17 @@ def main():
     metal = "not probed"
     failed = False
     try:
+        command = ["cargo", "test", "--locked", "-p", "corti-core", "-p", "corti-coreaudio",
+                   "-p", "corti-capture", "-p", "corti-detect", "-p", "corti-app"]
+        print("+ " + " ".join(command), flush=True)
+        capture_tests = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT)
+        print(capture_tests.stdout, flush=True)
+        (args.output_dir / "capture-quality-native.log").write_text(capture_tests.stdout)
+        passed = capture_suite_passed(capture_tests.stdout, capture_tests.returncode)
+        results.append({"check": "capture-quality-native-suites", "passed": passed})
+        if not passed:
+            raise RuntimeError("capture-quality native suites failed or required tests did not execute")
         run_test("ggml::tests::quality_probe_metal", "metal-probe", ("ggml",))
         metal = result_path.read_text().strip()
         if metal not in {"available", "unavailable"}:
@@ -79,12 +129,33 @@ def main():
                 resample_comparison.append(json.loads(line[start:])["resample_comparison"])
         if not resample_comparison:
             raise RuntimeError("resampler comparison produced no measurements")
+        # Compile before timing. Only the authored, model-free benchmark process is measured by time;
+        # its JSON rows record paired order and variance inputs, with no machine-speed pass threshold.
+        build = subprocess.run(
+            ["cargo", "build", "--locked", "-p", "corti-core", "--release", "--example",
+             "capture_rate_bench", "--message-format=json"], env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(build.stderr, flush=True)
+        (args.output_dir / "capture-rate-build.log").write_text(build.stdout + build.stderr)
+        executable = next((row.get("executable") for line in build.stdout.splitlines()
+                           if line.startswith('{') and (row := json.loads(line)).get("reason") == "compiler-artifact"
+                           and row.get("target", {}).get("name") == "capture_rate_bench"
+                           and row.get("executable")), None)
+        if build.returncode != 0 or not executable:
+            raise RuntimeError("capture-rate benchmark compilation failed")
+        measured = subprocess.run(["/usr/bin/time", "-l", executable, "--quick"], env=env,
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        print(measured.stdout, flush=True)
+        (args.output_dir / "capture-rate.log").write_text(measured.stdout)
+        capture_rate = capture_rate_receipt(measured.stdout, measured.returncode)
+        results.append({"check": "capture-rate-throughput", "passed": True})
     except (OSError, ValueError, RuntimeError, StopIteration) as error:
         print(f"::error::{error}", flush=True)
         failed = True
     finally:
         report = {"metal": metal, "spanish_available": fixture_set["spanish_available"],
-                  "results": results, "resample_comparison": resample_comparison}
+                  "results": results, "resample_comparison": resample_comparison,
+                  "capture_rate": capture_rate}
         (args.output_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
@@ -101,6 +172,14 @@ def main():
                     output.write("\nOptimized-build resampler comparison (model-free; "
                                  "native allocations and RSS are not measured):\n\n```json\n")
                     for row in resample_comparison:
+                        output.write(json.dumps(row, separators=(",", ":")) + "\n")
+                    output.write("```\n")
+                if capture_rate:
+                    output.write("\nCapture-rate normalizer: 90 verified synthetic measurements; "
+                                 "release build, unchanged settings, no speed threshold. "
+                                 "JSON rows and benchmark-only macOS memory/time receipts are in "
+                                 "capture-rate.log and the job log. HAL, AEC and disk are excluded.\n\n```json\n")
+                    for row in capture_rate:
                         output.write(json.dumps(row, separators=(",", ":")) + "\n")
                     output.write("```\n")
     return int(failed)

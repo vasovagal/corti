@@ -27,6 +27,9 @@ pub const MAX_CAPTURE_AEC_FILTER_LEN: usize = 32 * 1024;
 pub struct CaptureProcessing {
     pub schema_version: u32,
     pub aec: CaptureAecState,
+    /// Immutable capture history. Absence is a legacy unknown, never clean-capture evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<corti_core::QualityRecord>,
 }
 
 /// AEC disposition plus the exact immutable settings captured when recording started.
@@ -61,6 +64,7 @@ impl CaptureProcessing {
         Self {
             schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
             aec: CaptureAecState::Disabled,
+            quality: None,
         }
     }
 
@@ -68,10 +72,14 @@ impl CaptureProcessing {
         Self {
             schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
             aec: CaptureAecState::NotApplicable,
+            quality: None,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(quality) = &self.quality {
+            quality.validate().context("validating capture quality")?;
+        }
         anyhow::ensure!(
             self.schema_version == CAPTURE_PROCESSING_SCHEMA_VERSION,
             "unsupported capture-processing schema version {}",
@@ -499,6 +507,21 @@ pub fn write_clean_wav_with_options(
     lookahead_seconds: f32,
     sidecar: AecStatsSidecar,
 ) -> Result<Option<PathBuf>> {
+    write_clean_wav_with_quality(raw_2track_wav, aec_cfg, lookahead_seconds, sidecar, None)
+}
+
+/// Quality-aware offline fallback. A primed AEC may emit a filter response during unavailable input;
+/// restore exact unavailable-frame zeros after the complete output/tail, before writing the derivative.
+/// Source/retained epoch mapping comes from the existing mandatory capture record, never current settings.
+/// Refuse before AEC or output creation when accounting overflow prevents exact availability masking;
+/// callers can retain the raw recording through their existing fallback.
+pub fn write_clean_wav_with_quality(
+    raw_2track_wav: &Path,
+    aec_cfg: &corti_aec::AecConfig,
+    lookahead_seconds: f32,
+    sidecar: AecStatsSidecar,
+    quality: Option<&corti_core::QualityRecord>,
+) -> Result<Option<PathBuf>> {
     let mut reader = hound::WavReader::open(raw_2track_wav)
         .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
     let spec = reader.spec();
@@ -526,7 +549,21 @@ pub fn write_clean_wav_with_options(
         }
     };
     let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
-    let tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+    let mut tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
+    anyhow::ensure!(mic.len() == tap.len(), "unaligned stereo recording for AEC");
+    let unavailable = match quality {
+        Some(quality) => {
+            anyhow::ensure!(
+                quality
+                    .epochs
+                    .iter()
+                    .all(|epoch| epoch.retained_rate_hz == spec.sample_rate),
+                "capture quality rate does not match the retained WAV"
+            );
+            quality.retained_source_loss_intervals(mic.len() as u64)?
+        }
+        None => Vec::new(),
+    };
 
     // Drive the streaming canceller with the env-tunable lookahead (ADR 0007 §1): the lookahead window
     // warms the filter and locks the mic↔far delay before the opening is emitted. This is the live path —
@@ -552,6 +589,25 @@ pub fn write_clean_wav_with_options(
     clean.truncate(mic.len());
     if want_stats {
         blocks.extend(fin.stats);
+    }
+    for (start, end, track) in unavailable {
+        let start = usize::try_from(start).context("unavailable frame offset overflow")?;
+        let end = usize::try_from(end).context("unavailable frame offset overflow")?;
+        if matches!(
+            track,
+            corti_core::QualityTrack::Mic | corti_core::QualityTrack::Both
+        ) {
+            let end = end.min(clean.len());
+            if start < end {
+                clean[start..end].fill(0.0);
+            }
+        }
+        if matches!(
+            track,
+            corti_core::QualityTrack::Tap | corti_core::QualityTrack::Both
+        ) {
+            tap[start..end].fill(0.0);
+        }
     }
 
     let out = clean_wav_path(raw_2track_wav);
@@ -859,6 +915,7 @@ mod platform {
         pub fn discard(self) {
             let _ = self.session.stop(); // finalize the partial file (best-effort)
             let _ = std::fs::remove_file(&self.out);
+            let _ = corti_core::quality_store::remove_quality_files(&self.out);
         }
 
         fn stop_capture(self) -> Result<FinishedRecording> {
@@ -872,6 +929,7 @@ mod platform {
             let handle = session.stop()?;
             if handle.callbacks == 0 {
                 let _ = std::fs::remove_file(&out); // no file should exist, but be tidy
+                let _ = corti_core::quality_store::remove_quality_files(&out);
                 anyhow::bail!(
                     "no audio captured (IO proc never fired) — likely the macOS audio-capture permission \
                      is not granted to corti"
@@ -879,12 +937,14 @@ mod platform {
             }
             if handle.frames == 0 {
                 let _ = std::fs::remove_file(&out);
+                let _ = corti_core::quality_store::remove_quality_files(&out);
                 anyhow::bail!("IO proc fired but produced no audio frames (a format/layout issue)");
             }
             if handle.dropped_samples > 0 {
                 tracing::warn!(
                     target: "corti::capture",
                     dropped_samples = handle.dropped_samples,
+                    dropped_frames = handle.dropped_frames,
                     path = %out.display(),
                     "dropped samples during capture (disk too slow / ring overflow) — recording may have gaps"
                 );
@@ -936,13 +996,14 @@ mod platform {
                 }
             }
 
-            let processing = if tap_only {
+            let mut processing = if tap_only {
                 CaptureProcessing::not_applicable()
             } else {
                 match (requested_aec, handle.filter_disposition) {
                     (None, _) => CaptureProcessing::disabled(),
                     (Some(aec), CaptureFilterDisposition::Applied) => CaptureProcessing {
                         schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
+                        quality: None,
                         aec: CaptureAecState::Applied {
                             config: aec.config,
                             lookahead_seconds: aec.lookahead_seconds,
@@ -951,6 +1012,7 @@ mod platform {
                     (Some(aec), CaptureFilterDisposition::RawFallback)
                     | (Some(aec), CaptureFilterDisposition::NotRequested) => CaptureProcessing {
                         schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
+                        quality: None,
                         aec: CaptureAecState::RawFallback {
                             config: aec.config,
                             lookahead_seconds: aec.lookahead_seconds,
@@ -958,6 +1020,7 @@ mod platform {
                     },
                     (Some(aec), CaptureFilterDisposition::Degraded) => CaptureProcessing {
                         schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
+                        quality: None,
                         aec: CaptureAecState::Degraded {
                             config: aec.config,
                             lookahead_seconds: aec.lookahead_seconds,
@@ -965,6 +1028,7 @@ mod platform {
                     },
                 }
             };
+            processing.quality = Some(handle.quality);
             let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
             tracing::info!(
                 target: "corti::capture",
@@ -987,6 +1051,60 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use corti_core::OwningApp;
+
+    #[test]
+    fn capture_quality_is_additive_and_source_loss_survives_serde_and_recovery() {
+        use corti_core::{
+            BatchRecoveryOutcome, CaptureEpoch, CaptureEpochReason, QualityCause, QualityClass,
+            QualityRecord, QualityResolution, QualitySpan, QualityStage, QualityTrack,
+            SourceCompleteness,
+        };
+        let legacy: CaptureProcessing =
+            serde_json::from_str(r#"{"schema_version":1,"aec":{"state":"disabled"}}"#).unwrap();
+        assert_eq!(legacy.quality, None);
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 48_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 48_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        quality
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 4,
+                end_frame: 12,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        let mut captured = legacy;
+        captured.quality = Some(quality.clone());
+        let encoded = serde_json::to_string(&captured).unwrap();
+        let restored: CaptureProcessing = serde_json::from_str(&encoded).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, captured);
+        assert_eq!(restored.schema_version, 1);
+        let mut settled = restored.quality.unwrap();
+        settled
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        assert_eq!(
+            settled.source_completeness(),
+            SourceCompleteness::Incomplete
+        );
+        assert_eq!(settled, quality);
+    }
 
     #[test]
     fn stem_includes_date_and_app_slug() {
@@ -1231,6 +1349,287 @@ mod tests {
             })
             .collect();
         (mic, tap)
+    }
+
+    #[test]
+    fn offline_aec_masks_primed_gap_and_tail_without_masking_compressed_epoch_audio() {
+        use corti_core::{
+            CaptureEpoch, CaptureEpochReason, QualityCause, QualityClass, QualityRecord,
+            QualityResolution, QualitySpan, QualityStage, QualityTrack,
+        };
+        let rate = 8_000;
+        let frames = 48_000;
+        let gap = 32_013..32_050;
+        let tail = frames - 19..frames;
+        let next_retained = 40_000;
+        let next_source = 520_000;
+        let (mut mic, mut tap) = synthetic_echo(frames);
+        mic[gap.clone()].fill(0.0);
+        tap[gap.clone()].fill(0.0);
+        mic[tail.clone()].fill(0.0);
+        tap[tail.clone()].fill(0.0);
+        let dir =
+            std::env::temp_dir().join(format!("corti-offline-unavailable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("recording.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(&raw, spec).unwrap();
+        for index in 0..frames {
+            writer.write_sample(mic[index]).unwrap();
+            writer.write_sample(tap[index]).unwrap();
+        }
+        writer.finalize().unwrap();
+        let config = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let clean = write_clean_wav_with_options(&raw, &config, 0.5, AecStatsSidecar::Off)
+            .unwrap()
+            .unwrap();
+        let baseline = hound::WavReader::open(&clean)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            gap.clone().any(|frame| baseline[frame * 2].abs() > 1e-8),
+            "primed AEC must expose the pre-mask failure"
+        );
+
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: rate,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: rate,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        let source_loss = |epoch, start_frame, end_frame, cause| QualitySpan {
+            epoch,
+            start_frame,
+            end_frame,
+            track: QualityTrack::Both,
+            cause,
+            class: QualityClass::SourceLoss,
+            stage: QualityStage::Capture,
+            resolution: QualityResolution::Outstanding,
+        };
+        quality
+            .insert_span(source_loss(
+                0,
+                gap.start as u64,
+                gap.end as u64,
+                QualityCause::RingOverflow,
+            ))
+            .unwrap();
+        quality
+            .insert_span(source_loss(
+                0,
+                next_retained as u64,
+                next_source,
+                QualityCause::HostDiscontinuity,
+            ))
+            .unwrap();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(65_000_000_000),
+                source_rate_hz: rate,
+                source_frame_base: next_source,
+                retained_start_frame: next_retained as u64,
+                retained_rate_hz: rate,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::HostDiscontinuity,
+            })
+            .unwrap();
+        quality
+            .insert_span(source_loss(
+                1,
+                next_source + (tail.start - next_retained) as u64,
+                next_source + (tail.end - next_retained) as u64,
+                QualityCause::RingOverflow,
+            ))
+            .unwrap();
+        write_clean_wav_with_quality(&raw, &config, 0.5, AecStatsSidecar::Off, Some(&quality))
+            .unwrap()
+            .unwrap();
+        let masked = hound::WavReader::open(&clean)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(masked.len(), frames * 2);
+        for frame in 0..frames {
+            if gap.contains(&frame) || tail.contains(&frame) {
+                assert_eq!(
+                    (masked[frame * 2].to_bits(), masked[frame * 2 + 1].to_bits()),
+                    (0.0_f32.to_bits(), 0.0_f32.to_bits())
+                );
+            } else {
+                assert_eq!(
+                    &masked[frame * 2..frame * 2 + 2],
+                    &baseline[frame * 2..frame * 2 + 2],
+                    "available audio at frame {frame} changed"
+                );
+            }
+        }
+        assert!(
+            masked[next_retained * 2..tail.start * 2]
+                .iter()
+                .any(|sample| *sample != 0.0),
+            "compressed-away gap must not erase later C audio"
+        );
+        assert_eq!(
+            quality.source_completeness(),
+            corti_core::SourceCompleteness::Incomplete
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_aec_refuses_omitted_source_gaps_and_saturation_before_creating_output() {
+        use corti_core::{
+            CaptureEpoch, CaptureEpochReason, MAX_QUALITY_SPANS, QualityCause, QualityClass,
+            QualityError, QualityRecord, QualityResolution, QualitySpan, QualityStage,
+            QualityTrack,
+        };
+        let rate = 8_000;
+        let frames = 48_000;
+        let late_gap = 32_013..32_050;
+        let (mut mic, mut tap) = synthetic_echo(frames);
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: rate,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: rate,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        for gap in (0..MAX_QUALITY_SPANS)
+            .map(|index| index * 4..index * 4 + 2)
+            .chain(std::iter::once(late_gap.clone()))
+        {
+            mic[gap.clone()].fill(0.0);
+            tap[gap.clone()].fill(0.0);
+            quality
+                .insert_span(QualitySpan {
+                    epoch: 0,
+                    start_frame: gap.start as u64,
+                    end_frame: gap.end as u64,
+                    track: QualityTrack::Both,
+                    cause: QualityCause::RingOverflow,
+                    class: QualityClass::SourceLoss,
+                    stage: QualityStage::Capture,
+                    resolution: QualityResolution::Outstanding,
+                })
+                .unwrap();
+        }
+        quality.validate().unwrap();
+        assert_eq!(quality.spans.len(), MAX_QUALITY_SPANS);
+        assert_eq!(quality.overflow.omitted_spans, [1, 0, 0]);
+        assert!(
+            quality
+                .spans
+                .iter()
+                .all(|span| span.end_frame < late_gap.start as u64)
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "corti-offline-omitted-unavailable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("recording.wav");
+        let mut writer = hound::WavWriter::create(
+            &raw,
+            hound::WavSpec {
+                channels: 2,
+                sample_rate: rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for frame in 0..frames {
+            writer.write_sample(mic[frame]).unwrap();
+            writer.write_sample(tap[frame]).unwrap();
+        }
+        writer.finalize().unwrap();
+        let raw_bytes = std::fs::read(&raw).unwrap();
+        let config = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let clean = write_clean_wav_with_options(&raw, &config, 0.5, AecStatsSidecar::Off)
+            .unwrap()
+            .unwrap();
+        let baseline = hound::WavReader::open(&clean)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            late_gap
+                .clone()
+                .any(|frame| baseline[frame * 2].abs() > 1e-8),
+            "primed AEC must expose regeneration in the omitted late gap"
+        );
+        std::fs::remove_file(&clean).unwrap();
+
+        let mut saturated = quality.clone();
+        saturated.overflow.omitted_spans = [0; 3];
+        saturated.overflow.outstanding_omitted_spans = [0; 3];
+        for count in [u64::MAX, 1] {
+            saturated
+                .record_omitted_spans(
+                    QualityClass::DegradedOnly,
+                    QualityResolution::Outstanding,
+                    count,
+                )
+                .unwrap();
+        }
+        assert!(saturated.overflow.counter_saturated);
+        for uncertain in [&quality, &saturated] {
+            let error = write_clean_wav_with_quality(
+                &raw,
+                &config,
+                0.5,
+                AecStatsSidecar::Write,
+                Some(uncertain),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<QualityError>(),
+                Some(&QualityError::UnknownAvailability)
+            );
+            assert!(!clean.exists(), "refusal must precede derivative creation");
+            assert!(
+                !aec_stats_path(&raw).exists(),
+                "refusal must precede stats creation"
+            );
+            assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn drive_filter(

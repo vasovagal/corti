@@ -13,6 +13,198 @@ use serde_json::{Map, Number, Value};
 
 use crate::config::{AppConfig, BackendChoice};
 
+/// Leave 16 KiB of the existing 64 KiB note-prefix bound for non-quality provenance/frontmatter.
+/// Mandatory sidecar and checkpoint records remain full; only the display projection is bounded here.
+pub(crate) const QUALITY_FRONTMATTER_BYTES: usize = 48 * 1024;
+
+pub(crate) fn quality_frontmatter_projection(
+    quality: &corti_core::QualityRecord,
+) -> anyhow::Result<corti_core::QualityRecord> {
+    quality.validate()?;
+    let mut projection = quality.clone();
+    while serde_json::to_vec(&projection)?.len() > QUALITY_FRONTMATTER_BYTES {
+        let span = projection
+            .spans
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("quality_epoch_projection_exceeds_prefix_budget"))?;
+        // Keep every epoch/source offset. Omitted facts remain class/resolution-aware lower bounds in
+        // the same record type; successful recovery cannot erase an omitted source-loss fact.
+        projection.record_omitted_spans(span.class, span.resolution, 1)?;
+    }
+    Ok(projection)
+}
+
+/// Carry the same bounded record into note frontmatter; no private text or recording path is added.
+pub(crate) fn attach_quality(
+    provenance: &mut TranscriptProvenance,
+    quality: &corti_core::QualityRecord,
+    storage: Option<crate::transcribe::RecordingStorageStatus>,
+) -> anyhow::Result<()> {
+    quality.validate()?;
+    let projection = quality_frontmatter_projection(quality)?;
+    provenance
+        .configuration
+        .insert("quality".into(), serde_json::to_value(&projection)?);
+    provenance.configuration.insert(
+        "quality_projection_truncated".into(),
+        Value::Bool(projection != *quality),
+    );
+    provenance.configuration.insert(
+        "quality_full_span_count".into(),
+        Value::from(quality.spans.len()),
+    );
+    provenance.configuration.insert(
+        "source_completeness".into(),
+        serde_json::to_value(quality.source_completeness())?,
+    );
+    provenance.configuration.insert(
+        "text_completeness".into(),
+        serde_json::to_value(quality.completeness())?,
+    );
+    if let Some(storage) = storage {
+        provenance
+            .configuration
+            .insert("quality_storage".into(), serde_json::to_value(storage)?);
+    }
+    Ok(())
+}
+
+/// Preserve the Markdown turn syntax while displaying known source offsets. A turn crossing an
+/// unfilled epoch boundary keeps its text exactly once; its endpoints are mapped independently and
+/// the timing uncertainty is explicit. Word positions inside such a turn are not inferred.
+pub(crate) fn quality_body(
+    meta: &corti_core::RecordingMeta,
+    transcript: &corti_core::DiarizedTranscript,
+    quality: Option<&corti_core::QualityRecord>,
+    storage: Option<crate::transcribe::RecordingStorageStatus>,
+) -> String {
+    use corti_core::{QualityClass, SourceCompleteness};
+    let Some(quality) = quality else {
+        return corti_vagus::recording_body(meta, transcript);
+    };
+    if quality.validate().is_err() {
+        return format!(
+            "{}\n\n> Capture quality is invalid; source and transcript completeness are unknown.\n",
+            corti_vagus::recording_body(meta, transcript)
+        );
+    }
+    let mut display = transcript.clone();
+    let mut uncertain_turns = 0usize;
+    for segment in &mut display.segments {
+        let start = source_endpoint(quality, segment.start, false);
+        let end = source_endpoint(quality, segment.end, true);
+        match (start, end) {
+            (Some((start, first)), Some((end, last))) if end >= start => {
+                segment.start = start;
+                segment.end = end;
+                uncertain_turns += usize::from(first != last);
+            }
+            _ if !quality.epochs.is_empty() => uncertain_turns += 1,
+            _ => {}
+        }
+    }
+    let mut body = corti_vagus::recording_body(meta, &display);
+    if quality.completeness() != SourceCompleteness::Complete {
+        body.push_str("\n\n> Transcript coverage is partial or unknown. Retained audio can be retried with `corti --redo <id> --local`.\n");
+    }
+    if let Some(storage) = storage
+        && storage != crate::transcribe::RecordingStorageStatus::AudioDurable
+    {
+        body.push_str(&format!(
+            "\n> Capture storage: {}. Completion is unverified.\n",
+            enum_label(storage)
+        ));
+    }
+    for span in &quality.spans {
+        if span.class == QualityClass::DegradedOnly {
+            continue;
+        }
+        let epoch = quality.epochs.iter().find(|epoch| epoch.id == span.epoch);
+        let times = epoch.and_then(|epoch| {
+            Some((
+                epoch.source_time_ns(span.start_frame).ok()??,
+                epoch.source_time_ns(span.end_frame).ok()??,
+            ))
+        });
+        let location = match times {
+            Some((start, end)) => format!("{:.3}–{:.3} s", start as f64 / 1e9, end as f64 / 1e9),
+            None => format!(
+                "epoch {} frames {}–{} (source offset unknown)",
+                span.epoch, span.start_frame, span.end_frame
+            ),
+        };
+        body.push_str(&format!(
+            "\n> Audio/text availability: {} at {location}; {}, {}, {}.\n",
+            enum_label(span.cause),
+            enum_label(span.track),
+            enum_label(span.class),
+            enum_label(span.resolution)
+        ));
+    }
+    for pair in quality.epochs.windows(2) {
+        let previous = &pair[0];
+        let next = &pair[1];
+        let retained_delta = next
+            .retained_start_frame
+            .saturating_sub(previous.retained_start_frame);
+        let expected = previous.source_start_ns.and_then(|base| {
+            u64::try_from(
+                u128::from(retained_delta) * 1_000_000_000 / u128::from(previous.retained_rate_hz),
+            )
+            .ok()
+            .and_then(|delta| base.checked_add(delta))
+        });
+        if next.source_start_ns != expected {
+            body.push_str(&format!(
+                "\n> Unfilled capture epoch {}: source offset {}, retained frame {} at {} Hz.\n",
+                next.id,
+                next.source_start_ns
+                    .map(|ns| format!("{:.3} s", ns as f64 / 1e9))
+                    .unwrap_or_else(|| "unknown".into()),
+                next.retained_start_frame,
+                next.retained_rate_hz
+            ));
+        }
+    }
+    if quality.overflow.omitted_spans != [0; 3]
+        || quality.overflow.omitted_epochs != 0
+        || quality.overflow.counter_saturated
+    {
+        body.push_str(&format!("\n> Quality accounting overflow: source/processing/degraded spans {:?}; outstanding {:?}; omitted epochs {}; counter saturated {}.\n", quality.overflow.omitted_spans, quality.overflow.outstanding_omitted_spans, quality.overflow.omitted_epochs, quality.overflow.counter_saturated));
+    }
+    if uncertain_turns != 0 {
+        body.push_str(&format!("\n> {uncertain_turns} transcript turn(s) cross an epoch boundary or have an unknown source offset; within-turn source timing is uncertain.\n"));
+    }
+    body
+}
+
+fn enum_label(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn source_endpoint(
+    quality: &corti_core::QualityRecord,
+    seconds: f64,
+    end: bool,
+) -> Option<(f64, u32)> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let (index, epoch) = quality.epochs.iter().enumerate().rev().find(|(_, epoch)| {
+        let boundary = epoch.retained_start_frame as f64 / f64::from(epoch.retained_rate_hz);
+        seconds > boundary || (!end && seconds == boundary) || (seconds == 0.0 && boundary == 0.0)
+    })?;
+    if index + 1 == quality.epochs.len() && quality.overflow.omitted_epochs != 0 {
+        return None;
+    }
+    let source = epoch.source_start_ns? as f64 / 1e9;
+    let retained = epoch.retained_start_frame as f64 / f64::from(epoch.retained_rate_hz);
+    Some((source + seconds - retained, epoch.id))
+}
+
 /// How the audio supplied to ASR was echo-processed. Capture/retry callers select this from the durable
 /// queue record, never mutable Settings.
 #[derive(Clone, Copy)]
@@ -425,6 +617,255 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_capacity_quality_uses_labelled_projection_without_losing_authoritative_facts() {
+        use corti_core::{
+            CaptureEpoch, CaptureEpochReason, QualityCause, QualityClass, QualityRecord,
+            QualityResolution, QualitySpan, QualityStage, QualityTrack,
+        };
+        let mut quality = QualityRecord::observed();
+        for index in 0..64_u32 {
+            quality
+                .insert_epoch(CaptureEpoch {
+                    id: index,
+                    source_start_ns: Some(
+                        u64::MAX - 64_000_000_000 + u64::from(index) * 1_000_000_000,
+                    ),
+                    source_rate_hz: u32::MAX,
+                    source_frame_base: u64::MAX - 1_000,
+                    retained_start_frame: u64::MAX - 1_000 + u64::from(index) * 10,
+                    retained_rate_hz: u32::MAX,
+                    mic_channels: 1,
+                    tap_channels: 1,
+                    reason: if index == 0 {
+                        CaptureEpochReason::Start
+                    } else {
+                        CaptureEpochReason::HostDiscontinuity
+                    },
+                })
+                .unwrap();
+        }
+        for epoch in 0..64_u32 {
+            for index in 0..4_u64 {
+                let source = index % 2 == 0;
+                quality
+                    .insert_span(QualitySpan {
+                        epoch,
+                        start_frame: u64::MAX - 1_000 + index * 2,
+                        end_frame: u64::MAX - 999 + index * 2,
+                        track: QualityTrack::Both,
+                        cause: if source {
+                            QualityCause::HostDiscontinuity
+                        } else {
+                            QualityCause::MicTapMismatch
+                        },
+                        class: if source {
+                            QualityClass::SourceLoss
+                        } else {
+                            QualityClass::ProcessingLoss
+                        },
+                        stage: QualityStage::Capture,
+                        resolution: if source {
+                            QualityResolution::Outstanding
+                        } else {
+                            QualityResolution::RecoveredByBatch
+                        },
+                    })
+                    .unwrap();
+            }
+        }
+        quality.validate().unwrap();
+        let full_bytes = serde_json::to_vec(&quality).unwrap().len();
+        assert!(
+            full_bytes > 64 * 1024,
+            "fixture must exercise the existing prefix cap"
+        );
+        let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        attach_quality(
+            &mut provenance,
+            &quality,
+            Some(crate::transcribe::RecordingStorageStatus::AudioDurable),
+        )
+        .unwrap();
+        let projected: QualityRecord =
+            serde_json::from_value(provenance.configuration["quality"].clone()).unwrap();
+        assert_eq!(projected.epochs, quality.epochs);
+        assert!(projected.spans.len() < quality.spans.len());
+        let projected_bytes = serde_json::to_vec(&projected).unwrap().len();
+        assert!(projected_bytes <= QUALITY_FRONTMATTER_BYTES);
+        assert_eq!(
+            provenance.configuration["quality_projection_truncated"],
+            true
+        );
+        assert_eq!(provenance.configuration["quality_full_span_count"], 256);
+        assert_eq!(
+            projected.spans.len() as u64 + projected.overflow.omitted_spans.iter().sum::<u64>(),
+            256
+        );
+        assert_eq!(
+            projected.overflow.outstanding_omitted_spans[1], 0,
+            "recovered processing history stays recovered"
+        );
+        assert!(projected.overflow.outstanding_omitted_spans[0] > 0);
+        assert_eq!(
+            provenance.configuration["source_completeness"],
+            serde_json::to_value(quality.source_completeness()).unwrap()
+        );
+
+        let dir =
+            std::env::temp_dir().join(format!("corti-full-quality-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let note = dir.join("note.md");
+        let body = "\n# Synthetic\n\nState: transcribed \n\nSynthetic body unchanged.\n";
+        let fresh = format!(
+            "---\nsource: synthetic\n{}---\n{body}",
+            provenance.frontmatter_line().unwrap()
+        );
+        assert!(fresh.len() - body.len() < 64 * 1024);
+        std::fs::write(&note, &fresh).unwrap();
+        let current = corti_vagus::note::CurrentNote::from_returned_path(note.clone()).unwrap();
+        current
+            .refresh_provenance(&TranscriptProvenance::legacy_unknown(GenerationMode::Live))
+            .unwrap();
+        current.refresh_provenance(&provenance).unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), fresh);
+
+        let audio = dir.join("recording.wav");
+        let mut checkpoint = crate::checkpoint::FilingCheckpoint::new(
+            corti_core::DiarizedTranscript::new(Vec::new()),
+            None,
+            None,
+        );
+        checkpoint.quality = Some(quality.clone());
+        checkpoint.quality_storage = Some(crate::transcribe::RecordingStorageStatus::AudioDurable);
+        checkpoint.set_provenance(provenance);
+        checkpoint.store(&audio).unwrap();
+        let mut restored = crate::checkpoint::FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(restored.quality.as_ref(), Some(&quality));
+        restored
+            .provenance
+            .configuration
+            .insert("quality_projection_truncated".into(), Value::Bool(false));
+        assert!(restored.store(&audio).is_err());
+        let meta = corti_core::RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: corti_core::OwningApp::from_bundle_id("synthetic.fixture"),
+            audio_path: audio,
+        };
+        let marked = quality_body(
+            &meta,
+            &checkpoint.transcript,
+            Some(&quality),
+            checkpoint.quality_storage,
+        );
+        assert_eq!(marked.matches("> Audio/text availability:").count(), 256);
+        println!(
+            "quality prefix fixture: full_bytes={full_bytes} projected_bytes={projected_bytes} full_spans=256 epochs=64"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn source_epoch_display_preserves_words_and_marks_every_loss_and_overflow() {
+        use corti_core::{
+            CaptureEpoch, CaptureEpochReason, DiarizedTranscript, OwningApp, QualityCause,
+            QualityClass, QualityRecord, QualityResolution, QualitySpan, QualityStage,
+            QualityTrack, RecordingMeta, Speaker, TranscriptSegment,
+        };
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        quality
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 4_000,
+                end_frame: 8_000,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(90_000_000_000),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 16_000,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::HostDiscontinuity,
+            })
+            .unwrap();
+        quality
+            .record_omitted_spans(QualityClass::SourceLoss, QualityResolution::Outstanding, 2)
+            .unwrap();
+        let transcript = DiarizedTranscript::new(vec![
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 0.8,
+                end: 1.2,
+                text: "Synthetic crossing once.".into(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 1.5,
+                end: 1.9,
+                text: "Synthetic later once.".into(),
+            },
+        ]);
+        assert_eq!(source_endpoint(&quality, 1.5, false), Some((90.5, 1)));
+        assert_eq!(source_endpoint(&quality, 1.0, true), Some((1.0, 0)));
+        assert_eq!(source_endpoint(&quality, 1.0, false), Some((90.0, 1)));
+        let meta = RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: OwningApp::from_bundle_id("synthetic.fixture"),
+            audio_path: "synthetic.wav".into(),
+        };
+        let body = quality_body(
+            &meta,
+            &transcript,
+            Some(&quality),
+            Some(crate::transcribe::RecordingStorageStatus::AudioDurable),
+        );
+        assert_eq!(body.matches("Synthetic crossing once.").count(), 1);
+        assert_eq!(body.matches("Synthetic later once.").count(), 1);
+        assert!(
+            body.contains("**[01:30]"),
+            "later turn must retain its source time"
+        );
+        assert!(body.contains("ring_overflow at 0.250–0.500 s"));
+        assert!(body.contains("Unfilled capture epoch 1: source offset 90.000 s"));
+        assert!(
+            body.contains(
+                "Quality accounting overflow: source/processing/degraded spans [2, 0, 0]"
+            )
+        );
+        assert!(body.contains("1 transcript turn(s) cross an epoch boundary"));
+        assert!(body.contains("--redo <id> --local"));
+        assert_eq!(
+            transcript.segments[1].start, 1.5,
+            "retained canonical timings are immutable"
+        );
+    }
+
+    #[test]
     fn aws_batch_provenance_is_secret_free_and_names_the_opaque_service_model() {
         let cfg = AppConfig {
             transcribe_backend: BackendChoice::Aws,
@@ -562,6 +1003,7 @@ mod tests {
         captured.filter_len = 4_096;
         let processing = corti_capture::CaptureProcessing {
             schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+            quality: None,
             aec: corti_capture::CaptureAecState::Degraded {
                 config: captured,
                 lookahead_seconds: 7.5,
