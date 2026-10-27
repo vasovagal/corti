@@ -119,7 +119,7 @@ jobs:
           if-no-files-found: warn
 
   decode_quality_preflight:
-    name: Decoder quality preflight 0ff1bfec31538c9ebe850127a047ac4dc09c42fc
+    name: Decoder quality preflight 465f18a16a64f8c6ea5d8121c325f4c831139ca8
     runs-on: macos-26
     timeout-minutes: 60
     # Temporary validation before the exact decoder quality implementation enters PR history.
@@ -127,11 +127,11 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 0ff1bfec31538c9ebe850127a047ac4dc09c42fc
+          ref: 465f18a16a64f8c6ea5d8121c325f4c831139ca8
       - name: Identify the exact WIP candidate
         run: |
-          test "$(git rev-parse HEAD)" = "0ff1bfec31538c9ebe850127a047ac4dc09c42fc"
-          printf '%s\n' 'Decoder quality preflight tests WIP `0ff1bfec31538c9ebe850127a047ac4dc09c42fc`; this is separate from the PR head and per-commit results.' >> "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = "465f18a16a64f8c6ea5d8121c325f4c831139ca8"
+          printf '%s\n' 'Decoder quality preflight tests WIP `465f18a16a64f8c6ea5d8121c325f4c831139ca8`; this is separate from the PR head and per-commit results.' >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/rust-setup
         with:
           components: clippy rustfmt
@@ -187,6 +187,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: quality-decode-preflight-0ff1bfec31538c9ebe850127a047ac4dc09c42fc
+          name: quality-decode-preflight-465f18a16a64f8c6ea5d8121c325f4c831139ca8
           path: ${{ runner.temp }}/quality-decode-preflight-results
           if-no-files-found: warn
