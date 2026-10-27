@@ -314,10 +314,10 @@ impl<const PENDING: usize> CaptureTimeline<PENDING> {
             }
         };
         let observed_host = input.timestamp.offset();
-        let same_host_rate = self
+        let same_source_rate = self
             .current
             .is_some_and(|current| current.format.source_rate_hz == input.format.source_rate_hz);
-        let unobserved_sample_gap = if observed_host.is_none() && same_host_rate {
+        let unobserved_sample_gap = if observed_host.is_none() && same_source_rate {
             input
                 .timestamp
                 .sample_frame()
@@ -329,7 +329,7 @@ impl<const PENDING: usize> CaptureTimeline<PENDING> {
         } else {
             0
         };
-        let host_remainder = if observed_host.is_none() && same_host_rate {
+        let host_remainder = if observed_host.is_none() && same_source_rate {
             self.expected_host_remainder
         } else {
             0
@@ -454,7 +454,12 @@ impl<const PENDING: usize> CaptureTimeline<PENDING> {
                     .map_or(source_end, |minimum| minimum.max(source_end)),
             );
         }
-        let sample = input.timestamp.sample_frame().or(self.expected_sample);
+        // A sample anchor cannot advance in a different rate's units. If the transition has no
+        // valid sample clock, wait for a valid observation to anchor the new rate.
+        let sample = input
+            .timestamp
+            .sample_frame()
+            .or(self.expected_sample.filter(|_| same_source_rate));
         self.expected_sample = sample.and_then(|sample| {
             i64::try_from(input.frames)
                 .ok()
@@ -1379,6 +1384,202 @@ mod tests {
                 accepted(&mut timeline, next).as_slice(),
                 [CaptureDescriptor::Audio(_)]
             ));
+        }
+    }
+
+    #[test]
+    fn rate_transition_with_invalid_sample_clock_reanchors_without_fabricated_loss() {
+        for (old_rate, new_rate) in [(44_100, 48_000), (48_000, 44_100)] {
+            for (sample_time, sample_time_valid) in [
+                (0.0, false),
+                (1_000_000.0, false),
+                (f64::NAN, true),
+                (f64::INFINITY, true),
+                (0.5, true),
+                (9_007_199_254_740_994.0, true),
+            ] {
+                for host_valid in [true, false] {
+                    for invalid_callbacks in [1, 3] {
+                        for reset_sample in [false, true] {
+                            let old_frames = u64::from(old_rate / 100);
+                            let new_frames = u64::from(new_rate / 100);
+                            let mut timeline = CaptureTimeline::<64>::new().unwrap();
+                            let mut first = block(0, old_frames);
+                            first.format.source_rate_hz = old_rate;
+                            accepted(&mut timeline, first);
+                            let mut changed = block(old_frames, new_frames);
+                            changed.format.source_rate_hz = new_rate;
+                            changed.format.generation = 1;
+                            changed.timestamp.sample_time = sample_time;
+                            changed.timestamp.sample_time_valid = sample_time_valid;
+                            changed.timestamp.host_time_valid = host_valid;
+                            for index in 0..invalid_callbacks {
+                                changed.timestamp.source_offset_ns = if host_valid {
+                                    (index + 1) * 10_000_000
+                                } else {
+                                    u64::MAX
+                                };
+                                let descriptors = accepted(&mut timeline, changed);
+                                if index == 0 {
+                                    let [
+                                        CaptureDescriptor::Epoch(epoch),
+                                        CaptureDescriptor::Audio(_),
+                                    ] = descriptors.as_slice()
+                                    else {
+                                        panic!(
+                                            "expected a loss-free rate transition: {descriptors:?}"
+                                        );
+                                    };
+                                    assert_eq!(epoch.reason, CaptureEpochReason::RateChange);
+                                    assert_eq!(epoch.source_start_ns, Some(10_000_000));
+                                } else {
+                                    assert!(matches!(
+                                        descriptors.as_slice(),
+                                        [CaptureDescriptor::Audio(_)]
+                                    ));
+                                }
+                            }
+                            let source_frame = old_frames + invalid_callbacks * new_frames;
+                            let source_ns = (invalid_callbacks + 1) * 10_000_000;
+                            let resumed_sample = if reset_sample {
+                                0
+                            } else {
+                                (invalid_callbacks + 1) * new_frames
+                            };
+                            let mut resumed = block(source_frame, new_frames);
+                            resumed.format = changed.format;
+                            resumed.timestamp.sample_time = resumed_sample as f64;
+                            resumed.timestamp.source_offset_ns = source_ns;
+                            let descriptors = accepted(&mut timeline, resumed);
+                            assert!(
+                                matches!(descriptors.as_slice(), [CaptureDescriptor::Audio(audio)]
+                                if audio.start_frame == source_frame && audio.epoch == 1),
+                                "invalid sample across {old_rate}->{new_rate} fabricated loss: {descriptors:?}"
+                            );
+                            assert_eq!(
+                                timeline.current.unwrap().time_at(source_frame).unwrap(),
+                                Some(source_ns)
+                            );
+                            resumed.timestamp.sample_time += new_frames as f64;
+                            resumed.timestamp.source_offset_ns += 10_000_000;
+                            assert!(matches!(
+                                accepted(&mut timeline, resumed).as_slice(),
+                                [CaptureDescriptor::Audio(_)]
+                            ));
+                            assert_eq!(timeline.dropped_counts(), DroppedCounts::default());
+                            assert!(timeline.finish().unwrap().next().is_none());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reanchored_sample_clock_after_rate_transition_preserves_later_exact_gap() {
+        let mut timeline = CaptureTimeline::<64>::new().unwrap();
+        let mut first = block(0, 441);
+        first.format.source_rate_hz = 44_100;
+        accepted(&mut timeline, first);
+        let mut changed = block(441, 480);
+        changed.format.generation = 1;
+        changed.timestamp.sample_time_valid = false;
+        changed.timestamp.source_offset_ns = 10_000_000;
+        accepted(&mut timeline, changed);
+        let mut resumed = block(960, 480);
+        resumed.format = changed.format;
+        resumed.timestamp.source_offset_ns = 20_000_000;
+        accepted(&mut timeline, resumed);
+        resumed.timestamp.sample_time = 1_920.0;
+        resumed.timestamp.source_offset_ns = 40_000_000;
+        let descriptors = accepted(&mut timeline, resumed);
+        let [
+            CaptureDescriptor::Loss(loss),
+            CaptureDescriptor::Epoch(epoch),
+            CaptureDescriptor::Audio(audio),
+        ] = descriptors.as_slice()
+        else {
+            panic!("expected the exact gap after reanchoring: {descriptors:?}");
+        };
+        assert_eq!((loss.start_frame, loss.end_frame), (1_401, 1_881));
+        assert_eq!(loss.cause, QualityCause::HostDiscontinuity);
+        assert_eq!(epoch.source_start_ns, Some(40_000_000));
+        assert_eq!(audio.start_frame, 1_881);
+    }
+
+    #[test]
+    fn invalid_sample_rate_transition_preserves_real_host_gap_and_offset() {
+        for (gap_at_transition, transition_host_valid) in
+            [(true, true), (false, true), (false, false)]
+        {
+            let mut timeline = CaptureTimeline::<64>::new().unwrap();
+            let mut first = block(0, 441);
+            first.format.source_rate_hz = 44_100;
+            accepted(&mut timeline, first);
+            let mut changed = block(441, 480);
+            changed.format.generation = 1;
+            changed.timestamp.sample_time_valid = false;
+            changed.timestamp.host_time_valid = transition_host_valid;
+            changed.timestamp.source_offset_ns = if !transition_host_valid {
+                u64::MAX
+            } else if gap_at_transition {
+                20_000_000
+            } else {
+                10_000_000
+            };
+            let mut descriptors = accepted(&mut timeline, changed);
+            let mut resumed = block(960, 480);
+            resumed.format = changed.format;
+            resumed.timestamp.source_offset_ns = 30_000_000;
+            descriptors.extend(accepted(&mut timeline, resumed));
+            assert!(
+                descriptors
+                    .iter()
+                    .all(|descriptor| !matches!(descriptor, CaptureDescriptor::Loss(_))),
+                "host-only gap must not invent an exact interval: {descriptors:?}"
+            );
+            let omitted: u64 = descriptors
+                .iter()
+                .filter_map(|descriptor| match descriptor {
+                    CaptureDescriptor::Overflow(overflow) => Some(overflow.omitted_source_spans),
+                    _ => None,
+                })
+                .sum();
+            assert_eq!(omitted, 1);
+            assert_eq!(
+                timeline.current.unwrap().time_at(921).unwrap(),
+                Some(30_000_000)
+            );
+            assert_eq!(timeline.next_frame, 1_401);
+        }
+    }
+
+    #[test]
+    fn same_rate_invalid_sample_clock_keeps_anchor_across_layout_change() {
+        for layout_changed in [true, false] {
+            let mut timeline = CaptureTimeline::<64>::new().unwrap();
+            accepted(&mut timeline, block(0, 480));
+            let mut unobserved = block(480, 480);
+            unobserved.format.generation = u64::from(layout_changed);
+            unobserved.timestamp.sample_time = 1_000_000.0;
+            unobserved.timestamp.sample_time_valid = false;
+            unobserved.timestamp.source_offset_ns = u64::MAX;
+            unobserved.timestamp.host_time_valid = false;
+            accepted(&mut timeline, unobserved);
+            let mut resumed = block(1_440, 480);
+            resumed.format = unobserved.format;
+            let descriptors = accepted(&mut timeline, resumed);
+            let [
+                CaptureDescriptor::Loss(loss),
+                CaptureDescriptor::Epoch(epoch),
+                CaptureDescriptor::Audio(audio),
+            ] = descriptors.as_slice()
+            else {
+                panic!("same-rate anchor must retain the exact gap: {descriptors:?}");
+            };
+            assert_eq!((loss.start_frame, loss.end_frame), (960, 1_440));
+            assert_eq!(epoch.source_start_ns, Some(30_000_000));
+            assert_eq!(audio.start_frame, 1_440);
         }
     }
 
