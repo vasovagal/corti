@@ -159,6 +159,10 @@ const AEC_PUSH_FRAMES: usize = 16 * 1024;
 /// This is the in-flight half of ADR 0007: identical DSP to [`write_clean_wav`], just fed from the ring
 /// drain instead of a finished file. Its memory is the filter's own state plus one block — nothing here is
 /// sized by call length.
+///
+/// The streaming interface is independent of the capture backend, so callers can process aligned audio
+/// blocks and collect diagnostics without opening an audio device. On macOS the capture writer uses the
+/// same methods through its `CaptureFilter` adapter.
 pub struct StreamingAecFilter {
     aec: corti_aec::StreamingAec,
     /// Where the per-block echo record goes, when anyone asked for it. `None` is the pre-#149 filter: the
@@ -195,15 +199,16 @@ impl StreamingAecFilter {
             stats,
         }
     }
-}
 
-#[cfg(target_os = "macos")]
-impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
-    fn max_output_lag_samples(&self) -> usize {
+    /// Maximum number of pushed mic samples that may still be waiting for output.
+    pub fn max_output_lag_samples(&self) -> usize {
         self.aec.max_output_lag_samples()
     }
 
-    fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+    /// Process aligned mono mic and far-end blocks, returning the cleaned samples ready for output.
+    /// Output may be delayed during warm-up; all pushes plus [`finish`](Self::finish) return exactly one
+    /// sample per input mic sample. Panics if the two input blocks have different lengths.
+    pub fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
         let out = self.aec.push(mic, far);
         if self.stats.is_some() {
             // Drain per push so a call longer than the canceller's own ring loses nothing here.
@@ -215,8 +220,10 @@ impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
         out
     }
 
-    fn finish(self: Box<Self>) -> Vec<f32> {
-        let Self { aec, stats } = *self;
+    /// Flush the remaining audio and complete the attached collector, including any trailing partial
+    /// block. Consumes the filter; diagnostics can then be drained through [`AecStatsCollector::take`].
+    pub fn finish(self) -> Vec<f32> {
+        let Self { aec, stats } = self;
         match stats {
             Some(collector) => {
                 // `finish` consumes the canceller, so this is the only way to reach the blocks the flush
@@ -227,6 +234,21 @@ impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
             }
             None => aec.finish(),
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl corti_coreaudio::CaptureFilter for StreamingAecFilter {
+    fn max_output_lag_samples(&self) -> usize {
+        StreamingAecFilter::max_output_lag_samples(self)
+    }
+
+    fn push(&mut self, mic: &[f32], far: &[f32]) -> Vec<f32> {
+        StreamingAecFilter::push(self, mic, far)
+    }
+
+    fn finish(self: Box<Self>) -> Vec<f32> {
+        StreamingAecFilter::finish(*self)
     }
 }
 
@@ -322,6 +344,8 @@ pub const MAX_CAPTURE_BLOCK_STATS: usize = 32 * 1024;
 /// filter records here and the thread that *stops* the capture — the one that learns from
 /// [`CaptureFilterDisposition`] whether the filter's output actually reached the WAV — decides whether the
 /// record describes the retained audio and is worth persisting.
+/// Create a fresh collector for each filter/session. Clones share one record, and [`take`](Self::take)
+/// drains the blocks for every clone.
 #[derive(Clone, Default)]
 pub struct AecStatsCollector {
     inner: std::sync::Arc<std::sync::Mutex<CollectedAecStats>>,
@@ -367,9 +391,12 @@ impl AecStatsCollector {
         guard.finished = true;
     }
 
-    /// Take the record, leaving the collector empty. `None` until the filter has finished — a filter that
-    /// never ran, or that panicked before its flush, has nothing trustworthy to say.
-    fn take(&self) -> Option<(Vec<corti_aec::BlockStats>, u64, usize)> {
+    /// Drain the completed record: blocks, total dropped blocks, and locked delay in samples. Returns
+    /// `None` until the attached filter has finished — a filter that never ran, or that panicked before
+    /// its flush, has nothing trustworthy to say. Further calls return an empty block list with the same
+    /// drop count and delay. Capture callers must also check that the filtered audio was retained before
+    /// persisting these diagnostics.
+    pub fn take(&self) -> Option<(Vec<corti_aec::BlockStats>, u64, usize)> {
         let mut guard = self.lock();
         if !guard.finished {
             return None;
@@ -1194,19 +1221,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The in-flight filter's collector sees every block, records the locked delay, and does not change a
-    /// single emitted sample — the sidecar is a by-product, exactly as it is for the file-to-file pass.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_in_flight_filter_collects_blocks_without_changing_its_audio() {
-        use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
-
-        let sample_rate = 8_000u32;
-        let frames = 64 * 1024 + 97;
-        let cfg = corti_aec::AecConfig {
-            filter_len: 256,
-            ..Default::default()
-        };
+    fn synthetic_echo(frames: usize) -> (Vec<f32>, Vec<f32>) {
         let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         let mic: Vec<f32> = (0..frames)
             .map(|i| {
@@ -1215,46 +1230,162 @@ mod tests {
                 near + echo
             })
             .collect();
+        (mic, tap)
+    }
 
-        let drive = |mut filter: Box<dyn CaptureFilter>| -> Vec<f32> {
-            let mut out = Vec::with_capacity(frames);
-            for start in (0..frames).step_by(FILTER_FRAMES_PER_CHUNK) {
-                let end = (start + FILTER_FRAMES_PER_CHUNK).min(frames);
-                out.extend(filter.push(&mic[start..end], &tap[start..end]));
+    fn drive_filter(
+        mut filter: StreamingAecFilter,
+        mic: &[f32],
+        tap: &[f32],
+        chunk_sizes: &[usize],
+    ) -> Vec<f32> {
+        let lag = filter.max_output_lag_samples();
+        let mut out = Vec::with_capacity(mic.len());
+        let mut start = 0;
+        for chunk in chunk_sizes.iter().cycle() {
+            if start == mic.len() {
+                break;
             }
-            out.extend(filter.finish());
-            out
-        };
+            let end = (start + chunk).min(mic.len());
+            out.extend(filter.push(&mic[start..end], &tap[start..end]));
+            assert!(
+                out.len() <= end,
+                "must not emit more frames than were pushed"
+            );
+            assert!(
+                end - out.len() <= lag,
+                "must respect the declared output lag"
+            );
+            start = end;
+        }
+        out.extend(filter.finish());
+        assert_eq!(
+            out.len(),
+            mic.len(),
+            "finish must flush exactly the real tail"
+        );
+        out
+    }
 
-        let plain = drive(Box::new(StreamingAecFilter::new_with_lookahead(
-            sample_rate,
-            cfg.clone(),
-            0.5,
-        )));
+    fn assert_same_samples(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "same frame count");
+        assert!(
+            actual.iter().all(|sample| sample.is_finite()),
+            "generated finite audio must stay finite"
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .zip(expected)
+                .position(|(a, b)| a.to_bits() != b.to_bits()),
+            None,
+            "samples must match bit for bit"
+        );
+    }
+
+    /// The collector drains more blocks than the canceller's ring can retain, including the final
+    /// partial block, without changing a single emitted sample.
+    #[test]
+    fn the_in_flight_filter_collects_blocks_without_changing_its_audio() {
+        let sample_rate = 8_000u32;
+        let cfg = corti_aec::AecConfig {
+            filter_len: 32,
+            ..Default::default()
+        };
+        let frames = (corti_aec::MAX_BLOCK_STATS + 17) * cfg.filter_len + 7;
+        let expected_blocks = frames.div_ceil(cfg.filter_len);
+        assert!(expected_blocks > corti_aec::MAX_BLOCK_STATS);
+        assert!(expected_blocks < MAX_CAPTURE_BLOCK_STATS);
+        let (mic, tap) = synthetic_echo(frames);
+
+        let plain = drive_filter(
+            StreamingAecFilter::new_with_lookahead(sample_rate, cfg.clone(), 0.5),
+            &mic,
+            &tap,
+            &[4096],
+        );
 
         let collector = AecStatsCollector::new();
         assert!(collector.take().is_none(), "nothing before the filter runs");
-        let collected = drive(Box::new(StreamingAecFilter::new_with_lookahead_and_stats(
-            sample_rate,
-            cfg.clone(),
-            0.5,
-            Some(collector.clone()),
-        )));
-        assert_eq!(plain, collected, "collecting must not change the audio");
+        let collected = drive_filter(
+            StreamingAecFilter::new_with_lookahead_and_stats(
+                sample_rate,
+                cfg.clone(),
+                0.5,
+                Some(collector.clone()),
+            ),
+            &mic,
+            &tap,
+            &[4096],
+        );
+        assert_same_samples(&collected, &plain);
 
         let (blocks, dropped, delay_samples) = collector.take().expect("the filter finished");
-        assert_eq!(dropped, 0, "well under the collector cap");
+        assert_eq!(dropped, 0, "per-push draining must prevent ring overflow");
         assert!(delay_samples > 0, "the warm-up locked a delay");
         // Emitted samples tile into `filter_len` blocks; the last one is short and zero-padded.
-        assert_eq!(blocks.len(), frames.div_ceil(cfg.filter_len));
-        assert_eq!(blocks[0].t_start_secs, 0.0);
-        assert!(
-            blocks
-                .windows(2)
-                .all(|w| w[1].t_start_secs > w[0].t_start_secs),
-            "the record is sorted, which `span_stats` requires"
+        assert_eq!(blocks.len(), expected_blocks);
+        for (k, block) in blocks.iter().enumerate() {
+            assert_eq!(
+                block.t_start_secs,
+                (k * cfg.filter_len) as f64 / f64::from(sample_rate),
+                "statistics must cover the cleaned timeline without gaps"
+            );
+        }
+        assert_eq!(
+            collector.take(),
+            Some((Vec::new(), dropped, delay_samples)),
+            "take drains only the blocks, preserving completion metadata"
         );
-        assert!(collector.take().unwrap().0.is_empty(), "take() drains");
+    }
+
+    #[test]
+    fn short_in_flight_filter_flushes_audio_and_stats() {
+        let sample_rate = 8_000;
+        let cfg = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        // Include empty input, both sides of a hop boundary, and a partial final block, all shorter
+        // than the explicit lookahead so every output sample and statistic must come from finish.
+        for frames in [0, 1, 255, 256, 257, 353] {
+            let (mic, tap) = synthetic_echo(frames);
+            let collector = AecStatsCollector::new();
+            let mut filter = StreamingAecFilter::new_with_lookahead_and_stats(
+                sample_rate,
+                cfg.clone(),
+                0.5,
+                Some(collector.clone()),
+            );
+            let mut reference =
+                corti_aec::StreamingAec::new_with_lookahead_seconds(sample_rate, cfg.clone(), 0.5);
+            assert_eq!(
+                filter.max_output_lag_samples(),
+                reference.max_output_lag_samples()
+            );
+            for (mic, tap) in mic.chunks(113).zip(tap.chunks(113)) {
+                assert!(filter.push(mic, tap).is_empty());
+                assert!(reference.push(mic, tap).is_empty());
+                assert!(
+                    collector.take().is_none(),
+                    "diagnostics are not yet complete"
+                );
+            }
+            let actual = filter.finish();
+            let expected = reference.finish_with_stats();
+            assert_eq!(actual.len(), frames, "finish must not retain zero padding");
+            assert_same_samples(&actual, &expected.audio);
+            assert_eq!(expected.stats.len(), frames.div_ceil(cfg.filter_len));
+            assert_eq!(
+                collector.take(),
+                Some((
+                    expected.stats,
+                    expected.stats_dropped,
+                    expected.delay_samples
+                )),
+                "finish must publish the same trailing statistics as the underlying canceller"
+            );
+        }
     }
 
     /// The collector is bounded by a constant, not by call length: past the cap the oldest blocks go and
@@ -1290,16 +1421,13 @@ mod tests {
         );
     }
 
-    /// #74 acceptance: **ERLE parity**. The in-flight filter the capture writer drives in
-    /// [`FILTER_FRAMES_PER_CHUNK`] blocks must cancel exactly as well as the post-capture
-    /// [`write_clean_wav`] pass, which reads the whole file and pushes [`AEC_PUSH_FRAMES`] at a time. Both
+    /// #74 acceptance: **ERLE parity**. The in-flight filter driven in capture-sized or irregular blocks
+    /// must cancel exactly as well as the post-capture [`write_clean_wav`] pass, which reads the whole
+    /// file and pushes [`AEC_PUSH_FRAMES`] at a time. Both
     /// drive the same `StreamingAec`, so the chunk size must not change the output — asserted sample-exact
     /// here, with a real echo so a broken canceller can't pass by leaving the mic untouched.
-    #[cfg(target_os = "macos")]
     #[test]
     fn in_flight_filter_matches_post_capture_pass() {
-        use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
-
         // 8 kHz keeps the 5 s lookahead (40k samples) and the run cheap; a short filter keeps the FFTs small.
         // The length is deliberately not a multiple of any block size in play (4096 in flight, 16384 batch,
         // filter_len 256), so `finish`'s zero-pad and overshoot-truncate actually run on both sides.
@@ -1309,15 +1437,8 @@ mod tests {
             filter_len: 256,
             ..Default::default()
         };
-        let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         // Mic = quiet near-end speech + a delayed, attenuated copy of the far end (the echo to cancel).
-        let mic: Vec<f32> = (0..frames)
-            .map(|i| {
-                let near = (i as f32 * 0.011).sin() * 0.05;
-                let echo = if i >= 24 { tap[i - 24] * 0.6 } else { 0.0 };
-                near + echo
-            })
-            .collect();
+        let (mic, tap) = synthetic_echo(frames);
 
         let dir = std::env::temp_dir().join("corti-aec-parity-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1340,29 +1461,72 @@ mod tests {
             w.finalize().unwrap();
         }
 
-        let clean_path = write_clean_wav(&raw, &cfg).unwrap().unwrap();
+        let lookahead_seconds = 5.0;
+        let clean_path = write_clean_wav_with_lookahead(&raw, &cfg, lookahead_seconds)
+            .unwrap()
+            .unwrap();
         let mut r = hound::WavReader::open(&clean_path).unwrap();
         let interleaved: Vec<f32> = r.samples::<f32>().collect::<Result<_, _>>().unwrap();
         let batch: Vec<f32> = interleaved.iter().step_by(2).copied().collect();
 
-        // The writer thread's drive: fixed-size blocks, nothing sized by the recording length.
-        let mut filter: Box<dyn CaptureFilter> =
-            Box::new(StreamingAecFilter::new(sample_rate, cfg.clone()));
-        let mut in_flight = Vec::with_capacity(frames);
-        for start in (0..frames).step_by(FILTER_FRAMES_PER_CHUNK) {
-            let end = (start + FILTER_FRAMES_PER_CHUNK).min(frames);
-            in_flight.extend(filter.push(&mic[start..end], &tap[start..end]));
+        // Capture-sized, irregular, and file-sized pushes all preserve the same output and lag bound.
+        for chunk_sizes in [
+            &[4096][..],
+            &[1, 257, 31, 4095, 7, 1024],
+            &[AEC_PUSH_FRAMES],
+        ] {
+            let in_flight = drive_filter(
+                StreamingAecFilter::new_with_lookahead(sample_rate, cfg.clone(), lookahead_seconds),
+                &mic,
+                &tap,
+                chunk_sizes,
+            );
+            assert_same_samples(&in_flight, &batch);
         }
-        in_flight.extend(filter.finish());
-        in_flight.truncate(frames);
-
-        assert_eq!(in_flight.len(), batch.len(), "same frame count");
-        assert_eq!(in_flight, batch, "chunk size must not change the output");
 
         let energy = |v: &[f32]| v.iter().map(|s| (s * s) as f64).sum::<f64>();
-        let erle = 10.0 * (energy(&mic) / energy(&in_flight).max(f64::MIN_POSITIVE)).log10();
+        let erle = 10.0 * (energy(&mic) / energy(&batch).max(f64::MIN_POSITIVE)).log10();
         assert!(erle > 6.0, "expected real cancellation, got {erle:.1} dB");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_filter_adapter_matches_portable_filter() {
+        use corti_coreaudio::{CaptureFilter, FILTER_FRAMES_PER_CHUNK};
+
+        let cfg = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let (mic, tap) = synthetic_echo(2 * FILTER_FRAMES_PER_CHUNK + 97);
+        let portable_stats = AecStatsCollector::new();
+        let capture_stats = AecStatsCollector::new();
+        let mut portable = StreamingAecFilter::new_with_lookahead_and_stats(
+            8_000,
+            cfg.clone(),
+            0.5,
+            Some(portable_stats.clone()),
+        );
+        let mut capture: Box<dyn CaptureFilter> =
+            Box::new(StreamingAecFilter::new_with_lookahead_and_stats(
+                8_000,
+                cfg,
+                0.5,
+                Some(capture_stats.clone()),
+            ));
+        assert_eq!(
+            capture.max_output_lag_samples(),
+            portable.max_output_lag_samples()
+        );
+        for (mic, tap) in mic
+            .chunks(FILTER_FRAMES_PER_CHUNK)
+            .zip(tap.chunks(FILTER_FRAMES_PER_CHUNK))
+        {
+            assert_same_samples(&capture.push(mic, tap), &portable.push(mic, tap));
+        }
+        assert_same_samples(&capture.finish(), &portable.finish());
+        assert_eq!(capture_stats.take(), portable_stats.take());
     }
 }
