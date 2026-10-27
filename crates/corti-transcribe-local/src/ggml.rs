@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 
+use crate::asr::DecodedRegion;
 use anyhow::{Context, Result, ensure};
+use corti_transcribe::decode::{DecodeErrorCategory, RegionStatus};
 use corti_transcribe::segment::Word;
 use transcribe_cpp::{
     Backend, Model, ModelOptions, RunOptions, Session, SessionOptions, TimestampKind, Transcript,
@@ -107,25 +109,57 @@ impl GgmlAsr {
     }
 
     /// Decode one 16 kHz mono VAD region; word times are lifted by `offset_sec` to absolute call time.
-    /// Mirrors the sherpa contract: a failed region decode yields no words (warned), never an error.
-    pub(crate) fn asr_segment(&self, samples_16k: &[f32], offset_sec: f64) -> Vec<Word> {
+    /// Preserve partial native output and report incompleteness separately from its words.
+    pub(crate) fn asr_segment(&self, samples_16k: &[f32], offset_sec: f64) -> DecodedRegion {
         let opts = RunOptions {
             timestamps: TimestampKind::Word,
             ..RunOptions::default()
         };
         let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        match session.run(samples_16k, &opts) {
-            Ok(t) => words_from(&t, offset_sec),
-            Err(e) => {
-                tracing::warn!(
-                    target: "corti::transcribe::local",
-                    error = %e,
-                    "ggml region decode failed — dropping the region"
-                );
-                Vec::new()
-            }
-        }
+        ggml_result(session.run(samples_16k, &opts), offset_sec)
     }
+}
+
+fn ggml_result(
+    result: std::result::Result<Transcript, transcribe_cpp::Error>,
+    offset_sec: f64,
+) -> DecodedRegion {
+    let (transcript, failure) = match result {
+        Ok(t) => (Some(t), None),
+        Err(transcribe_cpp::Error::Aborted { partial, .. }) => {
+            (partial.map(|t| *t), Some(DecodeErrorCategory::Aborted))
+        }
+        Err(transcribe_cpp::Error::OutputTruncated { partial, .. }) => (
+            partial.map(|t| *t),
+            Some(DecodeErrorCategory::OutputTruncated),
+        ),
+        Err(_) => {
+            return DecodedRegion {
+                words: Vec::new(),
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            };
+        }
+    };
+    let mut words = transcript
+        .as_ref()
+        .map_or_else(Vec::new, |t| words_from(t, offset_sec));
+    let count = words.len();
+    words.retain(|word| {
+        word.start.is_finite()
+            && word.end.is_finite()
+            && word.start >= offset_sec
+            && word.end >= word.start
+    });
+    let status = if let Some(category) = failure {
+        RegionStatus::Partial(category)
+    } else if words.len() != count {
+        RegionStatus::Partial(DecodeErrorCategory::UnmappableResult)
+    } else if words.is_empty() {
+        RegionStatus::RecognizedEmpty
+    } else {
+        RegionStatus::Complete
+    };
+    DecodedRegion { words, status }
 }
 
 /// Map a transcribe.cpp [`Transcript`] (times in ms, region-relative) to corti [`Word`]s (seconds,
@@ -167,6 +201,68 @@ fn words_from(t: &Transcript, offset_sec: f64) -> Vec<Word> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ggml_errors_are_content_free_and_keep_native_partial_words() {
+        let ordinary = ggml_result(
+            Err(transcribe_cpp::Error::Backend(
+                "synthetic private error".into(),
+            )),
+            4.0,
+        );
+        assert_eq!(
+            ordinary,
+            DecodedRegion {
+                words: vec![],
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure)
+            }
+        );
+        let partial = Transcript {
+            words: vec![transcribe_cpp::Word {
+                t0_ms: 125,
+                t1_ms: 625,
+                text: "synthetic".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        for truncated in [false, true] {
+            for transcript in [
+                None,
+                Some(Box::new(Transcript::default())),
+                Some(Box::new(partial.clone())),
+            ] {
+                let expected = transcript
+                    .as_ref()
+                    .map_or_else(Vec::new, |t| words_from(t, 4.0));
+                let error = if truncated {
+                    transcribe_cpp::Error::OutputTruncated {
+                        message: "synthetic private error".into(),
+                        partial: transcript,
+                    }
+                } else {
+                    transcribe_cpp::Error::Aborted {
+                        message: "synthetic private error".into(),
+                        partial: transcript,
+                    }
+                };
+                let result = ggml_result(Err(error), 4.0);
+                assert_eq!(result.words, expected);
+                assert_eq!(
+                    result.status,
+                    RegionStatus::Partial(if truncated {
+                        DecodeErrorCategory::OutputTruncated
+                    } else {
+                        DecodeErrorCategory::Aborted
+                    })
+                );
+            }
+        }
+        assert_eq!(
+            ggml_result(Ok(Transcript::default()), 4.0).status,
+            RegionStatus::RecognizedEmpty
+        );
+    }
 
     /// CI infrastructure probe: inspect the native Result directly, since the production adapter's
     /// empty word list cannot distinguish silence from a failed decoder before the #163 fix.

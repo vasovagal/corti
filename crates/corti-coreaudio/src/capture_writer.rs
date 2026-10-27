@@ -1971,7 +1971,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .expected_retained_frames(),
-                5
+                Some(5)
             );
             let quality = restored.quality().unwrap();
             assert_eq!(
@@ -2036,7 +2036,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .expected_retained_frames(),
-            2
+            Some(2)
         );
         let quality = restored.quality().unwrap();
         assert_eq!(

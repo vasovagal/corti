@@ -26,7 +26,7 @@
 //!   including one returned after a contained panic/failure. Discard remains inside the one-model gate; a
 //!   reaper spawn failure transfers joining to the pipeline without dropping the handle/reporter.
 //!
-//! A zero-drop finish flips the state line and reports [`LiveOutcome::Filed`]. Any drop still flushes tails
+//! A complete finish flips the state line and reports [`LiveOutcome::Filed`]. Any processing loss still flushes tails
 //! but leaves `State: transcribing` and reports [`LiveOutcome::Fallback`], so the lossless WAV batch pass
 //! rewrites the same note. Completed finish/discard handles are reaped before the gate opens; a new model
 //! session never overlaps an older one that is still flushing or draining after discard.
@@ -48,6 +48,7 @@ use corti_core::{
     DiarizedTranscript, MicTapMismatches as LiveMismatches, RecordingMeta, Speaker,
     TranscriptSegment,
 };
+use corti_transcribe::decode::{DecodeQualityTracker, DecodeReport, InputSpan};
 use corti_transcribe::segment::{
     AudioEvidence, CleanupConfig, CleanupDecisions, CleanupStage, EchoAssessment, EchoCandidate,
     EchoSource, EchoVerdict, SEGMENT_GAP, SpanEvidence, SpeakerTurn, TextRule, Word,
@@ -205,9 +206,14 @@ fn padded_slice<'a>(
 #[derive(Debug)]
 pub enum LiveOutcome {
     /// The note is fully written and its state line flipped — the job can go straight to `Done`.
-    Filed { note_path: PathBuf },
+    Filed {
+        note_path: PathBuf,
+        settled_quality: Option<corti_core::QualityRecord>,
+    },
     /// The session ran but never produced a segment, so no note was created — run the batch path.
-    NoNote,
+    NoNote {
+        settled_quality: Option<corti_core::QualityRecord>,
+    },
     /// The live result is not canonical (decode failure, panic, or a lossy tee). Batch transcription must
     /// rewrite `note_path` in place when one exists, never create a second note.
     Fallback {
@@ -222,9 +228,9 @@ impl LiveOutcome {
     /// Any note the batch/discard path must take ownership of.
     fn note_path(&self) -> Option<&PathBuf> {
         match self {
-            Self::Filed { note_path } => Some(note_path),
+            Self::Filed { note_path, .. } => Some(note_path),
             Self::Fallback { note_path, .. } => note_path.as_ref(),
-            Self::NoNote => None,
+            Self::NoNote { .. } => None,
         }
     }
 }
@@ -947,7 +953,7 @@ fn session_thread(
     };
     match &outcome {
         LiveOutcome::Filed { .. } => publisher.complete("Call complete — transcript filed."),
-        LiveOutcome::NoNote => publisher.complete("Call complete — no note was filed."),
+        LiveOutcome::NoNote { .. } => publisher.complete("Call complete — no note was filed."),
         LiveOutcome::Fallback { reason, .. } => publisher.error(format!(
             "Live transcript stopped ({reason}); Corti will rebuild it from the recording."
         )),
@@ -1060,7 +1066,9 @@ fn run_session(
     }
 
     let Some(quality) = await_capture_verdict(verdict_rx, consumed, writer)? else {
-        return Ok(LiveOutcome::NoNote);
+        return Ok(LiveOutcome::NoNote {
+            settled_quality: None,
+        });
     };
     let p = parts?;
     finish_session(
@@ -2002,6 +2010,29 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             };
             let tap_slice = padded_slice(&chunk.tap, offset, take, &mut tap_padding);
 
+            // Bind decoder input before AEC. Its ordered one-for-one output retains this coordinate
+            // through lookahead and finish; tee holes and late channel starts never compress it.
+            let retained = chunk
+                .retained_start_frame
+                .checked_add(offset as u64)
+                .context("live received input position overflow")?;
+            if has_mic {
+                writer.decode_quality.observe_input(
+                    corti_core::QualityTrack::Mic,
+                    chunk.epoch,
+                    retained,
+                    take as u64,
+                );
+            }
+            if has_tap {
+                writer.decode_quality.observe_input(
+                    corti_core::QualityTrack::Tap,
+                    chunk.epoch,
+                    retained,
+                    take as u64,
+                );
+            }
+
             let clean = match aec.as_mut() {
                 Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => {
                     let cleaned =
@@ -2027,10 +2058,16 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                     .collect(),
             };
             if !clean.is_empty() {
-                mic.push(&clean, sample_rate);
+                writer.delivered_input(corti_core::QualityTrack::Mic, clean.len())?;
+                writer.call_channel(corti_core::QualityTrack::Mic, mic, |channel| {
+                    channel.push(&clean, sample_rate)
+                });
             }
             if has_tap {
-                them.push(tap_slice, sample_rate);
+                writer.delivered_input(corti_core::QualityTrack::Tap, tap_slice.len())?;
+                writer.call_channel(corti_core::QualityTrack::Tap, them, |channel| {
+                    channel.push(tap_slice, sample_rate)
+                });
             }
             if let Some(words) = mic.poll_words() {
                 publish_mic_words(window, publisher, words);
@@ -2065,8 +2102,8 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                         );
                         // Clearing bounds the window when the failure persists for the rest of the call;
                         // the incomplete mark keeps the batch rewrite from skipping the resulting gap.
-                        window.clear_after_flush();
                         writer.mark_incomplete();
+                        window.clear_after_flush();
                         // Leading edge only — a permission failure recurs every minute and would
                         // otherwise rewrite the tray until the call ends.
                         if dropped_windows == 1 {
@@ -2088,9 +2125,11 @@ fn checkpoint_and_flush<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: Transc
     writer: &mut NoteWriter<F>,
     publisher: &P,
 ) -> Result<()> {
-    let mic_words = mic.checkpoint();
+    let mic_words =
+        writer.call_channel(corti_core::QualityTrack::Mic, mic, LiveChannel::checkpoint);
     publish_mic_words(window, publisher, mic_words);
-    let them_words = them.checkpoint();
+    let them_words =
+        writer.call_channel(corti_core::QualityTrack::Tap, them, LiveChannel::checkpoint);
     publish_them_words(window, publisher, them_words);
     // The forced far-end tail is the last echo source this window will get; nothing may stay held across
     // the append, because the note is rendered from the words buffered in the window.
@@ -2282,6 +2321,7 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
             "durable live transcript chunk synced"
         );
     }
+    writer.advance_window();
     window.clear_after_flush();
     Ok(())
 }
@@ -2300,7 +2340,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     writer: &mut NoteWriter<F>,
     publisher: &P,
 ) -> Result<LiveOutcome> {
-    let capture = writer.freeze_live_quality(&quality)?;
+    writer.freeze_live_quality(&quality)?;
     if let Some(aec) = aec.take() {
         // `finish` consumes the filter, so the tail blocks — every block of a call shorter than the
         // lookahead — are only reachable through `finish_with_stats`. The final window's cleanup is the
@@ -2316,7 +2356,10 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
         );
         window.push_aec_blocks(fin.stats);
         if !fin.audio.is_empty() {
-            mic.push(&fin.audio, sample_rate);
+            writer.delivered_input(corti_core::QualityTrack::Mic, fin.audio.len())?;
+            writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, |channel| {
+                channel.push(&fin.audio, sample_rate)
+            });
         }
     }
     if let Some(words) = mic.poll_words() {
@@ -2325,15 +2368,27 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     if let Some(words) = them.poll_words() {
         publish_them_words(&mut window, publisher, words);
     }
-    let mic_words = mic.finish();
+    let mic_words =
+        writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, LiveChannel::finish);
     publish_mic_words(&mut window, publisher, mic_words);
-    let them_words = them.finish();
+    let them_words = writer.call_channel(
+        corti_core::QualityTrack::Tap,
+        &mut them,
+        LiveChannel::finish,
+    );
     publish_them_words(&mut window, publisher, them_words);
     // The session is over: every held region is judged now against everything the far end ever said in
     // range, and published or dropped. Nothing waits past the last append.
     release_held_mic_words(&mut window, publisher);
     let early_drop = window.early_drop.stats;
-    flush_window(&diarizer, &mut window, writer)?;
+    // Freeze after both decoder tails, including failure-only outcomes. Keep it available even if
+    // the final append fails and the session's error boundary takes ownership of the partial note.
+    writer.freeze_live_quality(&quality)?;
+    if let Err(error) = flush_window(&diarizer, &mut window, writer) {
+        writer.mark_incomplete();
+        writer.freeze_live_quality(&quality)?;
+        return Err(error);
+    }
     if early_drop != EarlyDropStats::default() {
         info!(
             target: "corti::live",
@@ -2345,7 +2400,12 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     }
 
     let mismatch_count = writer.mismatches.count();
+    let capture = writer.freeze_live_quality(&quality)?;
     writer.settle_capture_quality(&capture, quality.capture.is_some())?;
+    // Capture authority already retains unchanged facts. Carry any additional settled facts through
+    // successful completion too; ordinary metadata capacity does not require a fallback or new ASR.
+    let settled_quality =
+        (capture != quality.capture.clone().unwrap_or_default()).then(|| capture.clone());
     match writer.path().cloned() {
         Some(note_path)
             if quality.dropped_chunks == 0
@@ -2388,7 +2448,10 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 note_path = %note_path.display(),
                 "live note finalized — final chunk and state are synced"
             );
-            Ok(LiveOutcome::Filed { note_path })
+            Ok(LiveOutcome::Filed {
+                note_path,
+                settled_quality,
+            })
         }
         Some(note_path) => Ok(LiveOutcome::Fallback {
             reason: format!(
@@ -2398,14 +2461,14 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 mismatch_count
             ),
             note_path: Some(note_path),
-            settled_quality: (mismatch_count != 0).then_some(capture),
+            settled_quality: Some(capture),
         }),
-        None if mismatch_count != 0 => Ok(LiveOutcome::Fallback {
-            reason: format!("mic/tap mismatched {mismatch_count} chunk(s)"),
+        None if capture.requires_batch_recovery() => Ok(LiveOutcome::Fallback {
+            reason: "live processing coverage is incomplete".into(),
             note_path: None,
             settled_quality: Some(capture),
         }),
-        None => Ok(LiveOutcome::NoNote),
+        None => Ok(LiveOutcome::NoNote { settled_quality }),
     }
 }
 
@@ -2493,6 +2556,12 @@ trait LiveChannel {
     fn poll_words(&mut self) -> Option<Vec<Word>>;
     fn checkpoint(&mut self) -> Vec<Word>;
     fn finish(&mut self) -> Vec<Word>;
+    fn take_decode_report(&mut self) -> DecodeReport {
+        DecodeReport::default()
+    }
+    fn decode_complete(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(feature = "local")]
@@ -2508,6 +2577,12 @@ impl LiveChannel for corti_transcribe_local::LiveTranscriber {
     }
     fn finish(&mut self) -> Vec<Word> {
         corti_transcribe_local::LiveTranscriber::finish(self)
+    }
+    fn take_decode_report(&mut self) -> DecodeReport {
+        corti_transcribe_local::LiveTranscriber::take_decode_report(self)
+    }
+    fn decode_complete(&self) -> bool {
+        corti_transcribe_local::LiveTranscriber::decode_complete(self)
     }
 }
 
@@ -2573,9 +2648,16 @@ struct NoteWriter<F: NoteFiler> {
     note: Option<PathBuf>,
     final_segments: Vec<TranscriptSegment>,
     final_transcript_bytes: usize,
-    final_transcript_incomplete: bool,
+    final_ledger_unavailable: bool,
     mismatches: LiveMismatches,
-    settled_quality: Option<corti_core::QualityRecord>,
+    decode_quality: DecodeQualityTracker,
+    decode_incomplete: [bool; 2],
+    /// Samples actually supplied to the decoder; pre-AEC received positions can be ahead of this.
+    delivered_input_frames: [u64; 2],
+    window_input_start: [u64; 2],
+    /// Original Finish authority, never a previously settled snapshot. Tail errors can add facts
+    /// after the first freeze; fallback recomputes from this baseline without recounting omissions.
+    finish_capture: Option<corti_core::QualityRecord>,
 }
 
 impl<F: NoteFiler> NoteWriter<F> {
@@ -2605,24 +2687,94 @@ impl<F: NoteFiler> NoteWriter<F> {
             note: None,
             final_segments: Vec::new(),
             final_transcript_bytes: 0,
-            final_transcript_incomplete: false,
+            final_ledger_unavailable: false,
             mismatches: LiveMismatches::default(),
-            settled_quality: None,
+            decode_quality: DecodeQualityTracker::default(),
+            decode_incomplete: [false; 2],
+            delivered_input_frames: [0; 2],
+            window_input_start: [0; 2],
+            finish_capture: None,
         }
     }
 
     fn freeze_live_quality(&mut self, finish: &FinishQuality) -> Result<corti_core::QualityRecord> {
-        let quality = self
-            .mismatches
-            .settle(&finish.capture.clone().unwrap_or_default())?;
-        self.settled_quality = (self.mismatches.count() != 0).then(|| quality.clone());
-        Ok(quality)
+        let capture = finish.capture.clone().unwrap_or_default();
+        if let Some(original) = &self.finish_capture {
+            anyhow::ensure!(
+                original == &capture,
+                "conflicting live Finish capture authority"
+            );
+        } else {
+            self.finish_capture = Some(capture.clone());
+        }
+        Ok(self
+            .decode_quality
+            .settle(&self.mismatches.settle(&capture)?)?)
     }
 
     fn fallback_quality(&self) -> Option<corti_core::QualityRecord> {
-        self.settled_quality.clone().or_else(|| {
-            (self.mismatches.count() != 0).then(|| self.mismatches.provisional_quality())
-        })
+        self.finish_capture
+            .as_ref()
+            .and_then(|capture| {
+                self.mismatches
+                    .settle(capture)
+                    .and_then(|quality| self.decode_quality.settle(&quality))
+                    .ok()
+            })
+            .or_else(|| {
+                let mut quality = self.decode_quality.provisional_quality();
+                if self.mismatches.count() != 0 {
+                    // Both are supplementary records. The pipeline still reloads mandatory capture
+                    // authority; neither an early panic nor a missing sidecar establishes clean storage.
+                    quality
+                        .merge_snapshot(&self.mismatches.provisional_quality())
+                        .ok()?;
+                }
+                (!quality.spans.is_empty() || quality.overflow != Default::default())
+                    .then_some(quality)
+            })
+    }
+
+    /// Keep already-produced facts if a later region panics in this same decoder call. The original
+    /// panic immediately resumes into the existing session fallback; the decoder is never resumed.
+    fn call_channel<C: LiveChannel, T>(
+        &mut self,
+        track: corti_core::QualityTrack,
+        channel: &mut C,
+        operation: impl FnOnce(&mut C) -> T,
+    ) -> T {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(channel)));
+        self.drain_decode_report(track, channel);
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    fn drain_decode_report<C: LiveChannel>(
+        &mut self,
+        track: corti_core::QualityTrack,
+        channel: &mut C,
+    ) {
+        let index = usize::from(track == corti_core::QualityTrack::Tap);
+        let mut report = channel.take_decode_report();
+        if !channel.decode_complete() && !self.decode_incomplete[index] && report.is_complete() {
+            report.omit_failure();
+        }
+        self.decode_incomplete[index] |= !channel.decode_complete() || !report.is_complete();
+        self.decode_quality.record_report(track, report);
+    }
+
+    fn advance_window(&mut self) {
+        self.window_input_start = self.delivered_input_frames;
+    }
+
+    fn delivered_input(&mut self, track: corti_core::QualityTrack, frames: usize) -> Result<()> {
+        let index = usize::from(track == corti_core::QualityTrack::Tap);
+        self.delivered_input_frames[index] = self.delivered_input_frames[index]
+            .checked_add(frames as u64)
+            .context("live delivered input position overflow")?;
+        Ok(())
     }
 
     fn fallback_outcome(&self, reason: String) -> LiveOutcome {
@@ -2646,7 +2798,7 @@ impl<F: NoteFiler> NoteWriter<F> {
         corti_vagus::note::append(self.note.as_ref().expect("just created"), &chunk)?;
         // Record canonical post-diarization rows only after the raw append is durable. This optional
         // bounded assembly can be dropped wholesale without weakening the note's crash safety.
-        if !self.final_transcript_incomplete {
+        if !self.final_ledger_unavailable {
             let added = segments.iter().fold(0usize, |total, segment| {
                 total
                     .saturating_add(segment.text.len())
@@ -2656,7 +2808,7 @@ impl<F: NoteFiler> NoteWriter<F> {
             if self.final_transcript_bytes.saturating_add(added) > MAX_FINAL_TRANSCRIPT_BYTES {
                 self.final_segments.clear();
                 self.final_transcript_bytes = 0;
-                self.final_transcript_incomplete = true;
+                self.final_ledger_unavailable = true;
             } else {
                 self.final_transcript_bytes = self.final_transcript_bytes.saturating_add(added);
                 self.final_segments.extend_from_slice(segments);
@@ -2668,13 +2820,26 @@ impl<F: NoteFiler> NoteWriter<F> {
     /// Abandon the assembled final transcript: a dropped window leaves the note with a gap only the batch
     /// pass can fill, so it must not be published as canonical.
     fn mark_incomplete(&mut self) {
+        for (index, track) in [corti_core::QualityTrack::Mic, corti_core::QualityTrack::Tap]
+            .into_iter()
+            .enumerate()
+        {
+            self.decode_quality.record_window_not_filed(
+                track,
+                InputSpan {
+                    start_frame: self.window_input_start[index],
+                    end_frame: self.delivered_input_frames[index],
+                },
+            );
+        }
+        self.advance_window();
         self.final_segments.clear();
         self.final_transcript_bytes = 0;
-        self.final_transcript_incomplete = true;
+        self.final_ledger_unavailable = true;
     }
 
     fn final_transcript(&self) -> Option<DiarizedTranscript> {
-        (!self.final_transcript_incomplete).then(|| {
+        (!self.final_ledger_unavailable).then(|| {
             // Windows append `Me` and `Them` interleaved by start already, but the assembled final
             // transcript is what the hosted Final lane and the note see: keep it in time order (#157).
             let mut segments = self.final_segments.clone();
@@ -3101,6 +3266,13 @@ mod tests {
         clock_tail: Option<&'static str>,
         sample_rate: u32,
         panic_on_push: Option<usize>,
+        panic_on_finish: bool,
+        panic_after_report: Option<&'static str>,
+        on_push_reports: VecDeque<DecodeReport>,
+        checkpoint_report: DecodeReport,
+        finish_report: DecodeReport,
+        pending_report: DecodeReport,
+        decode_complete: bool,
     }
 
     impl Scripted {
@@ -3114,6 +3286,13 @@ mod tests {
                 clock_tail: None,
                 sample_rate: 1,
                 panic_on_push: None,
+                panic_on_finish: false,
+                panic_after_report: None,
+                on_push_reports: VecDeque::new(),
+                checkpoint_report: DecodeReport::default(),
+                finish_report: DecodeReport::default(),
+                pending_report: DecodeReport::default(),
+                decode_complete: true,
             }
         }
     }
@@ -3131,6 +3310,15 @@ mod tests {
             if let Some(words) = self.on_push.pop_front() {
                 self.pending.extend(words);
             }
+            if let Some(report) = self.on_push_reports.pop_front() {
+                self.decode_complete &= report.is_complete();
+                self.pending_report.merge(report);
+            }
+            assert_ne!(
+                self.panic_after_report,
+                Some("push"),
+                "scripted push panic after report"
+            );
         }
         fn poll_words(&mut self) -> Option<Vec<Word>> {
             if self.pending.is_empty() {
@@ -3140,9 +3328,26 @@ mod tests {
             }
         }
         fn checkpoint(&mut self) -> Vec<Word> {
+            let report = std::mem::take(&mut self.checkpoint_report);
+            self.decode_complete &= report.is_complete();
+            self.pending_report.merge(report);
+            assert_ne!(
+                self.panic_after_report,
+                Some("checkpoint"),
+                "scripted checkpoint panic after report"
+            );
             std::mem::take(&mut self.pending)
         }
         fn finish(&mut self) -> Vec<Word> {
+            assert!(!self.panic_on_finish, "scripted finish panic");
+            let report = std::mem::take(&mut self.finish_report);
+            self.decode_complete &= report.is_complete();
+            self.pending_report.merge(report);
+            assert_ne!(
+                self.panic_after_report,
+                Some("finish"),
+                "scripted finish panic after report"
+            );
             let mut words = std::mem::take(&mut self.pending);
             words.append(&mut self.tail);
             if let Some(text) = self.clock_tail.take() {
@@ -3154,6 +3359,862 @@ mod tests {
                 ));
             }
             words
+        }
+        fn take_decode_report(&mut self) -> DecodeReport {
+            std::mem::take(&mut self.pending_report)
+        }
+        fn decode_complete(&self) -> bool {
+            self.decode_complete
+        }
+    }
+
+    #[test]
+    fn decode_failures_cross_push_checkpoint_and_finish_without_losing_survivors() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for stage in ["push", "checkpoint", "finish"] {
+            let filer = TempFiler::new(&format!("decode-{stage}"));
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let expected = vec![
+                word(0.0, 0.5, "Synthetic first."),
+                word(2.0, 2.5, "Synthetic third."),
+                word(2.5, 3.0, "Synthetic tail."),
+            ];
+            let mut them = Scripted::new(
+                vec![vec![expected[0].clone()], vec![], vec![expected[1].clone()]],
+                vec![expected[2].clone()],
+            );
+            let mut report = DecodeReport::default();
+            report.record(RegionOutcome {
+                span: InputSpan {
+                    start_frame: 10,
+                    end_frame: 20,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::NoResult),
+            });
+            match stage {
+                "push" => them.on_push_reports = vec![DecodeReport::default(), report].into(),
+                "checkpoint" => them.checkpoint_report = report,
+                _ => them.finish_report = report,
+            }
+            let mut mic = Scripted::new(vec![], vec![]);
+            let (tx, rx) = sync_channel(3);
+            let epoch = fixture_epoch(10, false, true);
+            for index in 0..3 {
+                tx.send(CaptureChunk {
+                    epoch,
+                    retained_start_frame: index * 10,
+                    unavailable: vec![],
+                    mic: vec![],
+                    tap: vec![0.0; 10],
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let publisher = RecordingPublisher::default();
+            let mut window = TranscriptWindow::new(10, 1, false, CleanupConfig::default()).unwrap();
+            consume_chunks(
+                &rx,
+                10,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+            if stage == "checkpoint" {
+                checkpoint_and_flush(
+                    &mut mic,
+                    &mut them,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+            }
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            let outcome = finish_session(
+                10,
+                None,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                note_path: Some(path),
+                ..
+            } = outcome
+            else {
+                panic!("{stage}: failure must remain a positioned fallback")
+            };
+            assert_eq!(path, note);
+            assert_eq!(quality.spans.len(), 1);
+            let span = quality.spans[0];
+            assert_eq!((span.start_frame, span.end_frame), (10, 20));
+            assert_eq!(span.cause, corti_core::QualityCause::NoResult);
+            assert_eq!(span.track, corti_core::QualityTrack::Tap);
+            assert!(quality.requires_batch_recovery());
+            let published: Vec<_> = publisher
+                .0
+                .borrow()
+                .iter()
+                .flat_map(|(_, words)| words.clone())
+                .collect();
+            assert_eq!(
+                published, expected,
+                "{stage}: exact words and timestamps survive including tail"
+            );
+            let content = read(&note);
+            assert!(content.contains("no_result"));
+            assert!(content.contains("State: transcribing\n"));
+        }
+    }
+
+    #[test]
+    fn decode_source_binding_survives_late_mic_tee_holes_and_aec_tail() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for aec_enabled in [false, true] {
+            let sample_rate = 8_000;
+            let first = fixture_epoch(sample_rate, false, true);
+            let later = corti_core::CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(2_000_000),
+                source_frame_base: 1_000,
+                retained_start_frame: 16,
+                mic_channels: 1,
+                reason: corti_core::CaptureEpochReason::LayoutChange,
+                ..first
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(first).unwrap();
+            capture.insert_epoch(later).unwrap();
+            let (tx, rx) = sync_channel(3);
+            tx.send(CaptureChunk {
+                epoch: first,
+                retained_start_frame: 0,
+                mic: vec![],
+                tap: vec![0.0; 16],
+                unavailable: vec![],
+            })
+            .unwrap();
+            for retained_start_frame in [80, 160] {
+                tx.send(CaptureChunk {
+                    epoch: later,
+                    retained_start_frame,
+                    mic: vec![0.0; 16],
+                    tap: vec![0.0; 16],
+                    unavailable: vec![],
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let mut mic = Scripted::new(vec![], vec![]);
+            mic.finish_report.record(RegionOutcome {
+                span: InputSpan {
+                    start_frame: 16,
+                    end_frame: 32,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            });
+            let observed_mic = mic.audio.clone();
+            let mut tap = Scripted::new(vec![], vec![]);
+            let mut aec =
+                aec_enabled.then(|| new_live_aec(sample_rate, corti_aec::AecConfig::default()));
+            let mut window =
+                TranscriptWindow::new(sample_rate, 1, false, CleanupConfig::default()).unwrap();
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("decode-input-map-{aec_enabled}")),
+                meta(),
+                None,
+            );
+            consume_chunks(
+                &rx,
+                sample_rate,
+                &mut aec,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            let outcome = finish_session(
+                sample_rate,
+                aec,
+                mic,
+                tap,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 2,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert_eq!(
+                observed_mic.borrow().len(),
+                32,
+                "AEC tail completes original mic input"
+            );
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                ..
+            } = outcome
+            else {
+                panic!("decode loss must survive finish")
+            };
+            assert_eq!(quality.spans.len(), 1);
+            let span = quality.spans[0];
+            assert_eq!(
+                (span.epoch, span.start_frame, span.end_frame),
+                (1, 1_144, 1_160)
+            );
+            assert_eq!(span.track, corti_core::QualityTrack::Mic);
+            assert_eq!(span.cause, corti_core::QualityCause::DecodeFailure);
+        }
+    }
+
+    #[test]
+    fn fallback_after_later_finish_panic_retains_new_aec_tail_decode_loss() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for first_received_later_epoch in [false, true] {
+            let sample_rate = 8_000;
+            let first = fixture_epoch(sample_rate, true, true);
+            let received = if first_received_later_epoch {
+                corti_core::CaptureEpoch {
+                    id: 1,
+                    source_start_ns: Some(2_000_000),
+                    source_frame_base: 1_000,
+                    retained_start_frame: 16,
+                    reason: corti_core::CaptureEpochReason::LayoutChange,
+                    ..first
+                }
+            } else {
+                first
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(first).unwrap();
+            capture.insert_epoch(received).unwrap();
+            capture
+                .record_omitted_spans(
+                    corti_core::QualityClass::ProcessingLoss,
+                    corti_core::QualityResolution::Outstanding,
+                    2,
+                )
+                .unwrap();
+            let mut report = DecodeReport::default();
+            report.record(RegionOutcome {
+                span: InputSpan {
+                    start_frame: 16,
+                    end_frame: 32,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            });
+            report.omit_failure();
+            let mut mic = Scripted::new(vec![], vec![]);
+            mic.on_push_reports.push_back(report);
+            let mut tap = Scripted::new(vec![], vec![]);
+            tap.panic_on_finish = true;
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch: received,
+                retained_start_frame: 80,
+                mic: vec![0.0; 32],
+                tap: vec![0.0; 32],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            let mut aec = Some(new_live_aec(sample_rate, corti_aec::AecConfig::default()));
+            let mut window =
+                TranscriptWindow::new(sample_rate, 1, false, CleanupConfig::default()).unwrap();
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("decode-tail-panic-{first_received_later_epoch}")),
+                meta(),
+                None,
+            );
+            consume_chunks(
+                &rx,
+                sample_rate,
+                &mut aec,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert!(
+                mic.pushes.is_empty(),
+                "the new decode failure must arrive only in the AEC finish tail"
+            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                finish_session(
+                    sample_rate,
+                    aec,
+                    mic,
+                    tap,
+                    NoDiarizer,
+                    window,
+                    FinishQuality {
+                        dropped_chunks: 0,
+                        capture: Some(capture.clone()),
+                    },
+                    &mut writer,
+                    &NoopPublisher,
+                )
+            }));
+            assert!(
+                result.is_err(),
+                "the later channel finish must take the outer panic fallback"
+            );
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                ..
+            } = writer.fallback_outcome("synthetic later finish panic".into())
+            else {
+                panic!("fallback must keep quality")
+            };
+            let span = quality
+                .spans
+                .iter()
+                .find(|span| span.cause == corti_core::QualityCause::DecodeFailure)
+                .expect(
+                    "fallback must include the decode failure recorded after its initial freeze",
+                );
+            let expected_start = if first_received_later_epoch {
+                1_080
+            } else {
+                96
+            };
+            assert_eq!(
+                (span.epoch, span.start_frame, span.end_frame),
+                (received.id, expected_start, expected_start + 16)
+            );
+            assert_eq!(
+                quality.epochs, capture.epochs,
+                "Finish supplies the omitted Start binding"
+            );
+            assert_eq!(
+                quality.overflow.outstanding_omitted_spans[1], 3,
+                "original capture omissions plus new report omissions exactly once"
+            );
+            assert_eq!(
+                writer.fallback_quality(),
+                Some(quality),
+                "fallback replay must not accumulate omissions"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_aec_window_files_loss_for_delivered_tail_and_delayed_prefix() {
+        for tail_only in [true, false] {
+            let sample_rate = 8_000;
+            let epoch = fixture_epoch(sample_rate, true, true);
+            let frames = if tail_only { 16 } else { 8_208 };
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch,
+                retained_start_frame: 0,
+                mic: vec![0.0; frames],
+                tap: vec![0.0; frames],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            let mut mic = Scripted::new(
+                vec![vec![word(
+                    0.0,
+                    16.0 / f64::from(sample_rate),
+                    "Synthetic delayed microphone.",
+                )]],
+                vec![],
+            );
+            let delivered = mic.audio.clone();
+            let mut tap = Scripted::new(vec![], vec![]);
+            let mut window =
+                TranscriptWindow::new(sample_rate, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = 16;
+            let mut aec = Some(new_live_aec(sample_rate, corti_aec::AecConfig::default()));
+            let mut writer = NoteWriter::new(
+                FlakyFiler::new(&format!("decode-window-delivered-{tail_only}"), 1),
+                meta(),
+                None,
+            );
+            consume_chunks(
+                &rx,
+                sample_rate,
+                &mut aec,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            let delivered_before_finish = delivered.borrow().len();
+            assert_eq!(
+                delivered_before_finish == 0,
+                tail_only,
+                "fixture distinguishes final tail from later ordinary window"
+            );
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            let result = finish_session(
+                sample_rate,
+                aec,
+                mic,
+                tap,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &NoopPublisher,
+            );
+            if tail_only {
+                assert!(result.is_err(), "final tail append must fail");
+            } else {
+                assert!(result.is_ok(), "ordinary failed append is contained");
+            }
+            assert_eq!(
+                delivered.borrow().len(),
+                frames,
+                "AEC delivers every observed mic frame exactly once"
+            );
+            let quality = writer
+                .fallback_quality()
+                .expect("failed delivered window must retain quality");
+            let loss = quality
+                .spans
+                .iter()
+                .find(|span| {
+                    span.track == corti_core::QualityTrack::Mic
+                        && span.cause == corti_core::QualityCause::WindowNotFiled
+                })
+                .expect("failed window must mark the delayed mic input it actually received");
+            assert_eq!(
+                loss.start_frame, 0,
+                "an earlier silent checkpoint never filed this delayed prefix"
+            );
+            assert_eq!(
+                loss.end_frame,
+                if tail_only {
+                    16
+                } else {
+                    delivered_before_finish as u64
+                }
+            );
+            assert!(quality.requires_batch_recovery());
+        }
+    }
+
+    #[test]
+    fn successful_metadata_caps_reach_filed_and_no_note_without_decode_loss() {
+        use corti_core::{QualityClass, QualityResolution};
+        use corti_transcribe::decode::{RegionOutcome, RegionStatus};
+        for stage in ["push", "checkpoint", "finish"] {
+            for with_words in [false, true] {
+                for metadata in [false, true] {
+                    let mut report = DecodeReport::default();
+                    if metadata {
+                        for frame in 0..257 {
+                            report.record(RegionOutcome {
+                                span: InputSpan {
+                                    start_frame: frame,
+                                    end_frame: frame + 1,
+                                },
+                                status: if with_words {
+                                    RegionStatus::Complete
+                                } else {
+                                    RegionStatus::RecognizedEmpty
+                                },
+                            });
+                        }
+                    }
+                    assert!(report.is_complete());
+                    let mut mic = Scripted::new(
+                        vec![],
+                        if with_words {
+                            vec![word(0.0, 257.0 / 16_000.0, "Synthetic complete words.")]
+                        } else {
+                            vec![]
+                        },
+                    );
+                    match stage {
+                        "push" => mic.on_push_reports.push_back(report),
+                        "checkpoint" => mic.checkpoint_report = report,
+                        _ => mic.finish_report = report,
+                    }
+                    let mut tap = Scripted::new(vec![], vec![]);
+                    let epoch = fixture_epoch(16_000, true, true);
+                    let mut capture = corti_core::QualityRecord::observed();
+                    capture.insert_epoch(epoch).unwrap();
+                    capture
+                        .record_omitted_spans(
+                            QualityClass::DegradedOnly,
+                            QualityResolution::Outstanding,
+                            2,
+                        )
+                        .unwrap();
+                    let mut expected = capture.clone();
+                    expected
+                        .record_omitted_spans(
+                            QualityClass::DegradedOnly,
+                            QualityResolution::Outstanding,
+                            u64::from(metadata),
+                        )
+                        .unwrap();
+                    let (tx, rx) = sync_channel(1);
+                    tx.send(CaptureChunk {
+                        epoch,
+                        retained_start_frame: 0,
+                        mic: vec![0.0; 257],
+                        tap: vec![0.0; 257],
+                        unavailable: vec![],
+                    })
+                    .unwrap();
+                    drop(tx);
+                    let mut writer = NoteWriter::new(
+                        TempFiler::new(&format!("metadata-{stage}-{with_words}-{metadata}")),
+                        meta(),
+                        None,
+                    );
+                    let mut window =
+                        TranscriptWindow::new(16_000, 1, false, CleanupConfig::default()).unwrap();
+                    if stage == "checkpoint" {
+                        window.frame_limit = 257;
+                    }
+                    let publisher = RecordingPublisher::default();
+                    consume_chunks(
+                        &rx,
+                        16_000,
+                        &mut None,
+                        &mut mic,
+                        &mut tap,
+                        &NoDiarizer,
+                        &mut window,
+                        &mut writer,
+                        &publisher,
+                    )
+                    .unwrap();
+                    assert!(mic.decode_complete());
+                    let outcome = finish_session(
+                        16_000,
+                        None,
+                        mic,
+                        tap,
+                        NoDiarizer,
+                        window,
+                        FinishQuality {
+                            dropped_chunks: 0,
+                            capture: Some(capture.clone()),
+                        },
+                        &mut writer,
+                        &publisher,
+                    )
+                    .unwrap();
+                    let quality = match outcome {
+                        LiveOutcome::Filed {
+                            settled_quality, ..
+                        } if with_words => settled_quality,
+                        LiveOutcome::NoNote { settled_quality } if !with_words => settled_quality,
+                        _ => panic!(
+                            "ordinary metadata capacity must preserve the successful live outcome"
+                        ),
+                    };
+                    assert_eq!(quality, metadata.then(|| expected.clone()));
+                    assert_eq!(
+                        writer
+                            .freeze_live_quality(&FinishQuality {
+                                dropped_chunks: 0,
+                                capture: Some(capture.clone())
+                            })
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        writer.finish_capture.as_ref(),
+                        Some(&capture),
+                        "settlement preserves original authority"
+                    );
+                    assert!(!expected.requires_batch_recovery());
+                    assert_eq!(writer.decode_incomplete, [false, false]);
+                    let words: Vec<_> = publisher
+                        .0
+                        .borrow()
+                        .iter()
+                        .flat_map(|(_, words)| words.clone())
+                        .collect();
+                    assert_eq!(words.len(), usize::from(with_words));
+                    if with_words {
+                        assert_eq!(
+                            (words[0].start, words[0].end, words[0].text.as_str()),
+                            (0.0, 257.0 / 16_000.0, "Synthetic complete words.")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_report_survives_same_call_panic_without_processing_loss() {
+        use corti_core::{QualityClass, QualityResolution};
+        use corti_transcribe::decode::{RegionOutcome, RegionStatus};
+        for stage in ["push", "checkpoint", "finish"] {
+            let mut report = DecodeReport::default();
+            for frame in 0..257 {
+                report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: frame,
+                        end_frame: frame + 1,
+                    },
+                    status: RegionStatus::RecognizedEmpty,
+                });
+            }
+            let mut mic = Scripted::new(vec![], vec![]);
+            mic.panic_after_report = Some(stage);
+            match stage {
+                "push" => mic.on_push_reports.push_back(report),
+                "checkpoint" => mic.checkpoint_report = report,
+                _ => mic.finish_report = report,
+            }
+            let mut tap = Scripted::new(vec![], vec![]);
+            let epoch = fixture_epoch(16_000, true, true);
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            capture
+                .record_omitted_spans(
+                    QualityClass::DegradedOnly,
+                    QualityResolution::Outstanding,
+                    2,
+                )
+                .unwrap();
+            let finish = FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture.clone()),
+            };
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch,
+                retained_start_frame: 0,
+                mic: vec![0.0; 257],
+                tap: vec![0.0; 257],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            let mut window =
+                TranscriptWindow::new(16_000, 1, false, CleanupConfig::default()).unwrap();
+            if stage == "checkpoint" {
+                window.frame_limit = 257;
+            }
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("metadata-panic-{stage}")),
+                meta(),
+                None,
+            );
+            let consumed = consume_with_panic_boundary(|| {
+                consume_chunks(
+                    &rx,
+                    16_000,
+                    &mut None,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+            });
+            if stage == "finish" {
+                consumed.unwrap();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish_session(
+                        16_000,
+                        None,
+                        mic,
+                        tap,
+                        NoDiarizer,
+                        window,
+                        finish,
+                        &mut writer,
+                        &NoopPublisher
+                    )))
+                    .is_err()
+                );
+            } else {
+                assert!(consumed.is_err());
+                let (tx, rx) = sync_channel(1);
+                tx.send(Verdict::Finish(finish)).unwrap();
+                assert!(await_capture_verdict(&rx, consumed, &mut writer).is_err());
+            }
+            let mut expected = capture.clone();
+            expected
+                .record_omitted_spans(
+                    QualityClass::DegradedOnly,
+                    QualityResolution::Outstanding,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(writer.fallback_quality(), Some(expected.clone()));
+            assert_eq!(writer.fallback_quality(), Some(expected));
+            assert_eq!(writer.finish_capture.as_ref(), Some(&capture));
+            assert_eq!(writer.decode_incomplete, [false, false]);
+        }
+    }
+
+    #[test]
+    fn fallback_without_finish_keeps_mapping_omissions_and_omits_clean_quality() {
+        let mut writer = NoteWriter::new(TempFiler::new("decode-no-finish-mapping"), meta(), None);
+        assert!(writer.fallback_quality().is_none());
+        let epoch = fixture_epoch(8_000, true, true);
+        for index in 0..257 {
+            writer
+                .decode_quality
+                .observe_input(corti_core::QualityTrack::Mic, epoch, index * 2, 1);
+        }
+        let (tx, rx) = sync_channel(1);
+        drop(tx);
+        assert!(await_capture_verdict(&rx, Ok(()), &mut writer).is_err());
+        let quality = writer
+            .fallback_quality()
+            .expect("mapping overflow survives a disconnected Finish channel");
+        assert_eq!(quality.overflow.omitted_spans, [0, 0, 1]);
+        assert!(
+            !quality.requires_batch_recovery(),
+            "mapping inventory alone does not require ASR fallback"
+        );
+        assert!(quality.spans.is_empty());
+    }
+
+    #[test]
+    fn queued_decode_report_survives_same_call_panic_at_every_channel_boundary() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for stage in ["push", "checkpoint", "finish"] {
+            let sample_rate = 8_000;
+            let first = fixture_epoch(sample_rate, true, true);
+            let later = corti_core::CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(2_000_000),
+                source_frame_base: 1_000,
+                retained_start_frame: 16,
+                reason: corti_core::CaptureEpochReason::LayoutChange,
+                ..first
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(first).unwrap();
+            capture.insert_epoch(later).unwrap();
+            let finish = FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            };
+            let mut report = DecodeReport::default();
+            report.record(RegionOutcome {
+                span: InputSpan {
+                    start_frame: 0,
+                    end_frame: 16,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            });
+            let mut mic = Scripted::new(vec![], vec![]);
+            mic.panic_after_report = Some(stage);
+            match stage {
+                "push" => mic.on_push_reports.push_back(report),
+                "checkpoint" => mic.checkpoint_report = report,
+                _ => mic.finish_report = report,
+            }
+            let mut tap = Scripted::new(vec![], vec![]);
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch: later,
+                retained_start_frame: 80,
+                mic: vec![0.0; 16],
+                tap: vec![0.0; 16],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            let mut window =
+                TranscriptWindow::new(sample_rate, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = if stage == "checkpoint" { 16 } else { 64 };
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("decode-report-panic-{stage}")),
+                meta(),
+                None,
+            );
+            let consumed = consume_with_panic_boundary(|| {
+                consume_chunks(
+                    &rx,
+                    sample_rate,
+                    &mut None,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+            });
+            if stage == "finish" {
+                consumed.unwrap();
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish_session(
+                        sample_rate,
+                        None,
+                        mic,
+                        tap,
+                        NoDiarizer,
+                        window,
+                        finish,
+                        &mut writer,
+                        &NoopPublisher
+                    )))
+                    .is_err()
+                );
+            } else {
+                assert!(consumed.is_err());
+                let (tx, rx) = sync_channel(1);
+                tx.send(Verdict::Finish(finish)).unwrap();
+                assert!(await_capture_verdict(&rx, consumed, &mut writer).is_err());
+            }
+            let quality = writer
+                .fallback_quality()
+                .expect("original Finish capture remains available");
+            let loss = quality
+                .spans
+                .iter()
+                .find(|span| span.cause == corti_core::QualityCause::DecodeFailure)
+                .expect("a queued report must survive its own call's panic");
+            assert_eq!(
+                (loss.epoch, loss.start_frame, loss.end_frame),
+                (1, 1_064, 1_080)
+            );
+            assert_eq!(quality.spans.len(), 1);
+            assert!(quality.requires_batch_recovery());
         }
     }
 
@@ -3371,7 +4432,12 @@ mod tests {
                     &NoopPublisher,
                 )
                 .unwrap();
-                assert!(matches!(outcome, LiveOutcome::NoNote));
+                assert!(matches!(
+                    outcome,
+                    LiveOutcome::NoNote {
+                        settled_quality: None
+                    }
+                ));
                 assert_eq!(
                     actual_mic.borrow().len(),
                     if mic_only { audio.len() } else { 0 }
@@ -3762,6 +4828,9 @@ mod tests {
 
     #[test]
     fn mismatch_history_survives_final_filing_failure_later_consume_error_and_panic() {
+        use corti_core::{
+            QualityCause, QualityClass, QualityResolution, QualitySpan, QualityStage, QualityTrack,
+        };
         for failure in ["final_filer", "consume", "panic"] {
             let epoch = fixture_epoch(8_000, true, true);
             let later_epoch = corti_core::CaptureEpoch {
@@ -3776,6 +4845,7 @@ mod tests {
             let mut capture = corti_core::QualityRecord::observed();
             capture.insert_epoch(epoch).unwrap();
             capture.insert_epoch(later_epoch).unwrap();
+            let immutable_capture = capture.clone();
             let (tx, rx) = sync_channel(3);
             for index in 0..3 {
                 tx.send(CaptureChunk {
@@ -3851,19 +4921,52 @@ mod tests {
             else {
                 panic!("known mismatch history was lost")
             };
-            assert_eq!(quality.spans.len(), 1);
-            assert_eq!(quality.spans[0].epoch, 1);
+            let mut expected_spans = vec![QualitySpan {
+                epoch: 1,
+                start_frame: 6,
+                end_frame: 8,
+                track: QualityTrack::Mic,
+                cause: QualityCause::MicTapMismatch,
+                class: QualityClass::ProcessingLoss,
+                stage: QualityStage::Live,
+                resolution: QualityResolution::Outstanding,
+            }];
+            if failure == "final_filer" {
+                // The failed final append also loses both delivered tracks across both epochs.
+                // Consume errors and decoder panics never attempted that append in this fixture.
+                for (epoch, start_frame, end_frame) in [(0, 0, 4), (1, 4, 12)] {
+                    for track in [QualityTrack::Mic, QualityTrack::Tap] {
+                        expected_spans.push(QualitySpan {
+                            epoch,
+                            start_frame,
+                            end_frame,
+                            track,
+                            cause: QualityCause::WindowNotFiled,
+                            class: QualityClass::ProcessingLoss,
+                            stage: QualityStage::Live,
+                            resolution: QualityResolution::Outstanding,
+                        });
+                    }
+                }
+            }
+            expected_spans.sort_unstable();
             assert_eq!(
-                (quality.spans[0].start_frame, quality.spans[0].end_frame),
-                (6, 8)
+                quality,
+                corti_core::QualityRecord {
+                    spans: expected_spans,
+                    ..immutable_capture.clone()
+                },
+                "exact settled facts for {failure}"
             );
             assert!(quality.requires_batch_recovery());
-            assert!(capture.spans.is_empty());
-            capture.merge_snapshot(&quality).unwrap();
+            assert_eq!(capture, immutable_capture);
+            let mut handed_off = capture.clone();
+            handed_off.merge_snapshot(&quality).unwrap();
             assert_eq!(
-                capture.spans, quality.spans,
-                "mandatory handoff keeps the exact source interval"
+                handed_off, quality,
+                "mandatory handoff keeps every exact source interval"
             );
+            assert_eq!(capture, immutable_capture);
         }
     }
 
@@ -3928,7 +5031,9 @@ mod tests {
                 assert!(consumed.is_err());
                 parked_tx.send(()).unwrap();
                 let outcome = match await_capture_verdict(&verdict_rx, consumed, &mut writer) {
-                    Ok(None) => LiveOutcome::NoNote,
+                    Ok(None) => LiveOutcome::NoNote {
+                        settled_quality: None,
+                    },
                     Ok(Some(_)) => panic!("a panicked decoder must never resume finalization"),
                     Err(error) => writer.fallback_outcome(format!("{error:#}")),
                 };
@@ -3955,7 +5060,12 @@ mod tests {
             drop(verdict_tx);
             let (outcome, note) = worker.join().unwrap();
             if verdict == "discard" {
-                assert!(matches!(outcome, LiveOutcome::NoNote));
+                assert!(matches!(
+                    outcome,
+                    LiveOutcome::NoNote {
+                        settled_quality: None
+                    }
+                ));
                 assert!(
                     !note.exists(),
                     "Discard retains ownership after a consume panic"
@@ -4368,7 +5478,7 @@ mod tests {
             &NoopPublisher,
         )
         .unwrap();
-        let LiveOutcome::Filed { note_path } = outcome else {
+        let LiveOutcome::Filed { note_path, .. } = outcome else {
             panic!("expected Filed");
         };
         assert_eq!(note_path, note);
@@ -6097,10 +7207,10 @@ mod tests {
             vec![],
         );
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
-        for _ in 0..4 {
+        for index in 0..4 {
             tx.send(CaptureChunk {
                 epoch: fixture_epoch(1, false, true),
-                retained_start_frame: 0,
+                retained_start_frame: index * 30,
                 unavailable: Vec::new(),
                 mic: Vec::new(),
                 tap: vec![0.0; 30],
@@ -6137,6 +7247,67 @@ mod tests {
         let content = read(&note);
         assert!(content.contains("second window"));
         assert!(!content.contains("dropped window"));
+        let mut capture = corti_core::QualityRecord::observed();
+        capture.insert_epoch(fixture_epoch(1, false, true)).unwrap();
+        let outcome = finish_session(
+            1,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            },
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, LiveOutcome::Fallback { .. }),
+            "a recovered writer cannot recover the dropped words: {outcome:?}"
+        );
+        let content = read(&note);
+        assert!(content.contains("State: transcribing\n"));
+        assert!(content.contains("window_not_filed"));
+    }
+
+    #[test]
+    fn final_ledger_cap_does_not_make_durable_windows_partial() {
+        let filer = TempFiler::new("decode-ledger-cap");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        writer.final_transcript_bytes = MAX_FINAL_TRANSCRIPT_BYTES;
+        writer
+            .append_segment(&TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 0.0,
+                end: 1.0,
+                text: "Synthetic durable cache overflow.".into(),
+            })
+            .unwrap();
+        assert!(writer.final_transcript().is_none());
+        let outcome = finish_session(
+            1,
+            None,
+            Scripted::new(vec![], vec![]),
+            Scripted::new(vec![], vec![]),
+            NoDiarizer,
+            TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap(),
+            FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(corti_core::QualityRecord::observed()),
+            },
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+        assert!(matches!(outcome, LiveOutcome::Filed { .. }));
+        let content = read(&note);
+        assert!(content.contains("Synthetic durable cache overflow."));
+        assert!(!content.contains("window_not_filed"));
+        assert!(!content.contains("Transcript coverage is partial"));
     }
 
     /// A revoked vault grant must reach the tray as the remedy, not as a raw `Operation not permitted` path.
@@ -6276,7 +7447,12 @@ mod tests {
             &NoopPublisher,
         )
         .unwrap();
-        assert!(matches!(outcome, LiveOutcome::NoNote));
+        assert!(matches!(
+            outcome,
+            LiveOutcome::NoNote {
+                settled_quality: None
+            }
+        ));
         assert!(!note.exists());
     }
 
@@ -6332,7 +7508,7 @@ mod tests {
                     .unwrap();
                 // The optional final assembly cannot be required to update capture provenance.
                 writer.final_segments.clear();
-                writer.final_transcript_incomplete = true;
+                writer.final_ledger_unavailable = true;
             }
             let outcome = finish_session(
                 48_000,
@@ -6474,7 +7650,9 @@ mod tests {
             assert!(matches!(verdicts.recv().unwrap(), Verdict::Finish(_)));
             finishing_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            LiveOutcome::NoNote
+            LiveOutcome::NoNote {
+                settled_quality: None,
+            }
         });
         manager.finish("a");
         finishing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -6502,7 +7680,9 @@ mod tests {
         release_tx.send(()).unwrap();
         assert!(matches!(
             collector.join().unwrap(),
-            Some(LiveOutcome::NoNote)
+            Some(LiveOutcome::NoNote {
+                settled_quality: None
+            })
         ));
         wait_for_model_slot(&manager);
     }
@@ -6533,6 +7713,7 @@ mod tests {
             release_a_rx.recv().unwrap();
             LiveOutcome::Filed {
                 note_path: note_for_a,
+                settled_quality: None,
             }
         });
 
@@ -6551,11 +7732,13 @@ mod tests {
         wait_for_model_slot(&manager);
         install_active(&manager, "b", 0, |verdicts| {
             assert!(matches!(verdicts.recv().unwrap(), Verdict::Discard));
-            LiveOutcome::NoNote
+            LiveOutcome::NoNote {
+                settled_quality: None,
+            }
         });
         assert!(manager.accepts_note("b"));
 
-        let Some(LiveOutcome::Filed { note_path }) = manager.collect("a") else {
+        let Some(LiveOutcome::Filed { note_path, .. }) = manager.collect("a") else {
             panic!("A's own filed outcome must survive until collection");
         };
         assert_eq!(note_path, note_a);
@@ -6577,14 +7760,17 @@ mod tests {
             let path = PathBuf::from(format!("/tmp/{id}.md"));
             install_active(&manager, id, 0, move |verdicts| {
                 assert!(matches!(verdicts.recv().unwrap(), Verdict::Finish(_)));
-                LiveOutcome::Filed { note_path: path }
+                LiveOutcome::Filed {
+                    note_path: path,
+                    settled_quality: None,
+                }
             });
             manager.finish(id);
             wait_for_model_slot(&manager);
         }
 
         for id in ["b", "a", "c"] {
-            let Some(LiveOutcome::Filed { note_path }) = manager.collect(id) else {
+            let Some(LiveOutcome::Filed { note_path, .. }) = manager.collect(id) else {
                 panic!("missing outcome for {id}");
             };
             assert_eq!(note_path, PathBuf::from(format!("/tmp/{id}.md")));
@@ -6633,7 +7819,9 @@ mod tests {
             assert!(matches!(verdicts.recv().unwrap(), Verdict::Discard));
             draining_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            LiveOutcome::NoNote
+            LiveOutcome::NoNote {
+                settled_quality: None,
+            }
         });
 
         manager.discard("discarded");

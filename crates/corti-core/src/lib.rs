@@ -9,6 +9,7 @@ pub mod capture_accounting;
 pub mod capture_mismatch;
 pub mod capture_normalizer;
 pub mod quality;
+pub mod quality_mapping;
 pub mod quality_store;
 mod recording;
 mod transcript;
@@ -21,5 +22,6 @@ pub use quality::{
     QualityOverflow, QualityRecord, QualityResolution, QualitySpan, QualityStage, QualityTrack,
     SourceCompleteness,
 };
+pub use quality_mapping::insert_retained_processing_loss;
 pub use recording::{JobStatus, RecordingMeta, RecordingMode, WEBINAR_NAME};
 pub use transcript::{DiarizedTranscript, Speaker, TranscriptSegment};

@@ -18,12 +18,44 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use corti_transcribe::decode::{DecodeErrorCategory, DecodeReport, RegionOutcome, RegionStatus};
 use corti_transcribe::segment::{SpeakerTurn, Word};
 use sherpa_onnx::{OfflineSpeakerDiarization, VoiceActivityDetector};
 
-use crate::asr::Asr;
+use crate::asr::{Asr, RegionDecoder};
 use crate::engine::{self, TARGET_RATE, VAD_WINDOW};
+use crate::input_clock::{InputClock, MappingError, SkippedClock};
 use crate::resample::Resampler;
+
+/// Visit borrowed completed PCM before popping it, avoiding an extra region-sized allocation.
+pub(crate) trait Segmenter: Send {
+    fn accept(&mut self, samples: &[f32]);
+    fn flush(&mut self);
+    fn reset(&mut self);
+    fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32]));
+}
+
+impl Segmenter for VoiceActivityDetector {
+    fn accept(&mut self, samples: &[f32]) {
+        self.accept_waveform(samples);
+    }
+    fn flush(&mut self) {
+        VoiceActivityDetector::flush(self);
+    }
+    fn reset(&mut self) {
+        VoiceActivityDetector::reset(self);
+    }
+    fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32])) {
+        while let Some(segment) = self.front() {
+            // Negative native positions are unmappable and are handled by the shared drain path.
+            visit(
+                u64::try_from(segment.start()).unwrap_or(u64::MAX),
+                segment.samples(),
+            );
+            self.pop();
+        }
+    }
+}
 
 /// Accumulates 16 kHz samples and releases them in whole [`VAD_WINDOW`]-sized windows, carrying the
 /// sub-window remainder across pushes so the VAD sees exactly the window sequence a batch `.chunks(512)`
@@ -71,8 +103,8 @@ impl WindowBuffer {
 /// One `LiveTranscriber` handles one channel (its VAD is stateful); the [`Asr`] engine is shared —
 /// pass the same `Arc` to a second instance for the far-end channel.
 pub struct LiveTranscriber {
-    rec: Arc<Asr>,
-    vad: VoiceActivityDetector,
+    rec: Arc<dyn RegionDecoder>,
+    vad: Box<dyn Segmenter>,
     /// Built lazily on the first non-16 kHz push and reused so resampling is continuous across pushes.
     resampler: Option<Resampler>,
     src_rate: i32,
@@ -84,6 +116,14 @@ pub struct LiveTranscriber {
     finished: bool,
     /// One-shot latch so a persistent `LinearResampler::create` failure logs once, not per push.
     resampler_warned: bool,
+    input_clock: InputClock,
+    skipped_clock: SkippedClock,
+    report: DecodeReport,
+    decode_complete: bool,
+    /// If an input clock is unrepresentable, later words cannot carry trustworthy timestamps.
+    clock_available: bool,
+    #[cfg(test)]
+    resampler_factory: Box<dyn FnMut(i32) -> Option<Resampler> + Send>,
 }
 
 impl LiveTranscriber {
@@ -91,6 +131,10 @@ impl LiveTranscriber {
     /// [`crate::Asr`] plus a VAD built by the crate, or use [`crate::LiveEngine`] to load once and spawn
     /// a transcriber per channel.
     pub fn new(rec: Arc<Asr>, vad: VoiceActivityDetector) -> Self {
+        Self::with_parts(rec, Box::new(vad))
+    }
+
+    pub(crate) fn with_parts(rec: Arc<dyn RegionDecoder>, vad: Box<dyn Segmenter>) -> Self {
         Self {
             rec,
             vad,
@@ -101,6 +145,13 @@ impl LiveTranscriber {
             vad_base_samples: 0,
             finished: false,
             resampler_warned: false,
+            input_clock: InputClock::default(),
+            skipped_clock: SkippedClock::default(),
+            report: DecodeReport::default(),
+            decode_complete: true,
+            clock_available: true,
+            #[cfg(test)]
+            resampler_factory: Box::new(Resampler::new),
         }
     }
 
@@ -112,11 +163,27 @@ impl LiveTranscriber {
         if self.finished || samples.is_empty() {
             return;
         }
+        let Some(input_span) = self.input_clock.admit(samples.len()) else {
+            self.report.omit_failure();
+            self.decode_complete = false;
+            self.clock_available = false;
+            return;
+        };
+        if !self.clock_available {
+            self.report.omit_failure();
+            return;
+        }
         let rate = sample_rate as i32;
         if rate == TARGET_RATE {
             // A 16 kHz push while a resampler is live: flush its buffered tail first, otherwise those
             // samples are stranded and finish() would inject them out of order after the 16 kHz audio.
             self.flush_resampler_tail();
+            if self
+                .input_clock
+                .map_input(input_span, sample_rate, self.output_position())
+            {
+                self.report.omit_metadata();
+            }
             self.feed_16k(samples);
             return;
         }
@@ -129,10 +196,40 @@ impl LiveTranscriber {
         // Resample to an owned buffer first so the resampler borrow ends before `feed_16k`'s `&mut`.
         let up = self.resampler.as_mut().map(|r| r.push(samples));
         match up {
-            Some(up) => self.feed_16k(&up),
+            Some(up) => {
+                if self
+                    .input_clock
+                    .map_input(input_span, sample_rate, self.output_position())
+                {
+                    self.report.omit_metadata();
+                }
+                self.feed_16k(&up);
+            }
             // `create()` failed: drop the chunk rather than feed source-rate samples as 16 kHz (that garbles
             // words and stretches timestamps silently). Warn once; ensure_resampler retries on later pushes.
             None => {
+                // Close any valid speech preceding the loss before advancing the timeline. Reusing an
+                // open VAD region here would join unrelated speech across the missing chunk.
+                self.flush_decode_tail();
+                self.vad.reset();
+                self.input_clock.reset_vad();
+                self.report.record(RegionOutcome {
+                    span: input_span,
+                    status: RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable),
+                });
+                self.decode_complete = false;
+                match self
+                    .skipped_clock
+                    .advance(input_span.end_frame - input_span.start_frame, sample_rate)
+                    .and_then(|count| self.win.fed.checked_add(count))
+                {
+                    Some(position) => self.win.fed = position,
+                    None => {
+                        self.report.omit_failure();
+                        self.clock_available = false;
+                    }
+                }
+                self.vad_base_samples = self.win.fed;
                 if !self.resampler_warned {
                     self.resampler_warned = true;
                     tracing::warn!(
@@ -152,11 +249,46 @@ impl LiveTranscriber {
         let tail = self.resampler.as_mut().map(Resampler::finish);
         self.resampler = None;
         self.src_rate = 0;
-        if let Some(tail) = tail
-            && !tail.is_empty()
-        {
-            self.feed_16k(&tail);
+        if let Some(tail) = tail {
+            if !tail.is_empty() {
+                self.feed_16k(&tail);
+            }
+            self.input_clock.end_epoch();
         }
+    }
+
+    fn output_position(&self) -> u64 {
+        self.win.fed.saturating_add(self.win.buf.len() as u64)
+    }
+
+    /// Drain bounded, content-free decode outcomes. Completeness remains sticky after this drain.
+    pub fn take_decode_report(&mut self) -> DecodeReport {
+        std::mem::take(&mut self.report)
+    }
+
+    pub fn decode_complete(&self) -> bool {
+        self.decode_complete
+    }
+
+    /// The batch path has already performed the canonical resampling, but reports original WAV frames.
+    pub(crate) fn push_resampled(
+        &mut self,
+        samples: &[f32],
+        source_frames: usize,
+        source_rate: u32,
+    ) {
+        let Some(span) = self.input_clock.admit(source_frames) else {
+            self.report.omit_failure();
+            self.decode_complete = false;
+            return;
+        };
+        if self
+            .input_clock
+            .map_input(span, source_rate, self.output_position())
+        {
+            self.report.omit_metadata();
+        }
+        self.feed_16k(samples);
     }
 
     /// Non-blocking drain of the words decoded so far. `None` when nothing is queued.
@@ -181,6 +313,7 @@ impl LiveTranscriber {
         self.flush_decode_tail();
         self.vad.reset();
         self.vad_base_samples = self.win.fed;
+        self.input_clock.reset_vad();
         std::mem::take(&mut self.pending)
     }
 
@@ -200,29 +333,23 @@ impl LiveTranscriber {
     fn flush_decode_tail(&mut self) {
         self.flush_resampler_tail();
         let remainder = self.win.take_remainder();
-        let rec = self.rec.clone();
-        let vad = &self.vad;
-        let pending = &mut self.pending;
         if !remainder.is_empty() {
-            vad.accept_waveform(&remainder);
+            self.vad.accept(&remainder);
         }
-        vad.flush();
-        drain_regions(vad, &rec, pending, self.vad_base_samples);
+        self.vad.flush();
+        self.drain_regions();
     }
 
     /// Feed already-16 kHz samples: buffer to whole VAD windows, then for each window accept + drain any
     /// regions the VAD closed.
     fn feed_16k(&mut self, samples_16k: &[f32]) {
-        let rec = self.rec.clone();
-        let vad = &self.vad;
-        let pending = &mut self.pending;
         // Zero-copy batch path: with nothing carried, feed whole windows straight from the input slice and
         // buffer only the sub-window remainder — a whole-channel push copies just the tail, not the channel.
         if self.win.buf.is_empty() {
             let (windows, remainder) = samples_16k.as_chunks::<VAD_WINDOW>();
             for window in windows {
-                vad.accept_waveform(window);
-                drain_regions(vad, &rec, pending, self.vad_base_samples);
+                self.vad.accept(window);
+                self.drain_regions();
             }
             self.win.fed += (samples_16k.len() - remainder.len()) as u64;
             self.win.buf.extend_from_slice(remainder);
@@ -234,32 +361,87 @@ impl LiveTranscriber {
         }
         let block = self.win.take_windows();
         for window in block.as_chunks::<VAD_WINDOW>().0 {
-            vad.accept_waveform(window);
-            drain_regions(vad, &rec, pending, self.vad_base_samples);
+            self.vad.accept(window);
+            self.drain_regions();
         }
     }
 
     fn ensure_resampler(&mut self, rate: i32) {
+        if rate <= 0 {
+            self.resampler = None;
+            self.src_rate = rate;
+            return;
+        }
         if self.resampler.is_none() || self.src_rate != rate {
-            self.resampler = Resampler::new(rate);
+            #[cfg(not(test))]
+            {
+                self.resampler = Resampler::new(rate);
+            }
+            #[cfg(test)]
+            {
+                self.resampler = (self.resampler_factory)(rate);
+            }
             self.src_rate = rate;
         }
     }
-}
 
-/// Pop every completed VAD region, decode it at its call-relative offset, and append the words. Shared by
-/// `push`, `checkpoint`, and `finish`; `seg.start()` is relative to the current VAD epoch, so checkpoints
-/// add the cumulative `vad_base_samples` back before either ASR engine decodes the region.
-fn drain_regions(
-    vad: &VoiceActivityDetector,
-    rec: &Asr,
-    out: &mut Vec<Word>,
-    vad_base_samples: u64,
-) {
-    while let Some(seg) = vad.front() {
-        let offset = absolute_offset_sec(vad_base_samples, seg.start() as u64);
-        out.extend(rec.asr_segment(seg.samples(), offset));
-        vad.pop();
+    /// The sole completed-region path, shared by native VAD and deterministic fault-injection tests.
+    fn drain_regions(&mut self) {
+        let Self {
+            rec,
+            vad,
+            pending,
+            vad_base_samples,
+            input_clock,
+            skipped_clock,
+            report,
+            decode_complete,
+            ..
+        } = self;
+        vad.drain_completed(&mut |relative_start, samples| {
+            let span = vad_base_samples
+                .checked_add(relative_start)
+                .and_then(|start| {
+                    start
+                        .checked_add(samples.len() as u64)
+                        .map(|end| (start, end))
+                })
+                .ok_or(MappingError::Invalid)
+                .and_then(|(start, end)| input_clock.input_span(start, end));
+            if span == Err(MappingError::Invalid) {
+                // No backend call or timed words can be trusted for invalid native coordinates.
+                report.omit_failure();
+                *decode_complete = false;
+                return;
+            }
+            // Native VAD indices live on an integer grid; failed input can last a fractional 16 kHz
+            // sample. Apply that remainder immediately, including after recovery and checkpoints.
+            let offset = absolute_offset_sec(*vad_base_samples, relative_start)
+                + skipped_clock.fractional_seconds();
+            let decoded = rec.decode(samples, offset);
+            pending.extend(decoded.words);
+            if matches!(
+                decoded.status,
+                RegionStatus::Failed(_) | RegionStatus::Partial(_)
+            ) {
+                *decode_complete = false;
+            }
+            if let Ok(span) = span {
+                report.record(RegionOutcome {
+                    span,
+                    status: decoded.status,
+                });
+            } else if matches!(
+                decoded.status,
+                RegionStatus::Complete | RegionStatus::RecognizedEmpty
+            ) {
+                // Valid canonical timing and successful decoding survive loss of source-span detail.
+                report.omit_metadata();
+            } else {
+                report.omit_failure();
+                *decode_complete = false;
+            }
+        });
     }
 }
 
@@ -334,12 +516,16 @@ mod stream {
     //! [`LiveTranscriber`]. The core stays sync — this owns a dedicated std thread running the transcriber and
     //! bridges it to the async world with a tokio mpsc, so no runtime ever enters the engine.
 
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::task::{Context, Poll};
     use std::thread::JoinHandle;
 
+    use corti_transcribe::decode::{
+        DecodeErrorCategory, DecodeReport, InputSpan, RegionOutcome, RegionStatus,
+    };
     use corti_transcribe::segment::Word;
     use futures_core::Stream;
 
@@ -349,6 +535,166 @@ mod stream {
     /// (ADR 0009): live audio is throwaway, so a slow decoder drops rather than growing memory + word latency
     /// without bound.
     const AUDIO_BACKLOG: usize = 64;
+
+    /// Terminal decode facts for the input admitted by the worker. This is not a source/capture
+    /// completeness certificate: rejected sink chunks never entered the transcriber's input clock.
+    #[derive(Clone, Debug)]
+    pub struct LiveStreamCompletion {
+        report: DecodeReport,
+        decode_complete: bool,
+        worker_failed: bool,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl LiveStreamCompletion {
+        /// Bounded region facts, with source spans relative to worker-admitted input only.
+        pub fn decode_report(&self) -> &DecodeReport {
+            &self.report
+        }
+        /// Whether decoding completed for admitted input; inspect dropped chunks separately.
+        pub fn decode_complete(&self) -> bool {
+            self.decode_complete
+        }
+        /// Whether the worker failed, independently of ordinary typed decoder failures.
+        pub fn worker_failed(&self) -> bool {
+            self.worker_failed
+        }
+        /// The same rejected-send counter as the sink, including pushes after worker exit. This is
+        /// not a source-frame count or a count of queued audio abandoned when a worker fails.
+        pub fn dropped_chunks(&self) -> usize {
+            self.dropped.load(Ordering::Relaxed)
+        }
+    }
+
+    struct StreamState {
+        report: DecodeReport,
+        decode_complete: bool,
+        worker_failed: bool,
+        input_frames: u64,
+        last_reported_input_frame: u64,
+        diagnosed: bool,
+        #[cfg(test)]
+        diagnostics: usize,
+    }
+
+    impl Default for StreamState {
+        fn default() -> Self {
+            Self {
+                report: DecodeReport::default(),
+                decode_complete: true,
+                worker_failed: false,
+                input_frames: 0,
+                last_reported_input_frame: 0,
+                diagnosed: false,
+                #[cfg(test)]
+                diagnostics: 0,
+            }
+        }
+    }
+
+    impl StreamState {
+        fn collect(&mut self, live: &mut LiveTranscriber) {
+            let report = live.take_decode_report();
+            self.input_frames = live.input_clock.frames;
+            self.decode_complete &= live.decode_complete() && report.is_complete();
+            for outcome in report.outcomes() {
+                self.last_reported_input_frame =
+                    self.last_reported_input_frame.max(outcome.span.end_frame);
+            }
+            self.report.merge(report);
+        }
+
+        fn worker_failed(&mut self) {
+            self.decode_complete = false;
+            if self.worker_failed {
+                return;
+            }
+            self.worker_failed = true;
+            if self.last_reported_input_frame < self.input_frames {
+                self.report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: self.last_reported_input_frame,
+                        end_frame: self.input_frames,
+                    },
+                    status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+                });
+            } else {
+                // No trustworthy nonempty pending span is available; never invent source coordinates.
+                self.report.omit_failure();
+            }
+        }
+    }
+
+    fn lock_state(state: &Mutex<StreamState>) -> MutexGuard<'_, StreamState> {
+        state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn diagnose_terminal(state: &Mutex<StreamState>, dropped: &AtomicUsize) {
+        let emit = {
+            let mut state = lock_state(state);
+            let incomplete = !state.decode_complete
+                || state.worker_failed
+                || dropped.load(Ordering::Relaxed) != 0;
+            if incomplete && !state.diagnosed {
+                state.diagnosed = true;
+                #[cfg(test)]
+                {
+                    state.diagnostics += 1;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        if emit {
+            // Observable without a tracing subscriber. No words, panic payload or native error text.
+            eprintln!("warning: live transcription stream ended with incomplete output");
+        }
+    }
+
+    fn run_worker(
+        live: &mut LiveTranscriber,
+        audio_rx: std::sync::mpsc::Receiver<(Vec<f32>, u32)>,
+        words_tx: &tokio::sync::mpsc::UnboundedSender<Vec<Word>>,
+        state: &Mutex<StreamState>,
+    ) {
+        while let Ok((samples, rate)) = audio_rx.recv() {
+            let pushed = catch_unwind(AssertUnwindSafe(|| live.push(&samples, rate)));
+            {
+                // Drain even when this same push already recorded facts and then panicked.
+                let mut state = lock_state(state);
+                state.collect(live);
+                if pushed.is_err() {
+                    state.worker_failed();
+                }
+            }
+            if let Some(words) = live.poll_words()
+                && words_tx.send(words).is_err()
+            {
+                return; // Existing consumer-drop behavior: stop, without another decode/finish.
+            }
+            if pushed.is_err() {
+                return;
+            }
+        }
+        let finished = catch_unwind(AssertUnwindSafe(|| live.finish()));
+        {
+            let mut state = lock_state(state);
+            state.collect(live);
+            if finished.is_err() {
+                state.worker_failed();
+            }
+        }
+        let tail = match finished {
+            Ok(words) => words,
+            Err(_) => live.poll_words().unwrap_or_default(),
+        };
+        if !tail.is_empty() {
+            let _ = words_tx.send(tail);
+        }
+    }
 
     /// Sink half: push audio (any sample rate) from any thread. Never blocks — when the decoder falls behind
     /// real time the bounded queue fills and further chunks are dropped (counted in
@@ -375,11 +721,27 @@ mod stream {
     }
 
     /// Stream half: yields a `Vec<Word>` each time the worker decodes one or more regions, then `None` once
-    /// the [`LiveSink`] is dropped and the final flush has been emitted. Reaching `None` joins the worker
-    /// thread (its `finish()` decode is already done by then), so end-of-stream implies the worker is done.
+    /// the worker ends. Reaching `None` joins the worker and exposes [`completion`](Self::completion).
+    /// EOF means termination, not complete decoding or complete source input. Queue drops are counted
+    /// separately; word times and report spans use only the input actually admitted by the worker.
     pub struct LiveWordStream {
         rx: tokio::sync::mpsc::UnboundedReceiver<Vec<Word>>,
         worker: Option<JoinHandle<()>>,
+        completion: Option<LiveStreamCompletion>,
+        state: Arc<Mutex<StreamState>>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl LiveWordStream {
+        /// Terminal facts become available after polling EOF. EOF itself means termination only.
+        pub fn completion(&self) -> Option<&LiveStreamCompletion> {
+            self.completion.as_ref()
+        }
+
+        #[cfg(test)]
+        fn diagnostic_count(&self) -> usize {
+            lock_state(&self.state).diagnostics
+        }
     }
 
     impl Stream for LiveWordStream {
@@ -389,9 +751,22 @@ mod stream {
             let this = self.get_mut();
             match this.rx.poll_recv(cx) {
                 Poll::Ready(None) => {
-                    // The worker dropped `words_tx` after its final flush, so this join is immediate.
-                    if let Some(worker) = this.worker.take() {
-                        let _ = worker.join();
+                    if this.completion.is_none() {
+                        // The sender has gone, so the worker has finished its output. A panic outside
+                        // a guarded push/finish (including destruction) still cannot look complete.
+                        if let Some(worker) = this.worker.take()
+                            && worker.join().is_err()
+                        {
+                            lock_state(&this.state).worker_failed();
+                        }
+                        diagnose_terminal(&this.state, &this.dropped);
+                        let mut state = lock_state(&this.state);
+                        this.completion = Some(LiveStreamCompletion {
+                            report: std::mem::take(&mut state.report),
+                            decode_complete: state.decode_complete,
+                            worker_failed: state.worker_failed,
+                            dropped: this.dropped.clone(),
+                        });
                     }
                     Poll::Ready(None)
                 }
@@ -402,47 +777,1119 @@ mod stream {
 
     /// Split a [`LiveTranscriber`] into a push [`LiveSink`] and a [`LiveWordStream`], running the transcriber
     /// on a dedicated std thread. Drop the sink to flush and terminate the stream; draining the stream to
-    /// `None` joins that thread.
+    /// `None` joins that thread. Inspect the completion's decode facts and independent dropped count.
+    /// A single content-free terminal warning discloses incomplete output. The process's ordinary panic
+    /// hook is unchanged; this adapter never formats or logs a panic payload itself.
     pub fn live_word_stream(mut live: LiveTranscriber) -> (LiveSink, LiveWordStream) {
         let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, u32)>(AUDIO_BACKLOG);
         let (words_tx, words_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Word>>();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(Mutex::new(StreamState::default()));
+        lock_state(&state).collect(&mut live);
+        // Preserve any already-decoded words even if the worker cannot be started.
+        if let Some(words) = live.poll_words() {
+            let _ = words_tx.send(words);
+        }
+        let worker_state = state.clone();
+        let worker_dropped = dropped.clone();
         let worker = std::thread::Builder::new()
             .name("corti-live-asr".into())
             .spawn(move || {
-                while let Ok((samples, rate)) = audio_rx.recv() {
-                    live.push(&samples, rate);
-                    if let Some(words) = live.poll_words()
-                        && words_tx.send(words).is_err()
-                    {
-                        return; // consumer dropped the stream
-                    }
-                }
-                let tail = live.finish();
-                if !tail.is_empty() {
-                    let _ = words_tx.send(tail);
-                }
-            })
-            .expect("spawn corti-live-asr thread");
+                run_worker(&mut live, audio_rx, &words_tx, &worker_state);
+                diagnose_terminal(&worker_state, &worker_dropped);
+            });
+        let worker = match worker {
+            Ok(worker) => Some(worker),
+            Err(_) => {
+                lock_state(&state).worker_failed();
+                diagnose_terminal(&state, &dropped);
+                None
+            }
+        };
         (
             LiveSink {
                 tx: audio_tx,
-                dropped: Arc::new(AtomicUsize::new(0)),
+                dropped: dropped.clone(),
             },
             LiveWordStream {
                 rx: words_rx,
-                worker: Some(worker),
+                worker,
+                completion: None,
+                state,
+                dropped,
             },
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::asr::{DecodedRegion, RegionDecoder};
+        use crate::live::Segmenter;
+        use corti_transcribe::decode::{DecodeErrorCategory, InputSpan, RegionStatus};
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        #[derive(Clone, Copy)]
+        enum Plan {
+            Complete,
+            Empty,
+            Failed,
+            Partial,
+            Panic,
+        }
+
+        struct Decoder {
+            plans: Vec<Plan>,
+            calls: Arc<AtomicUsize>,
+            block_first: Option<(
+                std::sync::mpsc::SyncSender<()>,
+                Mutex<std::sync::mpsc::Receiver<()>>,
+            )>,
+        }
+        impl RegionDecoder for Decoder {
+            fn decode(&self, pcm: &[f32], offset: f64) -> DecodedRegion {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == 1
+                    && let Some((started, release)) = &self.block_first
+                {
+                    started.send(()).unwrap();
+                    release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                let plan = self.plans.get(call - 1).copied().unwrap_or(Plan::Complete);
+                let status = match plan {
+                    Plan::Complete => RegionStatus::Complete,
+                    Plan::Empty => RegionStatus::RecognizedEmpty,
+                    Plan::Failed => RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+                    Plan::Partial => RegionStatus::Partial(DecodeErrorCategory::OutputTruncated),
+                    // The process's ordinary panic hook remains active. This marker is never logged
+                    // by the adapter's own terminal diagnostic.
+                    Plan::Panic => panic!("synthetic worker panic hook marker"),
+                };
+                let words = if matches!(plan, Plan::Empty | Plan::Failed) {
+                    vec![]
+                } else {
+                    vec![Word {
+                        start: offset,
+                        end: offset + pcm.len() as f64 / 16_000.0,
+                        text: format!("region {call}"),
+                    }]
+                };
+                DecodedRegion { words, status }
+            }
+        }
+
+        struct SegmenterFixture {
+            position: u64,
+            tail: bool,
+            pending: Option<(u64, Vec<f32>)>,
+            ready: VecDeque<(u64, Vec<f32>)>,
+            flushes: Arc<AtomicUsize>,
+        }
+        impl Segmenter for SegmenterFixture {
+            fn accept(&mut self, pcm: &[f32]) {
+                let region = (self.position, pcm.to_vec());
+                self.position += pcm.len() as u64;
+                if self.tail {
+                    if let Some(previous) = self.pending.replace(region) {
+                        self.ready.push_back(previous);
+                    }
+                } else {
+                    self.ready.push_back(region);
+                }
+            }
+            fn flush(&mut self) {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                if let Some(region) = self.pending.take() {
+                    self.ready.push_back(region);
+                }
+            }
+            fn reset(&mut self) {
+                self.position = 0;
+                self.pending = None;
+                self.ready.clear();
+            }
+            fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32])) {
+                while let Some((start, pcm)) = self.ready.pop_front() {
+                    visit(start, &pcm);
+                }
+            }
+        }
+
+        fn fixture(
+            plans: Vec<Plan>,
+            tail: bool,
+        ) -> (LiveTranscriber, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            fixture_with_block(plans, tail, None)
+        }
+        fn fixture_with_block(
+            plans: Vec<Plan>,
+            tail: bool,
+            block: Option<(
+                std::sync::mpsc::SyncSender<()>,
+                Mutex<std::sync::mpsc::Receiver<()>>,
+            )>,
+        ) -> (LiveTranscriber, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let live = LiveTranscriber::with_parts(
+                Arc::new(Decoder {
+                    plans,
+                    calls: calls.clone(),
+                    block_first: block,
+                }),
+                Box::new(SegmenterFixture {
+                    position: 0,
+                    tail,
+                    pending: None,
+                    ready: VecDeque::new(),
+                    flushes: flushes.clone(),
+                }),
+            );
+            (live, calls, flushes)
+        }
+
+        struct ThreadWake(std::thread::Thread);
+        impl std::task::Wake for ThreadWake {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        fn drain(stream: &mut LiveWordStream) -> Vec<Word> {
+            let waker = std::task::Waker::from(Arc::new(ThreadWake(std::thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut words = Vec::new();
+            loop {
+                match Pin::new(&mut *stream).poll_next(&mut cx) {
+                    Poll::Ready(Some(chunk)) => words.extend(chunk),
+                    Poll::Ready(None) => return words,
+                    Poll::Pending => {
+                        assert!(Instant::now() < deadline, "worker did not terminate");
+                        std::thread::park_timeout(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        fn run(live: LiveTranscriber, chunks: Vec<Vec<f32>>) -> (Vec<Word>, LiveWordStream) {
+            let (sink, mut stream) = live_word_stream(live);
+            assert!(stream.completion().is_none());
+            for pcm in chunks {
+                sink.push(pcm, 16_000);
+            }
+            assert_eq!(sink.dropped_chunks(), 0);
+            drop(sink);
+            let words = drain(&mut stream);
+            (words, stream)
+        }
+        fn expected(call: usize) -> Word {
+            Word {
+                start: (call - 1) as f64 * 512.0 / 16_000.0,
+                end: call as f64 * 512.0 / 16_000.0,
+                text: format!("region {call}"),
+            }
+        }
+        fn repeat_eof(stream: &mut LiveWordStream, diagnostics: usize) {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            for _ in 0..3 {
+                assert!(matches!(
+                    Pin::new(&mut *stream).poll_next(&mut cx),
+                    Poll::Ready(None)
+                ));
+                assert!(stream.completion().is_some());
+            }
+            assert_eq!(stream.diagnostic_count(), diagnostics);
+        }
+
+        #[test]
+        fn stream_middle_failure_retains_exact_neighbors_spans_and_terminal_status() {
+            let (live, calls, flushes) =
+                fixture(vec![Plan::Complete, Plan::Failed, Plan::Complete], false);
+            let (words, mut stream) = run(live, vec![vec![1.0; 512]; 3]);
+            assert_eq!(words, [expected(1), expected(3)]);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(flushes.load(Ordering::SeqCst), 1);
+            let completion = stream
+                .completion()
+                .expect("EOF must retain terminal decode facts");
+            assert!(!completion.decode_complete());
+            assert!(!completion.worker_failed());
+            assert_eq!(completion.dropped_chunks(), 0);
+            let outcomes = completion.decode_report().outcomes();
+            assert_eq!(outcomes.len(), 3);
+            assert_eq!(
+                outcomes[1].span,
+                InputSpan {
+                    start_frame: 512,
+                    end_frame: 1024
+                }
+            );
+            assert_eq!(
+                outcomes[1].status,
+                RegionStatus::Failed(DecodeErrorCategory::BackendFailure)
+            );
+            repeat_eof(&mut stream, 1);
+        }
+
+        #[test]
+        fn stream_partial_and_tail_failures_preserve_available_words_without_retry() {
+            for (plans, tail, wanted) in [
+                (
+                    vec![Plan::Complete, Plan::Partial, Plan::Complete],
+                    false,
+                    vec![expected(1), expected(2), expected(3)],
+                ),
+                (
+                    vec![Plan::Complete, Plan::Complete, Plan::Failed],
+                    true,
+                    vec![expected(1), expected(2)],
+                ),
+            ] {
+                let (live, calls, flushes) = fixture(plans, tail);
+                let (words, mut stream) = run(live, vec![vec![1.0; 1536]]);
+                assert_eq!(words, wanted);
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert_eq!(flushes.load(Ordering::SeqCst), 1);
+                let completion = stream.completion().expect("tail failure must survive EOF");
+                assert!(!completion.decode_complete());
+                assert!(!completion.worker_failed());
+                let lost = if tail { 2 } else { 1 };
+                assert_eq!(
+                    completion.decode_report().outcomes()[lost].span,
+                    InputSpan {
+                        start_frame: lost as u64 * 512,
+                        end_frame: (lost as u64 + 1) * 512
+                    }
+                );
+                repeat_eof(&mut stream, 1);
+            }
+        }
+
+        #[test]
+        fn stream_valid_empty_and_metadata_only_completion_remain_quiet() {
+            let (live, calls, _) =
+                fixture(vec![Plan::Complete, Plan::Empty, Plan::Complete], false);
+            let (words, mut stream) = run(live, vec![vec![1.0; 1536]]);
+            assert_eq!(words, [expected(1), expected(3)]);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            let completion = stream.completion().unwrap();
+            assert!(completion.decode_complete());
+            assert!(!completion.worker_failed());
+            assert_eq!(
+                completion.decode_report().outcomes()[1].status,
+                RegionStatus::RecognizedEmpty
+            );
+            repeat_eof(&mut stream, 0);
+
+            let (mut live, calls, _) = fixture(vec![Plan::Empty; 257], false);
+            live.push(&vec![0.0; 257 * 512], 16_000);
+            let (words, mut stream) = run(live, vec![]);
+            assert!(words.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 257);
+            let completion = stream.completion().unwrap();
+            assert!(completion.decode_complete());
+            assert_eq!(completion.decode_report().omitted_metadata(), 1);
+            assert_eq!(completion.decode_report().omitted_failures(), 0);
+            assert_eq!(completion.decode_report().outcomes().len(), 256);
+            repeat_eof(&mut stream, 0);
+        }
+
+        #[test]
+        fn stream_same_push_panic_preserves_pending_words_reports_and_known_loss() {
+            let (live, calls, flushes) =
+                fixture(vec![Plan::Complete, Plan::Failed, Plan::Panic], false);
+            let (words, mut stream) = run(live, vec![vec![1.0; 1536]]);
+            assert_eq!(
+                words,
+                [expected(1)],
+                "already decoded words must survive the same-call panic"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                flushes.load(Ordering::SeqCst),
+                0,
+                "do not resume/finish a panicked decoder"
+            );
+            let completion = stream.completion().unwrap();
+            assert!(!completion.decode_complete());
+            assert!(completion.worker_failed());
+            let failures: Vec<_> = completion
+                .decode_report()
+                .outcomes()
+                .iter()
+                .filter(|outcome| !outcome.status.is_complete())
+                .map(|outcome| outcome.span)
+                .collect();
+            assert_eq!(
+                failures,
+                [
+                    InputSpan {
+                        start_frame: 512,
+                        end_frame: 1024
+                    },
+                    InputSpan {
+                        start_frame: 1024,
+                        end_frame: 1536
+                    }
+                ]
+            );
+            repeat_eof(&mut stream, 1);
+        }
+
+        #[test]
+        fn stream_tail_panic_is_terminal_and_never_retries_the_backend() {
+            let (live, calls, flushes) =
+                fixture(vec![Plan::Complete, Plan::Complete, Plan::Panic], true);
+            let (words, mut stream) = run(live, vec![vec![1.0; 1536]]);
+            assert_eq!(words, [expected(1), expected(2)]);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(flushes.load(Ordering::SeqCst), 1);
+            let completion = stream.completion().unwrap();
+            assert!(completion.worker_failed());
+            assert!(!completion.decode_complete());
+            assert_eq!(
+                completion.decode_report().outcomes().last().unwrap().span,
+                InputSpan {
+                    start_frame: 1024,
+                    end_frame: 1536
+                }
+            );
+            repeat_eof(&mut stream, 1);
+        }
+
+        #[test]
+        fn stream_unhandled_worker_panic_keeps_known_facts_and_reports_join_failure() {
+            let state = Arc::new(Mutex::new(StreamState::default()));
+            let worker_state = state.clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let (words_tx, words_rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = std::thread::spawn(move || {
+                let mut state = lock_state(&worker_state);
+                state.report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 0,
+                        end_frame: 512,
+                    },
+                    status: RegionStatus::Complete,
+                });
+                state.input_frames = 1024;
+                state.last_reported_input_frame = 512;
+                words_tx.send(vec![expected(1)]).unwrap();
+                // Exercise join failure and poisoned-state recovery outside guarded native calls.
+                panic!("synthetic unhandled worker panic hook marker");
+            });
+            let mut stream = LiveWordStream {
+                rx: words_rx,
+                worker: Some(worker),
+                completion: None,
+                state,
+                dropped,
+            };
+            assert_eq!(drain(&mut stream), [expected(1)]);
+            let completion = stream.completion().unwrap();
+            assert!(completion.worker_failed());
+            assert!(!completion.decode_complete());
+            assert_eq!(completion.decode_report().outcomes().len(), 2);
+            assert_eq!(
+                completion.decode_report().outcomes()[0].status,
+                RegionStatus::Complete
+            );
+            assert_eq!(
+                completion.decode_report().outcomes()[1].span,
+                InputSpan {
+                    start_frame: 512,
+                    end_frame: 1024
+                }
+            );
+            repeat_eof(&mut stream, 1);
+        }
+
+        #[test]
+        fn stream_consumer_drop_stops_at_send_without_finish_or_extra_backend_calls() {
+            let (live, calls, flushes) = fixture(vec![Plan::Complete], false);
+            let (sink, mut stream) = live_word_stream(live);
+            let worker = stream.worker.take().unwrap();
+            drop(stream);
+            sink.push(vec![1.0; 512], 16_000);
+            worker.join().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(flushes.load(Ordering::SeqCst), 0);
+            sink.push(vec![1.0; 512], 16_000);
+            assert_eq!(
+                sink.dropped_chunks(),
+                1,
+                "disconnected sink retains its existing counter"
+            );
+        }
+
+        #[test]
+        fn stream_backlog_drops_are_visible_separately_from_admitted_decode_status() {
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let (live, calls, _) =
+                fixture_with_block(vec![], false, Some((started_tx, Mutex::new(release_rx))));
+            let (sink, mut stream) = live_word_stream(live);
+            sink.push(vec![1.0; 512], 16_000);
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            for _ in 0..AUDIO_BACKLOG {
+                sink.push(vec![1.0; 512], 16_000);
+            }
+            sink.push(vec![1.0; 512], 16_000);
+            assert_eq!(sink.dropped_chunks(), 1);
+            drop(sink);
+            release_tx.send(()).unwrap();
+            let words = drain(&mut stream);
+            assert_eq!(words.len(), AUDIO_BACKLOG + 1);
+            assert_eq!(calls.load(Ordering::SeqCst), AUDIO_BACKLOG + 1);
+            let completion = stream.completion().unwrap();
+            assert!(
+                completion.decode_complete(),
+                "only admitted input was decoded"
+            );
+            assert!(!completion.worker_failed());
+            assert_eq!(completion.dropped_chunks(), 1);
+            assert_eq!(completion.decode_report().omitted_failures(), 0);
+            assert_eq!(
+                completion
+                    .decode_report()
+                    .outcomes()
+                    .last()
+                    .unwrap()
+                    .span
+                    .end_frame,
+                (AUDIO_BACKLOG as u64 + 1) * 512
+            );
+            repeat_eof(&mut stream, 1);
+        }
+
+        #[test]
+        fn stream_report_merge_preserves_metadata_failure_priority_and_saturation() {
+            let mut plans = vec![Plan::Complete; 256];
+            plans.push(Plan::Failed);
+            let (mut live, calls, _) = fixture(plans, false);
+            live.push(&vec![1.0; 257 * 512], 16_000);
+            let (words, mut stream) = run(live, vec![vec![1.0; 512]]);
+            assert_eq!(words.len(), 257);
+            assert_eq!(calls.load(Ordering::SeqCst), 258);
+            let completion = stream.completion().unwrap();
+            assert!(!completion.decode_complete());
+            assert_eq!(completion.decode_report().outcomes().len(), 256);
+            assert_eq!(completion.decode_report().omitted_metadata(), 2);
+            assert_eq!(
+                completion
+                    .decode_report()
+                    .outcomes()
+                    .iter()
+                    .filter(|o| !o.status.is_complete())
+                    .count(),
+                1
+            );
+            repeat_eof(&mut stream, 1);
+
+            for failure in [false, true] {
+                let (mut live, calls, _) = fixture(vec![], false);
+                live.report.omit_metadata();
+                if failure {
+                    live.report.omit_failure();
+                }
+                for _ in 0..64 {
+                    live.report.merge(live.report.clone());
+                }
+                let (_, mut stream) = run(live, vec![]);
+                let completion = stream.completion().unwrap();
+                assert_eq!(completion.decode_complete(), !failure);
+                assert_eq!(completion.decode_report().omitted_metadata(), u64::MAX);
+                assert!(completion.decode_report().metadata_counter_saturated());
+                assert_eq!(
+                    completion.decode_report().omitted_failures(),
+                    if failure { u64::MAX } else { 0 }
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                repeat_eof(&mut stream, usize::from(failure));
+            }
+        }
     }
 }
 
 #[cfg(feature = "stream")]
-pub use stream::{LiveSink, LiveWordStream, live_word_stream};
+pub use stream::{LiveSink, LiveStreamCompletion, LiveWordStream, live_word_stream};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asr::DecodedRegion;
+    use corti_transcribe::decode::InputSpan;
     use sherpa_onnx::LinearResampler;
+
+    #[derive(Default)]
+    struct FakeSegmenter {
+        position: u64,
+        pending: Option<(u64, Vec<f32>)>,
+        completed: std::collections::VecDeque<(u64, Vec<f32>)>,
+        join: bool,
+    }
+
+    impl Segmenter for FakeSegmenter {
+        fn accept(&mut self, samples: &[f32]) {
+            if self.join
+                && let Some((_, pending)) = &mut self.pending
+            {
+                pending.extend_from_slice(samples);
+            } else {
+                if let Some(region) = self.pending.take() {
+                    self.completed.push_back(region);
+                }
+                self.pending = Some((self.position, samples.to_vec()));
+            }
+            self.position += samples.len() as u64;
+        }
+        fn flush(&mut self) {
+            if let Some(region) = self.pending.take() {
+                self.completed.push_back(region);
+            }
+        }
+        fn reset(&mut self) {
+            self.position = 0;
+            self.pending = None;
+            self.completed.clear();
+        }
+        fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32])) {
+            while let Some((start, samples)) = self.completed.pop_front() {
+                visit(start, &samples);
+            }
+        }
+    }
+
+    struct FakeDecoder {
+        fail: Option<usize>,
+        partial: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RegionDecoder for FakeDecoder {
+        fn decode(&self, samples: &[f32], offset: f64) -> DecodedRegion {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let blank = samples.iter().all(|sample| *sample == 0.0);
+            let failed = self.fail == Some(call);
+            let status = if failed && self.partial {
+                RegionStatus::Partial(DecodeErrorCategory::OutputTruncated)
+            } else if failed {
+                RegionStatus::Failed(DecodeErrorCategory::BackendFailure)
+            } else if blank {
+                RegionStatus::RecognizedEmpty
+            } else {
+                RegionStatus::Complete
+            };
+            let words = if (failed && !self.partial) || blank {
+                vec![]
+            } else {
+                vec![Word {
+                    start: offset,
+                    end: offset + samples.len() as f64 / 16_000.0,
+                    text: format!("region {call}"),
+                }]
+            };
+            DecodedRegion { words, status }
+        }
+    }
+
+    fn fake_live(fail: Option<usize>, partial: bool, join: bool) -> LiveTranscriber {
+        LiveTranscriber::with_parts(
+            Arc::new(FakeDecoder {
+                fail,
+                partial,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Box::new(FakeSegmenter {
+                join,
+                ..FakeSegmenter::default()
+            }),
+        )
+    }
+
+    #[test]
+    fn failed_middle_region_keeps_exact_neighbors_and_flush_tail() {
+        let samples = vec![1.0; VAD_WINDOW * 3];
+        let mut baseline = fake_live(None, false, false);
+        baseline.push(&samples, 16_000);
+        let expected = baseline.finish();
+        assert_eq!(expected.len(), 3);
+        let mut failed = fake_live(Some(2), false, false);
+        failed.push(&samples, 16_000);
+        let first = failed.poll_words().unwrap();
+        assert_eq!(first, expected[..1]);
+        let tail = failed.finish();
+        assert_eq!(tail, expected[2..]);
+        let report = failed.take_decode_report();
+        assert_eq!(
+            report.outcomes(),
+            &[
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 0,
+                        end_frame: 512
+                    },
+                    status: RegionStatus::Complete
+                },
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 512,
+                        end_frame: 1024
+                    },
+                    status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure)
+                },
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 1024,
+                        end_frame: 1536
+                    },
+                    status: RegionStatus::Complete
+                },
+            ]
+        );
+        assert!(!report.is_complete());
+        assert!(!failed.decode_complete());
+        assert!(failed.take_decode_report().is_complete());
+        assert!(!failed.decode_complete(), "draining cannot erase a failure");
+        assert!(failed.finish().is_empty());
+    }
+
+    #[test]
+    fn recognized_empty_and_partial_payload_remain_distinct() {
+        let mut empty = fake_live(None, false, false);
+        empty.push(&[0.0; VAD_WINDOW], 16_000);
+        assert!(empty.finish().is_empty());
+        assert!(empty.decode_complete());
+        assert_eq!(
+            empty.take_decode_report().outcomes()[0].status,
+            RegionStatus::RecognizedEmpty
+        );
+        for amplitude in [0.0, 1.0] {
+            let mut partial = fake_live(Some(1), true, false);
+            partial.push(&[amplitude; VAD_WINDOW], 16_000);
+            assert_eq!(partial.finish().len(), usize::from(amplitude != 0.0));
+            assert!(!partial.decode_complete());
+            assert_eq!(
+                partial.take_decode_report().outcomes()[0].status,
+                RegionStatus::Partial(DecodeErrorCategory::OutputTruncated)
+            );
+        }
+    }
+
+    #[test]
+    fn batch_and_live_reports_use_original_source_frames() {
+        let source = [1.0; VAD_WINDOW * 9];
+        let pcm = engine::resample_to_16k(&source, 48_000).unwrap();
+        let mut live = fake_live(Some(2), false, false);
+        live.push(&source, 48_000);
+        let live_words = live.finish();
+        let mut batch = fake_live(Some(2), false, false);
+        batch.push_resampled(&pcm, source.len(), 48_000);
+        assert_eq!(batch.finish(), live_words);
+        let expected = [
+            RegionOutcome {
+                span: InputSpan {
+                    start_frame: 0,
+                    end_frame: 1536,
+                },
+                status: RegionStatus::Complete,
+            },
+            RegionOutcome {
+                span: InputSpan {
+                    start_frame: 1536,
+                    end_frame: 3072,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            },
+            RegionOutcome {
+                span: InputSpan {
+                    start_frame: 3072,
+                    end_frame: 4608,
+                },
+                status: RegionStatus::Complete,
+            },
+        ];
+        assert_eq!(live.take_decode_report().outcomes(), &expected);
+        assert_eq!(batch.take_decode_report().outcomes(), &expected);
+        assert!(!batch.decode_complete());
+    }
+
+    #[test]
+    fn cap_eviction_records_metadata_with_per_push_report_drains() {
+        for amplitude in [0.0, 1.0] {
+            let mut live = fake_live(None, false, false);
+            let mut metadata = 0;
+            let mut outcomes = 0;
+            let mut words = Vec::new();
+            for index in 0..257 {
+                let rate = if index % 2 == 0 { 16_000 } else { 48_000 };
+                live.push(&vec![amplitude; 512 * rate as usize / 16_000], rate);
+                words.extend(live.poll_words().unwrap_or_default());
+                let report = live.take_decode_report();
+                assert!(report.is_complete());
+                assert_eq!(report.omitted_failures(), 0);
+                metadata += report.omitted_metadata();
+                outcomes += report.outcomes().len();
+            }
+            words.extend(live.finish());
+            let tail = live.take_decode_report();
+            metadata += tail.omitted_metadata();
+            outcomes += tail.outcomes().len();
+            assert!(tail.is_complete());
+            assert_eq!(metadata, 1, "one removed rate epoch is one metadata fact");
+            assert_eq!(outcomes, 257);
+            assert_eq!(words.len(), if amplitude == 0.0 { 0 } else { 257 });
+            if amplitude != 0.0 {
+                assert_eq!(words[0].start, 0.0);
+                assert_eq!(words.last().unwrap().end, 257.0 * 512.0 / 16_000.0);
+            }
+            assert!(live.decode_complete());
+            assert_eq!(live.take_decode_report().omitted_metadata(), 0);
+        }
+    }
+
+    #[test]
+    fn cap_evicted_long_success_keeps_words_and_counts_distinct_metadata_facts() {
+        for amplitude in [0.0, 1.0] {
+            let mut live = fake_live(None, false, true);
+            let mut metadata = 0;
+            for index in 0..257 {
+                let rate = if index % 2 == 0 { 16_000 } else { 48_000 };
+                live.push(&vec![amplitude; 16 * rate as usize / 16_000], rate);
+                let report = live.take_decode_report();
+                assert!(report.is_complete());
+                metadata += report.omitted_metadata();
+            }
+            let words = live.finish();
+            let report = live.take_decode_report();
+            assert!(
+                live.decode_complete(),
+                "mapping metadata loss is not failed decoding"
+            );
+            assert!(report.is_complete());
+            assert_eq!(report.omitted_failures(), 0);
+            assert_eq!(metadata, 1, "eviction is reported when it happens");
+            assert_eq!(
+                report.omitted_metadata(),
+                1,
+                "successful outcome lacks its exact source span"
+            );
+            assert!(report.outcomes().is_empty());
+            assert_eq!(words.len(), usize::from(amplitude != 0.0));
+            if amplitude != 0.0 {
+                assert_eq!(words[0].start, 0.0);
+                assert_eq!(words[0].end, 0.257);
+            }
+        }
+    }
+
+    #[test]
+    fn cap_evicted_failed_or_partial_region_still_has_processing_loss() {
+        for partial in [false, true] {
+            let mut live = fake_live(Some(1), partial, true);
+            for index in 0..257 {
+                let rate = if index % 2 == 0 { 16_000 } else { 48_000 };
+                live.push(&vec![1.0; 16 * rate as usize / 16_000], rate);
+            }
+            let words = live.finish();
+            let report = live.take_decode_report();
+            assert!(!live.decode_complete());
+            assert!(!report.is_complete());
+            assert_eq!(report.omitted_failures(), 1);
+            assert_eq!(
+                report.omitted_metadata(),
+                1,
+                "the earlier eviction remains independent"
+            );
+            assert_eq!(words.len(), usize::from(partial));
+            if partial {
+                assert_eq!((words[0].start, words[0].end), (0.0, 0.257));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_native_coordinates_never_decode_or_publish_fabricated_times() {
+        struct InvalidSegmenter {
+            start: u64,
+            pcm: Vec<f32>,
+        }
+        impl Segmenter for InvalidSegmenter {
+            fn accept(&mut self, samples: &[f32]) {
+                self.pcm.extend_from_slice(samples);
+            }
+            fn flush(&mut self) {}
+            fn reset(&mut self) {}
+            fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32])) {
+                if !self.pcm.is_empty() {
+                    visit(self.start, &std::mem::take(&mut self.pcm));
+                }
+            }
+        }
+        for (base, start) in [(0, u64::MAX), (0, u64::MAX - 8), (u64::MAX - 1, 2), (0, 1)] {
+            let decoder = Arc::new(FakeDecoder {
+                fail: None,
+                partial: false,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut live = LiveTranscriber::with_parts(
+                decoder.clone(),
+                Box::new(InvalidSegmenter { start, pcm: vec![] }),
+            );
+            live.vad_base_samples = base;
+            live.push(&[1.0; 512], 16_000);
+            let words = live.finish();
+            assert!(
+                words.is_empty(),
+                "invalid coordinates must not publish words: base={base}, start={start}"
+            );
+            assert_eq!(decoder.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(!live.decode_complete());
+            let report = live.take_decode_report();
+            assert_eq!(report.omitted_failures(), 1);
+            assert_eq!(report.omitted_metadata(), 0);
+        }
+    }
+
+    #[test]
+    fn resampler_failure_preserves_fractional_time_across_recovery_checkpoint_and_rate_change() {
+        for chunks in [vec![44_101], vec![1; 44_101], vec![13, 509, 43_579]] {
+            let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let factory_available = available.clone();
+            let mut live = fake_live(None, false, true);
+            live.resampler_factory = Box::new(move |rate| {
+                factory_available
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| Resampler::new(rate))
+                    .flatten()
+            });
+            // Valid pending VAD audio must be flushed before the missing chunk and never bridge it.
+            live.push(&[1.0; 123], 16_000);
+            for chunk in chunks {
+                live.push(&vec![1.0; chunk], 44_100);
+            }
+            assert_eq!(
+                live.checkpoint(),
+                vec![Word {
+                    start: 0.0,
+                    end: 123.0 / 16_000.0,
+                    text: "region 1".into()
+                }]
+            );
+            assert_eq!(live.win.fed, 16_123);
+            available.store(true, std::sync::atomic::Ordering::SeqCst);
+            live.push(&vec![1.0; 44_100], 44_100);
+            let recovered = live.checkpoint();
+            let recovered_start = 16_123.0 / 16_000.0 + 1.0 / 44_100.0;
+            assert_eq!(
+                recovered,
+                vec![Word {
+                    start: recovered_start,
+                    end: recovered_start + 1.0,
+                    text: "region 2".into()
+                }]
+            );
+            // A different-rate skip consumes the previous fractional remainder exactly.
+            available.store(false, std::sync::atomic::Ordering::SeqCst);
+            live.push(&[1.0; 2], 48_000);
+            assert_eq!(live.win.fed, 32_124);
+            let losses = live.take_decode_report();
+            assert!(!losses.is_complete());
+            assert!(losses.outcomes().iter().any(|outcome| outcome.status
+                == RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable)));
+            live.push(&[1.0; VAD_WINDOW], 16_000);
+            let final_start = 32_124.0 / 16_000.0 + 13.0 / (441.0 * 16_000.0);
+            assert_eq!(
+                live.finish(),
+                vec![Word {
+                    start: final_start,
+                    end: final_start + VAD_WINDOW as f64 / 16_000.0,
+                    text: "region 3".into()
+                }]
+            );
+            let report = live.take_decode_report();
+            assert!(report.is_complete());
+            assert!(!live.decode_complete());
+            assert_eq!(
+                report.outcomes(),
+                &[RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 88_326,
+                        end_frame: 88_838
+                    },
+                    status: RegionStatus::Complete,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn old_native_resampler_and_vad_tail_flush_before_failed_rate_switch() {
+        let mut live = fake_live(None, false, true);
+        live.resampler_factory = Box::new(|rate| {
+            if rate == 44_100 {
+                None
+            } else {
+                Resampler::new(rate)
+            }
+        });
+        live.push(&[1.0; 513], 48_000);
+        live.push(&vec![1.0; 44_100], 44_100);
+        assert_eq!(
+            live.poll_words().unwrap(),
+            vec![Word {
+                start: 0.0,
+                end: 171.0 / 16_000.0,
+                text: "region 1".into()
+            }]
+        );
+        live.push(&[1.0; 512], 16_000);
+        assert_eq!(
+            live.finish(),
+            vec![Word {
+                start: 16_171.0 / 16_000.0,
+                end: 16_171.0 / 16_000.0 + 512.0 / 16_000.0,
+                text: "region 2".into()
+            }]
+        );
+        assert_eq!(
+            live.take_decode_report().outcomes(),
+            &[
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 0,
+                        end_frame: 513
+                    },
+                    status: RegionStatus::Complete
+                },
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 513,
+                        end_frame: 44_613
+                    },
+                    status: RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable)
+                },
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 44_613,
+                        end_frame: 45_125
+                    },
+                    status: RegionStatus::Complete
+                },
+            ]
+        );
+        assert!(!live.decode_complete());
+    }
+
+    #[test]
+    fn fractional_skipped_duration_is_visible_immediately_without_a_later_clock_jump() {
+        let mut live = fake_live(None, false, true);
+        live.resampler_factory = Box::new(|_| None);
+        live.push(&[1.0], 44_100);
+        live.push(&[1.0; 512], 16_000);
+        let first_start = 1.0 / 44_100.0;
+        assert_eq!(
+            live.checkpoint(),
+            vec![Word {
+                start: first_start,
+                end: first_start + 512.0 / 16_000.0,
+                text: "region 1".into()
+            }]
+        );
+        live.push(&[1.0; 512], 16_000);
+        let second_start = 512.0 / 16_000.0 + first_start;
+        assert_eq!(
+            live.checkpoint(),
+            vec![Word {
+                start: second_start,
+                end: second_start + 512.0 / 16_000.0,
+                text: "region 2".into()
+            }]
+        );
+        live.push(&[1.0; 2], 48_000);
+        live.push(&[1.0; 512], 16_000);
+        let third_start = 1025.0 / 16_000.0 + 13.0 / (441.0 * 16_000.0);
+        assert_eq!(
+            live.finish(),
+            vec![Word {
+                start: third_start,
+                end: third_start + 512.0 / 16_000.0,
+                text: "region 3".into()
+            }]
+        );
+        let report = live.take_decode_report();
+        assert_eq!(
+            report.outcomes()[1].span,
+            InputSpan {
+                start_frame: 1,
+                end_frame: 513
+            }
+        );
+        assert_eq!(
+            report.outcomes()[4].span,
+            InputSpan {
+                start_frame: 1027,
+                end_frame: 1539
+            }
+        );
+        assert!(!live.decode_complete());
+    }
+
+    #[test]
+    fn unavailable_clock_cannot_emit_later_words_at_compressed_timestamps() {
+        // Invalid rate and a deliberately unrepresentable reduced denominator both fail closed.
+        for rates in [
+            vec![0],
+            vec![
+                1_000_000_007,
+                1_000_000_009,
+                1_000_000_021,
+                1_000_000_033,
+                1_000_000_087,
+            ],
+        ] {
+            let mut live = fake_live(None, false, true);
+            live.resampler_factory = Box::new(|_| None);
+            live.push(&[1.0; 123], 16_000);
+            for rate in &rates {
+                live.push(&[1.0], *rate);
+            }
+            assert!(!live.clock_available);
+            assert_eq!(
+                live.poll_words().unwrap(),
+                vec![Word {
+                    start: 0.0,
+                    end: 123.0 / 16_000.0,
+                    text: "region 1".into(),
+                }]
+            );
+            live.push(&[1.0; 512], 16_000);
+            assert!(live.finish().is_empty());
+            assert_eq!(live.input_clock.frames, 635 + rates.len() as u64);
+            let report = live.take_decode_report();
+            assert!(!report.is_complete());
+            assert_eq!(
+                report.outcomes()[0],
+                RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 0,
+                        end_frame: 123
+                    },
+                    status: RegionStatus::Complete,
+                }
+            );
+            assert_eq!(report.omitted_failures(), 2);
+            assert!(!live.decode_complete());
+        }
+    }
 
     fn verify_engine(dir: &std::path::Path) -> (crate::models::Models, Arc<Asr>) {
         let engine = std::env::var("CORTI_VERIFY_ASR_ENGINE").unwrap_or_else(|_| "sherpa".into());
@@ -485,6 +1932,129 @@ mod tests {
             interleaved.iter().step_by(channels).copied().collect(),
             spec.sample_rate,
         )
+    }
+
+    struct NativeDecodeReceipt {
+        offset: f64,
+        pcm: Vec<u32>,
+        words: Vec<Word>,
+    }
+
+    struct WrappedNativeDecoder {
+        native: Arc<Asr>,
+        fail_middle: bool,
+        receipts: std::sync::Mutex<Vec<NativeDecodeReceipt>>,
+    }
+
+    impl RegionDecoder for WrappedNativeDecoder {
+        fn decode(&self, samples: &[f32], offset: f64) -> DecodedRegion {
+            let mut receipts = self.receipts.lock().unwrap();
+            let decoded = if self.fail_middle && receipts.len() == 1 {
+                DecodedRegion {
+                    words: vec![],
+                    status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+                }
+            } else {
+                self.native.decode(samples, offset)
+            };
+            receipts.push(NativeDecodeReceipt {
+                offset,
+                pcm: samples.iter().map(|v| v.to_bits()).collect(),
+                words: decoded.words.clone(),
+            });
+            decoded
+        }
+    }
+
+    #[test]
+    #[ignore = "needs pinned ASR/VAD models and authored say fixture; real Metal required for ggml"]
+    fn native_middle_region_failure_preserves_exact_neighbors() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("CORTI_VERIFY_MODEL_DIR").expect("model directory"),
+        );
+        let (mono, rate) = verify_audio();
+        let (models, rec) = verify_engine(&dir);
+        assert!(
+            mono.len() < rate as usize * 18,
+            "authored utterance must fit one VAD region"
+        );
+        // Reuse only the authored synthetic fixture, with a two-second separating pause.
+        let mut three = Vec::new();
+        for _ in 0..3 {
+            three.extend_from_slice(&mono);
+            three.resize(three.len() + rate as usize * 2, 0.0);
+        }
+        let baseline = Arc::new(WrappedNativeDecoder {
+            native: rec.clone(),
+            fail_middle: false,
+            receipts: std::sync::Mutex::new(vec![]),
+        });
+        let mut live = LiveTranscriber::with_parts(
+            baseline.clone(),
+            Box::new(engine::build_vad(&models, 0.5, 1.0).expect("baseline VAD")),
+        );
+        live.push(&three, rate);
+        let baseline_words = live.finish();
+        assert!(live.decode_complete());
+        let baseline_report = live.take_decode_report();
+        let expected = baseline.receipts.lock().unwrap();
+        assert_eq!(
+            expected.len(),
+            3,
+            "fixture must produce exactly three regions"
+        );
+        assert!(expected.iter().all(|region| !region.words.is_empty()));
+        assert_eq!(
+            baseline_words,
+            expected
+                .iter()
+                .flat_map(|region| region.words.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let injected = Arc::new(WrappedNativeDecoder {
+            native: rec,
+            fail_middle: true,
+            receipts: std::sync::Mutex::new(vec![]),
+        });
+        let mut live = LiveTranscriber::with_parts(
+            injected.clone(),
+            Box::new(engine::build_vad(&models, 0.5, 1.0).expect("injected VAD")),
+        );
+        live.push(&three, rate);
+        let surviving = live.finish();
+        let actual = injected.receipts.lock().unwrap();
+        assert_eq!(actual.len(), 3);
+        for (baseline, injected) in expected.iter().zip(actual.iter()) {
+            assert_eq!(baseline.offset, injected.offset);
+            assert_eq!(
+                baseline.pcm, injected.pcm,
+                "region PCM identity must not change"
+            );
+        }
+        assert_eq!(actual[0].words, expected[0].words);
+        assert_eq!(actual[2].words, expected[2].words);
+        assert!(actual[1].words.is_empty());
+        assert_eq!(
+            surviving,
+            [expected[0].words.clone(), expected[2].words.clone()].concat()
+        );
+        let report = live.take_decode_report();
+        assert_eq!(report.outcomes().len(), 3);
+        assert_eq!(report.outcomes()[0], baseline_report.outcomes()[0]);
+        assert_eq!(report.outcomes()[2], baseline_report.outcomes()[2]);
+        assert_eq!(
+            report.outcomes()[1],
+            RegionOutcome {
+                span: baseline_report.outcomes()[1].span,
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure)
+            }
+        );
+        assert!(!report.is_complete());
+        assert!(!live.decode_complete());
+        eprintln!(
+            "NATIVE_DECODE_FAILURE regions=3 failed=2 exact_neighbor_words=true exact_pcm=true rate={rate}"
+        );
     }
 
     // Diagnostics for the unchanged exact native equality gate. These helpers run only after a

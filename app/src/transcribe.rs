@@ -1,4 +1,4 @@
-//! Backend selection: turn a recording into a [`DiarizedTranscript`].
+//! Backend selection: turn a recording into a [`corti_core::DiarizedTranscript`].
 //!
 //! Both backends (`aws`, `local`) can be compiled in; which one runs is chosen at **runtime** from config
 //! ([`AppConfig::transcribe_backend`], env `CORTI_TRANSCRIBE_BACKEND`) behind the single
@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use corti_core::{DiarizedTranscript, RecordingMeta};
+use corti_core::RecordingMeta;
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
@@ -25,6 +25,8 @@ pub struct Backend {
 
 /// The concrete backend resolved at runtime among the compiled-in features.
 enum BackendKind {
+    #[cfg(test)]
+    Scripted(Box<ScriptedDecode>),
     /// AWS Transcribe. Holds the SDK config (credential chain resolved once); `None` if it failed.
     /// Boxed: `SdkConfig` is large and would bloat the whole enum otherwise.
     #[cfg(feature = "aws")]
@@ -36,7 +38,23 @@ enum BackendKind {
     Unavailable(&'static str),
 }
 
+#[cfg(test)]
+type ScriptedDecode = dyn Fn(
+        &Path,
+        &RecordingMeta,
+        &corti_core::QualityRecord,
+    ) -> Result<corti_transcribe::TranscriptionOutcome>
+    + Send
+    + Sync;
+
 impl Backend {
+    #[cfg(test)]
+    pub(crate) fn scripted(cfg: AppConfig, decode: Box<ScriptedDecode>) -> Self {
+        Self {
+            cfg,
+            kind: BackendKind::Scripted(decode),
+        }
+    }
     pub(crate) fn identity(&self) -> FirstAsrBackend {
         match self.cfg.transcribe_backend {
             BackendChoice::Local => FirstAsrBackend::Local,
@@ -70,6 +88,8 @@ impl Backend {
     /// rows. A build with neither backend compiled in answers `false` and never gets that far anyway.
     pub fn audio_evidence_supported(&self) -> bool {
         match &self.kind {
+            #[cfg(test)]
+            BackendKind::Scripted(_) => false,
             #[cfg(feature = "aws")]
             BackendKind::Aws(_) => false,
             #[cfg(feature = "local")]
@@ -100,19 +120,24 @@ impl Backend {
     /// Transcribe a recording into a diarized transcript using the runtime-selected backend. The durable
     /// pipeline supplies the stable name persisted on the recording row so retries reattach; explicit CLI
     /// runs pass `None` so `--redo --aws` always creates a fresh AWS attempt.
-    pub fn transcribe(
+    pub fn transcribe_with_quality(
         &self,
         aws_job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
-    ) -> Result<DiarizedTranscript> {
+        quality: &corti_core::QualityRecord,
+    ) -> Result<corti_transcribe::TranscriptionOutcome> {
         // The job name is only used by the AWS arm; keep it referenced for builds without that feature.
-        let _ = aws_job_name;
+        let _ = (aws_job_name, quality);
         match &self.kind {
+            #[cfg(test)]
+            BackendKind::Scripted(decode) => decode(audio, meta, quality),
             #[cfg(feature = "aws")]
-            BackendKind::Aws(sdk) => self.transcribe_aws(sdk.as_deref(), aws_job_name, audio, meta),
+            BackendKind::Aws(sdk) => {
+                self.transcribe_aws(sdk.as_deref(), aws_job_name, audio, meta, quality)
+            }
             #[cfg(feature = "local")]
-            BackendKind::Local => self.transcribe_local(audio, meta),
+            BackendKind::Local => self.transcribe_local(audio, meta, quality),
             BackendKind::Unavailable(reason) => anyhow::bail!("{reason}"),
         }
     }
@@ -124,7 +149,8 @@ impl Backend {
         job_name: Option<&str>,
         audio: &Path,
         meta: &RecordingMeta,
-    ) -> Result<DiarizedTranscript> {
+        quality: &corti_core::QualityRecord,
+    ) -> Result<corti_transcribe::TranscriptionOutcome> {
         use anyhow::Context;
         use corti_transcribe::Transcriber;
         use corti_transcribe_aws::{AwsOptions, AwsTranscriber};
@@ -143,7 +169,7 @@ impl Backend {
             language: self.cfg.language.clone(),
             ..AwsOptions::new(bucket)
         };
-        AwsTranscriber::new(sdk, opts).transcribe(audio, meta)
+        AwsTranscriber::new(sdk, opts).transcribe_with_quality(audio, meta, quality)
     }
 
     /// Describe the exact cloud staging a durable attempt will own. The pipeline persists this before the
@@ -151,6 +177,8 @@ impl Backend {
     pub fn aws_staging_for_attempt(&self, job_name: &str) -> Result<Option<AwsStaging>> {
         let _ = job_name;
         match &self.kind {
+            #[cfg(test)]
+            BackendKind::Scripted(_) => Ok(None),
             #[cfg(feature = "aws")]
             BackendKind::Aws(sdk) => {
                 use anyhow::Context;
@@ -204,7 +232,12 @@ impl Backend {
     }
 
     #[cfg(feature = "local")]
-    fn transcribe_local(&self, audio: &Path, meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+    fn transcribe_local(
+        &self,
+        audio: &Path,
+        meta: &RecordingMeta,
+        quality: &corti_core::QualityRecord,
+    ) -> Result<corti_transcribe::TranscriptionOutcome> {
         use corti_transcribe::Transcriber;
         use corti_transcribe_local::{LocalConfig, LocalTranscriber};
 
@@ -220,7 +253,7 @@ impl Backend {
             // shipping constants; the app keeps them at default until a tuned default is adopted.
             ..LocalConfig::default()
         };
-        LocalTranscriber::new(cfg).transcribe(audio, meta)
+        LocalTranscriber::new(cfg).transcribe_with_quality(audio, meta, quality)
     }
 }
 
@@ -470,7 +503,8 @@ pub(crate) fn load_recording_quality(
 }
 
 /// Retain known history before deleting transient carriers. Legacy audio with no quality facts keeps
-/// its existing behavior; a missing/corrupt authority must never be manufactured or promoted here.
+/// its existing behavior; an absent authority can retain history only as explicitly legacy-unknown
+/// storage. Neither that history nor a malformed existing envelope establishes capture authority.
 pub(crate) fn persist_recording_quality(
     id: &str,
     audio: &Path,
@@ -604,7 +638,7 @@ fn load_aec_block_stats(path: &Path) -> Option<Vec<corti_aec::BlockStats>> {
 /// Optionally run the file-to-file AEC pass, then transcribe with the runtime-selected `backend`. This is
 /// the tray-free, queue-free transcription core shared by the pipeline worker
 /// ([`crate::pipeline::transcribe_and_file`]) and the `--redo`/`--input` CLI ([`crate::cli`]). Returns the
-/// transcript plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
+/// transcript/decode quality outcome plus the audio path actually fed to the backend (the cleaned WAV when AEC ran, else the raw
 /// input) for logging, and whether the cleanup had per-block AEC statistics to work from. Persisting any
 /// transcript sidecar is a caller's concern, not this primitive's.
 ///
@@ -618,7 +652,12 @@ pub fn transcribe_recording(
     attempt: TranscriptionAttempt<'_>,
     meta: &RecordingMeta,
     raw_audio: &Path,
-) -> Result<(DiarizedTranscript, PathBuf, OfflineAecOutcome, bool)> {
+) -> Result<(
+    corti_transcribe::TranscriptionOutcome,
+    PathBuf,
+    OfflineAecOutcome,
+    bool,
+)> {
     // Clean speaker bleed on disk before transcription (backend-agnostic). The input file is never
     // touched. A tap-only ("webinar") recording has no mic track, so AEC is skipped deliberately (not an
     // error); a genuine AEC failure falls back to the raw recording so the pipeline never stalls.
@@ -671,7 +710,14 @@ pub fn transcribe_recording(
         (raw_audio.to_path_buf(), OfflineAecOutcome::NotRequested)
     };
 
-    let mut transcript = backend.transcribe(attempt.aws_job_name, &input, meta)?;
+    let unknown = corti_core::QualityRecord::default();
+    let mut outcome = backend.transcribe_with_quality(
+        attempt.aws_job_name,
+        &input,
+        meta,
+        attempt.quality.unwrap_or(&unknown),
+    )?;
+    let transcript = &mut outcome.transcript;
 
     // Deterministic segment cleanup (#149) on the merged timeline the backend returned — the one place
     // where the two channels can see each other. This covers local, AWS and `corti --input`, and runs
@@ -689,7 +735,11 @@ pub fn transcribe_recording(
     let cleanup_cfg = backend.cleanup_config();
     // The learned lexicon is the last pass (`corti --review` grows it); it runs even when every
     // structural knob is off, so a hand-disabled cleanup still applies the owner's corrections.
-    let lexicon = crate::lexicon::load_compiled();
+    let lexicon = match &backend.kind {
+        #[cfg(test)]
+        BackendKind::Scripted(_) => None,
+        _ => crate::lexicon::load_compiled(),
+    };
     if !cleanup_cfg.is_noop() || lexicon.is_some() {
         let segments_in = transcript.segments.len();
         let segments_taken = std::mem::take(&mut transcript.segments);
@@ -723,7 +773,7 @@ pub fn transcribe_recording(
         );
     }
 
-    Ok((transcript, input, aec_outcome, audio_evidence))
+    Ok((outcome, input, aec_outcome, audio_evidence))
 }
 
 /// Whether an env var is set and non-empty (after trim) — the conventional "this is configured" test, and
@@ -794,6 +844,99 @@ fn build_sdk_config_for_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_recording_path_invokes_scripted_backend_once_and_keeps_partial_output() {
+        use corti_core::{
+            DiarizedTranscript, OwningApp, QualityCause, QualityClass, QualityResolution,
+            QualityStage, QualityTrack, Speaker, TranscriptSegment,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let expected = DiarizedTranscript::new(vec![TranscriptSegment {
+            speaker: Speaker::Me,
+            start: 1.25,
+            end: 1.75,
+            text: "Synthetic surviving batch region.".into(),
+        }]);
+        let returned = expected.clone();
+        let backend = Backend::scripted(
+            AppConfig {
+                transcribe_backend: BackendChoice::Local,
+                aec_enabled: false,
+                ..Default::default()
+            },
+            Box::new(move |_, _, quality| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut quality = quality.clone();
+                corti_core::insert_retained_processing_loss(
+                    &mut quality,
+                    16,
+                    32,
+                    QualityTrack::Mic,
+                    QualityCause::DecodeFailure,
+                    QualityStage::Batch,
+                )?;
+                Ok(corti_transcribe::TranscriptionOutcome {
+                    transcript: returned.clone(),
+                    quality,
+                    decode_complete: false,
+                })
+            }),
+        );
+        let mut quality = corti_core::QualityRecord::observed();
+        quality
+            .insert_epoch(corti_core::CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: corti_core::CaptureEpochReason::Start,
+            })
+            .unwrap();
+        let audio = PathBuf::from("/synthetic-quality-test/recording.wav");
+        let meta = RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: OwningApp::unknown(),
+            audio_path: audio.clone(),
+        };
+        let (outcome, used, aec, evidence) = transcribe_recording(
+            &backend,
+            None,
+            TranscriptionAttempt::fresh("synthetic").with_quality(&quality),
+            &meta,
+            &audio,
+        )
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "production recording and backend dispatch must invoke ASR once"
+        );
+        assert_eq!(outcome.transcript, expected);
+        assert!(!outcome.decode_complete);
+        assert_eq!(used, audio);
+        assert_eq!(aec, OfflineAecOutcome::NotRequested);
+        assert!(!evidence);
+        assert!(
+            quality.spans.is_empty(),
+            "immutable capture input stays unchanged"
+        );
+        let span = outcome.quality.spans[0];
+        assert_eq!((span.start_frame, span.end_frame), (16, 32));
+        assert_eq!(span.stage, QualityStage::Batch);
+        assert_eq!(span.class, QualityClass::ProcessingLoss);
+        assert_eq!(span.resolution, QualityResolution::Outstanding);
+    }
 
     #[test]
     fn retry_backend_guard_precedes_audio_and_text_egress() {

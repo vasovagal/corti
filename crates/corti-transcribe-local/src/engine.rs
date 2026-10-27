@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use corti_transcribe::decode::{DecodeErrorCategory, RegionStatus};
 use corti_transcribe::segment::{SpeakerTurn, Word};
 use sherpa_onnx::{
     FastClusteringConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
@@ -20,6 +21,7 @@ use sherpa_onnx::{
     SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
 };
 
+use crate::asr::DecodedRegion;
 use crate::live::LiveTranscriber;
 use crate::models::Models;
 use crate::resample::Resampler;
@@ -194,6 +196,7 @@ pub fn build_diarizer(
 /// (one stateful VAD per channel); `rec` is shared across both channels via the `Arc`.
 ///
 /// [`LiveTranscriber`]: crate::LiveTranscriber
+#[cfg(test)]
 pub fn transcribe_channel(
     rec: Arc<crate::Asr>,
     vad: VoiceActivityDetector,
@@ -203,6 +206,20 @@ pub fn transcribe_channel(
     // The channel is already at 16 kHz (the caller resampled), so `push` does no resampling.
     live.push(samples_16k, TARGET_RATE as u32);
     live.finish()
+}
+
+pub(crate) fn transcribe_resampled_channel(
+    rec: Arc<crate::Asr>,
+    vad: VoiceActivityDetector,
+    samples_16k: &[f32],
+    source_frames: usize,
+    source_rate: u32,
+) -> (Vec<Word>, corti_transcribe::decode::DecodeReport, bool) {
+    let mut live = LiveTranscriber::new(rec, vad);
+    live.push_resampled(samples_16k, source_frames, source_rate);
+    let words = live.finish();
+    let complete = live.decode_complete();
+    (words, live.take_decode_report(), complete)
 }
 
 /// Run far-end diarization on a 16 kHz mono channel → time-ordered speaker turns labelled `Them N`.
@@ -226,18 +243,49 @@ pub(crate) fn asr_segment(
     rec: &OfflineRecognizer,
     samples_16k: &[f32],
     offset_sec: f64,
-) -> Vec<Word> {
+) -> DecodedRegion {
     let stream = rec.create_stream();
     stream.accept_waveform(TARGET_RATE, samples_16k);
     rec.decode(&stream);
-    match stream.get_result() {
-        Some(r) => tokens_to_words(
-            &r.tokens,
-            r.timestamps.as_deref(),
-            r.durations.as_deref(),
-            offset_sec,
-        ),
-        None => Vec::new(),
+    sherpa_result(stream.get_result(), offset_sec)
+}
+
+fn sherpa_result(
+    result: Option<sherpa_onnx::OfflineRecognizerResult>,
+    offset_sec: f64,
+) -> DecodedRegion {
+    match result {
+        Some(r) => {
+            let mut words = tokens_to_words(
+                &r.tokens,
+                r.timestamps.as_deref(),
+                r.durations.as_deref(),
+                offset_sec,
+            );
+            let count = words.len();
+            words.retain(|word| {
+                word.start.is_finite()
+                    && word.end.is_finite()
+                    && word.start >= offset_sec
+                    && word.end >= word.start
+            });
+            let has_text = !r.text.trim().is_empty()
+                || r.tokens
+                    .iter()
+                    .any(|token| !token.replace('\u{2581}', " ").trim().is_empty());
+            let status = if words.len() != count || (has_text && words.is_empty()) {
+                RegionStatus::Partial(DecodeErrorCategory::UnmappableResult)
+            } else if words.is_empty() {
+                RegionStatus::RecognizedEmpty
+            } else {
+                RegionStatus::Complete
+            };
+            DecodedRegion { words, status }
+        }
+        None => DecodedRegion {
+            words: Vec::new(),
+            status: RegionStatus::Failed(DecodeErrorCategory::NoResult),
+        },
     }
 }
 
@@ -307,6 +355,38 @@ mod tests {
 
     fn toks(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sherpa_missing_result_is_failure_but_valid_blank_is_complete() {
+        assert_eq!(
+            sherpa_result(None, 0.0).status,
+            RegionStatus::Failed(DecodeErrorCategory::NoResult)
+        );
+        let blank = sherpa_result(
+            Some(sherpa_onnx::OfflineRecognizerResult {
+                text: " ".into(),
+                tokens: vec![],
+                timestamps: None,
+                durations: None,
+            }),
+            0.0,
+        );
+        assert_eq!(blank.status, RegionStatus::RecognizedEmpty);
+        assert!(blank.words.is_empty());
+        let unmapped = sherpa_result(
+            Some(sherpa_onnx::OfflineRecognizerResult {
+                text: "synthetic speech".into(),
+                tokens: vec![],
+                timestamps: None,
+                durations: None,
+            }),
+            0.0,
+        );
+        assert_eq!(
+            unmapped.status,
+            RegionStatus::Partial(DecodeErrorCategory::UnmappableResult)
+        );
     }
 
     #[test]
