@@ -119,7 +119,7 @@ jobs:
           if-no-files-found: warn
 
   capture_preflight:
-    name: Capture preflight 0d4260015294a2810c26b98fe36c7c39fca8b9fa
+    name: Capture preflight a1943310261ccea5f69bfe0f5347e0a423eb0cbb
     runs-on: macos-26
     timeout-minutes: 60
     # Temporary, exact-candidate validation before the capture implementation enters PR history.
@@ -127,11 +127,11 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: 0d4260015294a2810c26b98fe36c7c39fca8b9fa
+          ref: a1943310261ccea5f69bfe0f5347e0a423eb0cbb
       - name: Identify the exact WIP candidate
         run: |
-          test "$(git rev-parse HEAD)" = "0d4260015294a2810c26b98fe36c7c39fca8b9fa"
-          printf '%s\n' 'Capture preflight tests WIP `0d4260015294a2810c26b98fe36c7c39fca8b9fa`; this is separate from the PR head and per-commit results.' >> "$GITHUB_STEP_SUMMARY"
+          test "$(git rev-parse HEAD)" = "a1943310261ccea5f69bfe0f5347e0a423eb0cbb"
+          printf '%s\n' 'Capture preflight tests WIP `a1943310261ccea5f69bfe0f5347e0a423eb0cbb`; this is separate from the PR head and per-commit results.' >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/rust-setup
         with:
           components: clippy rustfmt
@@ -187,6 +187,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: quality-preflight-0d4260015294a2810c26b98fe36c7c39fca8b9fa
+          name: quality-preflight-a1943310261ccea5f69bfe0f5347e0a423eb0cbb
           path: ${{ runner.temp }}/quality-preflight-results
           if-no-files-found: warn
