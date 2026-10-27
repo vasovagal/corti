@@ -242,7 +242,8 @@ pub(crate) fn asr_segment(
 }
 
 /// Reassemble Parakeet sentencepiece tokens into whole [`Word`]s. A new word starts at a token prefixed
-/// with the sentencepiece word-boundary marker `▁` (U+2581); the marker becomes a space. Token timestamps
+/// with the sentencepiece word-boundary marker `▁` (U+2581), or the leading ASCII space sherpa uses after
+/// normalizing that marker. Token timestamps
 /// (relative to the segment) are shifted by `offset_sec`; a word's end is the last token's start + its
 /// duration. Pure (no sherpa types) so it is unit-tested directly.
 pub fn tokens_to_words(
@@ -262,7 +263,7 @@ pub fn tokens_to_words(
         let end = start + dur.get(i).copied().unwrap_or(0.0) as f64;
         let piece = tok.replace(WORD_BOUNDARY, " ");
 
-        if tok.starts_with(WORD_BOUNDARY) {
+        if tok.starts_with(WORD_BOUNDARY) || tok.starts_with(' ') {
             if let Some(w) = cur.take() {
                 push_word(&mut words, w);
             }
@@ -389,6 +390,86 @@ mod tests {
         assert_eq!(words[1].text, "world");
         assert!((words[1].start - 0.5).abs() < 1e-6);
         assert!((words[1].end - 0.8).abs() < 1e-6); // 0.6 + 0.2
+    }
+
+    #[test]
+    fn normalized_ascii_boundaries_preserve_words_punctuation_and_times() {
+        let normalized = toks(&[" Hel", "lo", ",", " wor", "ld", "!"]);
+        let original = toks(&["▁Hel", "lo", ",", "▁wor", "ld", "!"]);
+        let timestamps = [0.0, 0.125, 0.25, 0.5, 0.625, 0.75];
+        let durations = [0.125; 6];
+        let expected = vec![
+            Word {
+                start: 10.0,
+                end: 10.375,
+                text: "Hello,".into(),
+            },
+            Word {
+                start: 10.5,
+                end: 10.875,
+                text: "world!".into(),
+            },
+        ];
+        for tokens in [&normalized, &original] {
+            assert_eq!(
+                tokens_to_words(tokens, Some(&timestamps), Some(&durations), 10.0),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_boundaries_preserve_separator_only_timing_and_content() {
+        let tokens = toks(&["Hi", " ", " ", "there", "!", "▁again", " "]);
+        let timestamps = [0.0, 0.125, 0.25, 0.375, 0.5, 0.75, 0.875];
+        let durations = [0.125; 7];
+        assert_eq!(
+            tokens_to_words(&tokens, Some(&timestamps), Some(&durations), 5.0),
+            vec![
+                Word {
+                    start: 5.0,
+                    end: 5.125,
+                    text: "Hi".into(),
+                },
+                Word {
+                    // Preserve the existing standalone-marker rule: the last empty boundary supplies
+                    // the start, and subsequent subwords/punctuation supply the end.
+                    start: 5.25,
+                    end: 5.625,
+                    text: "there!".into(),
+                },
+                Word {
+                    start: 5.75,
+                    end: 5.875,
+                    text: "again".into(),
+                },
+            ]
+        );
+        assert!(tokens_to_words(&toks(&[" ", " ", "▁"]), None, None, 5.0).is_empty());
+    }
+
+    #[test]
+    fn normalized_boundaries_keep_legacy_missing_timestamp_and_duration_rules() {
+        let normalized = toks(&[" Hel", "lo", " world"]);
+        let original = toks(&["▁Hel", "lo", "▁world"]);
+        let timestamps = [0.25];
+        let durations = [0.125, 0.25];
+        for (ts, dur) in [
+            (None, None),
+            (Some(timestamps.as_slice()), None),
+            (None, Some(durations.as_slice())),
+            (Some(timestamps.as_slice()), Some(durations.as_slice())),
+        ] {
+            let words = tokens_to_words(&normalized, ts, dur, 10.0);
+            assert_eq!(words, tokens_to_words(&original, ts, dur, 10.0));
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[0].text, "Hello");
+            assert_eq!(words[1].text, "world");
+            assert_eq!(words[0].start, if ts.is_some() { 10.25 } else { 10.0 });
+            assert_eq!(words[0].end, if dur.is_some() { 10.25 } else { 10.0 });
+            assert_eq!(words[1].start, 10.0);
+            assert_eq!(words[1].end, 10.0);
+        }
     }
 
     #[test]
