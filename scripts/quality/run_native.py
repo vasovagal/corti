@@ -29,9 +29,12 @@ def main():
                CORTI_VERIFY_WAV=str(Path(first["path"]).resolve()),
                CORTI_VERIFY_METAL_RESULT=str(result_path.resolve()))
     results = []
+    resample_comparison = []
 
-    def run_test(name, label, features=()):
+    def run_test(name, label, features=(), release=False):
         command = ["cargo", "test", "--locked", "--lib", "-p", "corti-transcribe-local"]
+        if release:
+            command.append("--release")
         if features:
             command += ["--features", ",".join(features)]
         command += [name, "--", "--ignored", "--exact", "--nocapture"]
@@ -44,6 +47,7 @@ def main():
         results.append({"check": label, "passed": passed})
         if not passed:
             raise RuntimeError(f"native check failed or did not execute exactly one test: {label}")
+        return result.stdout
 
     metal = "not probed"
     failed = False
@@ -65,12 +69,22 @@ def main():
                 if engine == "ggml":
                     run_test("live::tests::ggml_checkpoint_keeps_call_relative_timestamps",
                              label + "-checkpoint", features)
+        comparison_output = run_test(
+            "resample::comparison::benchmark_production_against_borrowed_packets",
+            "resampler-buffering", release=True,
+        )
+        for line in comparison_output.splitlines():
+            start = line.find('{"resample_comparison":')
+            if start >= 0:
+                resample_comparison.append(json.loads(line[start:])["resample_comparison"])
+        if not resample_comparison:
+            raise RuntimeError("resampler comparison produced no measurements")
     except (OSError, ValueError, RuntimeError, StopIteration) as error:
         print(f"::error::{error}", flush=True)
         failed = True
     finally:
         report = {"metal": metal, "spanish_available": fixture_set["spanish_available"],
-                  "results": results}
+                  "results": results, "resample_comparison": resample_comparison}
         (args.output_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
@@ -83,6 +97,12 @@ def main():
                     output.write(f"- Voice {language}: {voice} ({locale})\n")
                 for result in results:
                     output.write(f"- {result['check']}: {'pass' if result['passed'] else 'FAIL'}\n")
+                if resample_comparison:
+                    output.write("\nOptimized-build resampler comparison (model-free; "
+                                 "native allocations and RSS are not measured):\n\n```json\n")
+                    for row in resample_comparison:
+                        output.write(json.dumps(row, separators=(",", ":")) + "\n")
+                    output.write("```\n")
     return int(failed)
 
 

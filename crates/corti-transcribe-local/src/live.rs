@@ -19,10 +19,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use corti_transcribe::segment::{SpeakerTurn, Word};
-use sherpa_onnx::{LinearResampler, OfflineSpeakerDiarization, VoiceActivityDetector};
+use sherpa_onnx::{OfflineSpeakerDiarization, VoiceActivityDetector};
 
 use crate::asr::Asr;
 use crate::engine::{self, TARGET_RATE, VAD_WINDOW};
+use crate::resample::Resampler;
 
 /// Accumulates 16 kHz samples and releases them in whole [`VAD_WINDOW`]-sized windows, carrying the
 /// sub-window remainder across pushes so the VAD sees exactly the window sequence a batch `.chunks(512)`
@@ -73,7 +74,7 @@ pub struct LiveTranscriber {
     rec: Arc<Asr>,
     vad: VoiceActivityDetector,
     /// Built lazily on the first non-16 kHz push and reused so resampling is continuous across pushes.
-    resampler: Option<LinearResampler>,
+    resampler: Option<Resampler>,
     src_rate: i32,
     win: WindowBuffer,
     pending: Vec<Word>,
@@ -125,8 +126,8 @@ impl LiveTranscriber {
             self.flush_resampler_tail();
         }
         self.ensure_resampler(rate);
-        // Resample to an owned buffer first so the `&self.resampler` borrow ends before `feed_16k`'s `&mut`.
-        let up = self.resampler.as_ref().map(|r| r.resample(samples, false));
+        // Resample to an owned buffer first so the resampler borrow ends before `feed_16k`'s `&mut`.
+        let up = self.resampler.as_mut().map(|r| r.push(samples));
         match up {
             Some(up) => self.feed_16k(&up),
             // `create()` failed: drop the chunk rather than feed source-rate samples as 16 kHz (that garbles
@@ -148,7 +149,7 @@ impl LiveTranscriber {
     /// push rebuilds a fresh one). Called before a rate change or a 16 kHz push so the buffered tail is
     /// emitted in order rather than stranded until finish().
     fn flush_resampler_tail(&mut self) {
-        let tail = self.resampler.as_ref().map(|r| r.resample(&[], true));
+        let tail = self.resampler.as_mut().map(Resampler::finish);
         self.resampler = None;
         self.src_rate = 0;
         if let Some(tail) = tail
@@ -240,7 +241,7 @@ impl LiveTranscriber {
 
     fn ensure_resampler(&mut self, rate: i32) {
         if self.resampler.is_none() || self.src_rate != rate {
-            self.resampler = LinearResampler::create(rate, TARGET_RATE);
+            self.resampler = Resampler::new(rate);
             self.src_rate = rate;
         }
     }
@@ -441,6 +442,7 @@ pub use stream::{LiveSink, LiveWordStream, live_word_stream};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sherpa_onnx::LinearResampler;
 
     fn verify_engine(dir: &std::path::Path) -> (crate::models::Models, Arc<Asr>) {
         let engine = std::env::var("CORTI_VERIFY_ASR_ENGINE").unwrap_or_else(|_| "sherpa".into());
@@ -799,9 +801,9 @@ mod tests {
         let one_second = vec![0.0f32; 48_000];
         let mut emitted = 0usize;
         for _ in 0..180 {
-            let resampler = LinearResampler::create(48_000, TARGET_RATE).unwrap();
-            emitted += resampler.resample(&one_second, false).len();
-            emitted += resampler.resample(&[], true).len();
+            let mut resampler = Resampler::new(48_000).unwrap();
+            emitted += resampler.push(&one_second).len();
+            emitted += resampler.finish().len();
         }
         assert_eq!(
             emitted,
@@ -861,7 +863,7 @@ mod tests {
         let (mono, rate) = verify_audio();
         let (m, rec) = verify_engine(&dir);
 
-        // Whole-channel push (the batch path).
+        // Whole-channel live push, compared with both irregular pushes and the real batch entry below.
         let mut whole =
             LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
         whole.push(&mono, rate);
@@ -889,6 +891,51 @@ mod tests {
             words_whole, words_chunked,
             "chunked push must equal whole-channel push"
         );
+        let batch_pcm = engine::resample_to_16k(&mono, rate as i32).expect("batch resampler");
+        let words_batch = engine::transcribe_channel(
+            rec.clone(),
+            engine::build_vad(&m, 0.5, 1.0).expect("batch vad"),
+            &batch_pcm,
+        );
+        assert_eq!(
+            words_whole, words_batch,
+            "batch preprocessing must equal live source-rate input"
+        );
+        // Quantify the intentional numerical change against the old one-shot native call. This is
+        // reporting, not an equality requirement: caller-dependent rounding is the defect being fixed.
+        if rate != TARGET_RATE as u32
+            && (8_000..=192_000).contains(&rate)
+            && mono.len() <= DIAGNOSTIC_MAX_SOURCE_SAMPLES
+            && mono.len() <= rate as usize * DIAGNOSTIC_MAX_SECONDS
+        {
+            let legacy = LinearResampler::create(rate as i32, TARGET_RATE)
+                .expect("legacy resampler")
+                .resample(&mono, true);
+            let mut differing = 0usize;
+            let mut max_abs_delta = 0.0f32;
+            for (old, canonical) in legacy.iter().zip(&batch_pcm) {
+                if old.to_bits() != canonical.to_bits() {
+                    differing += 1;
+                    max_abs_delta = max_abs_delta.max((old - canonical).abs());
+                }
+            }
+            let legacy_words = engine::transcribe_channel(
+                rec,
+                engine::build_vad(&m, 0.5, 1.0).expect("legacy vad"),
+                &legacy,
+            );
+            eprintln!(
+                "RESAMPLE_BASELINE rate={rate} legacy_samples={} canonical_samples={} differing={differing} unmatched_samples={} max_abs_delta={max_abs_delta:e} legacy_words={} canonical_words={} words_equal={} legacy_word_hash={:016x} canonical_word_hash={:016x}",
+                legacy.len(),
+                batch_pcm.len(),
+                legacy.len().abs_diff(batch_pcm.len()),
+                legacy_words.len(),
+                words_batch.len(),
+                legacy_words == words_batch,
+                word_hash(&legacy_words),
+                word_hash(&words_batch),
+            );
+        }
         eprintln!("live-vs-batch equivalence OK: {} words", words_whole.len());
     }
 

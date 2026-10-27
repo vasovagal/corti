@@ -30,6 +30,7 @@ mod engine;
 pub mod ggml;
 mod live;
 pub mod models;
+mod resample;
 
 pub use asr::Asr;
 pub use corti_transcribe::segment::Word;

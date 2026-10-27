@@ -14,15 +14,15 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use corti_transcribe::segment::{SpeakerTurn, Word};
 use sherpa_onnx::{
-    FastClusteringConfig, LinearResampler, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
-    OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-    OfflineTransducerModelConfig, SileroVadModelConfig, SpeakerEmbeddingExtractorConfig,
-    VadModelConfig, VoiceActivityDetector,
+    FastClusteringConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
+    OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
+    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
+    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
 };
 
 use crate::live::LiveTranscriber;
 use crate::models::Models;
+use crate::resample::Resampler;
 
 /// All ONNX models run at 16 kHz mono.
 pub(crate) const TARGET_RATE: i32 = 16_000;
@@ -46,14 +46,18 @@ fn vad_buffer_seconds(min_silence: f32) -> f32 {
     MAX_SPEECH_SECONDS + trailing + (2 * VAD_WINDOW) as f32 / TARGET_RATE as f32
 }
 
-/// Resample a mono channel to 16 kHz (no-op if already there). Uses sherpa's `LinearResampler`.
+/// Resample a mono channel to 16 kHz (no-op if already there), using the same fixed source packets and
+/// final flush as live transcription. Native filter settings are unchanged; packet-edge rounding is
+/// deliberately canonical rather than preserving the old one-shot call's low sample bits.
 pub fn resample_to_16k(samples: &[f32], from_hz: i32) -> Result<Vec<f32>> {
     if from_hz == TARGET_RATE || samples.is_empty() {
         return Ok(samples.to_vec());
     }
-    let resampler = LinearResampler::create(from_hz, TARGET_RATE)
+    let mut resampler = Resampler::new(from_hz)
         .with_context(|| format!("creating resampler {from_hz} → {TARGET_RATE} Hz"))?;
-    Ok(resampler.resample(samples, true))
+    let mut output = resampler.push(samples);
+    output.extend(resampler.finish());
+    Ok(output)
 }
 
 /// Build the Parakeet-TDT offline recognizer.
@@ -185,8 +189,8 @@ pub fn build_diarizer(
 
 /// Transcribe one 16 kHz mono channel by driving the shared live engine over the whole buffer: push it in a
 /// single shot, then flush. Batch and live share exactly one decode path ([`LiveTranscriber`]) — the only
-/// difference is that batch feeds the entire channel at once, so a single push then finish is byte-identical
-/// to the old `.chunks(512)` loop (same VAD window sequence, same regions, same words). `vad` is consumed
+/// difference is that batch feeds the entire already-resampled channel at once. Both callers use the same
+/// source-packet resampler and VAD window sequence. `vad` is consumed
 /// (one stateful VAD per channel); `rec` is shared across both channels via the `Arc`.
 ///
 /// [`LiveTranscriber`]: crate::LiveTranscriber
