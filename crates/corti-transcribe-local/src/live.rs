@@ -485,6 +485,264 @@ mod tests {
         )
     }
 
+    // Diagnostics for the unchanged exact native equality gate. These helpers run only after a
+    // mismatch, publish counts/timing/hashes rather than PCM or recognized content, and cap their
+    // additional retained audio independently of a manually supplied verification WAV.
+    const DIAGNOSTIC_MAX_SOURCE_SAMPLES: usize = 4 * 1024 * 1024;
+    const DIAGNOSTIC_MAX_SECONDS: usize = 120;
+    const DIAGNOSTIC_MAX_REGIONS: usize = 512;
+    const DIAGNOSTIC_MAX_REGION_SAMPLES: usize = 22 * TARGET_RATE as usize;
+    const DIAGNOSTIC_MAX_VAD_SAMPLES: usize = 2_000_000;
+    const VERIFY_CHUNKS: [usize; 6] = [377, 512, 100, 999, 1, 4096];
+
+    fn sample_hash(samples: &[f32]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for sample in samples {
+            sample.to_bits().hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    fn word_hash(words: &[Word]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for word in words {
+            word.start.to_bits().hash(&mut hash);
+            word.end.to_bits().hash(&mut hash);
+            word.text.hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    fn diagnostic_resample(samples: &[f32], rate: u32, chunked: bool) -> Vec<f32> {
+        if rate == TARGET_RATE as u32 {
+            return samples.to_vec();
+        }
+        let resampler =
+            LinearResampler::create(rate as i32, TARGET_RATE).expect("diagnostic resampler");
+        let mut output = Vec::new();
+        if chunked {
+            let mut offset = 0;
+            for size in VERIFY_CHUNKS.into_iter().cycle() {
+                if offset == samples.len() {
+                    break;
+                }
+                let end = (offset + size).min(samples.len());
+                output.extend(resampler.resample(&samples[offset..end], false));
+                offset = end;
+            }
+        } else {
+            output.extend(resampler.resample(samples, false));
+        }
+        output.extend(resampler.resample(&[], true));
+        output
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RegionDigest {
+        start: i32,
+        samples: usize,
+        hash: u64,
+    }
+
+    struct RegionSnapshot {
+        digest: RegionDigest,
+        samples: Vec<f32>,
+    }
+
+    fn exact_regions_equal(left: &[RegionSnapshot], right: &[RegionSnapshot]) -> bool {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| {
+                left.digest.start == right.digest.start
+                    && left.samples.len() == right.samples.len()
+                    && left
+                        .samples
+                        .iter()
+                        .zip(&right.samples)
+                        .all(|(left, right)| left.to_bits() == right.to_bits())
+            })
+    }
+
+    #[test]
+    fn diagnostic_region_equality_checks_bits_and_spans_even_when_hashes_match() {
+        let snapshot = |start, samples: Vec<f32>| RegionSnapshot {
+            digest: RegionDigest {
+                start,
+                samples: samples.len(),
+                hash: 7,
+            },
+            samples,
+        };
+        let original = [snapshot(5, vec![0.0, 1.0])];
+        assert!(exact_regions_equal(
+            &original,
+            &[snapshot(5, vec![0.0, 1.0])]
+        ));
+        assert!(!exact_regions_equal(
+            &original,
+            &[snapshot(6, vec![0.0, 1.0])]
+        ));
+        assert!(!exact_regions_equal(
+            &original,
+            &[snapshot(5, vec![-0.0, 1.0])]
+        ));
+        assert!(!exact_regions_equal(&original, &[snapshot(5, vec![0.0])]));
+    }
+
+    fn diagnostic_regions(
+        samples: &[f32],
+        models: &crate::models::Models,
+        label: &str,
+    ) -> Option<Vec<RegionSnapshot>> {
+        let vad = engine::build_vad(models, 0.5, 1.0).expect("diagnostic VAD");
+        let mut regions = Vec::new();
+        let mut retained_samples = 0usize;
+        let mut omitted = 0usize;
+        let mut drain = || {
+            while let Some(region) = vad.front() {
+                let samples = region.samples();
+                let digest = RegionDigest {
+                    start: region.start(),
+                    samples: samples.len(),
+                    hash: sample_hash(samples),
+                };
+                if regions.len() < DIAGNOSTIC_MAX_REGIONS
+                    && samples.len() <= DIAGNOSTIC_MAX_VAD_SAMPLES - retained_samples
+                {
+                    retained_samples += samples.len();
+                    eprintln!("CHUNK_DIAGNOSTIC vad={label} region={digest:?}");
+                    regions.push(RegionSnapshot {
+                        digest,
+                        samples: samples.to_vec(),
+                    });
+                } else {
+                    omitted += 1;
+                }
+                vad.pop();
+            }
+        };
+        for window in samples.chunks(VAD_WINDOW) {
+            vad.accept_waveform(window);
+            drain();
+        }
+        vad.flush();
+        drain();
+        eprintln!(
+            "CHUNK_DIAGNOSTIC vad={label} regions={} omitted={omitted}",
+            regions.len()
+        );
+        (omitted == 0).then_some(regions)
+    }
+
+    fn diagnose_chunking(
+        mono: &[f32],
+        rate: u32,
+        models: &crate::models::Models,
+        rec: &Arc<Asr>,
+        model_dir: &std::path::Path,
+    ) {
+        if !(8_000..=192_000).contains(&rate)
+            || mono.len() > DIAGNOSTIC_MAX_SOURCE_SAMPLES
+            || mono.len() > rate as usize * DIAGNOSTIC_MAX_SECONDS
+        {
+            eprintln!("CHUNK_DIAGNOSTIC skipped=fixture_exceeds_diagnostic_bound");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let whole = diagnostic_resample(mono, rate, false);
+        let chunked = diagnostic_resample(mono, rate, true);
+        let mut first_delta = None;
+        let mut differing = 0usize;
+        let mut max_abs_delta = 0.0f32;
+        for (index, (left, right)) in whole.iter().zip(&chunked).enumerate() {
+            if left.to_bits() != right.to_bits() {
+                first_delta.get_or_insert(index);
+                differing += 1;
+                max_abs_delta = max_abs_delta.max((left - right).abs());
+            }
+        }
+        let unmatched_samples = whole.len().abs_diff(chunked.len());
+        let pcm_equal = unmatched_samples == 0 && differing == 0;
+        eprintln!(
+            "CHUNK_DIAGNOSTIC rate={rate} whole_samples={} chunked_samples={} whole_hash={:016x} chunked_hash={:016x} pcm_equal={pcm_equal} differing={differing} unmatched_samples={unmatched_samples} first_delta={first_delta:?} max_abs_delta={max_abs_delta:e}",
+            whole.len(),
+            chunked.len(),
+            sample_hash(&whole),
+            sample_hash(&chunked),
+        );
+        let whole_regions = diagnostic_regions(&whole, models, "whole");
+        let chunked_regions = diagnostic_regions(&chunked, models, "chunked");
+        let regions_equal = whole_regions
+            .as_ref()
+            .zip(chunked_regions.as_ref())
+            .map(|(whole, chunked)| exact_regions_equal(whole, chunked));
+        // This replay isolates native resampling/VAD. Equality here does not prove the application's
+        // actual feed_16k glue correct; that boundary remains a hypothesis if every replay stage agrees.
+        eprintln!("CHUNK_DIAGNOSTIC replay_regions_equal={regions_equal:?}");
+
+        if let Some(region) = whole_regions
+            .as_ref()
+            .and_then(|regions| regions.first())
+            .filter(|region| region.samples.len() <= DIAGNOSTIC_MAX_REGION_SAMPLES)
+        {
+            let region = &region.samples;
+            let first = rec.asr_segment(region, 0.0);
+            let repeated = rec.asr_segment(region, 0.0);
+            eprintln!(
+                "CHUNK_DIAGNOSTIC repeated_region_equal={} first_words={} repeated_words={} first_hash={:016x} repeated_hash={:016x}",
+                first == repeated,
+                first.len(),
+                repeated.len(),
+                word_hash(&first),
+                word_hash(&repeated),
+            );
+            if first != repeated {
+                let (_, fresh) = verify_engine(model_dir);
+                let fresh_words = fresh.asr_segment(region, 0.0);
+                eprintln!(
+                    "CHUNK_DIAGNOSTIC fresh_region_equal={} fresh_words={} fresh_hash={:016x}",
+                    first == fresh_words,
+                    fresh_words.len(),
+                    word_hash(&fresh_words),
+                );
+            }
+            match rec.as_ref() {
+                Asr::Sherpa(sherpa) => {
+                    let stream = sherpa.create_stream();
+                    stream.accept_waveform(TARGET_RATE, region);
+                    sherpa.decode(&stream);
+                    if let Some(result) = stream.get_result() {
+                        eprintln!(
+                            "CHUNK_DIAGNOSTIC tokens={} sentencepiece_boundaries={} ascii_space_boundaries={} timestamp_count={} duration_count={}",
+                            result.tokens.len(),
+                            result
+                                .tokens
+                                .iter()
+                                .filter(|token| token.starts_with('\u{2581}'))
+                                .count(),
+                            result
+                                .tokens
+                                .iter()
+                                .filter(|token| token.starts_with(' '))
+                                .count(),
+                            result.timestamps.as_ref().map_or(0, Vec::len),
+                            result.durations.as_ref().map_or(0, Vec::len),
+                        );
+                    } else {
+                        eprintln!("CHUNK_DIAGNOSTIC token_result=absent");
+                    }
+                }
+                #[cfg(feature = "ggml")]
+                Asr::Ggml(_) => {}
+            }
+        }
+        eprintln!(
+            "CHUNK_DIAGNOSTIC elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+
     /// A window that spans two pushes is still released as one 512-sample window: the boundary remainder is
     /// carried, not dropped or short-fed. Pure — no models.
     #[test]
@@ -613,12 +871,7 @@ mod tests {
         let mut chunked =
             LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
         let mut i = 0;
-        for (n, step) in [377usize, 512, 100, 999, 1, 4096]
-            .iter()
-            .cloned()
-            .cycle()
-            .enumerate()
-        {
+        for (n, step) in VERIFY_CHUNKS.iter().cloned().cycle().enumerate() {
             if i >= mono.len() {
                 break;
             }
@@ -629,6 +882,9 @@ mod tests {
         }
         let words_chunked = chunked.finish();
 
+        if words_whole != words_chunked {
+            diagnose_chunking(&mono, rate, &m, &rec, &dir);
+        }
         assert_eq!(
             words_whole, words_chunked,
             "chunked push must equal whole-channel push"
