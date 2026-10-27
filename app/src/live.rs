@@ -2994,12 +2994,13 @@ mod tests {
         assert!(!final_content.contains("State: transcribing"));
     }
 
-    /// Without acoustic evidence, duplicates within and across windows survive. The unchanged
-    /// backchannel and fragment passes still run before the append.
+    /// Without acoustic evidence, duplicates within and across windows survive. Raw critical
+    /// protection belongs to the original poll, so its backchannel child also survives. Unprotected
+    /// fragments still merge before the append.
     ///
     /// Synthetic script — this repo is public, so the shapes are reproduced with invented words.
     #[test]
-    fn live_windows_keep_text_duplicates_and_drop_backchannels_and_merge_fragments() {
+    fn live_windows_keep_protected_poll_children_and_merge_unprotected_fragments() {
         let filer = TempFiler::new("cleanup");
         let note = filer.note();
         let mut writer = NoteWriter::new(filer, meta(), None);
@@ -3022,7 +3023,7 @@ mod tests {
         let mut mic = Scripted::new(
             vec![
                 vec![
-                    // A backchannel over the far end, and an echo of what it just said.
+                    // One returned poll: the later phrase's critical difference protects both children.
                     word(4.0, 4.3, "Yeah."),
                     word(8.0, 9.9, "Rotate the widget calibration."),
                 ],
@@ -3069,6 +3070,7 @@ mod tests {
         assert!(
             content.ends_with(
                 "**[00:02] Them:** We should rotate the widget calibration before Friday.\n\n\
+                 **[00:04] Me:** Yeah.\n\n\
                  **[00:08] Me:** Rotate the widget calibration.\n\n\
                  **[00:40] Me:** I will send the summary after this call.\n\n\
                  **[00:57] Them:** The gateway timeout hits the queue depth.\n\n\
@@ -3077,7 +3079,10 @@ mod tests {
             ),
             "unexpected note body:\n{content}"
         );
-        assert!(!content.contains("Me:** Yeah."), "backchannel survived");
+        assert!(
+            content.contains("**[00:04] Me:** Yeah."),
+            "a protected original-poll child was deleted as a backchannel"
+        );
         assert!(
             content.contains("Me:** Rotate the widget calibration."),
             "in-window duplicate was deleted without evidence"
@@ -3085,6 +3090,36 @@ mod tests {
         assert!(
             content.contains("Me:** Gateway timeout queue depth."),
             "cross-window duplicate was deleted without evidence"
+        );
+    }
+
+    /// A separate ordinary acknowledgement has no matching raw poll and still follows the default
+    /// backchannel rule. This control must not inherit protection from an unrelated mic phrase.
+    #[test]
+    fn live_unprotected_backchannel_is_removed_from_its_own_poll() {
+        let filer = TempFiler::new("ordinary-backchannel-poll");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        publish_them_words(
+            &mut window,
+            &NoopPublisher,
+            vec![word(
+                2.0,
+                6.0,
+                "We should rotate the widget calibration before Friday.",
+            )],
+        );
+        publish_mic_words(&mut window, &NoopPublisher, vec![word(4.0, 4.3, "Yeah.")]);
+        release_held_mic_words(&mut window, &NoopPublisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = read(&note);
+        assert!(content.ends_with(
+            "**[00:02] Them:** We should rotate the widget calibration before Friday.\n\n"
+        ));
+        assert!(
+            !content.contains("Me:**"),
+            "unexpected note body:\n{content}"
         );
     }
 
