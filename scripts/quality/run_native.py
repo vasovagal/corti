@@ -29,6 +29,40 @@ CAPTURE_REQUIRED_TESTS = (
     "host_gap_with_invalid_sample_clock_preserves_later_source_time_and_unknown_loss",
     "full_capacity_quality_uses_labelled_projection_without_losing_authoritative_facts",
     "stranded_recording_retry_reloads_quality_without_a_queue_carrier",
+    "settled_retry_quality_survives_long_retention_and_failed_artifact_deletion",
+    "manual_rearm_crash_before_recording_reset_repairs_routing_without_losing_quality",
+    "manual_rearm_never_restores_first_batch_hosted_authorization",
+    "exhaustion_crash_retains_settled_quality_without_repeating_backend_work",
+    "manual_rearm_of_exhausted_active_job_cannot_extend_its_attempt_budget",
+    "final_attempt_checkpoint_crash_recovers_filing_without_an_extra_backend_call",
+    "manual_retry_unreadable_checkpoint_cannot_rearm_known_aws_origin",
+    "settled_mismatch_quality_survives_retry_rewrite_reopen_refusal_and_checkpoint",
+    "supplemental_live_quality_never_certifies_missing_corrupt_or_unfinished_capture",
+    "mismatched_chunks_keep_both_tracks_in_filter_order",
+    "single_track_layouts_do_not_create_mismatches",
+    "mismatch_uses_writer_position_after_a_tee_drop_and_unfilled_jump",
+    "mismatch_warnings_report_the_leading_edge_and_each_hundred",
+    "late_track_origins_and_absent_epochs_preserve_word_and_filter_clocks",
+    "late_microphone_origin_shifts_acoustic_evidence_once",
+    "mismatch_history_survives_final_filing_failure_later_consume_error_and_panic",
+    "consumed_panic_waits_for_finish_when_the_start_epoch_tee_was_dropped",
+    "note_less_live_fallback_retains_settled_quality_for_durable_batch",
+    "mic_only_epoch_emits_absent_tap_and_bounded_positioned_chunks",
+    "tee_position_after_a_drop_keeps_the_writer_clock",
+    "recording_quality_merge_survives_duplicate_stale_claim_and_reopen_without_reset",
+    "malformed_recording_quality_fails_before_mutation_without_payload_diagnostics",
+    "failed_recording_quality_merge_and_manual_rearm_are_atomic_without_implicit_restart",
+    "recording_reschedule_merges_new_quality_and_rejects_stale_claims",
+    "manual_recording_rearm_rolls_back_both_authorities_and_reopens_together",
+    "manual_recording_rearm_preserves_absent_origin_active_claims_and_backoff",
+    "recording_retry_gc_preserves_owned_and_unknown_payloads_until_explicit_cleanup",
+    "both_short_sides_and_empty_expected_tracks_keep_exact_missing_tail",
+    "retained_positions_survive_tee_drops_unfilled_jumps_and_rate_rounding",
+    "absent_conflicting_cross_epoch_or_arithmetic_mapping_remains_counted_loss",
+    "cap_coalescing_warning_cadence_and_saturation_keep_all_loss_accounted",
+    "good_start_epoch_keeps_a_later_mismatch_exact_before_finish",
+    "observed_epoch_inventory_is_bounded_and_conflicts_remain_counted_loss",
+    "provisional_processing_facts_merge_only_with_independent_capture_authority",
 )
 
 
@@ -92,7 +126,8 @@ def main():
     failed = False
     try:
         command = ["cargo", "test", "--locked", "-p", "corti-core", "-p", "corti-coreaudio",
-                   "-p", "corti-capture", "-p", "corti-detect", "-p", "corti-app"]
+                   "-p", "corti-capture", "-p", "corti-detect", "-p", "corti-app",
+                   "-p", "corti-jobs", "-p", "corti-queue"]
         print("+ " + " ".join(command), flush=True)
         capture_tests = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT)

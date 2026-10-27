@@ -612,11 +612,12 @@ impl<S: QualitySink> Writer<S> {
                 .ok_or_else(|| anyhow!("capture retained frame overflow"))?;
         }
         if self.tee.is_some() {
-            if self.tee_tap.is_empty() {
+            let buffered = self.tee_mic.len().max(self.tee_tap.len());
+            if buffered == 0 {
                 self.tee_start = self.retained_frames;
             }
             if unavailable && self.tee_unavailable.is_empty() {
-                self.tee_unavailable.resize(self.tee_tap.len(), false);
+                self.tee_unavailable.resize(buffered, false);
             }
             if unavailable || !self.tee_unavailable.is_empty() {
                 self.tee_unavailable.push(unavailable);
@@ -628,28 +629,35 @@ impl<S: QualitySink> Writer<S> {
                     frame_mean(frame, 0, mic)
                 });
             }
-            self.tee_tap.push(if unavailable {
-                0.0
-            } else {
-                frame_mean(frame, mic, total - mic)
-            });
+            if total > mic {
+                self.tee_tap.push(if unavailable {
+                    0.0
+                } else {
+                    frame_mean(frame, mic, total - mic)
+                });
+            }
         }
         self.retained_frames = self
             .retained_frames
             .checked_add(1)
             .ok_or_else(|| anyhow!("capture retained frame overflow"))?;
-        if self.tee_tap.len() == TEE_FRAMES_PER_CHUNK {
+        if self.tee_mic.len().max(self.tee_tap.len()) == TEE_FRAMES_PER_CHUNK {
             self.flush_tee()?;
         }
         Ok(())
     }
 
     fn flush_tee(&mut self) -> Result<()> {
-        if self.tee_tap.is_empty() {
+        if self.tee_mic.is_empty() && self.tee_tap.is_empty() {
             return Ok(());
         }
         let Some(tee) = &self.tee else { return Ok(()) };
+        let (_, epoch) = self
+            .current
+            .ok_or_else(|| anyhow!("capture tee has no epoch"))?;
         let chunk = CaptureChunk {
+            epoch,
+            retained_start_frame: self.tee_start,
             mic: std::mem::replace(&mut self.tee_mic, Vec::with_capacity(TEE_FRAMES_PER_CHUNK)),
             tap: std::mem::replace(&mut self.tee_tap, Vec::with_capacity(TEE_FRAMES_PER_CHUNK)),
             unavailable: std::mem::take(&mut self.tee_unavailable),
@@ -657,9 +665,6 @@ impl<S: QualitySink> Writer<S> {
         if tee.tx.try_send(chunk).is_err() {
             tee.dropped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let (_, epoch) = self
-                .current
-                .ok_or_else(|| anyhow!("capture tee has no epoch"))?;
             // Cover every source frame touched by this retained interval. Ceiling the right edge
             // also retains a meaningful interval when an upsampled chunk covers less than one frame.
             let source = |retained: u64, ceil: bool| -> Result<u64> {
@@ -1158,6 +1163,11 @@ mod tests {
             chunks.iter().map(|chunk| chunk.tap.len()).sum::<usize>(),
             18
         );
+        assert_eq!(chunks.len(), 2, "each tee chunk has exactly one epoch");
+        assert_eq!(chunks[0].epoch, outcome.quality.epochs[0]);
+        assert_eq!(chunks[0].retained_start_frame, 0);
+        assert_eq!(chunks[1].epoch, outcome.quality.epochs[2]);
+        assert_eq!(chunks[1].retained_start_frame, 2);
         assert!(
             chunks.iter().all(|chunk| chunk.unavailable.is_empty()),
             "an omitted large gap must not mark later C unavailable"
@@ -1284,6 +1294,89 @@ mod tests {
         assert_eq!(outcome.quality.epochs[0].mic_channels, 1);
         assert_eq!(outcome.quality.epochs[1].mic_channels, 2);
         assert_eq!(outcome.quality.epochs[1].retained_start_frame, 1);
+    }
+
+    #[test]
+    fn mic_only_epoch_emits_absent_tap_and_bounded_positioned_chunks() {
+        let fixture = Fixture::new();
+        let mic_only = CaptureFormat {
+            generation: 2,
+            mic_channels: 1,
+            tap_channels: 0,
+            source_rate_hz: 8_000,
+        };
+        let frames = TEE_FRAMES_PER_CHUNK + 2;
+        let descriptors = [
+            epoch(0, 0, 0, 8_000),
+            audio(0, 0, 1, 8_000),
+            CaptureDescriptor::Epoch(EpochStart {
+                id: 1,
+                source_start_ns: Some(125_000),
+                source_frame_base: 1,
+                format: mic_only,
+                reason: CaptureEpochReason::LayoutChange,
+            }),
+            CaptureDescriptor::Audio(AudioBlock {
+                epoch: 1,
+                start_frame: 1,
+                frames: frames as u64,
+                samples: frames as u64,
+                format: mic_only,
+            }),
+        ];
+        let (pcm, descriptors) =
+            rings(&descriptors, &[vec![0.1, 0.2], vec![0.25; frames]].concat());
+        let (tx, rx) = std::sync::mpsc::sync_channel(3);
+        let outcome = run_writer(
+            pcm,
+            descriptors,
+            fixture.0.clone(),
+            OutputLayout::TwoTrack,
+            8_000,
+            Some(CaptureTee::new(tx)),
+            None,
+        )
+        .unwrap();
+        let chunks: Vec<_> = rx.try_iter().collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.retained_start_frame)
+                .collect::<Vec<_>>(),
+            [0, 1, 4_097]
+        );
+        assert_eq!(chunks[1].mic.len(), TEE_FRAMES_PER_CHUNK);
+        assert_eq!(chunks[2].mic.len(), 2);
+        let mut mismatch = corti_core::MicTapMismatches::default();
+        for chunk in &chunks {
+            mismatch.observe(
+                chunk.epoch,
+                chunk.retained_start_frame,
+                chunk.mic.len(),
+                chunk.tap.len(),
+                8_000,
+            );
+            if chunk.epoch.id == 1 {
+                assert_eq!(chunk.epoch, outcome.quality.epochs[1]);
+                assert!(
+                    chunk.tap.is_empty(),
+                    "an absent track must not start a live decoder"
+                );
+            }
+        }
+        assert_eq!(
+            mismatch.count(),
+            0,
+            "actual writer chunks must satisfy the live layout contract"
+        );
+        assert!(
+            !mismatch
+                .settle(&outcome.quality)
+                .unwrap()
+                .requires_batch_recovery()
+        );
+        assert_eq!(fixture.samples()[2..], [0.25, 0.0].repeat(frames));
     }
 
     #[test]
@@ -1448,6 +1541,54 @@ mod tests {
         let chunk = rx.recv().unwrap();
         assert_eq!(chunk.mic, vec![0.1, 0.2, 0.0, 0.0, 0.0, 0.6, 0.7]);
         assert_eq!(chunk.tap, vec![0.2, 0.3, 0.0, 0.0, 0.0, 0.7, 0.8]);
+    }
+
+    #[test]
+    fn tee_position_after_a_drop_keeps_the_writer_clock() {
+        let fixture = Fixture::new();
+        let frames = TEE_FRAMES_PER_CHUNK * 2;
+        let (mut pcm_tx, pcm_rx) = rtrb::RingBuffer::new(frames * 2);
+        let (mut descriptor_tx, descriptor_rx) = rtrb::RingBuffer::new(4);
+        for _ in 0..frames * 2 {
+            pcm_tx.push(0.25).unwrap();
+        }
+        descriptor_tx.push(epoch(0, 0, 0, 8_000)).unwrap();
+        descriptor_tx
+            .push(audio(0, 0, frames as u64, 8_000))
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let tee = CaptureTee::new(tx);
+        let dropped = tee.dropped_counter();
+        let out = fixture.0.clone();
+        let writer = std::thread::spawn(move || {
+            run_writer(
+                pcm_rx,
+                descriptor_rx,
+                out,
+                OutputLayout::TwoTrack,
+                8_000,
+                Some(tee),
+                None,
+            )
+        });
+        wait_for(|| dropped.load(Ordering::Relaxed) == 1);
+        let first = rx.recv().unwrap();
+        assert_eq!(first.retained_start_frame, 0);
+        for _ in 0..6 {
+            pcm_tx.push(0.5).unwrap();
+        }
+        descriptor_tx
+            .push(audio(0, frames as u64, 3, 8_000))
+            .unwrap();
+        drop(pcm_tx);
+        drop(descriptor_tx);
+        let outcome = writer.join().unwrap().unwrap();
+        let last = rx.recv().unwrap();
+        assert_eq!(last.retained_start_frame, frames as u64);
+        assert_eq!(last.epoch, outcome.quality.epochs[0]);
+        assert_eq!(last.mic, [0.5; 3]);
+        assert_eq!(last.tap, [0.5; 3]);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
     #[test]

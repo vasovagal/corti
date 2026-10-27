@@ -92,6 +92,10 @@ const TEE_FRAMES_PER_CHUNK: usize = 4096;
 /// Delivered off the writer thread over the bounded [`CaptureTee`] channel.
 #[derive(Debug, Clone)]
 pub struct CaptureChunk {
+    /// Immutable writer mapping for this chunk. Tee drops do not compress this position, and the
+    /// writer flushes at epoch boundaries so layout and source-rate changes cannot share a chunk.
+    pub epoch: corti_core::CaptureEpoch,
+    pub retained_start_frame: u64,
     pub mic: Vec<f32>,
     pub tap: Vec<f32>,
     /// Frame-aligned source unavailability from the ordered capture descriptors. Empty means every

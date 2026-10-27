@@ -21,6 +21,7 @@ struct Output {
     unavailable: Vec<bool>,
     frames: u64,
     dropped: u64,
+    epoch: Option<corti_core::CaptureEpoch>,
 }
 
 impl Output {
@@ -38,16 +39,22 @@ impl Output {
             .checked_add(1)
             .ok_or_else(|| anyhow!("microphone output frame overflow"))?;
         if self.mono.len() == TEE_FRAMES_PER_CHUNK {
-            self.send();
+            self.send()?;
         }
         Ok(())
     }
 
-    fn send(&mut self) {
+    fn send(&mut self) -> Result<()> {
         if self.mono.is_empty() {
-            return;
+            return Ok(());
         }
+        let epoch = self
+            .epoch
+            .ok_or_else(|| anyhow!("microphone tee has no epoch"))?;
+        let retained_start_frame = self.frames - self.mono.len() as u64;
         let chunk = CaptureChunk {
+            epoch,
+            retained_start_frame,
             mic: std::mem::replace(&mut self.mono, Vec::with_capacity(TEE_FRAMES_PER_CHUNK)),
             tap: Vec::new(),
             unavailable: std::mem::take(&mut self.unavailable),
@@ -56,6 +63,7 @@ impl Output {
             self.tee.dropped.fetch_add(1, Ordering::Relaxed);
             self.dropped = self.dropped.saturating_add(1);
         }
+        Ok(())
     }
 }
 
@@ -72,6 +80,7 @@ pub(super) fn run_microphone_tee(
         unavailable: Vec::new(),
         frames: 0,
         dropped: 0,
+        epoch: None,
     };
     let mut current: Option<EpochStart> = None;
     let mut normalizer: Option<CaptureRateNormalizer> = None;
@@ -107,8 +116,10 @@ pub(super) fn run_microphone_tee(
                         old.finish(|frame, unavailable| output.emit(frame, unavailable))
                             .map_err(normalization_error)?;
                     }
-                    quality
-                        .insert_epoch(start.with_retained_base(output.frames, retained_rate)?)?;
+                    output.send()?;
+                    let epoch = start.with_retained_base(output.frames, retained_rate)?;
+                    quality.insert_epoch(epoch)?;
+                    output.epoch = Some(epoch);
                     normalizer = Some(CaptureRateNormalizer::new(
                         start.format.source_rate_hz,
                         retained_rate,
@@ -204,7 +215,7 @@ pub(super) fn run_microphone_tee(
             .finish(|frame, unavailable| output.emit(frame, unavailable))
             .map_err(normalization_error)?;
     }
-    output.send();
+    output.send()?;
     quality.record_omitted_spans(
         QualityClass::ProcessingLoss,
         QualityResolution::Outstanding,
@@ -348,6 +359,15 @@ mod tests {
         events.extend([CaptureDescriptor::Epoch(next), audio(next, 528_002, 2)]);
         let (outcome, chunks) = run(&samples, &events).unwrap();
         assert_eq!(outcome.frames, 4);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "an epoch boundary flushes the prior tee tail"
+        );
+        assert_eq!(chunks[0].epoch, outcome.quality.epochs[0]);
+        assert_eq!(chunks[0].retained_start_frame, 0);
+        assert_eq!(chunks[1].epoch, outcome.quality.epochs[1]);
+        assert_eq!(chunks[1].retained_start_frame, 2);
         assert!(chunks.iter().all(|chunk| chunk.unavailable.is_empty()));
         assert_eq!(outcome.quality.epochs[1].retained_start_frame, 2);
         assert_eq!(
@@ -375,6 +395,9 @@ mod tests {
         ];
         let (outcome, chunks) = run(&[0.5; 8], &events).unwrap();
         assert_eq!(outcome.frames, 6);
+        assert_eq!(chunks[0].epoch, outcome.quality.epochs[0]);
+        assert_eq!(chunks[1].epoch, outcome.quality.epochs[1]);
+        assert_eq!(chunks[1].retained_start_frame, 2);
         assert_eq!(chunks.iter().map(|chunk| chunk.mic.len()).sum::<usize>(), 6);
         assert!(
             chunks

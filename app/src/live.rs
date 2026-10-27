@@ -44,7 +44,10 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result};
 use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
-use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
+use corti_core::{
+    DiarizedTranscript, MicTapMismatches as LiveMismatches, RecordingMeta, Speaker,
+    TranscriptSegment,
+};
 use corti_transcribe::segment::{
     AudioEvidence, CleanupConfig, CleanupDecisions, CleanupStage, EchoAssessment, EchoCandidate,
     EchoSource, EchoVerdict, SEGMENT_GAP, SpanEvidence, SpeakerTurn, TextRule, Word,
@@ -59,7 +62,8 @@ use crate::pipeline::PipelineMsg;
 use crate::settings::SharedConfig;
 
 /// Bounded tee backlog in chunks (~4096 frames ≈ 85 ms each at 48 kHz, so ≈ 175 s of slack, ≤ ~72 MiB
-/// of two-track PCM plus worst-case availability bitmaps; chunks without loss allocate no bitmap).
+/// of two-track PCM plus worst-case availability bitmaps, plus < 1 MiB of chunk/epoch metadata;
+/// chunks without loss allocate no bitmap).
 /// The larger fixed queue absorbs one bounded 10-minute diarization pass on the measured local backend plus
 /// model/decode bursts. It never scales with call length; on a slower machine it still drops + counts rather
 /// than growing or blocking the capture writer.
@@ -162,6 +166,41 @@ impl LiveAvailability {
     }
 }
 
+fn observe_mismatch(mismatches: &mut LiveMismatches, chunk: &CaptureChunk, sample_rate: u32) {
+    if mismatches.observe(
+        chunk.epoch,
+        chunk.retained_start_frame,
+        chunk.mic.len(),
+        chunk.tap.len(),
+        sample_rate,
+    ) {
+        warn!(
+            target: "corti::live",
+            mismatched_chunks = mismatches.count(),
+            "live mic/tap length mismatch; padding the shorter track for batch recovery"
+        );
+    }
+}
+
+/// Reused, fixed-size padding storage; input vectors and their available prefixes stay untouched.
+fn padded_slice<'a>(
+    input: &'a [f32],
+    offset: usize,
+    take: usize,
+    scratch: &'a mut [f32],
+) -> &'a [f32] {
+    if offset + take <= input.len() {
+        &input[offset..offset + take]
+    } else {
+        let output = &mut scratch[..take];
+        output.fill(0.0);
+        if let Some(remaining) = input.get(offset..) {
+            output[..remaining.len()].copy_from_slice(remaining);
+        }
+        output
+    }
+}
+
 /// How a live session ended, collected by the pipeline worker at `Process` time.
 #[derive(Debug)]
 pub enum LiveOutcome {
@@ -174,6 +213,8 @@ pub enum LiveOutcome {
     Fallback {
         reason: String,
         note_path: Option<PathBuf>,
+        /// Settled live-stage losses travel separately from immutable capture provenance.
+        settled_quality: Option<corti_core::QualityRecord>,
     },
 }
 
@@ -626,6 +667,7 @@ fn join_live_thread(handle: JoinHandle<LiveOutcome>) -> LiveOutcome {
     handle.join().unwrap_or_else(|_| LiveOutcome::Fallback {
         reason: "live transcription thread panicked".to_string(),
         note_path: None,
+        settled_quality: None,
     })
 }
 
@@ -900,14 +942,8 @@ fn session_thread(
     }));
     let outcome = match result {
         Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => LiveOutcome::Fallback {
-            reason: format!("{e:#}"),
-            note_path: writer.path().cloned(),
-        },
-        Err(_) => LiveOutcome::Fallback {
-            reason: "live transcription panicked".to_string(),
-            note_path: writer.path().cloned(),
-        },
+        Ok(Err(e)) => writer.fallback_outcome(format!("{e:#}")),
+        Err(_) => writer.fallback_outcome("live transcription panicked".to_string()),
     };
     match &outcome {
         LiveOutcome::Filed { .. } => publisher.complete("Call complete — transcript filed."),
@@ -994,17 +1030,19 @@ fn run_session(
     let consumed = match parts.as_mut() {
         Ok(p) => {
             publisher.listening();
-            consume_chunks(
-                rx,
-                sample_rate,
-                &mut p.aec,
-                &mut p.mic,
-                &mut p.them,
-                &p.engine,
-                &mut p.window,
-                writer,
-                publisher,
-            )
+            consume_with_panic_boundary(|| {
+                consume_chunks(
+                    rx,
+                    sample_rate,
+                    &mut p.aec,
+                    &mut p.mic,
+                    &mut p.them,
+                    &p.engine,
+                    &mut p.window,
+                    writer,
+                    publisher,
+                )
+            })
         }
         // Engine failed to load: surface it to the reader now, but still wait for the recording-specific
         // verdict so discard/fallback ownership remains unchanged.
@@ -1021,25 +1059,44 @@ fn run_session(
         ));
     }
 
+    let Some(quality) = await_capture_verdict(verdict_rx, consumed, writer)? else {
+        return Ok(LiveOutcome::NoNote);
+    };
+    let p = parts?;
+    finish_session(
+        sample_rate,
+        p.aec,
+        p.mic,
+        p.them,
+        p.engine,
+        p.window,
+        quality,
+        writer,
+        publisher,
+    )
+}
+
+fn consume_with_panic_boundary(work: impl FnOnce() -> Result<()>) -> Result<()> {
+    // A failed decoder is never resumed. Keep its positioned loss facts alive until the recorder
+    // supplies Finish/Discard, including the Start epoch when its tee chunks were not received.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("live chunk consumption panicked")))
+}
+
+fn await_capture_verdict<F: NoteFiler>(
+    verdict_rx: &Receiver<Verdict>,
+    consumed: Result<()>,
+    writer: &mut NoteWriter<F>,
+) -> Result<Option<FinishQuality>> {
     match verdict_rx.recv() {
         Ok(Verdict::Finish(quality)) => {
-            let p = parts?;
+            writer.freeze_live_quality(&quality)?;
             consumed?;
-            finish_session(
-                sample_rate,
-                p.aec,
-                p.mic,
-                p.them,
-                p.engine,
-                p.window,
-                quality,
-                writer,
-                publisher,
-            )
+            Ok(Some(quality))
         }
         Ok(Verdict::Discard) => {
             writer.discard()?;
-            Ok(LiveOutcome::NoNote)
+            Ok(None)
         }
         // Manager gone (app shutting down mid-call): leave whatever was written; don't flip.
         Err(_) => anyhow::bail!("live session received no finish/discard verdict"),
@@ -1301,6 +1358,10 @@ struct TranscriptWindow {
     /// echo pass unable to delete a suspected duplicate.
     aec_blocks: Vec<corti_aec::BlockStats>,
     aec_availability: LiveAvailability,
+    /// A late first track starts its decoder clock at zero. Shift its words once at ingress rather
+    /// than replaying an arbitrarily long silent prefix. These offsets do not repair tee-drop gaps.
+    mic_origin_frame: Option<u64>,
+    tap_origin_frame: Option<u64>,
 }
 
 impl TranscriptWindow {
@@ -1352,6 +1413,8 @@ impl TranscriptWindow {
             carry: RawEchoSources::default(),
             aec_blocks: Vec::new(),
             aec_availability: LiveAvailability::default(),
+            mic_origin_frame: None,
+            tap_origin_frame: None,
         })
     }
 
@@ -1372,7 +1435,11 @@ impl TranscriptWindow {
 
     /// Take the blocks a `StreamingAec::block_stats()` drain produced. Ordered by `t_start_secs` because
     /// the drain is, and the two clocks (window frames, canceller blocks) advance together.
-    fn push_aec_blocks(&mut self, blocks: Vec<corti_aec::BlockStats>) {
+    fn push_aec_blocks(&mut self, mut blocks: Vec<corti_aec::BlockStats>) {
+        let origin = self.mic_origin_frame.unwrap_or(0) as f64 / f64::from(self.sample_rate);
+        for block in &mut blocks {
+            block.t_start_secs += origin;
+        }
         self.aec_blocks.extend(blocks);
         if self.aec_blocks.len() > MAX_WINDOW_AEC_BLOCKS {
             let excess = self.aec_blocks.len() - MAX_WINDOW_AEC_BLOCKS;
@@ -1753,10 +1820,15 @@ impl EarlyDrop {
 fn publish_mic_words<P: TranscriptPublisher>(
     window: &mut TranscriptWindow,
     publisher: &P,
-    words: Vec<Word>,
+    mut words: Vec<Word>,
 ) {
     if words.is_empty() {
         return;
+    }
+    let origin = window.mic_origin_frame.unwrap_or(0) as f64 / f64::from(window.sample_rate);
+    for word in &mut words {
+        word.start += origin;
+        word.end += origin;
     }
     let poll = window.remember_mic_poll(&words);
     let now = window.next_start_sec();
@@ -1773,8 +1845,13 @@ fn publish_mic_words<P: TranscriptPublisher>(
 fn publish_them_words<P: TranscriptPublisher>(
     window: &mut TranscriptWindow,
     publisher: &P,
-    words: Vec<Word>,
+    mut words: Vec<Word>,
 ) {
+    let origin = window.tap_origin_frame.unwrap_or(0) as f64 / f64::from(window.sample_rate);
+    for word in &mut words {
+        word.start += origin;
+        word.end += origin;
+    }
     let now = window.next_start_sec();
     let offset = window.them_words.len();
     window.push_them_words(words);
@@ -1861,12 +1938,27 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     publisher: &P,
 ) -> Result<()> {
     let mut dropped_windows = 0u32;
+    let mut mic_padding = [0.0; corti_capture::FILTER_FRAMES_PER_CHUNK];
+    let mut tap_padding = [0.0; corti_capture::FILTER_FRAMES_PER_CHUNK];
+    let mut mic_unavailable = [false; corti_capture::FILTER_FRAMES_PER_CHUNK];
     while let Ok(chunk) = rx.recv() {
         let chunk_frames = chunk.mic.len().max(chunk.tap.len());
+        observe_mismatch(&mut writer.mismatches, &chunk, sample_rate);
         anyhow::ensure!(
             chunk.unavailable.is_empty() || chunk.unavailable.len() == chunk_frames,
             "invalid capture availability length"
         );
+        let now = window.start_frame.saturating_add(window.frames);
+        if chunk_frames != 0 && (chunk.epoch.mic_channels != 0 || !chunk.mic.is_empty()) {
+            window.mic_origin_frame.get_or_insert(now);
+        }
+        if chunk_frames != 0 && (chunk.epoch.tap_channels != 0 || !chunk.tap.is_empty()) {
+            window.tap_origin_frame.get_or_insert(now);
+        }
+        // Once a track starts, legitimate absent-track epochs advance that same decoder/filter
+        // clock with bounded silence. A call that never has that track still never feeds its ASR.
+        let has_mic = window.mic_origin_frame.is_some();
+        let has_tap = window.tap_origin_frame.is_some();
         let mut offset = 0usize;
         while offset < chunk_frames {
             let take = window
@@ -1874,21 +1966,22 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 .min(chunk_frames - offset)
                 .min(corti_capture::FILTER_FRAMES_PER_CHUNK);
             let end = offset + take;
-            let unavailable = if chunk.unavailable.is_empty() {
-                &[][..]
-            } else {
-                &chunk.unavailable[offset..end]
-            };
-            let mic_slice = if chunk.mic.len() == chunk_frames {
-                &chunk.mic[offset..end]
+            for (index, unavailable) in mic_unavailable[..take].iter_mut().enumerate() {
+                // A missing reference does not mean the observed mic sample is unavailable.
+                *unavailable = offset + index >= chunk.mic.len()
+                    || chunk
+                        .unavailable
+                        .get(offset + index)
+                        .copied()
+                        .unwrap_or(false);
+            }
+            let unavailable = &mic_unavailable[..take];
+            let mic_slice = if has_mic {
+                padded_slice(&chunk.mic, offset, take, &mut mic_padding)
             } else {
                 &[]
             };
-            let tap_slice = if chunk.tap.len() == chunk_frames {
-                &chunk.tap[offset..end]
-            } else {
-                &[]
-            };
+            let tap_slice = padded_slice(&chunk.tap, offset, take, &mut tap_padding);
 
             let clean = match aec.as_mut() {
                 Some(aec) if !mic_slice.is_empty() && mic_slice.len() == tap_slice.len() => {
@@ -1917,7 +2010,7 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             if !clean.is_empty() {
                 mic.push(&clean, sample_rate);
             }
-            if !tap_slice.is_empty() {
+            if has_tap {
                 them.push(tap_slice, sample_rate);
             }
             if let Some(words) = mic.poll_words() {
@@ -2188,6 +2281,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     writer: &mut NoteWriter<F>,
     publisher: &P,
 ) -> Result<LiveOutcome> {
+    let capture = writer.freeze_live_quality(&quality)?;
     if let Some(aec) = aec.take() {
         // `finish` consumes the filter, so the tail blocks — every block of a call shorter than the
         // lookahead — are only reachable through `finish_with_stats`. The final window's cleanup is the
@@ -2231,7 +2325,7 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
         );
     }
 
-    let capture = quality.capture.clone().unwrap_or_default();
+    let mismatch_count = writer.mismatches.count();
     writer.settle_capture_quality(&capture, quality.capture.is_some())?;
     match writer.path().cloned() {
         Some(note_path)
@@ -2279,11 +2373,18 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
         }
         Some(note_path) => Ok(LiveOutcome::Fallback {
             reason: format!(
-                "capture completeness {:?}; live tee dropped {} chunk(s)",
+                "capture completeness {:?}; live tee dropped {} chunk(s); mic/tap mismatched {} chunk(s)",
                 capture.completeness(),
-                quality.dropped_chunks
+                quality.dropped_chunks,
+                mismatch_count
             ),
             note_path: Some(note_path),
+            settled_quality: (mismatch_count != 0).then_some(capture),
+        }),
+        None if mismatch_count != 0 => Ok(LiveOutcome::Fallback {
+            reason: format!("mic/tap mismatched {mismatch_count} chunk(s)"),
+            note_path: None,
+            settled_quality: Some(capture),
         }),
         None => Ok(LiveOutcome::NoNote),
     }
@@ -2454,6 +2555,8 @@ struct NoteWriter<F: NoteFiler> {
     final_segments: Vec<TranscriptSegment>,
     final_transcript_bytes: usize,
     final_transcript_incomplete: bool,
+    mismatches: LiveMismatches,
+    settled_quality: Option<corti_core::QualityRecord>,
 }
 
 impl<F: NoteFiler> NoteWriter<F> {
@@ -2484,6 +2587,30 @@ impl<F: NoteFiler> NoteWriter<F> {
             final_segments: Vec::new(),
             final_transcript_bytes: 0,
             final_transcript_incomplete: false,
+            mismatches: LiveMismatches::default(),
+            settled_quality: None,
+        }
+    }
+
+    fn freeze_live_quality(&mut self, finish: &FinishQuality) -> Result<corti_core::QualityRecord> {
+        let quality = self
+            .mismatches
+            .settle(&finish.capture.clone().unwrap_or_default())?;
+        self.settled_quality = (self.mismatches.count() != 0).then(|| quality.clone());
+        Ok(quality)
+    }
+
+    fn fallback_quality(&self) -> Option<corti_core::QualityRecord> {
+        self.settled_quality.clone().or_else(|| {
+            (self.mismatches.count() != 0).then(|| self.mismatches.provisional_quality())
+        })
+    }
+
+    fn fallback_outcome(&self, reason: String) -> LiveOutcome {
+        LiveOutcome::Fallback {
+            reason,
+            note_path: self.path().cloned(),
+            settled_quality: self.fallback_quality(),
         }
     }
 
@@ -2871,6 +2998,8 @@ mod tests {
         }
         let (tx, rx) = sync_channel(1);
         tx.send(CaptureChunk {
+            epoch: fixture_epoch(sample_rate, true, true),
+            retained_start_frame: 0,
             mic: raw,
             tap: far.clone(),
             unavailable: missing,
@@ -2928,6 +3057,20 @@ mod tests {
         assert_eq!(*tap_audio.borrow(), far);
     }
 
+    fn fixture_epoch(sample_rate: u32, mic: bool, tap: bool) -> corti_core::CaptureEpoch {
+        corti_core::CaptureEpoch {
+            id: 0,
+            source_start_ns: Some(0),
+            source_rate_hz: sample_rate,
+            source_frame_base: 0,
+            retained_start_frame: 0,
+            retained_rate_hz: sample_rate,
+            mic_channels: u32::from(mic),
+            tap_channels: u32::from(tap),
+            reason: corti_core::CaptureEpochReason::Start,
+        }
+    }
+
     /// Scripted stand-in for `LiveTranscriber`: each `push` queues the next scripted word batch;
     /// `finish` returns the scripted tail.
     struct Scripted {
@@ -2935,6 +3078,10 @@ mod tests {
         pending: Vec<Word>,
         tail: Vec<Word>,
         pushes: Vec<usize>,
+        audio: std::rc::Rc<RefCell<Vec<f32>>>,
+        clock_tail: Option<&'static str>,
+        sample_rate: u32,
+        panic_on_push: Option<usize>,
     }
 
     impl Scripted {
@@ -2944,13 +3091,24 @@ mod tests {
                 pending: Vec::new(),
                 tail,
                 pushes: Vec::new(),
+                audio: Default::default(),
+                clock_tail: None,
+                sample_rate: 1,
+                panic_on_push: None,
             }
         }
     }
 
     impl LiveChannel for Scripted {
-        fn push(&mut self, samples: &[f32], _sample_rate: u32) {
+        fn push(&mut self, samples: &[f32], sample_rate: u32) {
             self.pushes.push(samples.len());
+            self.audio.borrow_mut().extend_from_slice(samples);
+            self.sample_rate = sample_rate;
+            assert_ne!(
+                self.panic_on_push,
+                Some(self.pushes.len()),
+                "scripted decoder panic"
+            );
             if let Some(words) = self.on_push.pop_front() {
                 self.pending.extend(words);
             }
@@ -2968,7 +3126,852 @@ mod tests {
         fn finish(&mut self) -> Vec<Word> {
             let mut words = std::mem::take(&mut self.pending);
             words.append(&mut self.tail);
+            if let Some(text) = self.clock_tail.take() {
+                let frames = self.audio.borrow().len();
+                words.push(word(
+                    frames.saturating_sub(1) as f64 / f64::from(self.sample_rate),
+                    frames as f64 / f64::from(self.sample_rate),
+                    text,
+                ));
+            }
             words
+        }
+    }
+
+    #[test]
+    fn mismatched_chunks_keep_both_tracks_in_filter_order() {
+        for aec_enabled in [false, true] {
+            for (mic_short, missing_frames) in
+                [(false, 37), (true, 37), (false, 4096), (true, 4096)]
+            {
+                let sample_rate = 8_000;
+                let frames = 4_096;
+                let mut expected_mic = Vec::new();
+                let mut expected_tap = Vec::new();
+                let mut missing_mic = Vec::new();
+                let (tx, rx) = sync_channel(3);
+                for chunk_index in 0..3 {
+                    let mic_len =
+                        frames - usize::from(chunk_index == 1 && mic_short) * missing_frames;
+                    let tap_len =
+                        frames - usize::from(chunk_index == 1 && !mic_short) * missing_frames;
+                    let mic: Vec<_> = (0..mic_len)
+                        .map(|frame| ((chunk_index * frames + frame) as f32 * 0.031).sin() * 0.2)
+                        .collect();
+                    let tap: Vec<_> = (0..tap_len)
+                        .map(|frame| ((chunk_index * frames + frame) as f32 * 0.019).cos() * 0.1)
+                        .collect();
+                    expected_mic.extend_from_slice(&mic);
+                    expected_mic.resize((chunk_index + 1) * frames, 0.0);
+                    expected_tap.extend_from_slice(&tap);
+                    expected_tap.resize((chunk_index + 1) * frames, 0.0);
+                    missing_mic.extend((0..frames).map(|frame| frame >= mic_len));
+                    tx.send(CaptureChunk {
+                        epoch: fixture_epoch(sample_rate, true, true),
+                        retained_start_frame: (chunk_index * frames) as u64,
+                        mic,
+                        tap,
+                        unavailable: Vec::new(),
+                    })
+                    .unwrap();
+                }
+                drop(tx);
+                if aec_enabled {
+                    let mut reference = new_live_aec(sample_rate, corti_aec::AecConfig::default());
+                    let mut filtered = Vec::new();
+                    for (mic, tap) in expected_mic.chunks(4096).zip(expected_tap.chunks(4096)) {
+                        filtered.extend(reference.push(mic, tap));
+                    }
+                    filtered.extend(reference.finish());
+                    for (sample, &missing) in filtered.iter_mut().zip(&missing_mic) {
+                        if missing {
+                            *sample = 0.0;
+                        }
+                    }
+                    expected_mic = filtered;
+                }
+                let mut mic = Scripted::new(Vec::new(), Vec::new());
+                let mut tap = Scripted::new(Vec::new(), Vec::new());
+                mic.clock_tail = Some("later microphone");
+                tap.clock_tail = Some("later far end");
+                let actual_mic = mic.audio.clone();
+                let actual_tap = tap.audio.clone();
+                let mut aec =
+                    aec_enabled.then(|| new_live_aec(sample_rate, corti_aec::AecConfig::default()));
+                let mut window =
+                    TranscriptWindow::new(sample_rate, 1, false, CleanupConfig::default()).unwrap();
+                window.frame_limit = 7_001;
+                let publisher = RecordingPublisher::default();
+                let mut capture = corti_core::QualityRecord::observed();
+                capture
+                    .insert_epoch(fixture_epoch(sample_rate, true, true))
+                    .unwrap();
+                let mut writer = NoteWriter::new(TempFiler::new("mismatch-order"), meta(), None);
+                consume_chunks(
+                    &rx,
+                    sample_rate,
+                    &mut aec,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                assert_eq!(writer.mismatches.count(), 1, "once per received chunk");
+                let outcome = finish_session(
+                    sample_rate,
+                    aec,
+                    mic,
+                    tap,
+                    NoDiarizer,
+                    window,
+                    FinishQuality {
+                        dropped_chunks: 0,
+                        capture: Some(capture.clone()),
+                    },
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                assert_eq!(
+                    *actual_tap.borrow(),
+                    expected_tap,
+                    "AEC={aec_enabled}, mic_short={mic_short}: tap timeline"
+                );
+                assert_eq!(
+                    *actual_mic.borrow(),
+                    expected_mic,
+                    "AEC={aec_enabled}, mic_short={mic_short}: mic timeline"
+                );
+                let LiveOutcome::Fallback {
+                    settled_quality: Some(settled),
+                    ..
+                } = outcome
+                else {
+                    panic!("mismatch must retain settled quality through fallback");
+                };
+                assert!(
+                    capture.spans.is_empty(),
+                    "capture provenance stays immutable"
+                );
+                assert_eq!(settled.spans.len(), 1);
+                let span = settled.spans[0];
+                assert_eq!(span.start_frame, (frames * 2 - missing_frames) as u64);
+                assert_eq!(span.end_frame, (frames * 2) as u64);
+                assert_eq!(span.cause, corti_core::QualityCause::MicTapMismatch);
+                assert_eq!(span.class, corti_core::QualityClass::ProcessingLoss);
+                assert_eq!(
+                    span.track,
+                    if mic_short {
+                        corti_core::QualityTrack::Mic
+                    } else {
+                        corti_core::QualityTrack::Tap
+                    }
+                );
+                for label in ["later microphone", "later far end"] {
+                    let end = publisher
+                        .0
+                        .borrow()
+                        .iter()
+                        .flat_map(|(_, words)| words)
+                        .find(|word| word.text == label)
+                        .map(|word| word.end);
+                    assert_eq!(end, Some((frames * 3) as f64 / f64::from(sample_rate)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_track_layouts_do_not_create_mismatches() {
+        for aec_enabled in [false, true] {
+            for mic_only in [false, true] {
+                let epoch = fixture_epoch(8_000, mic_only, !mic_only);
+                let mut capture = corti_core::QualityRecord::observed();
+                capture.insert_epoch(epoch).unwrap();
+                let audio: Vec<_> = (0..4_133)
+                    .map(|frame| (frame as f32 * 0.013).sin() * 0.2)
+                    .collect();
+                let (tx, rx) = sync_channel(2);
+                for (index, samples) in audio.chunks(4_096).enumerate() {
+                    tx.send(CaptureChunk {
+                        epoch,
+                        retained_start_frame: (index * 4_096) as u64,
+                        mic: if mic_only {
+                            samples.to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                        tap: if mic_only {
+                            Vec::new()
+                        } else {
+                            samples.to_vec()
+                        },
+                        unavailable: Vec::new(),
+                    })
+                    .unwrap();
+                }
+                drop(tx);
+                let mut mic = Scripted::new(Vec::new(), Vec::new());
+                let mut tap = Scripted::new(Vec::new(), Vec::new());
+                let actual_mic = mic.audio.clone();
+                let actual_tap = tap.audio.clone();
+                let mut aec =
+                    aec_enabled.then(|| new_live_aec(8_000, corti_aec::AecConfig::default()));
+                let mut window =
+                    TranscriptWindow::new(8_000, 1, false, CleanupConfig::default()).unwrap();
+                let mut writer =
+                    NoteWriter::new(TempFiler::new("single-track-layout"), meta(), None);
+                consume_chunks(
+                    &rx,
+                    8_000,
+                    &mut aec,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+                .unwrap();
+                assert_eq!(writer.mismatches.count(), 0);
+                let outcome = finish_session(
+                    8_000,
+                    aec,
+                    mic,
+                    tap,
+                    NoDiarizer,
+                    window,
+                    FinishQuality {
+                        dropped_chunks: 0,
+                        capture: Some(capture),
+                    },
+                    &mut writer,
+                    &NoopPublisher,
+                )
+                .unwrap();
+                assert!(matches!(outcome, LiveOutcome::NoNote));
+                assert_eq!(
+                    actual_mic.borrow().len(),
+                    if mic_only { audio.len() } else { 0 }
+                );
+                assert_eq!(
+                    actual_tap.borrow().len(),
+                    if mic_only { 0 } else { audio.len() }
+                );
+                if mic_only {
+                    let expected = if aec_enabled {
+                        let mut reference = new_live_aec(8_000, corti_aec::AecConfig::default());
+                        let mut filtered = Vec::new();
+                        for samples in audio.chunks(4_096) {
+                            filtered.extend(reference.push(samples, &vec![0.0; samples.len()]));
+                        }
+                        filtered.extend(reference.finish());
+                        filtered
+                    } else {
+                        audio
+                    };
+                    assert_eq!(*actual_mic.borrow(), expected);
+                } else {
+                    assert_eq!(*actual_tap.borrow(), audio);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mismatch_uses_writer_position_after_a_tee_drop_and_unfilled_jump() {
+        for unfilled_jump in [false, true] {
+            let initial = fixture_epoch(8_000, true, true);
+            let later = if unfilled_jump {
+                corti_core::CaptureEpoch {
+                    id: 1,
+                    source_start_ns: Some(12_000_000_000),
+                    source_frame_base: 96_000,
+                    retained_start_frame: 8_192,
+                    reason: corti_core::CaptureEpochReason::HostDiscontinuity,
+                    ..initial
+                }
+            } else {
+                initial
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(initial).unwrap();
+            if unfilled_jump {
+                capture.insert_epoch(later).unwrap();
+            }
+            capture
+                .insert_span(corti_core::QualitySpan {
+                    epoch: 0,
+                    start_frame: 4_096,
+                    end_frame: 8_192,
+                    track: corti_core::QualityTrack::Both,
+                    cause: corti_core::QualityCause::TeeDrop,
+                    class: corti_core::QualityClass::ProcessingLoss,
+                    stage: corti_core::QualityStage::Live,
+                    resolution: corti_core::QualityResolution::Outstanding,
+                })
+                .unwrap();
+            let (tx, rx) = sync_channel(3);
+            // Retained 4096..8192 was dropped by the tee. The consumer has only 4096 prior frames.
+            for (epoch, start, mic_len) in [
+                (initial, 0, 4_096),
+                (later, 8_192, 4_059),
+                (later, 12_288, 4_096),
+            ] {
+                tx.send(CaptureChunk {
+                    epoch,
+                    retained_start_frame: start,
+                    mic: vec![0.2; mic_len],
+                    tap: vec![0.1; 4_096],
+                    unavailable: Vec::new(),
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let mut mic = Scripted::new(Vec::new(), Vec::new());
+            let mut tap = Scripted::new(Vec::new(), Vec::new());
+            let mut window =
+                TranscriptWindow::new(8_000, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = 5_003;
+            let mut writer = NoteWriter::new(TempFiler::new("mismatch-position"), meta(), None);
+            consume_chunks(
+                &rx,
+                8_000,
+                &mut None,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert_eq!(writer.mismatches.count(), 1);
+            let outcome = finish_session(
+                8_000,
+                None,
+                mic,
+                tap,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 1,
+                    capture: Some(capture.clone()),
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                ..
+            } = outcome
+            else {
+                panic!("mismatch lost at fallback")
+            };
+            let span = quality
+                .spans
+                .iter()
+                .find(|span| span.cause == corti_core::QualityCause::MicTapMismatch)
+                .unwrap();
+            let source_start = if unfilled_jump {
+                96_000 + 4_059
+            } else {
+                8_192 + 4_059
+            };
+            assert_eq!(
+                (span.epoch, span.start_frame, span.end_frame),
+                (later.id, source_start, source_start + 37)
+            );
+            assert!(
+                quality.spans.contains(&capture.spans[0]),
+                "tee loss must survive settlement"
+            );
+            assert_eq!(capture.spans.len(), 1, "capture is immutable");
+        }
+    }
+
+    #[test]
+    fn mismatch_warnings_report_the_leading_edge_and_each_hundred() {
+        use tracing_subscriber::layer::SubscriberExt;
+        struct Warnings(Arc<Mutex<Vec<u64>>>);
+        impl tracing_subscriber::Layer<tracing_subscriber::Registry> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, tracing_subscriber::Registry>,
+            ) {
+                struct Counts<'a>(&'a mut Vec<u64>);
+                impl tracing::field::Visit for Counts<'_> {
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        if field.name() == "mismatched_chunks" {
+                            self.0.push(value);
+                        }
+                    }
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                event.record(&mut Counts(&mut self.0.lock().unwrap()));
+            }
+        }
+        let epoch = fixture_epoch(8_000, true, true);
+        let mut mismatch = LiveMismatches::default();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(Warnings(warnings.clone())),
+            || {
+                for index in 0..300 {
+                    observe_mismatch(
+                        &mut mismatch,
+                        &CaptureChunk {
+                            epoch,
+                            retained_start_frame: index * 4,
+                            mic: vec![0.1; 2],
+                            tap: vec![0.2; 4],
+                            unavailable: Vec::new(),
+                        },
+                        8_000,
+                    );
+                }
+            },
+        );
+        assert_eq!(*warnings.lock().unwrap(), [1, 100, 200, 300]);
+        assert_eq!(mismatch.count(), 300);
+    }
+
+    #[test]
+    fn late_track_origins_and_absent_epochs_preserve_word_and_filter_clocks() {
+        for aec_enabled in [false, true] {
+            for layout in [
+                [(true, true), (false, true), (true, true)],
+                [(false, true), (false, true), (true, true)],
+                [(true, false), (true, false), (true, true)],
+                [(true, true), (true, false), (true, true)],
+            ] {
+                let frames = 1_024;
+                let rate = 8_000;
+                let mut capture = corti_core::QualityRecord::observed();
+                let mut raw_mic = Vec::new();
+                let mut raw_tap = Vec::new();
+                let mut unavailable = Vec::new();
+                let (tx, rx) = sync_channel(3);
+                for (index, &(mic, tap)) in layout.iter().enumerate() {
+                    let start = index * frames;
+                    let epoch = corti_core::CaptureEpoch {
+                        id: index as u32,
+                        source_frame_base: start as u64,
+                        retained_start_frame: start as u64,
+                        source_start_ns: Some(start as u64 * 1_000_000_000 / u64::from(rate)),
+                        reason: if index == 0 {
+                            corti_core::CaptureEpochReason::Start
+                        } else {
+                            corti_core::CaptureEpochReason::LayoutChange
+                        },
+                        ..fixture_epoch(rate, mic, tap)
+                    };
+                    capture.insert_epoch(epoch).unwrap();
+                    let m: Vec<_> = (0..frames)
+                        .map(|j| {
+                            if mic {
+                                ((start + j) as f32 * 0.031).sin() * 0.2
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    let t: Vec<_> = (0..frames)
+                        .map(|j| {
+                            if tap {
+                                ((start + j) as f32 * 0.017).cos() * 0.1
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect();
+                    raw_mic.extend_from_slice(&m);
+                    raw_tap.extend_from_slice(&t);
+                    unavailable.extend(vec![!mic; frames]);
+                    tx.send(CaptureChunk {
+                        epoch,
+                        retained_start_frame: start as u64,
+                        mic: if mic { m } else { Vec::new() },
+                        tap: if tap { t } else { Vec::new() },
+                        unavailable: Vec::new(),
+                    })
+                    .unwrap();
+                }
+                drop(tx);
+                let mic_origin = layout.iter().position(|&(mic, _)| mic).unwrap() * frames;
+                let tap_origin = layout.iter().position(|&(_, tap)| tap).unwrap() * frames;
+                let mut mic = Scripted::new(
+                    vec![vec![word(0.0, 0.001, "microphone first sample")]],
+                    Vec::new(),
+                );
+                let mut tap = Scripted::new(
+                    vec![vec![word(0.0, 0.001, "reference first sample")]],
+                    Vec::new(),
+                );
+                mic.clock_tail = Some("microphone final sample");
+                tap.clock_tail = Some("reference final sample");
+                let mic_audio = mic.audio.clone();
+                let tap_audio = tap.audio.clone();
+                let mut aec =
+                    aec_enabled.then(|| new_live_aec(rate, corti_aec::AecConfig::default()));
+                let mut window =
+                    TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+                window.frame_limit = 1_501;
+                let mut writer = NoteWriter::new(TempFiler::new("layout-clocks"), meta(), None);
+                let publisher = RecordingPublisher::default();
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut aec,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                assert_eq!(writer.mismatches.count(), 0);
+                assert_eq!(window.mic_origin_frame, Some(mic_origin as u64));
+                assert_eq!(window.tap_origin_frame, Some(tap_origin as u64));
+                if aec_enabled {
+                    assert!(
+                        window
+                            .aec_blocks
+                            .iter()
+                            .all(|block| block.t_start_secs >= mic_origin as f64 / f64::from(rate))
+                    );
+                }
+                finish_session(
+                    rate,
+                    aec,
+                    mic,
+                    tap,
+                    NoDiarizer,
+                    window,
+                    FinishQuality {
+                        dropped_chunks: 0,
+                        capture: Some(capture),
+                    },
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                assert_eq!(*tap_audio.borrow(), raw_tap[tap_origin..]);
+                let expected_mic = if aec_enabled {
+                    let mut reference = new_live_aec(rate, corti_aec::AecConfig::default());
+                    let mut filtered = Vec::new();
+                    for (mic, tap) in raw_mic[mic_origin..]
+                        .chunks(4_096)
+                        .zip(raw_tap[mic_origin..].chunks(4_096))
+                    {
+                        filtered.extend(reference.push(mic, tap));
+                    }
+                    filtered.extend(reference.finish());
+                    for (sample, missing) in filtered.iter_mut().zip(&unavailable[mic_origin..]) {
+                        if *missing {
+                            *sample = 0.0;
+                        }
+                    }
+                    filtered
+                } else {
+                    raw_mic[mic_origin..].to_vec()
+                };
+                assert_eq!(*mic_audio.borrow(), expected_mic);
+                for (label, origin) in [
+                    ("microphone first sample", mic_origin),
+                    ("reference first sample", tap_origin),
+                ] {
+                    let start = publisher
+                        .0
+                        .borrow()
+                        .iter()
+                        .flat_map(|(_, words)| words)
+                        .find(|word| word.text == label)
+                        .map(|word| word.start);
+                    assert_eq!(start, Some(origin as f64 / f64::from(rate)));
+                }
+                for label in ["microphone final sample", "reference final sample"] {
+                    let end = publisher
+                        .0
+                        .borrow()
+                        .iter()
+                        .flat_map(|(_, words)| words)
+                        .find(|word| word.text == label)
+                        .map(|word| word.end);
+                    assert_eq!(end, Some((frames * 3) as f64 / f64::from(rate)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_microphone_origin_shifts_acoustic_evidence_once() {
+        let mut window = TranscriptWindow::new(8_000, 1, false, CleanupConfig::default()).unwrap();
+        window.mic_origin_frame = Some(8_000);
+        let block = corti_aec::BlockStats {
+            t_start_secs: 0.25,
+            mic_energy: 0.1,
+            far_energy: 0.2,
+            echo_estimate_energy: 0.1,
+            error_energy: 0.01,
+            double_talk: false,
+            suppressed: false,
+        };
+        window.push_aec_blocks(vec![block]);
+        assert_eq!(window.aec_blocks[0].t_start_secs, 1.25);
+        window.clear_after_flush();
+        window.push_aec_blocks(vec![corti_aec::BlockStats {
+            t_start_secs: 0.5,
+            ..block
+        }]);
+        assert_eq!(
+            window
+                .aec_blocks
+                .iter()
+                .map(|block| block.t_start_secs)
+                .collect::<Vec<_>>(),
+            [1.25, 1.5]
+        );
+    }
+
+    #[test]
+    fn mismatch_history_survives_final_filing_failure_later_consume_error_and_panic() {
+        for failure in ["final_filer", "consume", "panic"] {
+            let epoch = fixture_epoch(8_000, true, true);
+            let later_epoch = corti_core::CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(500_000),
+                source_frame_base: 4,
+                retained_start_frame: 4,
+                mic_channels: 2,
+                reason: corti_core::CaptureEpochReason::LayoutChange,
+                ..epoch
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            capture.insert_epoch(later_epoch).unwrap();
+            let (tx, rx) = sync_channel(3);
+            for index in 0..3 {
+                tx.send(CaptureChunk {
+                    epoch: if index == 0 { epoch } else { later_epoch },
+                    retained_start_frame: index * 4,
+                    mic: vec![0.1; if index == 1 { 2 } else { 4 }],
+                    tap: vec![0.2; 4],
+                    unavailable: if failure == "consume" && index == 2 {
+                        vec![true]
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let mut mic = Scripted::new(
+                Vec::new(),
+                vec![word(0.001, 0.002, "final microphone words")],
+            );
+            mic.panic_on_push = (failure == "panic").then_some(2);
+            let mut tap = Scripted::new(Vec::new(), Vec::new());
+            let mut writer = NoteWriter::new(FlakyFiler::new("mismatch-error", 1), meta(), None);
+            let mut window =
+                TranscriptWindow::new(8_000, 1, false, CleanupConfig::default()).unwrap();
+            let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                consume_chunks(
+                    &rx,
+                    8_000,
+                    &mut None,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+            }));
+            let finish = FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture.clone()),
+            };
+            match failure {
+                "final_filer" => {
+                    consumed.unwrap().unwrap();
+                    assert!(
+                        finish_session(
+                            8_000,
+                            None,
+                            mic,
+                            tap,
+                            NoDiarizer,
+                            window,
+                            finish,
+                            &mut writer,
+                            &NoopPublisher
+                        )
+                        .is_err()
+                    );
+                }
+                "consume" => {
+                    assert!(consumed.unwrap().is_err());
+                    // The session waits for Finish, freezes quality, then propagates consumed?.
+                    writer.freeze_live_quality(&finish).unwrap();
+                }
+                "panic" => assert!(consumed.is_err()),
+                _ => unreachable!(),
+            }
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                ..
+            } = writer.fallback_outcome(failure.to_string())
+            else {
+                panic!("known mismatch history was lost")
+            };
+            assert_eq!(quality.spans.len(), 1);
+            assert_eq!(quality.spans[0].epoch, 1);
+            assert_eq!(
+                (quality.spans[0].start_frame, quality.spans[0].end_frame),
+                (6, 8)
+            );
+            assert!(quality.requires_batch_recovery());
+            assert!(capture.spans.is_empty());
+            capture.merge_snapshot(&quality).unwrap();
+            assert_eq!(
+                capture.spans, quality.spans,
+                "mandatory handoff keeps the exact source interval"
+            );
+        }
+    }
+
+    #[test]
+    fn consumed_panic_waits_for_finish_when_the_start_epoch_tee_was_dropped() {
+        for verdict in ["finish", "discard", "disconnect"] {
+            let first = fixture_epoch(8_000, true, true);
+            let later = corti_core::CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(500_000),
+                source_frame_base: 4,
+                retained_start_frame: 4,
+                mic_channels: 2,
+                reason: corti_core::CaptureEpochReason::LayoutChange,
+                ..first
+            };
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(first).unwrap();
+            capture.insert_epoch(later).unwrap();
+            let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+            let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let filer = TempFiler::new("mismatch-skipped-start-panic");
+                let note = filer.note();
+                let mut writer = NoteWriter::new(filer, meta(), None);
+                writer
+                    .append_segment(&TranscriptSegment {
+                        speaker: Speaker::Me,
+                        start: 0.0,
+                        end: 0.0005,
+                        text: "owned prefix".into(),
+                    })
+                    .unwrap();
+                let (tx, rx) = sync_channel(1);
+                tx.send(CaptureChunk {
+                    epoch: later,
+                    retained_start_frame: 4,
+                    mic: vec![0.1; 2],
+                    tap: vec![0.2; 4],
+                    unavailable: Vec::new(),
+                })
+                .unwrap();
+                drop(tx);
+                let mut mic = Scripted::new(Vec::new(), Vec::new());
+                mic.panic_on_push = Some(1);
+                let mut tap = Scripted::new(Vec::new(), Vec::new());
+                let mut window =
+                    TranscriptWindow::new(8_000, 1, false, CleanupConfig::default()).unwrap();
+                let consumed = consume_with_panic_boundary(|| {
+                    consume_chunks(
+                        &rx,
+                        8_000,
+                        &mut None,
+                        &mut mic,
+                        &mut tap,
+                        &NoDiarizer,
+                        &mut window,
+                        &mut writer,
+                        &NoopPublisher,
+                    )
+                });
+                assert!(consumed.is_err());
+                parked_tx.send(()).unwrap();
+                let outcome = match await_capture_verdict(&verdict_rx, consumed, &mut writer) {
+                    Ok(None) => LiveOutcome::NoNote,
+                    Ok(Some(_)) => panic!("a panicked decoder must never resume finalization"),
+                    Err(error) => writer.fallback_outcome(format!("{error:#}")),
+                };
+                (outcome, note)
+            });
+            parked_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                !worker.is_finished(),
+                "consumption failure must await recording ownership"
+            );
+            match verdict {
+                "finish" => verdict_tx
+                    .send(Verdict::Finish(FinishQuality {
+                        dropped_chunks: 1,
+                        capture: Some(capture.clone()),
+                    }))
+                    .unwrap(),
+                "discard" => verdict_tx.send(Verdict::Discard).unwrap(),
+                "disconnect" => {}
+                _ => unreachable!(),
+            }
+            drop(verdict_tx);
+            let (outcome, note) = worker.join().unwrap();
+            if verdict == "discard" {
+                assert!(matches!(outcome, LiveOutcome::NoNote));
+                assert!(
+                    !note.exists(),
+                    "Discard retains ownership after a consume panic"
+                );
+                continue;
+            }
+            let LiveOutcome::Fallback {
+                settled_quality: Some(quality),
+                note_path: Some(owned),
+                ..
+            } = outcome
+            else {
+                panic!("panic fallback must retain note and known mismatch facts");
+            };
+            assert_eq!(owned, note);
+            assert!(note.exists());
+            if verdict == "finish" {
+                assert_eq!(quality.spans.len(), 1);
+                assert_eq!(
+                    (
+                        quality.spans[0].epoch,
+                        quality.spans[0].start_frame,
+                        quality.spans[0].end_frame
+                    ),
+                    (1, 6, 8)
+                );
+                capture.merge_snapshot(&quality).unwrap();
+                assert_eq!(capture.spans, quality.spans);
+            } else {
+                assert!(
+                    quality.spans.is_empty(),
+                    "no invented Start when authority never arrives"
+                );
+                assert_eq!(quality.overflow.outstanding_omitted_spans[1], 1);
+            }
         }
     }
 
@@ -3250,6 +4253,8 @@ mod tests {
         let publisher = RecordingPublisher::default();
         let (tx, rx) = sync_channel(2);
         tx.send(CaptureChunk {
+            epoch: fixture_epoch(1, false, true),
+            retained_start_frame: 0,
             unavailable: Vec::new(),
             mic: Vec::new(),
             tap: vec![0.0; 10],
@@ -3298,6 +4303,8 @@ mod tests {
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
         for _ in 0..2 {
             tx.send(CaptureChunk {
+                epoch: fixture_epoch(1, false, true),
+                retained_start_frame: 0,
                 unavailable: Vec::new(),
                 mic: Vec::new(),
                 tap: vec![0.0; 30],
@@ -3408,6 +4415,8 @@ mod tests {
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
         for _ in 0..4 {
             tx.send(CaptureChunk {
+                epoch: fixture_epoch(1, true, true),
+                retained_start_frame: 0,
                 unavailable: Vec::new(),
                 mic: vec![0.0; 30],
                 tap: vec![0.0; 30],
@@ -3514,6 +4523,8 @@ mod tests {
         let (tx, rx) = sync_channel::<CaptureChunk>(4);
         for _ in 0..2 {
             tx.send(CaptureChunk {
+                epoch: fixture_epoch(1, true, true),
+                retained_start_frame: 0,
                 unavailable: Vec::new(),
                 mic: vec![0.0; 5],
                 tap: vec![0.0; 5],
@@ -3741,6 +4752,8 @@ mod tests {
             let (tx, rx) = sync_channel::<CaptureChunk>(8);
             for _ in 0..5 {
                 tx.send(CaptureChunk {
+                    epoch: fixture_epoch(1, true, true),
+                    retained_start_frame: 0,
                     unavailable: Vec::new(),
                     mic: vec![0.0; 1],
                     tap: vec![0.0; 1],
@@ -3836,6 +4849,8 @@ mod tests {
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
         for _ in 0..3 {
             tx.send(CaptureChunk {
+                epoch: fixture_epoch(1, true, true),
+                retained_start_frame: 0,
                 unavailable: Vec::new(),
                 mic: vec![0.0; 2],
                 tap: vec![0.0; 2],
@@ -3976,6 +4991,8 @@ mod tests {
             let (tx, rx) = sync_channel::<CaptureChunk>(4);
             for _ in 0..2 {
                 tx.send(CaptureChunk {
+                    epoch: fixture_epoch(1, true, true),
+                    retained_start_frame: 0,
                     unavailable: Vec::new(),
                     mic: vec![0.0; 30],
                     tap: vec![0.0; 30],
@@ -4969,6 +5986,8 @@ mod tests {
         let (tx, rx) = sync_channel::<CaptureChunk>(8);
         for _ in 0..4 {
             tx.send(CaptureChunk {
+                epoch: fixture_epoch(1, false, true),
+                retained_start_frame: 0,
                 unavailable: Vec::new(),
                 mic: Vec::new(),
                 tap: vec![0.0; 30],
@@ -5085,6 +6104,7 @@ mod tests {
         let LiveOutcome::Fallback {
             reason,
             note_path: Some(note_path),
+            ..
         } = outcome
         else {
             panic!("a dropped tee must require fallback");
@@ -5106,6 +6126,8 @@ mod tests {
         let mut mic = Scripted::new(vec![], vec![]);
         let (tx, rx) = sync_channel::<CaptureChunk>(2);
         tx.send(CaptureChunk {
+            epoch: fixture_epoch(1, false, true),
+            retained_start_frame: 0,
             unavailable: Vec::new(),
             mic: Vec::new(),
             tap: vec![0.0; 10],
@@ -5471,6 +6493,7 @@ mod tests {
             LiveOutcome::Fallback {
                 reason: "contained panic".to_string(),
                 note_path: Some(failed_note),
+                settled_quality: None,
             }
         });
 
@@ -5524,6 +6547,7 @@ mod tests {
         let handle = std::thread::spawn(move || LiveOutcome::Fallback {
             reason: "contained failure".to_string(),
             note_path: Some(outcome_path),
+            settled_quality: None,
         });
         let (pipe_tx, pipe_rx) = std::sync::mpsc::channel();
         let state = spawn_discard_reaper_with(
@@ -5580,6 +6604,7 @@ mod tests {
         let handle = std::thread::spawn(move || LiveOutcome::Fallback {
             reason: "discard unlink failed".to_string(),
             note_path: Some(outcome_path),
+            settled_quality: None,
         });
         let _reaper = spawn_discard_reaper(DiscardWork {
             id: "blocked".to_string(),

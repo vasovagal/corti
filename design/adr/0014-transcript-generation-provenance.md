@@ -118,6 +118,57 @@ unknown. Failed/partial decode and unverified/interrupted storage do not authori
 Automatic origin matching and unknown-origin default/`--aws` redo refusal are unchanged; no note-read
 API or new durable origin retention is introduced.
 
+## Live alignment and settled-quality amendment (2026-10-27; #138)
+
+A received live chunk with two expected tracks must preserve the available audio when one track is
+shorter. The consumer pads the missing tail before the existing AEC and masks unavailable microphone
+output after filtering, including delayed/tail output. An epoch's legitimately absent track is not a
+mismatch. The producer supplies each tee chunk's exact epoch and retained-frame start, so mismatch
+intervals remain positioned after tee loss and unfilled source jumps. Each chunk belongs to one epoch;
+producer epoch transitions flush any partial tee tail.
+
+Mismatch accounting retains at most 64 observed epoch bindings (including good chunks) and 256
+intervals, coalesces compatible adjacent tails, and preserves omitted processing/epoch counts and
+saturation. Temporary audio/availability slices are bounded to 4096 frames. Warning cadence is the
+first mismatch and each hundredth mismatch. Source conversions round outward with checked arithmetic;
+missing/conflicting or boundary-crossing bindings produce counted omissions rather than invented spans.
+
+Per-channel first-presence origins avoid replaying a never-present prefix and shift words/AEC evidence
+once; later legitimate absence advances the started channel with bounded silence. These origins retain
+the existing received-frame clock: later tee loss can still compress live word times. Whole-file batch
+replacement is the accepted recovery for that limitation. Positioned mismatch quality instead uses
+the independent producer clock. The AEC algorithm and defaults are unchanged.
+
+The same `QualityRecord` carries supplemental live processing facts. Before the recorder verdict,
+Observed coverage describes those observations only; it is not capture/storage authority. Finish freezes
+quality against immutable capture before fallible finalization. Consume errors and panics retain known
+facts; a panicked consumer waits for Finish/Discard without resuming its decoder. Finish can supply a
+Start binding lost by the tee, Discard keeps deletion ownership, and a disconnected verdict cannot
+authorize a fabricated Start. Recovery reloads mandatory capture/storage independently before merging
+live evidence. Missing/corrupt/unfinished storage remains uncertified; successful authorized whole-file
+recovery may resolve processing loss but never source loss. Capture sidecar/queue provenance is immutable.
+
+The existing retry payload gains optional `settled_quality`, including no-note fallback. Recording-id
+enqueue and failure/reschedule transactions merge evidence monotonically while preserving original
+backend (including unknown), note ownership, claims, budgets, and backoff. Manual retry resets the Failed
+recording and rearms its job in one queue transaction, consuming `first_batch=false`; no retry flags or
+queue schema version are added. An already-active job keeps its budget/backoff. If that budget is spent,
+the click may require a second explicit retry after parking. Failed-row restart preserves the payload
+instead of deleting it as successful stale work. Attempt limits gate backend work only: a valid checkpoint
+or canonical note remains filing/completion authority even at `max_attempts + 1` after a crash.
+
+Malformed quality and unreadable/newer manual-retry checkpoint authority fail with content-free errors
+before rearming. Unknown/changed backend origins retain the prior refusal rule. The inherited automatic
+same-backend handling of an unreadable checkpoint is unchanged; this amendment does not certify that
+path as fail-closed. Failed-job GC retains recording retry authority while its recording row exists,
+including long audio retention and failed unlink. Confirmed artifact removal or explicit discard deletes
+the exact owned retry metadata. Malformed/unbound identities are retained conservatively.
+
+The [regression inventory](../../docs/live-alignment-regressions.md) maps all 34 new tests to their faults,
+records behavioral failure-first receipts, and distinguishes portable source proofs from pending native
+validation. This amendment does not add a note-read API, new startup discovery, a new scheduler, a second
+quality model, or new egress permission.
+
 ## Consequences
 
 - A bad note is self-describing enough to group quality reports by Corti release, final path, model set, and

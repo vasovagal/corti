@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }
+corti-core = { workspace = true }
 # Payloads are JSON strings; serde_json's default (sorted-key) Map makes equal payloads byte-equal,
 # which the active-job dedupe index relies on.
 serde_json = { workspace = true }

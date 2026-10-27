@@ -53,13 +53,22 @@ enum LiveResolution {
 struct LiveFallback {
     reason: String,
     note_path: Option<PathBuf>,
+    settled_quality: Option<corti_core::QualityRecord>,
 }
 
 fn resolve_live(outcome: Option<crate::live::LiveOutcome>) -> LiveResolution {
     match outcome {
         Some(crate::live::LiveOutcome::Filed { note_path }) => LiveResolution::Filed(note_path),
-        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => LiveResolution::Batch {
-            fallback: Some(LiveFallback { reason, note_path }),
+        Some(crate::live::LiveOutcome::Fallback {
+            reason,
+            note_path,
+            settled_quality,
+        }) => LiveResolution::Batch {
+            fallback: Some(LiveFallback {
+                reason,
+                note_path,
+                settled_quality,
+            }),
         },
         Some(crate::live::LiveOutcome::NoNote) | None => LiveResolution::Batch { fallback: None },
     }
@@ -342,8 +351,11 @@ pub fn run(
                                 crate::transcribe::RetryOrigin::Retry(None)
                             };
                             let original_backend = origin.first_backend(ctx.backend.identity());
-                            let preferred_note = if let Some(LiveFallback { reason, note_path }) =
-                                fallback
+                            let (preferred_note, settled_quality) = if let Some(LiveFallback {
+                                reason,
+                                note_path,
+                                settled_quality,
+                            }) = fallback
                             {
                                 warn!(
                                     target: "corti::live",
@@ -351,9 +363,9 @@ pub fn run(
                                     reason = %reason,
                                     "live result is not canonical — falling back to batch transcription"
                                 );
-                                note_path
+                                (note_path, settled_quality)
                             } else {
-                                None
+                                (None, None)
                             };
                             let preferred_note = preferred_note.map(OwnedNote::partial);
                             let mut payload = crate::jobs::retry_payload_with_origin(
@@ -370,18 +382,30 @@ pub fn run(
                             // origin survives a process death before decoding, staging or checkpointing.
                             // Fresh batch and initial live fallback retain their original first batch
                             // attempt + five retries. Recording-id dedupe keeps existing job budgets.
-                            if let Err(e) = ctx.queue.jobs().enqueue_recording(
-                                crate::jobs::RETRY_TRANSCRIPTION,
-                                &payload,
-                                crate::jobs::initial_batch_attempts(fresh_batch, had_live_session),
-                                Utc::now(),
-                            ) && let Err(failure) = fail_with_note(
-                                &ctx,
-                                &id,
-                                &meta,
-                                format!("could not persist first ASR origin: {e:#}"),
-                                preferred_note.as_ref(),
-                            ) {
+                            let enqueue = crate::jobs::with_settled_quality(
+                                payload,
+                                settled_quality.as_ref(),
+                            )
+                            .and_then(|payload| {
+                                ctx.queue.jobs().enqueue_recording(
+                                    crate::jobs::RETRY_TRANSCRIPTION,
+                                    &payload,
+                                    crate::jobs::initial_batch_attempts(
+                                        fresh_batch,
+                                        had_live_session,
+                                    ),
+                                    Utc::now(),
+                                )
+                            });
+                            if let Err(e) = enqueue
+                                && let Err(failure) = fail_with_note(
+                                    &ctx,
+                                    &id,
+                                    &meta,
+                                    format!("could not persist first ASR origin: {e:#}"),
+                                    preferred_note.as_ref(),
+                                )
+                            {
                                 error!(target: "corti::pipeline", error = %failure, "could not settle unarmed transcription");
                             }
                         }
@@ -402,7 +426,9 @@ pub fn run(
                             note_path = %note_path.display(),
                             "live note filed but its recording row could not be created"
                         ),
-                        Some(crate::live::LiveOutcome::Fallback { reason, note_path }) => {
+                        Some(crate::live::LiveOutcome::Fallback {
+                            reason, note_path, ..
+                        }) => {
                             warn!(
                                 target: "corti::live",
                                 reason = %reason,
@@ -534,15 +560,10 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
             let mut settled_job = job.clone();
             if job.kind == crate::jobs::RETRY_TRANSCRIPTION
                 && let Some(note) = recovery_note_from_error(&err)
-                && let Some(id) = job.payload["id"].as_str()
             {
                 // `Jobs::fail` persists the claimed payload in the same SQL settlement, so a path returned
                 // by vagus survives even when both checkpoint and recording completion writes failed.
-                settled_job.payload = crate::jobs::retry_payload_with_origin(
-                    id,
-                    Some(&note),
-                    crate::jobs::original_backend(&job.payload),
-                );
+                settled_job.payload = crate::jobs::retry_payload_with_note(&job.payload, &note);
             }
 
             let exhausts_recording = settled_job.kind == crate::jobs::RETRY_TRANSCRIPTION
@@ -553,7 +574,7 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
                     Ok(()) => ctx
                         .queue
                         .jobs()
-                        .fail(&settled_job, &msg, &JOB_BACKOFF)
+                        .fail_recording(&settled_job, &msg, &JOB_BACKOFF)
                         .map(|outcome| (outcome, msg.clone())),
                     Err(terminal_error) => {
                         let retry_error = format!(
@@ -561,12 +582,17 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
                         );
                         ctx.queue
                             .jobs()
-                            .reschedule(&settled_job, &retry_error, &JOB_BACKOFF)
+                            .reschedule_recording(&settled_job, &retry_error, &JOB_BACKOFF)
                             .map(|next_run_at| {
                                 (FailOutcome::Rescheduled { next_run_at }, retry_error)
                             })
                     }
                 }
+            } else if settled_job.kind == crate::jobs::RETRY_TRANSCRIPTION {
+                ctx.queue
+                    .jobs()
+                    .fail_recording(&settled_job, &msg, &JOB_BACKOFF)
+                    .map(|outcome| (outcome, msg.clone()))
             } else {
                 ctx.queue
                     .jobs()
@@ -644,9 +670,8 @@ fn record_retry_backoff(ctx: &Ctx, job: &ClaimedJob, error: &str) {
 
 /// The Queue window's Retry button. A `Failed` recording qualifies while either raw audio or a filing
 /// checkpoint survives (the UI normally keys on retained raw audio; re-check here on the owner thread).
-/// Old failed-job debris is cleared so the fresh enqueue gets a clean
-/// slate and a full attempt budget; the loop drains due jobs right after this message, so the retry
-/// starts immediately.
+/// A failed recording job is rearmed atomically with its full evidence/origin payload and a new manual
+/// attempt budget; the loop drains due jobs right after this message.
 fn manual_retry(ctx: &mut Ctx, id: &str) {
     let row = match ctx.queue.get(id) {
         Ok(Some(r)) => r,
@@ -675,27 +700,24 @@ fn manual_retry(ctx: &mut Ctx, id: &str) {
     } else {
         JobStatus::PendingTranscription
     };
-    let original_backend = crate::jobs::durable_original_backend(&ctx.queue, id, &row.audio_path)
-        .ok()
-        .flatten();
-    let payload = crate::jobs::retry_payload_with_origin(id, None, original_backend);
-    let _ = ctx.queue.jobs().delete_failed(
-        crate::jobs::RETRY_TRANSCRIPTION,
-        &crate::jobs::id_payload(id),
-    );
-    // Enqueue first: a crash/failure before the reset leaves the row terminal, whereas resetting first can
-    // create nonterminal work with no active job.
-    if let Err(e) = ctx.queue.jobs().enqueue_recording(
+    let payload = match crate::jobs::manual_retry_payload(&ctx.queue, id, &row.audio_path) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("[corti] cannot authorize retry for {id}: {error:#}");
+            return;
+        }
+    };
+    // Preserve the job authority and reset the recording in one transaction; neither can be exposed
+    // alone after a crash. Explicit retry consumes first-attempt permission rather than restoring it.
+    if let Err(e) = ctx.queue.retry_rearm_recording(
+        id,
+        retry_status,
         crate::jobs::RETRY_TRANSCRIPTION,
         &payload,
         crate::jobs::RETRY_MAX_ATTEMPTS,
         Utc::now(),
     ) {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
-        return;
-    }
-    if let Err(e) = ctx.queue.retry_reset_to(id, retry_status) {
-        eprintln!("[corti] retry is durable but {id} could not be reset: {e:#}");
         return;
     }
     tray::update_history(&ctx.app, id, retry_status, None, None, None);
@@ -933,6 +955,13 @@ fn live_note_history_status(existing: Option<JobStatus>) -> JobStatus {
 fn live_discarded(ctx: &Ctx, id: &str) {
     ctx.live.discard(id);
     ctx.live.reap_unspawned_discard(id);
+    if let Err(error) = ctx
+        .queue
+        .delete_recording_jobs(crate::jobs::RETRY_TRANSCRIPTION, id)
+    {
+        warn!(target: "corti::pipeline", job_id = %id, error = %error,
+            "could not remove discarded recording retry metadata");
+    }
     match ctx.queue.get(id) {
         Ok(Some(row)) if !row.status.is_terminal() => {
             let _ = ctx.queue.update(
@@ -1396,6 +1425,7 @@ pub(crate) fn transcribe_and_file(
     // Mandatory authority is loaded before either recovery ASR or any staging/hosted side effect.
     let mut quality =
         crate::transcribe::load_recording_quality(id, audio, capture_processing.as_ref())?;
+    crate::jobs::merge_durable_settled_quality(&ctx.queue, id, &mut quality.quality)?;
     let original_backend = origin.first_backend(ctx.backend.identity());
     if origin.selected_backend(ctx.backend.identity()).is_err() {
         return file_refused_recovery(
@@ -2124,6 +2154,43 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn note_less_live_fallback_retains_settled_quality_for_durable_batch() {
+        let mut quality = corti_core::QualityRecord::observed();
+        quality
+            .record_omitted_spans(
+                corti_core::QualityClass::ProcessingLoss,
+                corti_core::QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        let LiveResolution::Batch {
+            fallback: Some(fallback),
+        } = resolve_live(Some(crate::live::LiveOutcome::Fallback {
+            reason: "synthetic mismatch".into(),
+            note_path: None,
+            settled_quality: Some(quality.clone()),
+        }))
+        else {
+            panic!("note-less mismatch must enter durable batch recovery")
+        };
+        assert_eq!(fallback.note_path, None);
+        assert_eq!(fallback.settled_quality, Some(quality.clone()));
+        let payload = crate::jobs::with_settled_quality(
+            crate::jobs::retry_payload_with_origin(
+                "recording",
+                None,
+                Some(crate::transcribe::FirstAsrBackend::Local),
+            ),
+            fallback.settled_quality.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            corti_jobs::settled_quality(&payload).unwrap(),
+            Some(quality)
+        );
+    }
+
     /// Cross-feature regression: a dropped live result owns its partial note directly; once batch ASR
     /// crosses the durable checkpoint, filing can recover with no raw audio and rewrites that exact inode.
     #[test]
@@ -2149,10 +2216,12 @@ mod tests {
                 Some(LiveFallback {
                     reason,
                     note_path: Some(preferred_note),
+                    ..
                 }),
         } = resolve_live(Some(crate::live::LiveOutcome::Fallback {
             reason: "live capture tee dropped 2 chunk(s)".to_string(),
             note_path: Some(note.clone()),
+            settled_quality: None,
         }))
         else {
             panic!("a dropped live result must take the batch path");

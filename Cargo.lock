@@ -1523,6 +1523,7 @@ version = "0.17.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "corti-core",
  "rusqlite",
  "serde_json",
 ]

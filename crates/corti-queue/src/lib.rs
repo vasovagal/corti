@@ -340,6 +340,81 @@ impl Queue {
         corti_jobs::Jobs::new(&self.conn)
     }
 
+    /// Retain recording retry authority for the lifetime of its recording row, even when generic
+    /// failed-job debris has expired. Malformed/unbound retry payloads have unknown ownership and
+    /// remain retained conservatively; no payload contents are emitted as diagnostics.
+    pub fn gc_failed_jobs(&self, cutoff: DateTime<Utc>, recording_kind: &str) -> Result<usize> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting failed-job cleanup")?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT id,kind,payload FROM jobs WHERE state='failed' AND updated_at < ?1",
+            )?;
+            statement
+                .query_map(params![fmt_utc(cutoff)], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut deleted = 0;
+        for (job_id, kind, raw) in candidates {
+            if kind == recording_kind {
+                let Some(id) = recording_payload_id(&raw) else {
+                    continue;
+                };
+                let owned: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM recordings WHERE id=?1)",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if owned {
+                    continue;
+                }
+            }
+            deleted += transaction.execute(
+                "DELETE FROM jobs WHERE id=?1 AND state='failed'",
+                params![job_id],
+            )?;
+        }
+        transaction
+            .commit()
+            .context("persisting failed-job cleanup")?;
+        Ok(deleted)
+    }
+
+    /// Delete only this recording's typed retry payloads after explicit discard or confirmed artifact
+    /// removal. Unknown/malformed identities remain untouched rather than guessing their owner.
+    pub fn delete_recording_jobs(&self, kind: &str, recording_id: &str) -> Result<usize> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting recording-job cleanup")?;
+        let candidates = {
+            let mut statement = transaction.prepare("SELECT id,payload FROM jobs WHERE kind=?1")?;
+            statement
+                .query_map(params![kind], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut deleted = 0;
+        for (job_id, raw) in candidates {
+            if recording_payload_id(&raw).as_deref() == Some(recording_id) {
+                deleted += transaction.execute("DELETE FROM jobs WHERE id=?1", params![job_id])?;
+            }
+        }
+        transaction
+            .commit()
+            .context("persisting recording-job cleanup")?;
+        Ok(deleted)
+    }
+
     /// Open the queue **read-only** — for UI command threads that must never become a second writer
     /// (the pipeline thread stays the sole one; WAL supports concurrent readers beside it). Skips the
     /// migration (read-only can't run it; the pipeline's open already has). Errors if the DB doesn't
@@ -550,6 +625,37 @@ impl Queue {
     /// Backward-compatible transcription retry reset.
     pub fn retry_reset(&self, id: &str) -> Result<()> {
         self.retry_reset_to(id, JobStatus::PendingTranscription)
+    }
+
+    /// Explicit manual retry commits its recording reset and preserved job payload together. A crash
+    /// cannot expose a newly pending retry next to a still-Failed recording. The existing job owns its
+    /// backend, quality and note; only a parked failure receives a fresh attempt budget.
+    pub fn retry_rearm_recording(
+        &self,
+        id: &str,
+        status: JobStatus,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if payload.get("id").and_then(serde_json::Value::as_str) != Some(id) {
+            bail!("conflicting_recording_job_identity");
+        }
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting manual recording retry")?;
+        corti_jobs::Jobs::new(&transaction).rearm_recording_in_transaction(
+            kind,
+            payload,
+            max_attempts,
+            run_at,
+        )?;
+        self.retry_reset_to(id, status)?;
+        transaction
+            .commit()
+            .context("persisting manual recording retry")
     }
 
     /// Mark a job `Failed` with an error message (convenience over [`update`](Queue::update)).
@@ -1479,6 +1585,15 @@ fn fmt_utc(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+fn recording_payload_id(raw: &str) -> Option<String> {
+    let payload: serde_json::Value = serde_json::from_str(raw).ok()?;
+    payload
+        .get("id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_utc(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)
         .context("parsing postprocess UTC timestamp")?
@@ -2239,6 +2354,286 @@ CREATE INDEX IF NOT EXISTS idx_recordings_status ON recordings(status);
 
         q.fail(&id, "again").unwrap();
         assert!(q.retry_reset_to(&id, JobStatus::Done).is_err());
+    }
+
+    #[test]
+    fn manual_recording_rearm_rolls_back_both_authorities_and_reopens_together() {
+        let dir = std::env::temp_dir().join(format!("corti-manual-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("queue.db");
+        let q = Queue::open_at(&path).unwrap();
+        let id = q
+            .enqueue_with_capture_processing(
+                &meta("/cache/atomic.wav", "synthetic"),
+                Some("immutable_capture"),
+            )
+            .unwrap();
+        let mut quality = corti_core::QualityRecord::observed();
+        quality
+            .record_omitted_spans(
+                corti_core::QualityClass::ProcessingLoss,
+                corti_core::QualityResolution::Outstanding,
+                2,
+            )
+            .unwrap();
+        let payload = serde_json::json!({"id":id,"original_backend":"local","first_batch":true,
+            "settled_quality":quality,"preferred_note":"/synthetic/owned.md","note_canonical":true});
+        let now = Utc::now();
+        let backoff = corti_jobs::Backoff {
+            base: std::time::Duration::from_secs(1),
+            cap: std::time::Duration::from_secs(2),
+        };
+        q.jobs()
+            .enqueue_recording("retry_transcription", &payload, 1, now)
+            .unwrap();
+        let claim = q.jobs().claim_due(now).unwrap().unwrap();
+        q.jobs()
+            .fail_recording(&claim, "synthetic_exhausted", &backoff)
+            .unwrap();
+        q.set_status(&id, JobStatus::Failed).unwrap();
+        let snapshot = || {
+            q.conn
+                .query_row(
+                    "SELECT payload,state,attempts,max_attempts,next_run_at FROM jobs WHERE id=?1",
+                    params![claim.id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, u32>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let before = snapshot();
+        // Failure after the job was rearmed, before its Failed recording reset, rolls back both.
+        q.conn.execute_batch("CREATE TEMP TRIGGER reject_recording_reset BEFORE UPDATE OF status ON recordings WHEN NEW.status='pending_note' BEGIN SELECT RAISE(ABORT,'synthetic_reset_fault'); END;").unwrap();
+        let incoming = serde_json::json!({"id":id,"original_backend":"aws"});
+        assert!(
+            q.retry_rearm_recording(
+                &id,
+                JobStatus::PendingNote,
+                "retry_transcription",
+                &incoming,
+                5,
+                now
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(), before);
+        assert_eq!(q.get(&id).unwrap().unwrap().status, JobStatus::Failed);
+        q.conn
+            .execute_batch("DROP TRIGGER reject_recording_reset;")
+            .unwrap();
+        q.retry_rearm_recording(
+            &id,
+            JobStatus::PendingNote,
+            "retry_transcription",
+            &incoming,
+            5,
+            now,
+        )
+        .unwrap();
+        drop(q);
+        let q = Queue::open_at(&path).unwrap();
+        let row = q.get(&id).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::PendingNote);
+        assert_eq!(row.capture_processing.as_deref(), Some("immutable_capture"));
+        let resumed = q.jobs().claim_due(Utc::now()).unwrap().unwrap();
+        assert_eq!(
+            (resumed.id, resumed.attempts, resumed.max_attempts),
+            (claim.id, 1, 5)
+        );
+        let mut expected = payload;
+        expected["first_batch"] = serde_json::json!(false);
+        assert_eq!(resumed.payload, expected);
+        // Non-Failed rows cannot create replacement jobs, nor can a mismatched identity reset a row.
+        assert!(
+            q.retry_rearm_recording(&id, JobStatus::PendingNote, "other", &incoming, 99, now)
+                .is_err()
+        );
+        assert!(q.jobs().recording_payload("other", &id).unwrap().is_none());
+        assert!(
+            q.retry_rearm_recording(
+                &id,
+                JobStatus::PendingNote,
+                "retry_transcription",
+                &serde_json::json!({"id":"other"}),
+                99,
+                now
+            )
+            .is_err()
+        );
+        drop(q);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manual_recording_rearm_preserves_absent_origin_active_claims_and_backoff() {
+        for state in ["absent", "pending", "running"] {
+            let q = Queue::memory();
+            let id = q.enqueue(&meta("/cache/active.wav", "synthetic")).unwrap();
+            let now = Utc::now();
+            let mut quality = corti_core::QualityRecord::observed();
+            quality
+                .record_omitted_spans(
+                    corti_core::QualityClass::ProcessingLoss,
+                    corti_core::QualityResolution::Outstanding,
+                    1,
+                )
+                .unwrap();
+            let payload = serde_json::json!({"id":id,"first_batch":true,"settled_quality":quality});
+            let due = if state == "pending" {
+                now + chrono::Duration::days(1)
+            } else {
+                now
+            };
+            if state != "absent" {
+                q.jobs()
+                    .enqueue_recording("retry_transcription", &payload, 3, due)
+                    .unwrap();
+            }
+            let claimed = if state == "running" {
+                q.jobs().claim_due(now).unwrap()
+            } else {
+                None
+            };
+            q.set_status(&id, JobStatus::Failed).unwrap();
+            let scheduling = || {
+                q.conn
+                    .query_row(
+                        "SELECT state,attempts,max_attempts,next_run_at FROM jobs LIMIT 1",
+                        [],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, u32>(1)?,
+                                r.get::<_, u32>(2)?,
+                                r.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .unwrap()
+            };
+            let before = scheduling();
+            q.retry_rearm_recording(
+                &id,
+                JobStatus::PendingTranscription,
+                "retry_transcription",
+                &payload,
+                5,
+                now,
+            )
+            .unwrap();
+            assert_eq!(
+                q.get(&id).unwrap().unwrap().status,
+                JobStatus::PendingTranscription
+            );
+            let stored = q
+                .jobs()
+                .recording_payload("retry_transcription", &id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.get("original_backend"), None);
+            assert_eq!(stored["first_batch"], false);
+            assert_eq!(stored["settled_quality"], payload["settled_quality"]);
+            if state != "absent" {
+                assert_eq!(
+                    scheduling(),
+                    before,
+                    "active authorization cannot reset its schedule/budget"
+                );
+            } else {
+                let claim = q.jobs().claim_due(now).unwrap().unwrap();
+                assert_eq!((claim.attempts, claim.max_attempts), (1, 5));
+            }
+            if let Some(stale) = claimed {
+                assert_eq!(stale.payload["first_batch"], true);
+                q.jobs()
+                    .fail_recording(
+                        &stale,
+                        "synthetic_retry",
+                        &corti_jobs::Backoff {
+                            base: std::time::Duration::from_secs(1),
+                            cap: std::time::Duration::from_secs(2),
+                        },
+                    )
+                    .unwrap();
+                let stored = q
+                    .jobs()
+                    .recording_payload("retry_transcription", &id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    stored["first_batch"], false,
+                    "stale claim cannot restore consumed permission"
+                );
+                assert_eq!(stored["settled_quality"], payload["settled_quality"]);
+            }
+        }
+    }
+
+    #[test]
+    fn recording_retry_gc_preserves_owned_and_unknown_payloads_until_explicit_cleanup() {
+        let q = Queue::memory();
+        let id = q.enqueue(&meta("/cache/owned.wav", "synthetic")).unwrap();
+        q.set_status(&id, JobStatus::Failed).unwrap();
+        let now = Utc::now();
+        let kind = "retry_transcription";
+        let payloads = [
+            serde_json::json!({"id":id}),
+            serde_json::json!({"id":"orphan"}),
+            serde_json::json!({"id":42}),
+            serde_json::json!({"id":""}),
+            serde_json::json!({}),
+        ];
+        let backoff = corti_jobs::Backoff {
+            base: std::time::Duration::from_secs(1),
+            cap: std::time::Duration::from_secs(2),
+        };
+        for payload in payloads {
+            q.jobs().enqueue(kind, &payload, 1, now).unwrap();
+            let claim = q.jobs().claim_due(now).unwrap().unwrap();
+            q.jobs()
+                .fail(&claim, "synthetic_exhausted", &backoff)
+                .unwrap();
+        }
+        q.conn.execute("INSERT INTO jobs(kind,payload,state,next_run_at,created_at,updated_at) VALUES(?1,?2,'failed',?3,?3,?3)",
+            params![kind,"SYNTHETIC-PRIVATE-RETRY-SENTINEL",fmt_utc(now)]).unwrap();
+        let count = || {
+            q.conn
+                .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(
+            q.gc_failed_jobs(now + chrono::Duration::days(31), kind)
+                .unwrap(),
+            1,
+            "only orphan authority expires"
+        );
+        assert_eq!(count(), 5);
+        assert_eq!(
+            q.delete_recording_jobs(kind, &id).unwrap(),
+            1,
+            "explicit discard removes this recording's metadata"
+        );
+        assert!(
+            q.get(&id).unwrap().is_some(),
+            "history may outlive explicit artifact discard"
+        );
+        assert_eq!(count(), 4);
+        assert_eq!(
+            q.gc_failed_jobs(now + chrono::Duration::days(366), kind)
+                .unwrap(),
+            0,
+            "unknown identities stay conservative"
+        );
+        assert_eq!(q.delete_recording_jobs(kind, "").unwrap(), 0);
+        assert_eq!(count(), 4);
     }
 
     #[test]
