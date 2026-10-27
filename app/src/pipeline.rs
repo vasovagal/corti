@@ -848,10 +848,14 @@ pub(crate) fn complete_canonical_note(
     let checkpoint_write = checkpoint
         .store(audio)
         .context("persisting canonical completion checkpoint");
-    let completion = ctx
-        .queue
-        .complete_with_note(id, note)
-        .context("persisting canonical note completion");
+    let completion = crate::jobs::complete_with_retained_quality(
+        &ctx.queue,
+        id,
+        audio,
+        note,
+        checkpoint.quality.as_ref(),
+    )
+    .context("persisting canonical note completion");
     match (checkpoint_write, completion) {
         (Ok(()), Ok(())) => {}
         (Err(error), Ok(())) => warn!(
@@ -1295,9 +1299,21 @@ pub(crate) fn cleanup_aws_staging(ctx: &Ctx, audio: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Transcribe `audio`, durably checkpoint the backend result, then file it. Used for fresh recordings
-/// and transcription retry-job runs. Once `PendingNote` is committed, later retries use
-/// [`file_checkpoint`] and never invoke the backend again.
+/// A refused backend leaves a recording-wide processing obligation, not unknown capture coverage.
+/// No decoder region ran, so retain existing processing loss or add one bounded unpositioned fact.
+pub(crate) fn mark_refused_recovery_quality(quality: &mut corti_core::QualityRecord) -> Result<()> {
+    quality.validate()?;
+    if !quality.requires_batch_recovery() {
+        quality.record_omitted_spans(
+            corti_core::QualityClass::ProcessingLoss,
+            corti_core::QualityResolution::Outstanding,
+            1,
+        )?;
+    }
+    Ok(())
+}
+
+/// Retain a partial transcript when automatic recovery cannot use its original backend.
 fn file_refused_recovery(
     ctx: &mut Ctx,
     id: &str,
@@ -1309,7 +1325,7 @@ fn file_refused_recovery(
 ) -> Result<()> {
     // No decoder has recovered the missing text. Preserve every known source fact while preventing a
     // clean capture snapshot from being mistaken for a complete transcript.
-    quality.quality.coverage = corti_core::QualityCoverage::LegacyUnknown;
+    mark_refused_recovery_quality(&mut quality.quality)?;
     let owned = preferred_note.cloned().or(ctx
         .queue
         .get(id)?
@@ -1497,6 +1513,9 @@ pub(crate) fn transcribe_and_file(
                 corti_core::BatchRecoveryOutcome::SameBackendWholeFileSuccess,
             )?;
         }
+        // Retain recovery before the checkpoint can later be replayed or removed. A stale baseline
+        // rejects publication rather than clearing quality added by a concurrent explicit redo.
+        crate::transcribe::persist_recording_quality(id, audio, &quality)?;
 
         // Hosted final runs strictly after ASR and before the first post-ASR checkpoint. It owns no audio and
         // every disabled/auth/deadline/error/stale outcome returns this immutable raw transcript. Confirm the
@@ -1767,10 +1786,14 @@ fn file_and_done(
     let checkpoint_write = checkpoint
         .store(audio)
         .context("persisting returned note path in transcript checkpoint");
-    let completion = ctx
-        .queue
-        .complete_with_note(id, &note)
-        .context("persisting note path and Done status");
+    let completion = crate::jobs::complete_with_retained_quality(
+        &ctx.queue,
+        id,
+        audio,
+        &note,
+        checkpoint.quality.as_ref(),
+    )
+    .context("persisting note path and Done status");
 
     match (checkpoint_write, completion) {
         (Ok(()), Ok(())) => {}

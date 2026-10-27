@@ -41,7 +41,8 @@ never resumes the decoder, and never invents a missing Start epoch if authority 
 still removes the owned note. Batch recovery independently reloads mandatory capture/storage authority
 before merging the supplemental record. Missing, corrupt, unfinished, or unverified storage cannot be
 certified by live facts. Successful authorized whole-file recovery resolves processing loss only;
-source loss remains incomplete. The capture sidecar and immutable `capture_processing` are unchanged.
+source loss remains incomplete. Capture fields and immutable `capture_processing` remain unchanged;
+the existing sidecar can also retain a separate optional settlement of that same quality record.
 
 The existing retry payload carries `settled_quality`; recording-id deduplication and failure/reschedule
 settlement merge it monotonically without resetting origin, claim, budget, backoff, or note ownership.
@@ -202,3 +203,67 @@ No independent-review acceptance is claimed here.
 | `/tmp/corti-138-carrier-receipts.md` | `/tmp/corti-138-jobs-queue-after.log`, `/tmp/corti-138-jobs-queue-clippy.log`, `/tmp/corti-138-carrier-after.log`, `/tmp/corti-138-carrier-clippy.log`; exact commands and frozen source hashes are in the bundle. |
 
 The design choice is recorded in [ADR 0014](../design/adr/0014-transcript-generation-provenance.md#live-alignment-and-settled-quality-amendment-2026-10-27-138).
+
+## Fresh checkpoint review: quality history survives redo
+
+The original retry/checkpoint carriers disappeared at successful cleanup, and redo did not consume
+them even while present. The initial actual-source CLI regression failed with zero mismatch spans
+instead of one (`/tmp/corti-redo-settled-before.log`). The existing mandatory sidecar now retains an
+optional settled `QualityRecord`, independently of its immutable capture/storage fields. Redo consumes
+that lifetime history plus remaining transient facts. The 256 KiB bound, private transaction files,
+recording lifetime and exact-owner cleanup apply unchanged. Publication failure cannot complete the
+recording or delete its checkpoint/job. `--print` remains read-only, and missing/corrupt capture
+authority cannot be invented or certified by retained processing facts.
+
+| New permanent test | Fault detected |
+| --- | --- |
+| `redo_retains_live_mismatch_while_retry_payload_exists` | Dropping available retry history, or fabricating missing/corrupt capture authority. |
+| `redo_history_overlay_splits_live_overlap_but_never_recovers_new_batch_failure` | Recovering unmatched Live extensions, fresh Batch failures, or ambiguous omitted counts from an old recovered snapshot. |
+| `redo_history_overlay_stays_bounded_when_overlap_splits_at_the_span_cap` | Unbounded interval splitting or silently dropping outstanding overflow. |
+| `concurrent_settlement_publishers_preserve_the_winner_and_retry_union` | Two simultaneous publishers losing a winner's facts, or a reloaded retry failing to preserve their union. |
+| `settled_history_uses_existing_publication_and_rejects_stale_attempts` | Stale settlement, publication/rollback failures, or mutation of immutable capture fields. |
+| `settled_partial_history_survives_capture_finalization_without_promoting_storage` | Capture finalization losing an existing adjunct, or settlement falsely promoting capture storage. |
+| `redo_in_progress_retains_source_coverage_through_finalization` | Persisting an in-progress storage projection as permanent source uncertainty, or clearing genuine unknown/source loss when capture later becomes durable. |
+| `redo_finalizing_retains_source_coverage_through_finalization` | The same coverage poisoning during finalization, including both settlement/finalization orderings. |
+| `storage_completeness_projection_preserves_intrinsic_quality` | Reporting unfinished storage as complete, mutating the checkpoint's intrinsic quality, or downgrading known loss to unknown; checks all storage states and legacy absent-status behavior. |
+| `local_redo_after_backend_refusal_recovers_processing_without_rewriting_source` | Persisting a backend refusal as permanent source uncertainty, duplicating an existing processing obligation, or allowing refused backend side effects; retains source-loss/unknown controls through actual completion and later local redo. |
+
+The existing `explicit_local_redo_after_done_cleanup_resolves_tee_loss_without_inventing_origin`
+now includes live-only mismatch history and exercises the actual production completion helper under
+publication failure and success. Its old whole-sidecar byte assertion becomes equality of every frozen
+capture/storage/identity/frame field while allowing the optional settlement. Queue capture JSON stays
+byte-identical. Existing explicit-local authorization and source-loss controls remain; normal successful
+checkpoint/job removal, restart and disk-only redo must retain exact mismatch history. The test also
+imports an old recovered checkpoint while a newer same-interval Batch loss remains outstanding.
+
+The two phase regressions initially failed through actual app helpers with Unknown instead of Complete
+after clean capture finalization and successful whole-file recovery (`/tmp/corti-redo-phase-before.log`).
+Intrinsic record coverage is now retained separately from the note/provenance storage projection;
+unfinished storage still prevents recovery and a complete classification. Genuine unknown capture and
+source loss remain unknown/incomplete. The existing supplemental-quality test changes its unfinished
+record's intrinsic source expectation from Unknown to Complete while requiring reported Unknown.
+The provenance matrix also failed before the correction with Complete instead of Unknown
+(`/tmp/corti-redo-storage-projection-before.log`); it preserves known loss precedence and existing
+partial/unverified body markers without changing the full quality record stored in a checkpoint.
+
+The same lifetime boundary applies to backend refusal. Refusal must not overwrite intrinsic source
+coverage: it retains outstanding processing loss or adds one unpositioned processing obligation when
+none exists. This is a recording-wide refusal with no decoder-region result, not exact interval
+coverage. Existing refusal provenance/markers remain explicit, and the backend gate performs no staging,
+decode or hosted work. Verified authorized whole-file recovery can settle processing while preserving
+source loss and genuine unknown coverage.
+
+`/tmp/corti-redo-refusal-permanent-before.log` records the permanent test failing Unknown versus
+Complete with the original production assignment. Its eight cases retain the same production helper,
+checkpoint/completion path, cleanup/restart and explicit local recovery, with and without earlier
+processing loss, source loss and genuine unknown coverage. Repeated refusal is idempotent, and a
+refused backend dispatch must execute zero staging/decoder/hosted effects.
+
+At this source freeze, the final actual-source harness passes eleven CLI/storage/provenance tests
+with strict Clippy (`/tmp/corti-redo-refusal-{after,clippy}.log`). The unchanged portable core/jobs/queue/capture
+proof passes 125/19/26/15 tests; receipts are
+`/tmp/corti-redo-settled-{portable-tests,clippy}.log`. The phase tests cover 24 combinations and the
+reporting test 32 combinations. Native validation for this fix is pending at this freeze; the earlier
+receipts above apply to the prior implementation.
+The new reader accepts old sidecars with the adjunct absent. Intermediate `77ca04b` rejects the added
+field because of its private envelope's `deny_unknown_fields`; the released base had no such sidecar.

@@ -611,7 +611,8 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         BackendChoice::Aws => crate::transcribe::FirstAsrBackend::Aws,
     };
     require_redo_backend(args.backend, selected, original_backend)?;
-    let mut recording_quality = crate::transcribe::load_recording_quality(
+    let mut recording_quality = load_redo_quality(
+        queue.as_ref(),
         &resolved.id,
         &resolved.audio,
         resolved.capture_processing.as_ref(),
@@ -668,6 +669,12 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         print!("{body}");
         return Ok(());
     }
+
+    crate::transcribe::persist_recording_quality(
+        &resolved.id,
+        &resolved.audio,
+        &recording_quality,
+    )?;
 
     let aec_execution = redo_aec_execution(
         resolved.capture_processing.as_ref(),
@@ -726,6 +733,28 @@ fn run_redo(args: RedoArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read every existing quality authority before redo. Checkpoints/jobs are transient historical
+/// inputs; their stale live entries cannot undo recovery already retained with the recording.
+fn load_redo_quality(
+    queue: Option<&Queue>,
+    id: &str,
+    audio: &Path,
+    capture: Option<&corti_capture::CaptureProcessing>,
+) -> Result<crate::transcribe::RecordingQuality> {
+    let mut quality = crate::transcribe::load_recording_quality(id, audio, capture)?;
+    if let Some(queue) = queue {
+        crate::jobs::merge_durable_settled_quality(queue, id, &mut quality.quality)?;
+    }
+    let authority_audio = audio.with_file_name(format!("{id}.wav"));
+    if crate::checkpoint::path_for(&authority_audio).exists()
+        && let Some(checkpoint) =
+            crate::checkpoint::FilingCheckpoint::load(&authority_audio)?.quality
+    {
+        crate::jobs::merge_historical_quality(&mut quality.quality, &checkpoint)?;
+    }
+    Ok(quality)
 }
 
 /// An explicit local redo is the user-authorized recovery path, even for legacy/changed origins.
@@ -1211,6 +1240,571 @@ mod tests {
     }
 
     #[test]
+    fn local_redo_after_backend_refusal_recovers_processing_without_rewriting_source() {
+        use crate::transcribe::{FirstAsrBackend, RetryOrigin};
+        use corti_core::{
+            QualityCause, QualityClass, QualityCoverage, QualityResolution, QualityStage,
+            QualityTrack, SourceCompleteness,
+        };
+        for prior_loss in [false, true] {
+            for source_loss in [false, true] {
+                for coverage in [QualityCoverage::Observed, QualityCoverage::LegacyUnknown] {
+                    let dir = std::env::temp_dir().join(format!(
+                        "corti-redo-refusal-{}-{prior_loss}-{source_loss}-{coverage:?}",
+                        std::process::id()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let audio = dir.join("recording.wav");
+                    let mut captured = redo_processing_quality(source_loss);
+                    captured
+                        .spans
+                        .retain(|span| span.class == QualityClass::SourceLoss);
+                    captured.coverage = coverage;
+                    let mut store = corti_core::quality_store::QualityStore::begin(
+                        &audio,
+                        "recording",
+                        &captured,
+                    )
+                    .unwrap();
+                    let mut writer = hound::WavWriter::create(
+                        &audio,
+                        hound::WavSpec {
+                            channels: 2,
+                            sample_rate: 8_000,
+                            bits_per_sample: 32,
+                            sample_format: hound::SampleFormat::Float,
+                        },
+                    )
+                    .unwrap();
+                    for _ in 0..32 {
+                        writer.write_sample(0.0_f32).unwrap();
+                    }
+                    writer.finalize().unwrap();
+                    store.prepare_finalization(&captured, 16).unwrap();
+                    store.complete_after_audio_sync(16).unwrap();
+                    drop(store);
+                    let mut live = captured.clone();
+                    if prior_loss {
+                        live.insert_span(corti_core::QualitySpan {
+                            epoch: 0,
+                            start_frame: 8,
+                            end_frame: 10,
+                            track: QualityTrack::Mic,
+                            cause: QualityCause::MicTapMismatch,
+                            class: QualityClass::ProcessingLoss,
+                            stage: QualityStage::Live,
+                            resolution: QualityResolution::Outstanding,
+                        })
+                        .unwrap();
+                    }
+                    let mut processing = corti_capture::CaptureProcessing::disabled();
+                    processing.quality = Some(captured.clone());
+                    let immutable_carrier = serde_json::to_string(&processing).unwrap();
+                    let queue = Queue::open_at(dir.join("queue.sqlite")).unwrap();
+                    let id = queue
+                        .enqueue_with_capture_processing(
+                            &RecordingMeta {
+                                audio_path: audio.clone(),
+                                started_at: Local::now(),
+                                ended_at: None,
+                                owning_app: OwningApp::unknown(),
+                            },
+                            Some(&immutable_carrier),
+                        )
+                        .unwrap();
+                    let payload = crate::jobs::with_settled_quality(
+                        crate::jobs::retry_payload_with_origin(
+                            &id,
+                            None,
+                            Some(FirstAsrBackend::Local),
+                        ),
+                        Some(&live),
+                    )
+                    .unwrap();
+                    queue
+                        .jobs()
+                        .enqueue_recording(
+                            crate::jobs::RETRY_TRANSCRIPTION,
+                            &payload,
+                            5,
+                            chrono::Utc::now(),
+                        )
+                        .unwrap();
+                    let claim = queue.jobs().claim_due(chrono::Utc::now()).unwrap().unwrap();
+                    let origin = RetryOrigin::Retry(Some(FirstAsrBackend::Local));
+                    let mut external_effects = 0;
+                    assert!(
+                        origin
+                            .dispatch(FirstAsrBackend::Aws, || {
+                                external_effects += 1;
+                                Ok(())
+                            })
+                            .is_err()
+                    );
+                    assert_eq!(
+                        external_effects, 0,
+                        "refusal must precede staging, ASR and hosted work"
+                    );
+                    let mut refused =
+                        load_redo_quality(Some(&queue), &id, &audio, Some(&processing)).unwrap();
+                    crate::pipeline::mark_refused_recovery_quality(&mut refused.quality).unwrap();
+                    let first_refusal = refused.quality.clone();
+                    crate::pipeline::mark_refused_recovery_quality(&mut refused.quality).unwrap();
+                    assert_eq!(
+                        refused.quality, first_refusal,
+                        "a refusal cannot duplicate an already-pending processing obligation"
+                    );
+                    let note = dir.join("synthetic-note.md");
+                    let mut checkpoint = crate::checkpoint::FilingCheckpoint::new(
+                        corti_core::DiarizedTranscript::default(),
+                        Some(note.clone()),
+                        None,
+                    );
+                    checkpoint.quality = Some(refused.quality.clone());
+                    checkpoint.quality_storage = Some(refused.storage_status);
+                    checkpoint.original_backend = origin.first_backend(FirstAsrBackend::Aws);
+                    checkpoint.store(&audio).unwrap();
+                    crate::jobs::complete_with_retained_quality(
+                        &queue,
+                        &id,
+                        &audio,
+                        &note,
+                        checkpoint.quality.as_ref(),
+                    )
+                    .unwrap();
+                    std::fs::remove_file(crate::checkpoint::path_for(&audio)).unwrap();
+                    queue.jobs().complete(&claim).unwrap();
+                    drop(queue);
+                    let queue = Queue::open_at(dir.join("queue.sqlite")).unwrap();
+                    assert_eq!(queue.get(&id).unwrap().unwrap().status, JobStatus::Done);
+                    let original =
+                        crate::jobs::durable_original_backend(&queue, &id, &audio).unwrap();
+                    assert_eq!(original, None);
+                    let mut redo =
+                        load_redo_quality(Some(&queue), &id, &audio, Some(&processing)).unwrap();
+                    require_redo_backend(
+                        Some(BackendChoice::Local),
+                        FirstAsrBackend::Local,
+                        original,
+                    )
+                    .unwrap();
+                    settle_successful_redo_quality(
+                        Some(BackendChoice::Local),
+                        FirstAsrBackend::Local,
+                        original,
+                        &mut redo,
+                    )
+                    .unwrap();
+                    crate::transcribe::persist_recording_quality(&id, &audio, &redo).unwrap();
+                    let reopened = load_redo_quality(None, &id, &audio, Some(&processing)).unwrap();
+                    let expected = if source_loss {
+                        SourceCompleteness::Incomplete
+                    } else if coverage == QualityCoverage::LegacyUnknown {
+                        SourceCompleteness::Unknown
+                    } else {
+                        SourceCompleteness::Complete
+                    };
+                    assert_eq!(
+                        reopened.quality.completeness(),
+                        expected,
+                        "backend refusal must not poison source coverage across later authorized recovery"
+                    );
+                    assert_eq!(refused.quality.coverage, coverage);
+                    assert_eq!(
+                        refused.quality.completeness(),
+                        SourceCompleteness::Incomplete
+                    );
+                    assert!(refused.quality.requires_batch_recovery());
+                    assert_eq!(
+                        refused.quality.overflow.outstanding_omitted_spans
+                            [QualityClass::ProcessingLoss.index()],
+                        u64::from(!prior_loss)
+                    );
+                    assert!(!reopened.quality.requires_batch_recovery());
+                    assert_eq!(reopened.quality.coverage, coverage);
+                    assert_eq!(reopened.quality.epochs, captured.epochs);
+                    assert_eq!(
+                        reopened
+                            .quality
+                            .spans
+                            .iter()
+                            .filter(|span| span.class == QualityClass::SourceLoss)
+                            .copied()
+                            .collect::<Vec<_>>(),
+                        captured.spans
+                    );
+                    assert_eq!(
+                        queue
+                            .get(&id)
+                            .unwrap()
+                            .unwrap()
+                            .capture_processing
+                            .as_deref(),
+                        Some(immutable_carrier.as_str())
+                    );
+                    drop(queue);
+                    std::fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redo_in_progress_retains_source_coverage_through_finalization() {
+        redo_storage_phase_roundtrip(false);
+    }
+
+    #[test]
+    fn redo_finalizing_retains_source_coverage_through_finalization() {
+        redo_storage_phase_roundtrip(true);
+    }
+
+    fn redo_storage_phase_roundtrip(finalizing: bool) {
+        use corti_core::{QualityCoverage, SourceCompleteness};
+        for (coverage, imported_unknown) in [
+            (QualityCoverage::Observed, false),
+            (QualityCoverage::LegacyUnknown, false),
+            (QualityCoverage::Observed, true),
+        ] {
+            for source_loss in [false, true] {
+                for persist_first in [false, true] {
+                    let dir = std::env::temp_dir().join(format!("corti-redo-phase-{}-{finalizing}-{coverage:?}-{imported_unknown}-{source_loss}-{persist_first}", std::process::id()));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let audio = dir.join("recording.wav");
+                    let mut captured = redo_processing_quality(source_loss);
+                    captured.coverage = coverage;
+                    let mut store = corti_core::quality_store::QualityStore::begin(
+                        &audio,
+                        "recording",
+                        &captured,
+                    )
+                    .unwrap();
+                    let mut writer = hound::WavWriter::create(
+                        &audio,
+                        hound::WavSpec {
+                            channels: 2,
+                            sample_rate: 8_000,
+                            bits_per_sample: 32,
+                            sample_format: hound::SampleFormat::Float,
+                        },
+                    )
+                    .unwrap();
+                    for _ in 0..32 {
+                        writer.write_sample(0.0_f32).unwrap();
+                    }
+                    writer.finalize().unwrap();
+                    if finalizing {
+                        store.prepare_finalization(&captured, 16).unwrap();
+                    }
+                    let mut provisional =
+                        load_redo_quality(None, "recording", &audio, None).unwrap();
+                    if imported_unknown {
+                        crate::jobs::merge_historical_quality(
+                            &mut provisional.quality,
+                            &corti_core::QualityRecord::default(),
+                        )
+                        .unwrap();
+                    }
+                    assert!(!provisional.storage_complete());
+                    settle_successful_redo_quality(
+                        Some(BackendChoice::Local),
+                        crate::transcribe::FirstAsrBackend::Local,
+                        None,
+                        &mut provisional,
+                    )
+                    .unwrap();
+                    assert!(
+                        provisional.quality.requires_batch_recovery(),
+                        "unfinished storage cannot authorize processing recovery"
+                    );
+                    let mut provenance =
+                        corti_vagus::provenance::TranscriptProvenance::legacy_unknown(
+                            corti_vagus::provenance::GenerationMode::Batch,
+                        );
+                    crate::provenance::attach_quality(
+                        &mut provenance,
+                        &provisional.quality,
+                        Some(provisional.storage_status),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        provenance.configuration["source_completeness"],
+                        serde_json::json!(if source_loss { "incomplete" } else { "unknown" })
+                    );
+                    let mut checkpoint = crate::checkpoint::FilingCheckpoint::new(
+                        corti_core::DiarizedTranscript::default(),
+                        None,
+                        None,
+                    );
+                    checkpoint.quality = Some(provisional.quality.clone());
+                    checkpoint.quality_storage = Some(provisional.storage_status);
+                    checkpoint.store(&audio).unwrap();
+                    assert_eq!(
+                        crate::checkpoint::FilingCheckpoint::load(&audio)
+                            .unwrap()
+                            .quality,
+                        Some(provisional.quality.clone())
+                    );
+                    if persist_first {
+                        crate::transcribe::persist_recording_quality(
+                            "recording",
+                            &audio,
+                            &provisional,
+                        )
+                        .unwrap();
+                    }
+                    if !finalizing {
+                        store.prepare_finalization(&captured, 16).unwrap();
+                    }
+                    store.complete_after_audio_sync(16).unwrap();
+                    if !persist_first {
+                        crate::transcribe::persist_recording_quality(
+                            "recording",
+                            &audio,
+                            &provisional,
+                        )
+                        .unwrap();
+                    }
+                    let mut settled = load_redo_quality(None, "recording", &audio, None).unwrap();
+                    assert!(settled.storage_complete());
+                    settle_successful_redo_quality(
+                        Some(BackendChoice::Local),
+                        crate::transcribe::FirstAsrBackend::Local,
+                        None,
+                        &mut settled,
+                    )
+                    .unwrap();
+                    assert!(!settled.quality.requires_batch_recovery());
+                    crate::transcribe::persist_recording_quality("recording", &audio, &settled)
+                        .unwrap();
+                    let reopened = load_redo_quality(None, "recording", &audio, None).unwrap();
+                    let retained_coverage = if imported_unknown {
+                        QualityCoverage::LegacyUnknown
+                    } else {
+                        coverage
+                    };
+                    let expected = if source_loss {
+                        SourceCompleteness::Incomplete
+                    } else if retained_coverage == QualityCoverage::LegacyUnknown {
+                        SourceCompleteness::Unknown
+                    } else {
+                        SourceCompleteness::Complete
+                    };
+                    assert_eq!(
+                        reopened.quality.completeness(),
+                        expected,
+                        "storage phase must not become permanent source uncertainty; finalizing={finalizing}, persist_first={persist_first}"
+                    );
+                    assert_eq!(reopened.quality.coverage, retained_coverage);
+                    assert_eq!(reopened.quality.epochs, captured.epochs);
+                    drop(store);
+                    std::fs::remove_dir_all(dir).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn redo_history_overlay_splits_live_overlap_but_never_recovers_new_batch_failure() {
+        use corti_core::{
+            BatchRecoveryOutcome, QualityCause, QualityClass, QualityResolution, QualityStage,
+        };
+        let mut recovered = redo_processing_quality(true);
+        recovered
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        let mut imported = redo_processing_quality(true);
+        imported.spans[0].start_frame = 0;
+        imported.spans[0].end_frame = 6;
+        let batch = corti_core::QualitySpan {
+            start_frame: 2,
+            end_frame: 4,
+            cause: QualityCause::DecodeFailure,
+            stage: QualityStage::Batch,
+            ..imported.spans[0]
+        };
+        imported.insert_span(batch).unwrap();
+        crate::jobs::merge_historical_quality(&mut recovered, &imported).unwrap();
+        let live: Vec<_> = recovered
+            .spans
+            .iter()
+            .filter(|span| span.stage == QualityStage::Live)
+            .map(|span| (span.start_frame, span.end_frame, span.resolution))
+            .collect();
+        assert_eq!(
+            live,
+            vec![
+                (0, 2, QualityResolution::Outstanding),
+                (2, 4, QualityResolution::RecoveredByBatch),
+                (4, 6, QualityResolution::Outstanding)
+            ]
+        );
+        assert!(recovered.spans.contains(&batch));
+        let mut old_checkpoint = imported.clone();
+        old_checkpoint
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        crate::jobs::merge_historical_quality(&mut recovered, &old_checkpoint).unwrap();
+        assert!(
+            recovered.spans.contains(&batch),
+            "an old successful checkpoint cannot erase a later failure at identical batch frames"
+        );
+        assert_eq!(
+            recovered.source_completeness(),
+            corti_core::SourceCompleteness::Incomplete
+        );
+        assert!(recovered.requires_batch_recovery());
+        let mut omitted = redo_processing_quality(false);
+        omitted
+            .record_omitted_spans(
+                QualityClass::ProcessingLoss,
+                QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        crate::jobs::merge_historical_quality(&mut recovered, &omitted).unwrap();
+        assert_eq!(
+            recovered.overflow.outstanding_omitted_spans[QualityClass::ProcessingLoss.index()],
+            1
+        );
+    }
+
+    #[test]
+    fn redo_history_overlay_stays_bounded_when_overlap_splits_at_the_span_cap() {
+        let mut recovered = redo_processing_quality(false);
+        let template = recovered.spans[0];
+        recovered.spans.clear();
+        for index in 0..corti_core::MAX_QUALITY_SPANS as u64 {
+            recovered
+                .insert_span(corti_core::QualitySpan {
+                    start_frame: index * 4,
+                    end_frame: index * 4 + 1,
+                    resolution: corti_core::QualityResolution::RecoveredByBatch,
+                    ..template
+                })
+                .unwrap();
+        }
+        let mut imported = redo_processing_quality(false);
+        imported.spans[0].start_frame = 0;
+        imported.spans[0].end_frame = corti_core::MAX_QUALITY_SPANS as u64 * 4 + 1;
+        crate::jobs::merge_historical_quality(&mut recovered, &imported).unwrap();
+        recovered.validate().unwrap();
+        assert!(recovered.spans.len() <= corti_core::MAX_QUALITY_SPANS);
+        assert!(recovered.requires_batch_recovery());
+        assert!(
+            recovered.overflow.outstanding_omitted_spans
+                [corti_core::QualityClass::ProcessingLoss.index()]
+                > 0
+        );
+    }
+
+    #[test]
+    fn redo_retains_live_mismatch_while_retry_payload_exists() {
+        use corti_core::{
+            QualityCause, QualityClass, QualityResolution, QualitySpan, QualityStage, QualityTrack,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("corti-redo-live-history-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("recording.wav");
+        let captured = redo_processing_quality(false);
+        let mut settled = captured.clone();
+        settled
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 8,
+                end_frame: 10,
+                track: QualityTrack::Mic,
+                cause: QualityCause::MicTapMismatch,
+                class: QualityClass::ProcessingLoss,
+                stage: QualityStage::Live,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        let mut processing = corti_capture::CaptureProcessing::disabled();
+        processing.quality = Some(captured);
+        let queue = Queue::open_at(dir.join("queue.sqlite")).unwrap();
+        let meta = RecordingMeta {
+            audio_path: audio.clone(),
+            started_at: Local::now(),
+            ended_at: None,
+            owning_app: OwningApp::unknown(),
+        };
+        let id = queue
+            .enqueue_with_capture_processing(
+                &meta,
+                Some(&serde_json::to_string(&processing).unwrap()),
+            )
+            .unwrap();
+        let payload = crate::jobs::with_settled_quality(
+            crate::jobs::retry_payload_with_origin(
+                &id,
+                None,
+                Some(crate::transcribe::FirstAsrBackend::Local),
+            ),
+            Some(&settled),
+        )
+        .unwrap();
+        queue
+            .jobs()
+            .enqueue_recording(
+                crate::jobs::RETRY_TRANSCRIPTION,
+                &payload,
+                5,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let mut loaded = load_redo_quality(Some(&queue), &id, &audio, Some(&processing)).unwrap();
+        let mismatches: Vec<_> = loaded
+            .quality
+            .spans
+            .iter()
+            .filter(|span| span.cause == QualityCause::MicTapMismatch)
+            .collect();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "redo must load retained live history before any batch recovery"
+        );
+        assert_eq!(mismatches[0].start_frame, 8);
+        assert_eq!(mismatches[0].end_frame, 10);
+        assert!(
+            !loaded.storage_complete(),
+            "settled jobs cannot certify missing capture authority"
+        );
+        let partial = loaded.quality.clone();
+        settle_successful_redo_quality(
+            Some(BackendChoice::Local),
+            crate::transcribe::FirstAsrBackend::Local,
+            None,
+            &mut loaded,
+        )
+        .unwrap();
+        assert_eq!(loaded.quality, partial);
+        assert!(crate::transcribe::persist_recording_quality(&id, &audio, &loaded).is_err());
+        let authority = corti_core::quality_store::quality_sidecar_path(&audio).unwrap();
+        assert!(
+            !authority.exists(),
+            "missing capture authority must not be fabricated"
+        );
+        assert!(
+            queue
+                .jobs()
+                .recording_payload(crate::jobs::RETRY_TRANSCRIPTION, &id)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(&authority, b"synthetic corrupt authority").unwrap();
+        assert!(load_redo_quality(Some(&queue), &id, &audio, Some(&processing)).is_err());
+        assert_eq!(
+            std::fs::read(&authority).unwrap(),
+            b"synthetic corrupt authority"
+        );
+        drop(queue);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn explicit_local_redo_after_done_cleanup_resolves_tee_loss_without_inventing_origin() {
         use crate::transcribe::{FirstAsrBackend, RecordingStorageStatus};
         use corti_core::quality_store::{QualityStore, quality_sidecar_path};
@@ -1227,6 +1821,19 @@ mod tests {
             let audio = dir.join(format!("{id}.wav"));
             let db = dir.join(format!("{id}.sqlite"));
             let captured = redo_processing_quality(source_loss);
+            let mut settled = captured.clone();
+            settled
+                .insert_span(corti_core::QualitySpan {
+                    epoch: 0,
+                    start_frame: 8,
+                    end_frame: 10,
+                    track: corti_core::QualityTrack::Mic,
+                    cause: corti_core::QualityCause::MicTapMismatch,
+                    class: corti_core::QualityClass::ProcessingLoss,
+                    stage: corti_core::QualityStage::Live,
+                    resolution: corti_core::QualityResolution::Outstanding,
+                })
+                .unwrap();
             let mut store = QualityStore::begin(&audio, id, &captured).unwrap();
             let mut writer = hound::WavWriter::create(
                 &audio,
@@ -1267,7 +1874,11 @@ mod tests {
             let now = chrono::Utc::now();
             jobs.enqueue_recording(
                 crate::jobs::RETRY_TRANSCRIPTION,
-                &crate::jobs::retry_payload_with_origin(id, None, Some(FirstAsrBackend::Local)),
+                &crate::jobs::with_settled_quality(
+                    crate::jobs::retry_payload_with_origin(id, None, Some(FirstAsrBackend::Local)),
+                    Some(&settled),
+                )
+                .unwrap(),
                 5,
                 now,
             )
@@ -1279,11 +1890,39 @@ mod tests {
                 Some(note.clone()),
                 None,
             );
-            checkpoint.quality = Some(captured.clone());
+            checkpoint.quality = Some(settled.clone());
             checkpoint.quality_storage = Some(RecordingStorageStatus::AudioDurable);
             checkpoint.original_backend = Some(FirstAsrBackend::Local);
             checkpoint.store(&audio).unwrap();
-            queue.complete_with_note(id, &note).unwrap();
+            let pending =
+                corti_core::quality_store::quality_temporary_paths(&audio).unwrap()[0].clone();
+            std::fs::write(&pending, b"synthetic publication owner").unwrap();
+            assert!(
+                crate::jobs::complete_with_retained_quality(
+                    &queue,
+                    id,
+                    &audio,
+                    &note,
+                    checkpoint.quality.as_ref()
+                )
+                .is_err()
+            );
+            assert_ne!(queue.get(id).unwrap().unwrap().status, JobStatus::Done);
+            assert!(
+                jobs.recording_payload(crate::jobs::RETRY_TRANSCRIPTION, id)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(crate::checkpoint::path_for(&audio).exists());
+            std::fs::remove_file(pending).unwrap();
+            crate::jobs::complete_with_retained_quality(
+                &queue,
+                id,
+                &audio,
+                &note,
+                checkpoint.quality.as_ref(),
+            )
+            .unwrap();
             std::fs::remove_file(crate::checkpoint::path_for(&audio)).unwrap();
             jobs.complete(&claimed).unwrap();
             drop(queue);
@@ -1293,15 +1932,16 @@ mod tests {
             let original = crate::jobs::durable_original_backend(&queue, id, &audio).unwrap();
             assert_eq!(original, None);
             let mut quality =
-                crate::transcribe::load_recording_quality(id, &audio, Some(&processing)).unwrap();
+                load_redo_quality(Some(&queue), id, &audio, Some(&processing)).unwrap();
             assert!(quality.storage_complete());
-            assert_eq!(quality.quality, captured);
+            assert_eq!(quality.quality, settled);
             assert_eq!(
                 quality.quality.completeness(),
                 SourceCompleteness::Incomplete
             );
             require_redo_backend(Some(BackendChoice::Local), FirstAsrBackend::Local, original)
                 .unwrap();
+            let before_print = std::fs::read(&authority).unwrap();
             settle_successful_redo_quality(
                 Some(BackendChoice::Local),
                 FirstAsrBackend::Local,
@@ -1309,6 +1949,11 @@ mod tests {
                 &mut quality,
             )
             .unwrap();
+            assert_eq!(
+                std::fs::read(&authority).unwrap(),
+                before_print,
+                "print-only settlement is read-only"
+            );
             assert!(!quality.quality.requires_batch_recovery());
             assert_eq!(
                 quality.quality.completeness(),
@@ -1331,7 +1976,55 @@ mod tests {
                     .as_deref(),
                 Some(immutable_carrier.as_str())
             );
-            assert_eq!(std::fs::read(&authority).unwrap(), original_bytes);
+            crate::transcribe::persist_recording_quality(id, &audio, &quality).unwrap();
+            let reopened = load_redo_quality(None, id, &audio, Some(&processing)).unwrap();
+            assert_eq!(reopened.quality, quality.quality);
+            assert_eq!(reopened.quality.epochs, captured.epochs);
+            let mut later_failure = reopened.quality.clone();
+            let failed_batch = corti_core::QualitySpan {
+                epoch: 0,
+                start_frame: 8,
+                end_frame: 10,
+                track: corti_core::QualityTrack::Mic,
+                cause: corti_core::QualityCause::DecodeFailure,
+                class: corti_core::QualityClass::ProcessingLoss,
+                stage: corti_core::QualityStage::Batch,
+                resolution: corti_core::QualityResolution::Outstanding,
+            };
+            later_failure.insert_span(failed_batch).unwrap();
+            corti_core::quality_store::persist_settled_quality(
+                &audio,
+                id,
+                reopened.settled_snapshot.as_ref(),
+                &later_failure,
+            )
+            .unwrap();
+            // Replaying an older successful checkpoint is not another successful whole-file call.
+            crate::jobs::complete_with_retained_quality(
+                &queue,
+                id,
+                &audio,
+                &note,
+                Some(&quality.quality),
+            )
+            .unwrap();
+            let latest = load_redo_quality(Some(&queue), id, &audio, Some(&processing)).unwrap();
+            assert!(latest.quality.spans.contains(&failed_batch));
+            assert!(latest.quality.requires_batch_recovery());
+            let mut retained: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&authority).unwrap()).unwrap();
+            assert!(
+                retained
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("settled_quality")
+                    .is_some()
+            );
+            assert_eq!(
+                retained,
+                serde_json::from_slice::<serde_json::Value>(&original_bytes).unwrap(),
+                "all capture/storage fields remain frozen"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1351,6 +2044,7 @@ mod tests {
             let mut quality = RecordingQuality {
                 quality: captured.clone(),
                 storage_status: status,
+                settled_snapshot: None,
             };
             settle_successful_redo_quality(
                 Some(BackendChoice::Local),
@@ -1365,6 +2059,7 @@ mod tests {
         let mut quality = RecordingQuality {
             quality: captured.clone(),
             storage_status: RecordingStorageStatus::AudioDurable,
+            settled_snapshot: None,
         };
         for original in [None, Some(FirstAsrBackend::Aws)] {
             settle_successful_redo_quality(

@@ -88,11 +88,102 @@ pub(crate) fn merge_durable_settled_quality(
     if let Some(payload) = queue.jobs().recording_payload(RETRY_TRANSCRIPTION, id)?
         && let Some(settled) = corti_jobs::settled_quality(&payload)?
     {
-        quality
-            .merge_snapshot(&settled)
-            .map_err(|_| anyhow::anyhow!("conflicting_recording_quality"))?;
+        merge_historical_quality(quality, &settled)?;
     }
     Ok(())
+}
+
+/// Import a transient historical carrier into the retained baseline. Only ended live intervals can
+/// inherit an already-durable recovery. Batch failures remain outstanding, even at identical frames.
+/// Split overlap rather than promoting an unmatched extension. Omitted counters stay conservative.
+pub(crate) fn merge_historical_quality(
+    quality: &mut corti_core::QualityRecord,
+    incoming: &corti_core::QualityRecord,
+) -> Result<()> {
+    use corti_core::{QualityClass, QualityResolution, QualityStage};
+    incoming.validate()?;
+    quality.validate()?;
+    let mut imported = incoming.clone();
+    imported.spans.clear();
+    for span in &incoming.spans {
+        if span.stage != QualityStage::Live
+            || span.class != QualityClass::ProcessingLoss
+            || span.resolution != QualityResolution::Outstanding
+        {
+            imported.insert_span(*span)?;
+            continue;
+        }
+        let mut recovered: Vec<_> = quality
+            .spans
+            .iter()
+            .filter(|known| {
+                known.resolution == QualityResolution::RecoveredByBatch
+                    && known.stage == span.stage
+                    && known.class == span.class
+                    && known.epoch == span.epoch
+                    && known.track == span.track
+                    && known.cause == span.cause
+                    && known.start_frame < span.end_frame
+                    && known.end_frame > span.start_frame
+            })
+            .collect();
+        recovered.sort_unstable_by_key(|known| known.start_frame);
+        let mut cursor = span.start_frame;
+        for known in recovered {
+            let start = known.start_frame.max(cursor);
+            let end = known.end_frame.min(span.end_frame);
+            if start >= end {
+                continue;
+            }
+            if cursor < start {
+                imported.insert_span(corti_core::QualitySpan {
+                    start_frame: cursor,
+                    end_frame: start,
+                    ..*span
+                })?;
+            }
+            imported.insert_span(corti_core::QualitySpan {
+                start_frame: start,
+                end_frame: end,
+                resolution: QualityResolution::RecoveredByBatch,
+                ..*span
+            })?;
+            cursor = end;
+        }
+        if cursor < span.end_frame {
+            imported.insert_span(corti_core::QualitySpan {
+                start_frame: cursor,
+                ..*span
+            })?;
+        }
+    }
+    quality
+        .merge_snapshot(&imported)
+        .map_err(|_| anyhow::anyhow!("conflicting_recording_quality"))?;
+    Ok(())
+}
+
+/// Completion/replay is not a fresh batch success. Import its snapshot without resolving new losses,
+/// then publish against the exact current baseline before Done may delete jobs/checkpoints.
+pub(crate) fn complete_with_retained_quality(
+    queue: &Queue,
+    id: &str,
+    audio: &Path,
+    note: &Path,
+    checkpoint: Option<&corti_core::QualityRecord>,
+) -> Result<()> {
+    let row = queue.get(id)?;
+    let capture = crate::transcribe::decode_capture_processing(
+        row.as_ref()
+            .and_then(|row| row.capture_processing.as_deref()),
+    )?;
+    let mut quality = crate::transcribe::load_recording_quality(id, audio, capture.as_ref())?;
+    merge_durable_settled_quality(queue, id, &mut quality.quality)?;
+    if let Some(checkpoint) = checkpoint {
+        merge_historical_quality(&mut quality.quality, checkpoint)?;
+    }
+    crate::transcribe::persist_recording_quality(id, audio, &quality)?;
+    queue.complete_with_note(id, note)
 }
 
 pub(crate) fn retry_payload_with_note(
@@ -1534,8 +1625,27 @@ mod tests {
                 if !state.starts_with("durable") {
                     assert_eq!(
                         loaded.quality.source_completeness(),
-                        SourceCompleteness::Unknown
+                        if state == "missing" {
+                            SourceCompleteness::Unknown
+                        } else {
+                            SourceCompleteness::Complete
+                        }
                     );
+                    let mut provenance =
+                        corti_vagus::provenance::TranscriptProvenance::legacy_unknown(
+                            corti_vagus::provenance::GenerationMode::Batch,
+                        );
+                    crate::provenance::attach_quality(
+                        &mut provenance,
+                        &loaded.quality,
+                        Some(loaded.storage_status),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        provenance.configuration["source_completeness"],
+                        serde_json::json!("unknown")
+                    );
+                    assert!(!loaded.storage_complete());
                 }
                 assert_eq!(
                     corti_jobs::settled_quality(

@@ -360,6 +360,8 @@ pub(crate) enum RecordingStorageStatus {
 pub(crate) struct RecordingQuality {
     pub(crate) quality: corti_core::QualityRecord,
     pub(crate) storage_status: RecordingStorageStatus,
+    /// Exact prior settled authority, compared under publication ownership after this attempt.
+    pub(crate) settled_snapshot: Option<corti_core::QualityRecord>,
 }
 
 impl RecordingQuality {
@@ -396,6 +398,7 @@ fn validated_wav_frames(audio: &Path) -> Result<u64> {
 
 /// Read mandatory capture authority before every batch/retry/redo. The queue copy is immutable capture
 /// provenance; settlement happens on this separate record and never overwrites that JSON column.
+/// The mandatory envelope may also retain settled history after checkpoint/job cleanup.
 pub(crate) fn load_recording_quality(
     id: &str,
     audio: &Path,
@@ -430,13 +433,67 @@ pub(crate) fn load_recording_quality(
             .merge_snapshot(captured)
             .context("conflicting capture quality histories")?;
     }
-    if !readout.permits_completion() {
-        quality.coverage = corti_core::QualityCoverage::LegacyUnknown;
+    if let Some(settled) = readout
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.settled_quality())
+    {
+        // Validate the immutable queue/capture union before selecting its newer settled history.
+        // Normalization is only a containment comparison, never a new recovery decision.
+        let mut captured_facts = quality.clone();
+        let mut settled_facts = settled.clone();
+        for facts in [&mut captured_facts, &mut settled_facts] {
+            facts.resolve_processing_after_batch(
+                corti_core::BatchRecoveryOutcome::SameBackendWholeFileSuccess,
+            )?;
+        }
+        let expected = settled_facts.clone();
+        settled_facts.merge_snapshot(&captured_facts)?;
+        anyhow::ensure!(
+            settled_facts == expected,
+            "conflicting capture quality histories"
+        );
+        quality = settled.clone();
     }
+    // Storage eligibility is independent of intrinsic source coverage. Projecting unfinished
+    // storage into this record would persist temporary uncertainty after capture finalization.
+    // Recovery checks storage_complete(); provenance/body project the separate storage status.
     Ok(RecordingQuality {
         quality,
         storage_status,
+        settled_snapshot: readout
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settled_quality())
+            .cloned(),
     })
+}
+
+/// Retain known history before deleting transient carriers. Legacy audio with no quality facts keeps
+/// its existing behavior; a missing/corrupt authority must never be manufactured or promoted here.
+pub(crate) fn persist_recording_quality(
+    id: &str,
+    audio: &Path,
+    quality: &RecordingQuality,
+) -> Result<()> {
+    if quality.settled_snapshot.is_none() && quality.quality == corti_core::QualityRecord::default()
+    {
+        return Ok(());
+    }
+    let authority_audio = if audio.file_name().and_then(|name| name.to_str())
+        == Some(format!("{id}-clean.wav").as_str())
+    {
+        audio.with_file_name(format!("{id}.wav"))
+    } else {
+        audio.to_path_buf()
+    };
+    corti_core::quality_store::persist_settled_quality(
+        &authority_audio,
+        id,
+        quality.settled_snapshot.as_ref(),
+        &quality.quality,
+    )
+    .context("retaining settled recording quality")
 }
 
 /// Parse and validate a queue row's versioned capture-processing record. `None` is a legacy pre-marker row.

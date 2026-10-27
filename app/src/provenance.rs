@@ -55,11 +55,14 @@ pub(crate) fn attach_quality(
     );
     provenance.configuration.insert(
         "source_completeness".into(),
-        serde_json::to_value(quality.source_completeness())?,
+        serde_json::to_value(completeness_with_storage(
+            quality.source_completeness(),
+            storage,
+        ))?,
     );
     provenance.configuration.insert(
         "text_completeness".into(),
-        serde_json::to_value(quality.completeness())?,
+        serde_json::to_value(completeness_with_storage(quality.completeness(), storage))?,
     );
     if let Some(storage) = storage {
         provenance
@@ -67,6 +70,23 @@ pub(crate) fn attach_quality(
             .insert("quality_storage".into(), serde_json::to_value(storage)?);
     }
     Ok(())
+}
+
+/// Storage uncertainty affects completion claims, never the retained source record. Known losses
+/// remain incomplete; intrinsic unknown coverage remains unknown. An absent legacy storage field
+/// retains its previous reporting semantics rather than inventing a new storage observation.
+fn completeness_with_storage(
+    completeness: corti_core::SourceCompleteness,
+    storage: Option<crate::transcribe::RecordingStorageStatus>,
+) -> corti_core::SourceCompleteness {
+    if completeness == corti_core::SourceCompleteness::Complete
+        && storage
+            .is_some_and(|status| status != crate::transcribe::RecordingStorageStatus::AudioDurable)
+    {
+        corti_core::SourceCompleteness::Unknown
+    } else {
+        completeness
+    }
 }
 
 /// Preserve the Markdown turn syntax while displaying known source offsets. A turn crossing an
@@ -104,7 +124,7 @@ pub(crate) fn quality_body(
         }
     }
     let mut body = corti_vagus::recording_body(meta, &display);
-    if quality.completeness() != SourceCompleteness::Complete {
+    if completeness_with_storage(quality.completeness(), storage) != SourceCompleteness::Complete {
         body.push_str("\n\n> Transcript coverage is partial or unknown. Retained audio can be retried with `corti --redo <id> --local`.\n");
     }
     if let Some(storage) = storage
@@ -615,6 +635,95 @@ fn float_value(value: f32) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_completeness_projection_preserves_intrinsic_quality() {
+        use crate::transcribe::RecordingStorageStatus;
+        use corti_core::{QualityClass, QualityRecord, QualityResolution};
+        let mut source_loss = QualityRecord::observed();
+        source_loss
+            .record_omitted_spans(QualityClass::SourceLoss, QualityResolution::Outstanding, 1)
+            .unwrap();
+        let mut processing_loss = QualityRecord::observed();
+        processing_loss
+            .record_omitted_spans(
+                QualityClass::ProcessingLoss,
+                QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        let meta = corti_core::RecordingMeta {
+            started_at: chrono::Local::now(),
+            ended_at: None,
+            owning_app: corti_core::OwningApp::unknown(),
+            audio_path: "synthetic.wav".into(),
+        };
+        for (quality, verified, unverified_expected) in [
+            (
+                QualityRecord::observed(),
+                ["complete", "complete"],
+                ["unknown", "unknown"],
+            ),
+            (
+                QualityRecord::default(),
+                ["unknown", "unknown"],
+                ["unknown", "unknown"],
+            ),
+            (
+                source_loss,
+                ["incomplete", "incomplete"],
+                ["incomplete", "incomplete"],
+            ),
+            (
+                processing_loss,
+                ["complete", "incomplete"],
+                ["unknown", "incomplete"],
+            ),
+        ] {
+            for storage in [
+                None,
+                Some(RecordingStorageStatus::AudioDurable),
+                Some(RecordingStorageStatus::LegacyUnknown),
+                Some(RecordingStorageStatus::InProgress),
+                Some(RecordingStorageStatus::Finalizing),
+                Some(RecordingStorageStatus::AudioUnverified),
+                Some(RecordingStorageStatus::FrameCountMismatch),
+                Some(RecordingStorageStatus::InterruptedPublication),
+            ] {
+                let unverified =
+                    storage.is_some_and(|status| status != RecordingStorageStatus::AudioDurable);
+                let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+                attach_quality(&mut provenance, &quality, storage).unwrap();
+                assert_eq!(
+                    provenance.configuration["quality"],
+                    serde_json::to_value(&quality).unwrap(),
+                    "storage must not mutate intrinsic quality or checkpoint identity"
+                );
+                let expected = if unverified {
+                    unverified_expected
+                } else {
+                    verified
+                };
+                for (field, expected) in ["source_completeness", "text_completeness"]
+                    .into_iter()
+                    .zip(expected)
+                {
+                    assert_eq!(provenance.configuration[field], expected);
+                }
+                let body = quality_body(
+                    &meta,
+                    &corti_core::DiarizedTranscript::default(),
+                    Some(&quality),
+                    storage,
+                );
+                assert_eq!(body.contains("Completion is unverified."), unverified);
+                assert_eq!(
+                    body.contains("Transcript coverage is partial or unknown."),
+                    expected[1] != "complete"
+                );
+            }
+        }
+    }
 
     #[test]
     fn full_capacity_quality_uses_labelled_projection_without_losing_authoritative_facts() {

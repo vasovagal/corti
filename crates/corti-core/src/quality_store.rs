@@ -36,6 +36,10 @@ pub struct QualitySnapshot {
     state: QualityStorageState,
     expected_retained_frames: u64,
     quality: QualityRecord,
+    /// Processing history retained after transient jobs/checkpoints are removed. Capture facts and
+    /// storage certification above remain immutable after the capture writer finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settled_quality: Option<QualityRecord>,
 }
 
 // Do not expose recording identifiers, file names, or serialized payloads through diagnostic output.
@@ -60,6 +64,10 @@ impl QualitySnapshot {
 
     pub fn quality(&self) -> &QualityRecord {
         &self.quality
+    }
+
+    pub fn settled_quality(&self) -> Option<&QualityRecord> {
+        self.settled_quality.as_ref()
     }
 }
 
@@ -276,6 +284,7 @@ impl QualityStore {
             state: QualityStorageState::InProgress,
             expected_retained_frames: 0,
             quality: initial.clone(),
+            settled_quality: None,
         };
         publish(&paths, &durable, false, &mut faults)?;
         Ok(Self {
@@ -403,6 +412,81 @@ fn preserves_history(
     }
 }
 
+/// Preserve all facts while allowing only processing resolution to change. This comparison does
+/// not resolve the supplied record; callers must have independently established recovery.
+fn preserves_settled_history(
+    next: &QualityRecord,
+    previous: &QualityRecord,
+) -> Result<(), QualityStoreError> {
+    let mut next = next.clone();
+    let mut previous = previous.clone();
+    for quality in [&mut next, &mut previous] {
+        quality
+            .resolve_processing_after_batch(
+                crate::BatchRecoveryOutcome::SameBackendWholeFileSuccess,
+            )
+            .map_err(|_| QualityStoreError::InvalidQuality)?;
+    }
+    preserves_history(&next, &previous)
+}
+
+/// Retain settled processing history in the existing mandatory authority. This never creates a
+/// missing capture envelope or changes its identity, capture record, storage phase or frame binding.
+/// Call before removing a recording's last transient quality carrier. Registered transaction paths,
+/// owner-only publication, rollback and retention are the same as capture publication.
+pub fn persist_settled_quality(
+    audio: &Path,
+    recording_id: &str,
+    expected_settled: Option<&QualityRecord>,
+    quality: &QualityRecord,
+) -> Result<(), QualityStoreError> {
+    persist_settled_with_faults(
+        audio,
+        recording_id,
+        expected_settled,
+        quality,
+        &mut Faults::default(),
+    )
+}
+
+fn persist_settled_with_faults(
+    audio: &Path,
+    recording_id: &str,
+    expected_settled: Option<&QualityRecord>,
+    quality: &QualityRecord,
+    faults: &mut Faults,
+) -> Result<(), QualityStoreError> {
+    validate_identity(recording_id)?;
+    let paths = StorePaths::new(audio)?;
+    if paths.has_temporary()? {
+        return Err(QualityStoreError::InterruptedPublication);
+    }
+    // Acquire the existing publication owner BEFORE reading. A concurrent redo can otherwise
+    // publish between our read and the exclusive link, letting a stale snapshot erase its history.
+    fs::hard_link(&paths.sidecar, &paths.previous).map_err(|_| QualityStoreError::Write)?;
+    let prepared = (|| {
+        sync_parent(&paths.parent)?;
+        let mut snapshot = read_snapshot(&paths.previous, &paths, recording_id)?
+            .ok_or(QualityStoreError::InvalidTransition)?;
+        if snapshot.settled_quality.as_ref() != expected_settled {
+            return Err(QualityStoreError::HistoryRegression);
+        }
+        preserves_settled_history(quality, &snapshot.quality)?;
+        if let Some(previous) = &snapshot.settled_quality {
+            preserves_settled_history(quality, previous)?;
+        }
+        snapshot.settled_quality = Some(quality.clone());
+        encode(&snapshot)
+    })();
+    match prepared {
+        Ok(bytes) => publish_owned(&paths, &bytes, true, faults),
+        Err(error) => {
+            remove_if_present(&paths.previous)?;
+            Err(error)
+        }
+    }
+}
+
 /// Read recovery authority using the expected identity and a frame count from validated WAV data.
 /// `None` never certifies completion. Missing sidecars preserve legacy-unknown semantics; corrupt
 /// data/bindings return content-free errors. Surviving transaction files always fail closed, while
@@ -423,6 +507,15 @@ pub fn load_quality(
         match (primary, previous) {
             (Ok(Some(current)), Ok(Some(prior))) => {
                 preserves_history(&current.quality, &prior.quality)?;
+                if let Some(prior_settled) = &prior.settled_quality {
+                    preserves_settled_history(
+                        current
+                            .settled_quality
+                            .as_ref()
+                            .ok_or(QualityStoreError::HistoryRegression)?,
+                        prior_settled,
+                    )?;
+                }
                 Some(current)
             }
             (Ok(Some(current)), _) => Some(current),
@@ -494,6 +587,9 @@ fn read_snapshot(
     if snapshot.recording_id != recording_id || snapshot.audio_file_name != paths.audio_file_name {
         return Err(QualityStoreError::BindingMismatch);
     }
+    if let Some(settled) = &snapshot.settled_quality {
+        preserves_settled_history(settled, &snapshot.quality)?;
+    }
     Ok(Some(snapshot))
 }
 
@@ -518,6 +614,9 @@ fn encode(snapshot: &QualitySnapshot) -> Result<Vec<u8>, QualityStoreError> {
         .quality
         .validate()
         .map_err(|_| QualityStoreError::InvalidQuality)?;
+    if let Some(settled) = &snapshot.settled_quality {
+        preserves_settled_history(settled, &snapshot.quality)?;
+    }
     let mut bytes = BoundedBytes(Vec::new());
     serde_json::to_writer(&mut bytes, snapshot).map_err(|error| {
         if error.is_io() {
@@ -568,7 +667,7 @@ fn publish(
     has_prior: bool,
     faults: &mut Faults,
 ) -> Result<(), QualityStoreError> {
-    let bytes = encode(snapshot)?;
+    let encoded = encode(snapshot)?;
     if paths.has_temporary()? {
         return Err(QualityStoreError::InterruptedPublication);
     }
@@ -581,13 +680,48 @@ fn publish(
             return Err(error);
         }
     }
+    let prepared = (|| {
+        let mut snapshot = snapshot.clone();
+        if has_prior
+            && let Some(prior) = read_snapshot(&paths.previous, paths, &snapshot.recording_id)?
+            && let Some(mut settled) = prior.settled_quality
+        {
+            // The capture writer may still hold a pre-settlement in-memory snapshot. Carry the
+            // adjunct forward under ownership; only this writer may advance capture storage state.
+            settled
+                .merge_snapshot(&snapshot.quality)
+                .map_err(|_| QualityStoreError::HistoryRegression)?;
+            snapshot.settled_quality = Some(settled);
+            return encode(&snapshot);
+        }
+        Ok(encoded)
+    })();
+    let bytes = match prepared {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            if has_prior {
+                remove_if_present(&paths.previous)?;
+            }
+            return Err(error);
+        }
+    };
+    publish_owned(paths, &bytes, has_prior, faults)
+}
+
+/// The caller owns the exclusive transaction paths and has pinned the prior inode, if present.
+fn publish_owned(
+    paths: &StorePaths,
+    bytes: &[u8],
+    has_prior: bool,
+    faults: &mut Faults,
+) -> Result<(), QualityStoreError> {
     let mut renamed = false;
     let mut pending_owned = false;
     let result = (|| {
         let mut file = private_new(&paths.pending)?;
         pending_owned = true;
         faults.check(FaultPoint::Write, QualityStoreError::Write)?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .map_err(|_| QualityStoreError::Write)?;
         faults.check(FaultPoint::FileSync, QualityStoreError::FileSync)?;
         file.sync_all().map_err(|_| QualityStoreError::FileSync)?;
@@ -805,6 +939,207 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_settlement_publishers_preserve_the_winner_and_retry_union() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let capture = with_loss();
+        QualityStore::begin(&audio, "synthetic", &capture).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let publishers: Vec<_> = [8, 12]
+            .into_iter()
+            .map(|start_frame| {
+                let audio = audio.clone();
+                let barrier = barrier.clone();
+                let mut quality = capture.clone();
+                quality
+                    .insert_span(QualitySpan {
+                        epoch: 0,
+                        start_frame,
+                        end_frame: start_frame + 2,
+                        track: QualityTrack::Mic,
+                        cause: QualityCause::MicTapMismatch,
+                        class: QualityClass::ProcessingLoss,
+                        stage: QualityStage::Live,
+                        resolution: QualityResolution::Outstanding,
+                    })
+                    .unwrap();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = persist_settled_quality(&audio, "synthetic", None, &quality);
+                    (quality, result)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = publishers
+            .into_iter()
+            .map(|publisher| publisher.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let winner = &results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        let stored = load_quality(&audio, "synthetic", None).unwrap();
+        assert_eq!(stored.snapshot.unwrap().settled_quality(), Some(winner));
+        let mut union = winner.clone();
+        for (quality, _) in &results {
+            union.merge_snapshot(quality).unwrap();
+        }
+        persist_settled_quality(&audio, "synthetic", Some(winner), &union).unwrap();
+        let stored = load_quality(&audio, "synthetic", None).unwrap();
+        assert_eq!(stored.snapshot.unwrap().settled_quality(), Some(&union));
+        assert_eq!(
+            union.spans.len(),
+            3,
+            "source loss and both live histories survive"
+        );
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
+    fn settled_history_uses_existing_publication_and_rejects_stale_attempts() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let capture = with_loss();
+        let mut writer = QualityStore::begin(&audio, "synthetic", &capture).unwrap();
+        synthetic_wav(&audio, 16);
+        writer.prepare_finalization(&capture, 16).unwrap();
+        writer.complete_after_audio_sync(16).unwrap();
+        let frozen = writer.snapshot().clone();
+        let mut settled = capture.clone();
+        let live = QualitySpan {
+            epoch: 0,
+            start_frame: 8,
+            end_frame: 10,
+            track: QualityTrack::Mic,
+            cause: QualityCause::MicTapMismatch,
+            class: QualityClass::ProcessingLoss,
+            stage: QualityStage::Live,
+            resolution: QualityResolution::Outstanding,
+        };
+        settled.insert_span(live).unwrap();
+        persist_settled_quality(&audio, "synthetic", None, &settled).unwrap();
+        let mut stale = capture.clone();
+        stale
+            .insert_span(QualitySpan {
+                start_frame: 12,
+                end_frame: 14,
+                ..live
+            })
+            .unwrap();
+        assert_eq!(
+            persist_settled_quality(&audio, "synthetic", None, &stale),
+            Err(QualityStoreError::HistoryRegression)
+        );
+        let mut merged = settled.clone();
+        merged.merge_snapshot(&stale).unwrap();
+        persist_settled_quality(&audio, "synthetic", Some(&settled), &merged).unwrap();
+        let mut successful = merged.clone();
+        successful
+            .resolve_processing_after_batch(
+                crate::BatchRecoveryOutcome::SameBackendWholeFileSuccess,
+            )
+            .unwrap();
+        let before = fs::read(quality_sidecar_path(&audio).unwrap()).unwrap();
+        for point in [
+            FaultPoint::Write,
+            FaultPoint::FileSync,
+            FaultPoint::Rename,
+            FaultPoint::DirectorySync,
+        ] {
+            let mut faults = Faults {
+                failures: vec![point],
+            };
+            assert!(
+                persist_settled_with_faults(
+                    &audio,
+                    "synthetic",
+                    Some(&merged),
+                    &successful,
+                    &mut faults
+                )
+                .is_err()
+            );
+            assert_eq!(
+                fs::read(quality_sidecar_path(&audio).unwrap()).unwrap(),
+                before
+            );
+            assert_no_temporary(&audio);
+        }
+        persist_settled_quality(&audio, "synthetic", Some(&merged), &successful).unwrap();
+        let mut later_failure = successful.clone();
+        later_failure
+            .insert_span(QualitySpan {
+                stage: QualityStage::Batch,
+                cause: QualityCause::DecodeFailure,
+                ..live
+            })
+            .unwrap();
+        persist_settled_quality(&audio, "synthetic", Some(&successful), &later_failure).unwrap();
+        // A whole-file result started before this fresh failure cannot clear it, even at the same interval.
+        assert_eq!(
+            persist_settled_quality(&audio, "synthetic", Some(&successful), &successful),
+            Err(QualityStoreError::HistoryRegression)
+        );
+        let mut actual = load_quality(&audio, "synthetic", Some(16))
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert_eq!(actual.settled_quality.take(), Some(later_failure));
+        assert_eq!(actual, frozen);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(quality_sidecar_path(&audio).unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
+    fn settled_partial_history_survives_capture_finalization_without_promoting_storage() {
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let capture = initial();
+        let mut writer = QualityStore::begin(&audio, "synthetic", &capture).unwrap();
+        let mut settled = capture.clone();
+        settled
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: 8,
+                end_frame: 10,
+                track: QualityTrack::Mic,
+                cause: QualityCause::MicTapMismatch,
+                class: QualityClass::ProcessingLoss,
+                stage: QualityStage::Live,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        persist_settled_quality(&audio, "synthetic", None, &settled).unwrap();
+        assert_eq!(
+            load_quality(&audio, "synthetic", Some(16)).unwrap().status,
+            QualityReadStatus::InProgress
+        );
+        synthetic_wav(&audio, 16);
+        writer.prepare_finalization(&capture, 16).unwrap();
+        writer.complete_after_audio_sync(16).unwrap();
+        let read = load_quality(&audio, "synthetic", Some(16)).unwrap();
+        assert!(read.permits_completion());
+        assert_eq!(read.snapshot.unwrap().settled_quality(), Some(&settled));
+        remove_quality_files(&audio).unwrap();
+        assert!(persist_settled_quality(&audio, "synthetic", None, &settled).is_err());
+        assert!(!quality_sidecar_path(&audio).unwrap().exists());
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
     fn initial_authority_precedes_audio_and_binds_existing_identity() {
         let fixture = Fixture::new();
         let audio = fixture.audio();
@@ -827,6 +1162,10 @@ mod tests {
         assert_eq!(value["recording_id"], "synthetic-id");
         assert_eq!(value["audio_file_name"], "synthetic.wav");
         assert_eq!(value["state"], "in_progress");
+        assert!(
+            value.get("settled_quality").is_none(),
+            "old sidecars remain readable and absent optional fields stay absent"
+        );
         assert_no_temporary(&audio);
     }
 

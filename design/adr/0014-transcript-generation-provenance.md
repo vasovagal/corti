@@ -112,7 +112,8 @@ normal Done cleanup has removed the historical backend authority. This is repres
 nonserialized `BatchRecoveryOutcome::ExplicitLocalWholeFileSuccess`, not by a claim that the backend
 matches an unknown historical origin. Only the explicit-local CLI path, after successful whole-file
 decode by the actual local backend and verified `audio_durable` storage, may select that outcome.
-Historical origin stays unknown; immutable capture metadata and the mandatory sidecar are not rewritten.
+Historical origin stays unknown; immutable capture metadata and the sidecar's capture fields are not
+rewritten. The later #138 retention amendment below adds only an optional settled-history field.
 Source loss, unknown source mapping, epoch omissions, and saturated accounting remain incomplete or
 unknown. Failed/partial decode and unverified/interrupted storage do not authorize processing recovery.
 Automatic origin matching and unknown-origin default/`--aws` redo refusal are unchanged; no note-read
@@ -146,7 +147,8 @@ facts; a panicked consumer waits for Finish/Discard without resuming its decoder
 Start binding lost by the tee, Discard keeps deletion ownership, and a disconnected verdict cannot
 authorize a fabricated Start. Recovery reloads mandatory capture/storage independently before merging
 live evidence. Missing/corrupt/unfinished storage remains uncertified; successful authorized whole-file
-recovery may resolve processing loss but never source loss. Capture sidecar/queue provenance is immutable.
+recovery may resolve processing loss but never source loss. Capture fields in sidecar/queue provenance
+are immutable; the optional lifetime settlement described below does not replace that authority.
 
 The existing retry payload gains optional `settled_quality`, including no-note fallback. Recording-id
 enqueue and failure/reschedule transactions merge evidence monotonically while preserving original
@@ -168,6 +170,48 @@ The [regression inventory](../../docs/live-alignment-regressions.md) maps all 34
 records behavioral failure-first receipts, and distinguishes portable source proofs from pending native
 validation. This amendment does not add a note-read API, new startup discovery, a new scheduler, a second
 quality model, or new egress permission.
+
+### Retain settled history through redo and successful cleanup
+
+Successful job/checkpoint cleanup must not delete the only machine-readable history of a live mismatch.
+The existing mandatory sidecar therefore has an optional `settled_quality` containing the same bounded
+`QualityRecord`. Capture quality, recording/audio binding, expected frame count and storage phase remain
+immutable during settlement. The existing private atomic/rollback path and 256 KiB envelope bound cover
+both fields; recording-owned retention and temporary cleanup remain unchanged. Capture finalization
+preserves an already-published adjunct without treating it as permission to advance storage state.
+
+Intrinsic source coverage remains separate from storage eligibility. Loading an unfinished envelope
+must not overwrite that coverage with a temporary unknown value that settlement would retain forever.
+Note/provenance classifications project otherwise-complete coverage to unknown while explicit storage
+is unverified; known loss and genuine legacy uncertainty remain unchanged. Recovery still requires
+verified storage. Later capture finalization can establish storage eligibility without erasing any
+source or processing facts. Legacy checkpoints with absent storage metadata keep their existing meaning.
+
+Backend refusal is processing incompleteness, not unknown capture coverage. Refusal retains an existing
+outstanding processing loss or, if there is none, records one bounded unpositioned processing obligation.
+It represents the recording-wide refusal without a decoder-region result; it is not an exact audio
+interval or a claim that a decoder ran. Existing recovery provenance/body explains the refusal. A later
+authorized whole-file success may resolve this obligation; genuine unknown capture and source loss
+remain unchanged. The backend gate and its zero-staging/zero-decoder/zero-hosted behavior are unchanged.
+
+Redo loads lifetime history plus any remaining retry/checkpoint facts before decoding. A historical
+outstanding Live interval already covered by retained recovered Live history stays recovered only on
+matching epoch/track/cause/class/stage and covered frame portions. Unmatched extensions, Batch-stage
+failures and ambiguous omitted counts stay conservative. An old recovered checkpoint is not a fresh
+whole-file success and cannot erase a later Batch failure at the same interval. Generic snapshot merge
+semantics are unchanged; only an actual authorized successful whole-file operation resolves loss.
+
+Settlement claims the existing exclusive `.previous` transaction ownership before reading the latest
+envelope. Stale writers fail rather than overwrite a concurrent winner; reload/merge/retry preserves
+distinct facts. Successful batch settlement is retained before checkpoint publication, and both Done
+paths require retention before completing the row and deleting transient recovery authorities. Failure
+keeps the recording/job/checkpoint recoverable. Non-print redo retains its result before filing;
+`--print` remains read-only. Missing/corrupt capture authority is never fabricated to retain an adjunct.
+
+The new reader accepts existing sidecars without the optional field. Intermediate commit `77ca04b`
+rejects the new field because its private envelope uses `deny_unknown_fields`; no compatibility with
+that unreleased intermediate format is claimed. The released base had no quality sidecar. Existing
+released queue/notes/settings formats and SQLite schema version are unchanged.
 
 ## Consequences
 
