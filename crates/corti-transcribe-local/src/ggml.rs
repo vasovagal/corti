@@ -168,6 +168,43 @@ fn words_from(t: &Transcript, offset_sec: f64) -> Vec<Word> {
 mod tests {
     use super::*;
 
+    /// CI infrastructure probe: inspect the native Result directly, since the production adapter's
+    /// empty word list cannot distinguish silence from a failed decoder before the #163 fix.
+    #[test]
+    #[ignore = "needs pinned GGUF and synthetic 16 kHz WAV; writes CORTI_VERIFY_METAL_RESULT"]
+    fn quality_probe_metal() {
+        let dir = PathBuf::from(std::env::var("CORTI_VERIFY_MODEL_DIR").expect("model directory"));
+        let wav = std::env::var("CORTI_VERIFY_WAV").expect("synthetic fixture");
+        let result = std::env::var("CORTI_VERIFY_METAL_RESULT").expect("probe result path");
+        let mut reader = hound::WavReader::open(wav).expect("open synthetic WAV");
+        assert_eq!(reader.spec().sample_rate, 16_000);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().bits_per_sample, 16);
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .take(16_000)
+            .map(|sample| f32::from(sample.expect("fixture sample")) / 32_768.0)
+            .collect();
+        assert_eq!(samples.len(), 16_000, "probe must decode one second");
+        let path = resolve_gguf(None, &dir).expect("verified GGUF must exist");
+        let available = GgmlAsr::load(&path, 4).is_ok_and(|asr| {
+            asr.session
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .run(&samples, &RunOptions::default())
+                .is_ok()
+        });
+        std::fs::write(
+            result,
+            if available {
+                "available"
+            } else {
+                "unavailable"
+            },
+        )
+        .expect("write Metal probe result");
+    }
+
     #[test]
     fn words_map_with_offset() {
         let t = Transcript {
