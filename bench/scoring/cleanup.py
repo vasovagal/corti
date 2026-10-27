@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Segment-cleanup scorer for the bench harness (issue #149).
+"""Segment-cleanup diagnostics for the bench harness (issues #149, #161).
 
-Scores what `corti_transcribe::segment::cleanup` is supposed to fix, on a whole transcript rather than on
-words: cross-channel echo (#107), fragmented turns, and pure backchannel rows. Unlike `wer.py`/`cpwer.py`
-this needs **no reference** — every metric is intrinsic to the transcript, so it can be run over real calls
-that have no ground truth.
+Reports cross-channel text similarity, fragmented turns and pure backchannel rows. Unlike
+`wer.py`/`cpwer.py`, this needs **no reference**. These text-only diagnostics cannot establish whether a
+row is an acoustic echo or whether deleting it would lose independently spoken words. Rules 4 retain
+suspected duplicates without acoustic evidence, so fewer suspected matches is not inherently better.
 
 Inputs (both `--before` and `--after` accept either form; `.md` is detected by suffix, or forced with
 `--markdown`):
@@ -19,7 +19,7 @@ Inputs (both `--before` and `--after` accept either form; `.md` is detected by s
 Metrics, per transcript::
 
     n_segments             turns in the transcript
-    echo_pairs_remaining   turns that still look like a copy of the other channel (see below)
+    echo_pairs_remaining   turns with a suspected text match on the other channel (see below)
     turns_le3              turns of three words or fewer (the fragmentation symptom)
     backchannel_turns      turns that are nothing but "yeah" / "okay" / "makes sense" / …
     content_tokens         total content-token occurrences (the denominator for retention)
@@ -28,26 +28,26 @@ and, when both ``--before`` and ``--after`` are given::
 
     content_retention      after / before content-token occurrences (target >= 0.97)
     dropped                turns present in before and gone from after
-    orphan_drops           dropped turns whose content is NOT >= 70 % present in a kept neighbour
-                           within 6 s — i.e. speech the cleanup actually lost. MUST be 0.
+    orphan_drops           dropped turns not accounted for by a kept neighbour within 6 s: both
+                           >= 70 % content containment and the ordered raw critical tokens must survive
     backchannel_orphans    the same test for turns that are wholly a backchannel phrase ("I see.").
                            Not a loss — it is what the backchannel pass removes, and its words are
                            deliberately not stopwords — but reported so a wrong phrase list is visible.
+                           Raw values and protected case/unit tokens never receive this exemption.
 
-The echo detector is deliberately **looser than the cleanup rule** (containment >= 0.5 vs. the shipping
-0.7): a metric that used the rule's own threshold could only ever report zero. A turn counts once, no
-matter how many sources it echoes.
+The historical echo detector uses a **looser text threshold** than the cleanup candidate detector
+(containment >= 0.5 vs. the shipping 0.7). A turn counts once, no matter how many sources match. A number
+or polarity correction can still count as a suspected text match; the count never authorizes deletion.
 
-**`orphan_drops` reads differently for the audio rule (#149 phase 3b).** This scorer only sees two
-transcripts, so it judges a drop by whether the words turn up in a kept neighbour. That is the right test
-for the text rules — they drop a row *because* it repeats one. It is the wrong test for a drop made on the
-AEC's per-block evidence: those rows are exactly the ones whose garbled text matches nothing, which is why
-text could not catch them, so a working audio rule *raises* `orphan_drops` by construction. Attribute it by
-running the same transcript through `corti-bench clean` with and without `--aec-stats` and diffing the
-orphan list; the run's own `echo_dropped_audio` and `audio_evidence` counters are in the `corti-bench`
-JSON envelope, not here.
+**`orphan_drops` is a text diagnostic, not a speech-loss verdict.** A matching neighbour does not prove
+that an independently spoken repeat was retained. A correctly removed garbled mic ghost can raise this
+count because its words match nothing. Conversely, a changed number, name or negator must not be called
+accounted for solely because the older alphabetic content-token sets match. The raw critical signature
+therefore has to occur contiguously in the kept neighbour; this also allows ordinary fragment merges.
+Use labelled cases and cleanup decisions to assess deletion, including the run's `echo_dropped_audio`
+and `audio_evidence` values in the `corti-bench` JSON envelope.
 
-The stopword / filler / backchannel vocabularies are mirrored from
+The stopword / filler / backchannel vocabularies and raw critical-token policy are mirrored from
 ``crates/corti-transcribe/src/segment.rs``; keep the two in lock-step. Python stdlib only.
 
 Usage::
@@ -60,6 +60,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 
 # --- vocabularies (mirror of segment.rs) -----------------------------------------------------------------
 
@@ -87,11 +88,17 @@ STOPWORDS = {
 
 NOISE = FILLERS | BACKCHANNELS | STOPWORDS
 
+# Unlike the candidate detector's STOPWORDS, this closed grammar list never discards polarity.
+# Unknown words stay exact-case and ordered, without guessing which ones are names or identifiers.
+ECHO_GRAMMAR = {"a", "an", "the", "am", "is", "are", "was", "were", "be", "been", "being"}
+CRITICAL_LEADING_PUNCTUATION = "\"'“”‘’()[]{},!?;:¿¡"
+CRITICAL_TRAILING_PUNCTUATION = CRITICAL_LEADING_PUNCTUATION + "."
+
 # The echo window and the orphan-neighbour window are both the shipping `echo_window_seconds`.
 WINDOW_S = 6.0
-# Loose detector threshold: what still *looks* like an echo after cleanup ran at 0.7.
+# Loose text-only candidate threshold; this does not establish an acoustic echo.
 DETECT_CONTAINMENT = 0.5
-# A dropped turn is accounted for if this much of it survives in a neighbour.
+# A dropped turn also needs its raw critical signature to survive in the neighbour.
 ORPHAN_CONTAINMENT = 0.7
 # Longest VAD region the local backend can emit (MAX_SPEECH_SECONDS), used to bound a replayed turn.
 MAX_TURN_S = 20.0
@@ -121,7 +128,60 @@ def content_count(text):
     return sum(1 for t in tokens(text) if t not in NOISE)
 
 
+def raw_token_context(text):
+    """Mirror Rust's nonempty raw tokens and protection from lossy normalization."""
+    raw_tokens = [
+        (raw, token) for raw in text.split()
+        if (token := raw.lstrip(CRITICAL_LEADING_PUNCTUATION).rstrip(CRITICAL_TRAILING_PUNCTUATION))
+    ]
+    for i, (raw, token) in enumerate(raw_tokens):
+        lower = token.lower()
+        numeric_neighbor = any(
+            any(unicodedata.category(c).startswith("N") for c in raw_tokens[j][1])
+            for j in (i - 1, i + 1) if 0 <= j < len(raw_tokens)
+        )
+        ordinary_case = token == lower or (i == 0 and token == lower[:1].upper() + lower[1:])
+        # Unmarked medial fillers may be units; leading/comma-marked hesitations remain eligible
+        # for ordinary backchannel classification, while all fillers stay in the critical signature.
+        hesitation_context = (
+            i == 0 or raw.endswith(",") or raw_tokens[i - 1][0].endswith(",")
+        )
+        ambiguous_filler = lower in FILLERS and not hesitation_context
+        # Match Rust's raw_token_context before considering grammar equivalence. Raw markers
+        # such as @um/#ah and units such as A/Ah or mm/mM must survive without a unit vocabulary.
+        protected = (
+            any(unicodedata.category(c).startswith("N") for c in token)
+            or numeric_neighbor or not ordinary_case or lower != normalize_token(token)
+            or ambiguous_filler
+        )
+        yield token, protected
+
+
+def critical_tokens(text):
+    """Retain raw values and all possible filler/unit tokens; exempt only closed grammar."""
+    return [
+        token for token, protected in raw_token_context(text)
+        if protected or token.lower() not in ECHO_GRAMMAR
+    ]
+
+
+def contains_critical_tokens(subject, source):
+    """Allow a merged neighbour to contain the whole ordered signature, without erasing corrections."""
+    return any(source[i:i + len(subject)] == subject for i in range(len(source) - len(subject) + 1))
+
+
 def is_backchannel(text):
+    """Mirror the production classifier: backchannels must contain no protected raw values."""
+    contexts = list(raw_token_context(text))
+    single_upper_backchannel = (
+        len(contexts) == 1 and contexts[0][0] == contexts[0][0].upper()
+        and contexts[0][0].lower() in BACKCHANNELS
+    )
+    for token, protected in contexts:
+        if token.lower() != normalize_token(token):
+            return False
+        if protected and not single_upper_backchannel:
+            return False
     toks = tokens(text)
     if not toks:
         return False
@@ -239,28 +299,43 @@ def score(segments):
 
 
 def compare(before, after):
-    """Retention and orphan drops: what the cleanup removed, and whether any of it was real speech."""
+    """Text retention diagnostics; neither matching text nor an orphan establishes real speech."""
     kept = {(s["channel"], round(s["start"], 3)) for s in after}
     dropped = [s for s in before if (s["channel"], round(s["start"], 3)) not in kept]
 
     orphans, backchannel_orphans = [], 0
     for d in dropped:
         d_tok = content(d["text"])
-        if not d_tok:
-            continue  # nothing to lose: a filler or single-word backchannel row
+        d_critical = critical_tokens(d["text"])
+        if not d_tok and not d_critical:
+            continue
         best = 0.0
+        accounted = False
+        critical_difference = False
+        d_normalized = tokens(d["text"])
         for k in after:
             if k["start"] > d["end"] + WINDOW_S or k["end"] < d["start"] - WINDOW_S:
                 continue
-            best = max(best, containment(d_tok, content(k["text"])))
-        if best >= ORPHAN_CONTAINMENT:
+            overlap = containment(d_tok, content(k["text"]))
+            best = max(best, overlap)
+            preserved = contains_critical_tokens(d_critical, critical_tokens(k["text"]))
+            text_matches = overlap >= ORPHAN_CONTAINMENT or (
+                bool(d_normalized) and d_normalized == tokens(k["text"])
+            )
+            if k["channel"] != d["channel"] and text_matches and not preserved:
+                critical_difference = True
+            if preserved and (not d_tok or overlap >= ORPHAN_CONTAINMENT):
+                accounted = True
+        if accounted:
             continue
         # A whole-phrase backchannel ("I see.", "Of course.", "Sounds good.") is not lost content — it is
         # what the backchannel pass exists to remove, and `backchannel_turns` already counts it. Its words
         # are not in the stopword set (they carry meaning elsewhere), so it would otherwise look orphaned.
         # Counted separately rather than hidden, because a spike here would mean the phrase list is wrong.
-        if is_backchannel(d["text"]):
-            backchannel_orphans += 1
+        # A matched raw correction takes precedence even when either standalone turn is a backchannel.
+        if is_backchannel(d["text"]) and not critical_difference:
+            if d_tok:
+                backchannel_orphans += 1
             continue
         orphans.append({"start": d["start"], "channel": d["channel"], "best_containment": round(best, 3)})
 

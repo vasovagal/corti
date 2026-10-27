@@ -47,134 +47,173 @@ before emitting any clean frame. Ordinary recordings carry a versioned `CaptureP
 in `queue.db`, so retries skip the file pass only when capture positively identifies the WAV as
 processed/disabled. The request includes the original lookahead rather than re-reading environment.
 
-## Segment cleanup — echo, fragments, backchannels (#149)
+## Segment cleanup — protect words, retain suspected duplicates (#149, #161)
 
-`merge_by_time` is the first and only point where the two capture channels see each other, so it is the
-only place a cross-channel guard can live. `corti_transcribe::segment::cleanup` (`segment.rs:345`) runs
-there, on **both** paths — batch (`app/src/transcribe.rs`, right after `Backend::transcribe`, so it
-covers local, AWS and `corti --input`) and live (`app/src/live.rs`, inside `flush_window` before the
-append) — and always **before** the LLM tier, which is contractually forbidden from dropping or reordering
-rows (`crates/corti-postprocess/src/prompt.rs`, `validation.rs`). It is pure text/timing arithmetic: no
-model and no confidence score (the local backend exposes none) — with one exception, the optional audio
-evidence below. Filler words and stutters are deliberately out of scope: those belong to the decoder.
+Cleanup runs on the merged channel timeline, before filing or hosted post-processing: after batch
+recognition in app/src/transcribe.rs and at each live window flush in app/src/live.rs. The live early-drop
+path uses the same echo verdict before publishing a held mic region. Rules version 4 fixes text-only
+deletion of genuine corrections and repeated commands; tuning values remain unchanged.
 
-Three passes, in this order:
+The deterministic passes run in this order:
 
-1. **Echo** (`drop_echoes`, `:585`). Residual speaker bleed the AEC could not remove is decoded as a short
-   `Me` utterance 1–6 s after the far end said the same words (issue #107, whose AEC root causes stay open).
-   For each segment S, every **earlier, still-kept** other-channel segment O with
-   `O.start ≤ S.start ≤ O.end + echo_window_seconds` is a candidate source; S is dropped when it has three
-   or more content tokens and `|tok(S) ∩ tok(O)| / |tok(S)| ≥ echo_containment`, or when it has one or two
-   content tokens, the match is total, **and** `[S.start, S.end] ⊂ [O.start, O.end]` — the `Me: Gateway`
-   phantom sitting inside a far-end monologue. Content tokens are lowercase alphabetic tokens minus fillers,
-   stopwords and backchannels, as a set, so a stutter cannot inflate a score. Only kept segments are
-   sources, so echoes never chain; one source may kill several copies; the rule is symmetric and the two
-   directions are counted separately.
-2. **Merge** (`merge_fragments`, `:671`). `words_to_segments` only joins word gaps ≤ `SEGMENT_GAP` (1.5 s),
-   so every fragment visible in a note has a measured gap above that. Consecutive same-speaker segments
-   within `merge_gap_seconds` are joined — **unless the other channel started a turn in between**. That
-   clause is why this is not a VAD tuning problem: `vad_min_silence` can be raised, but it cannot know that
-   the far end took the floor, and raising it also delays live rows and pushes regions toward the 20 s cap.
-3. **Backchannel** (`drop_backchannel_turns`, `:715`). A segment of fewer than four words whose whole
-   normalized text is backchannel ("Yeah.", "Okay yeah.", "Makes sense.") and which overlaps other-channel
-   speech is dropped — **unless** the nearest earlier other-channel segment ends in `?`, which makes it an
-   answer, not listening.
+1. **Sort, then judge echoes.** Cross-channel text containment identifies a suspected duplicate, never
+   permission to delete one. The existing candidate window is
+   O.start ≤ S.start ≤ O.end + echo_window_seconds. Three or more content tokens use the containment
+   threshold; one or two require total containment and a subject span inside the source. Current-window
+   segments and retained raw live decoder polls supply candidates. A later-starting overlapping source
+   is also checked in the reverse direction, so arrival order cannot hide a protected correction.
+   Carry itself is read-only and is never emitted.
+2. **Merge fragments.** Consecutive same-speaker segments within merge_gap_seconds are joined unless the
+   other channel started a turn in between. This preserves turns that words_to_segments separated at
+   SEGMENT_GAP (1.5 seconds).
+3. **Drop backchannels.** A turn of fewer than four words whose complete normalized text is a
+   backchannel, such as “Yeah.”, may be removed when it overlaps the other channel. An answer to the
+   nearest earlier other-channel question is kept. Raw numbers, identifiers and protected unit tokens
+   prevent an alphabetic normalization from turning an answer into a backchannel.
+4. **Strip fillers and stutters.** The existing optional pass removes filler tokens, collapses repeated
+   words/bigrams and repairs punctuation and capitalization. It preserves quantity-adjacent tokens,
+   meaningful case and markers that normalization would erase, so “15 Ah” is not a filler and “15 mm
+   15 mM” is not a stutter. Unmarked medial filler spellings are retained as ambiguous content, including
+   units after worded quantities. Leading and comma-marked ordinary hesitations remain eligible.
+   Capitalization repair keeps unknown names and units intact; ordinary subject pronouns retain the
+   existing sentence-repair behavior. Case-only stutter equivalence is limited to closed grammar,
+   subject pronouns and “very”: “Very very important.” still collapses, while “May may approve” stays.
+   The pass remains optional.
+5. **Apply the lexicon.** The existing TextRule seam runs last on surviving segments, including when
+   structural cleanup is disabled.
 
-### Audio evidence — the AEC's own verdict on a mic span (#149 phase 3b)
+### Echo decisions require acoustic evidence
 
-Text cannot separate two populations that read identically: a `Me` row that is residual speaker bleed, and
-a `Me` row where both people happened to use the same nouns. Lowering `echo_containment` to catch the first
-necessarily starts eating the second — measured on real calls, any drop below 0.7 containment is by
-construction unaccounted-for speech. The signal that *does* separate them is not in the transcript at all:
-it is in the canceller.
+A matching text can be either an echo or an independently spoken reply. Under rules 4, a match without
+usable acoustic evidence stays in the transcript and its in-memory decision records a suspected
+duplicate. In particular, **AWS and corti-tap --inbox perform no echo deletion**: neither path supplies
+the AEC evidence that could authorize one. They still run the other enabled cleanup passes.
 
-`cleanup_with_evidence` (`segment.rs:372`) takes an optional
-`AudioEvidence = &dyn Fn(f64, f64) -> Option<SpanEvidence>` (`:323`), where
-`SpanEvidence { mic_db, echo_estimate_db, double_talk_fraction, blocks }` (`:308`) summarizes what the AEC
-measured over one span of the transcript's own timeline. `cleanup` is the same function with `None`.
-**`corti-transcribe` does not depend on `corti-aec`** — transcription must not pull in a DSP crate and the
-AWS backend has no canceller at all — so the caller folds `corti_aec::SpanStats` into those four fields
-(`app/src/transcribe.rs:306`, mirrored in `corti-bench`).
+Before acoustic deletion, a cross-channel text match is checked against the original text for changed
+numbers, units, versions, identifiers, names and English/Spanish polarity. These values are not compared
+through the older alphabetic content-token normalizer, which would erase digits and discard negators.
+A protected difference keeps the reply even when the acoustic predicate would otherwise pass.
+Unfamiliar lexical tokens are treated conservatively rather than assumed not to be names. The ordered,
+case-sensitive raw signature trims surrounding sentence punctuation and retains every filler spelling:
+a word that resembles hesitation can also be a unit. Only the closed grammar list
+a/an/the/am/is/are/was/were/be/been/being is exempt, in ordinary case, outside numeric context, and without
+meaningful markers. Numeric tokens and both immediate neighbours are protected;
+“A”/“Ah”, “mm”/“mM” and a missing unit therefore remain distinct. Internal punctuation, leading decimal
+points, signs, identifiers, currency and percent markers survive. No broader language-model rewrite or
+confidence threshold is introduced.
 
-The rule runs **inside the echo pass, before the text rules**, on `Me` segments only. S is dropped when:
+A protected input row keeps a flag independent of the bounded decision log. Sorting carries its original
+input index; merging propagates protection from either input. Protected rows bypass automatic
+backchannel, filler, stutter and capitalization changes, even if the explanatory decision was omitted
+at the cap. The explicit lexicon still runs last. Thus a protected “Got IT.” or “square um” cannot be lost
+after the echo pass. Short case variants with no content tokens use equality of a nonempty normalized
+token sequence inside the same channel/time gates; unrelated short answers do not become matches.
 
-1. S overlaps a far-end segment (`S.start < O.end && O.start < S.end`) — the far end had the floor. Without
-   this clause a quiet passage with no echo at all (both energies at the floor, difference ≈ 0) would look
-   exactly like a ghost;
-2. the evidence covers at least one block;
-3. `double_talk_fraction < 0.5` — see below;
-4. `mic_db − echo_estimate_db ≤ echo_audio_margin_db` (default `3.0`): the mic carried little more than what
-   the canceller was already subtracting as echo.
+Deletion is possible only for a **Me** segment when all of the existing acoustic conditions hold:
 
-It is counted separately as `CleanupStats::echo_dropped_audio`, never folded into `echo_dropped_me`, so a
-sweep can attribute every drop to text or to audio.
+1. Its interval overlaps far-end speech: S.start < O.end and O.start < S.end.
+2. The evidence covers at least one AEC block.
+3. The double-talk fraction is below 0.5.
+4. The finite difference mic_db − echo_estimate_db is at most echo_audio_margin_db (default 3.0).
 
-**A span with no blocks falls through to the text rules unchanged.** That covers the AWS backend, a
-recording with no `-aec-stats.json` sidecar, and the old end of a stats record that overflowed its bound.
-Absence of evidence is not evidence of speech.
+A Them segment is never deleted as an echo of Me: the canceller measures the mic, not contamination of
+the tap. No accessor, no covered blocks, a non-finite energy difference, or a firing double-talk guard
+cannot authorize deletion. The existing audio-only predicate can still identify a garbled mic ghost
+whose text has no matching source; raw critical-value protection applies when a cross-channel text
+match exists. Acoustic deletions are counted in CleanupStats.echo_dropped_audio. The legacy
+echo_dropped_me and echo_dropped_them text-deletion counters remain zero.
 
-**The double-talk guard.** `double_talk` is the adaptation gate firing (`Σd² > double_talk_ratio · Σx²`):
-the canceller judged the near end to dominate and froze its filter update. Two reasons to require the gate
-to have stayed quiet over most of the span. The mechanical one: with adaptation frozen the echo estimate
-stops tracking the room, so the comparison in (4) is against a stale number. The direct one: "the gate
-fired" is the canceller's own statement that it heard near-end speech, which is precisely the case where a
-`Me` row must be kept. This is not the same as never firing during real echo — the default ratio is 2.0 and
-measured capture ERLE tops out ≈10.6 dB (#107), so a mic carrying nothing but residual echo sits far below
-`2 · Σx²` and the gate stays quiet exactly where the rule needs it to. (Today `suppressed == !double_talk`,
-because the residual suppressor's bypass is the *same* comparison — #107 root cause #1 — so the guard also
-reads as "the suppressor was engaged". The two fields are recorded separately so it keeps working when
-those gates diverge.)
+SpanEvidence contains mic_db, echo_estimate_db, double_talk_fraction and blocks. An AudioEvidence
+accessor maps a segment's start/end seconds to an optional summary. The transcribe crate has no
+production DSP dependency: the caller converts corti_aec span statistics into that summary.
 
-Where the evidence comes from:
+The double-talk flag comes from the AEC's raw-energy adaptation gate. It is a conservative guard for
+this policy, not proof of a person's identity or a calibrated near-speech detector. The synthetic #107
+receipts expose gain-sensitive false gating and near-end attenuation. This change preserves the
+specified acoustic predicate and does not tune AEC defaults or claim to solve those defects.
 
-- **Live** — `app/src/live.rs` drains `StreamingAec::block_stats()` after every push into
-  `TranscriptWindow.aec_blocks`, bounded to the window plus `echo_window_seconds` of lookback (and a hard
-  `MAX_WINDOW_AEC_BLOCKS` cap), and `flush_window` builds the accessor over it. `finish_session` uses
-  `finish_with_stats()` so the tail blocks — every block of a call shorter than the lookahead — are not
-  lost, and logs the locked delay and `stats_dropped`.
-- **Batch** — `transcribe_recording` looks for `corti_capture::aec_stats_path(<recording>)`. That one path
-  covers both producers: the capture writer's in-flight filter writes it at stop, and the offline
-  `write_clean_wav_with_options` pass writes it when it runs. A missing, corrupt or future-schema sidecar
-  is logged and treated as absent.
-- **AWS** stays text-only in every case (`Backend::audio_evidence_supported`). It is the path where corti
-  is least sure the audio it timestamped is the audio corti's own canceller produced, the shipping default
-  is local, and a wrong answer here silently deletes transcript rows.
+### Evidence, decisions and live publication
 
-`CleanupConfig` (`:222`) carries six knobs; defaults are `echo_drop = true`,
-`echo_window_seconds = 6.0`, `echo_containment = 0.7`, `merge_gap_seconds = 2.5` (non-positive disables the
-pass), `drop_backchannels = true`, `echo_audio_margin_db = 3.0`. The app persists them as the `[cleanup]`
-table in `config.toml` (`app/src/config.rs:175`, effective values via `AppConfig::cleanup_config`, `:241`)
-with `CORTI_CLEANUP_ECHO_DROP`, `CORTI_CLEANUP_ECHO_WINDOW_SECONDS`, `CORTI_CLEANUP_ECHO_CONTAINMENT`,
-`CORTI_CLEANUP_MERGE_GAP_SECONDS`, `CORTI_CLEANUP_DROP_BACKCHANNELS` and
-`CORTI_CLEANUP_ECHO_AUDIO_MARGIN_DB` overriding it. Hand-edited nonsense is clamped the same way
-`aec_config` clamps a non-finite AEC knob — except a large negative margin, which is not nonsense but the
-way the audio rule is switched off while the text rules keep running. `CleanupStats` is logged per run
-under `corti::transcribe` / `corti::live`, per echo direction and with `echo_dropped_audio` separate.
+- **Live:** the canceller's bounded block-statistics buffer supplies both the early verdict and window
+  cleanup. A short mic region may wait for the far-end region or its existing echo-window deadline.
+  Release preserves its original words and timestamps; even a region suppressed from publication is
+  returned with its decision so a later evidence consumer can retain its input. Missing evidence means
+  the suspected duplicate is published. FIFO release and hold limits remain in effect. Both early
+  publication and filing retain each original returned poll on both tracks before pause splitting,
+  diarization or lexicon changes. A poll can contain several VAD regions; this inventory does not infer
+  their exact identities. Every microphone child shares its raw poll context and is compared again at
+  release and filing, including against far-end results that arrived later. An early protected decision
+  stays attached to its microphone group. Far-end
+  raw polls survive every filing window still inside the lookback; they are never rendered from the
+  inventory.
+  Both whole polls and their raw pause-separated children remain comparison sources: whole-poll
+  protection supplements each child's own match. Child text and intervals are included in the same
+  logical cap. Only those real speech intervals authorize acoustic overlap. A microphone region inside
+  a known far-end pause cannot be deleted using
+  the whole decoder result's envelope. Each inventory holds at most 256 sources and 1 MiB of logical
+  source data, including child text and metadata. If either cap omits a source, acoustic and automatic
+  text deletion are disabled for affected mic polls and children over its remaining lookback. That
+  missing-context protection remains attached to a released child; only omission counts enter tracing.
+  Mic poll contexts have a separate 1 MiB per-window logical budget, charged once and shared by child
+  regions. Explicitly omitted context disables acoustic and automatic text deletion for affected mic
+  children; an incomplete mic inventory also protects far-end descendants. Original far poll end
+  indices are charged to the existing window text budget. Successful window reset releases these
+  contexts and indices; none is reconstructed by text matching or by the bounded decision log.
+- **Batch:** the local backend reads the existing -aec-stats.json sidecar beside the recording. Capture
+  and the offline clean-WAV pass both use this path. Missing, corrupt or unsupported statistics are
+  treated as absent, so they cannot cause echo deletion.
+- **AWS and corti-tap:** evidence is absent. Text-only duplicates are kept, and the provenance records
+  the acoustic requirement explicitly.
 
-The live path additionally runs the **echo** rule one step earlier, at the region rather than at the
-window: a short mic region is withheld from the Live Transcript window and the hosted Live lane until the
-far end has closed a region or `echo_window_seconds` have passed, then published or dropped by the rule
-above, through the shared `EchoCandidate` (`segment.rs:504`). Nothing published live can be retracted, which
-is why that one rule pays a latency cost the other two do not. See
-[streaming.md](streaming.md#early-drop-before-publication-149-phase-2).
+Cleanup decisions are available in memory with the input stage/span, change, reason and acoustic
+evidence where applicable. These content-bearing decisions are not tracing fields. This commit does not
+persist a new evidence file; #164 adds that bounded local store separately.
 
-Every note records the rules it was produced under: `corti.configuration.segment_cleanup`
-(`app/src/provenance.rs:352`, mirrored for `corti-tap --inbox`) is either `"off"` or
-`{"rules": 2, "echo_drop": …, "echo_window_seconds": …, "echo_containment": …, "merge_gap_seconds": …,
-"drop_backchannels": …, "echo_audio_margin_db": …, "live_early_drop": …, "audio_evidence": true|false}`.
-`rules` is `CLEANUP_RULES_VERSION` (`segment.rs:217`) — bump it when a pass's behavior changes so an old
-note is never read as if it had today's rules. `live_early_drop` is true only for a live note whose echo
-rule also ran at the region, before publication (phase 2, above). `audio_evidence` is the **runtime**
-answer, not a setting: it is `false` for an AWS job, for a recording with no sidecar, and for a capture
-whose AEC was off, and it is what tells a reader whether the echo drops in this note could have come from
-anything but text.
+### Settings and provenance
 
-Offline, `corti-bench process --cleanup/--no-cleanup` runs the same function after ASR — and with `--aec`
-it feeds back the sidecar it just wrote — while `corti-bench clean --input <DiarizedTranscript.json>
-[--aec-stats <path>] [--echo-audio-margin-db N]` re-runs just the cleanup over a transcript that already
-exists, so a threshold sweep costs no decode. `bench/scoring/cleanup.py` scores what is left
-(`echo_pairs_remaining`, `turns_le3`, `backchannel_turns`, `content_retention`, and `orphan_drops`, which
-must be zero) over that JSON or over a replayed corti note.
+The defaults remain echo_drop = true, echo_window_seconds = 6.0, echo_containment = 0.7,
+merge_gap_seconds = 2.5, drop_backchannels = true, echo_audio_margin_db = 3.0 and strip_fillers = true.
+The app's existing cleanup settings/environment overrides and clamping behavior remain unchanged.
+A sufficiently negative acoustic margin disables echo deletion while leaving suspected-duplicate
+decisions and other enabled passes available. Turning off echo_drop also disables live early-drop.
+
+Every note records corti.configuration.segment_cleanup, mirrored by corti-tap --inbox. It is “off” when
+every pass is disabled; otherwise it includes the existing effective settings and these policy fields:
+
+~~~json
+{
+  "rules": 4,
+  "echo_policy": "acoustic_required_mic_only",
+  "text_only_duplicates": "keep_suspected",
+  "critical_text_protection": true,
+  "live_early_drop": false,
+  "audio_evidence": false
+}
+~~~
+
+The example represents a completed recording without acoustic evidence; its other cleanup settings and
+lexicon identity are omitted here for brevity. live_early_drop identifies whether the live region pass
+was enabled. audio_evidence reports availability, not a user setting or a guarantee that every span has
+covered blocks. False means that no echo deletion is permitted by this policy.
+
+### Offline evaluation
+
+corti-bench process --cleanup/--no-cleanup invokes the same cleanup after ASR; with --aec it can use
+the sidecar it produced. corti-bench clean can replay an existing transcript with optional --aec-stats
+and --echo-audio-margin-db arguments.
+
+bench/scoring/cleanup.py reports text similarity, fragmentation and retention diagnostics over JSON or
+display-only Markdown replay. Its historical echo_pairs_remaining field counts **suspected text
+matches**, not acoustically established echoes; lower is not inherently better. A genuine repeated
+command must remain when evidence cannot distinguish it from echo. Likewise, orphan_drops is a text
+diagnostic, not proof that a removed row was genuine speech or that a similar surviving row preserves a
+correction. A dropped row is textually accounted for only when its raw critical signature survives in
+order and contiguously in the neighbouring text, as it can after a fragment merge; content containment
+alone no longer hides a changed number or negator. The backchannel exemption uses the same raw-safe
+classification as production: “Okay, 15000.” and “I see 15000.” are answers with critical values. The
+historical alphabetic content-retention metric remains unchanged; inspect orphan_drops and the raw
+decisions when that metric cannot distinguish values. Use labelled cases to assess false-positive
+deletion.
 
 ## Local backend — Parakeet via sherpa or transcribe.cpp
 

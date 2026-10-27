@@ -12,7 +12,7 @@ use corti_core::{DiarizedTranscript, RecordingMeta};
 use tracing::{error, info, warn};
 
 use crate::checkpoint::AwsStaging;
-use corti_transcribe::segment::{CleanupConfig, SpanEvidence, TextRule, cleanup_with_rules};
+use corti_transcribe::segment::{CleanupConfig, SpanEvidence, TextRule, cleanup_with_decisions};
 
 use crate::config::{AppConfig, BackendChoice};
 
@@ -337,8 +337,8 @@ pub fn span_evidence(
 ///
 /// Absent is the ordinary case, not an error: the AWS backend has no canceller, foreign audio never had
 /// one, and a capture whose AEC was disabled wrote no sidecar. A *corrupt* or wrong-schema sidecar is
-/// logged and treated as absent — the cleanup falls back to its text rules rather than failing a
-/// transcription over a diagnostic file.
+/// logged and treated as absent — suspected text duplicates are retained, rather than failing a
+/// transcription over a diagnostic file or deleting speech without acoustic evidence.
 fn load_aec_block_stats(path: &Path) -> Option<Vec<corti_aec::BlockStats>> {
     let bytes = std::fs::read(path).ok()?;
     match serde_json::from_slice::<corti_capture::AecStatsFile>(&bytes) {
@@ -466,14 +466,15 @@ pub fn transcribe_recording(
         let segments_in = transcript.segments.len();
         let segments_taken = std::mem::take(&mut transcript.segments);
         let rule = lexicon.as_ref().map(|lexicon| lexicon as &dyn TextRule);
-        let (segments, stats) = match blocks.as_deref() {
+        let result = match blocks.as_deref() {
             Some(blocks) => {
                 let evidence = |start: f64, end: f64| span_evidence(blocks, start, end);
-                cleanup_with_rules(segments_taken, &cleanup_cfg, &[], Some(&evidence), rule)
+                cleanup_with_decisions(segments_taken, &cleanup_cfg, &[], Some(&evidence), rule)
             }
-            None => cleanup_with_rules(segments_taken, &cleanup_cfg, &[], None, rule),
+            None => cleanup_with_decisions(segments_taken, &cleanup_cfg, &[], None, rule),
         };
-        transcript.segments = segments;
+        transcript.segments = result.segments;
+        let stats = result.stats;
         info!(
             target: "corti::transcribe",
             job_id = %attempt.id,
@@ -488,6 +489,8 @@ pub fn transcribe_recording(
             fillers_removed = stats.fillers_removed,
             stutters_collapsed = stats.stutters_collapsed,
             lexicon_applied = stats.lexicon_applied,
+            cleanup_decisions = result.decisions.entries().len(),
+            cleanup_decisions_omitted = result.decisions.omitted,
             "segment cleanup applied"
         );
     }

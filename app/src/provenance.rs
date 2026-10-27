@@ -360,6 +360,15 @@ fn segment_cleanup(cleanup: &CleanupConfig, live: bool, audio_evidence: bool) ->
     );
     map.insert("echo_drop".into(), Value::Bool(cleanup.echo_drop));
     map.insert(
+        "echo_policy".into(),
+        Value::String("acoustic_required_mic_only".into()),
+    );
+    map.insert(
+        "text_only_duplicates".into(),
+        Value::String("keep_suspected".into()),
+    );
+    map.insert("critical_text_protection".into(), Value::Bool(true));
+    map.insert(
         "echo_window_seconds".into(),
         double_value(cleanup.echo_window_seconds),
     );
@@ -391,7 +400,7 @@ fn segment_cleanup(cleanup: &CleanupConfig, live: bool, audio_evidence: bool) ->
         Value::Bool(live && cleanup.echo_drop),
     );
     // Whether the AEC's per-block record was actually available to the echo pass, not whether it was
-    // wanted: `false` means every echo drop in this transcript came from the text rules alone.
+    // wanted: `false` means no segment can be deleted as an echo under rules 4.
     map.insert("audio_evidence".into(), Value::Bool(audio_evidence));
     Value::Object(map)
 }
@@ -432,7 +441,19 @@ mod tests {
         assert_eq!(provenance.models.asr.id, "aws/transcribe-default");
         assert_eq!(provenance.configuration["language"], "en-GB");
         assert_eq!(provenance.configuration["input"], "completed_recording");
-        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 3);
+        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 4);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_policy"],
+            "acoustic_required_mic_only"
+        );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["text_only_duplicates"],
+            "keep_suspected"
+        );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["critical_text_protection"],
+            true
+        );
         assert_eq!(
             provenance.configuration["segment_cleanup"]["strip_fillers"],
             true
@@ -497,6 +518,19 @@ mod tests {
         assert_eq!(provenance.configuration["live_buffer_minutes"], 3);
         assert_eq!(provenance.configuration["input"], "live_pcm_stream");
         assert_eq!(provenance.configuration["aec"]["mode"], "streaming");
+        assert_eq!(provenance.configuration["segment_cleanup"]["rules"], 4);
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["echo_policy"],
+            "acoustic_required_mic_only"
+        );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["text_only_duplicates"],
+            "keep_suspected"
+        );
+        assert_eq!(
+            provenance.configuration["segment_cleanup"]["critical_text_protection"],
+            true
+        );
         assert_eq!(
             provenance.configuration["segment_cleanup"]["live_early_drop"],
             true

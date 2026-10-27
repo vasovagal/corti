@@ -88,7 +88,11 @@ jobs:
           npm run build
           npm test
       - name: Test validation scripts
-        run: python3 -m unittest discover -s scripts/quality -p 'test_*.py'
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 -m unittest discover -s scripts/quality -p 'test_*.py'
+          python3 -m unittest discover -s bench/scoring -p 'test_cleanup.py'
       - name: Hardware
         run: |
           system_profiler SPHardwareDataType SPDisplaysDataType | tee "$RUNNER_TEMP/quality-hardware.txt"

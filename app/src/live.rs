@@ -46,8 +46,10 @@ use corti_aec::StreamingAec;
 use corti_capture::{CaptureChunk, CaptureTee};
 use corti_core::{DiarizedTranscript, RecordingMeta, Speaker, TranscriptSegment};
 use corti_transcribe::segment::{
-    CleanupConfig, CleanupStats, EchoCandidate, SEGMENT_GAP, SpeakerTurn, TextRule, Word,
-    cleanup_with_rules, diarize_words, merge_by_time, split_regions, words_to_segments,
+    AudioEvidence, CleanupConfig, CleanupDecisions, CleanupStage, EchoAssessment, EchoCandidate,
+    EchoSource, EchoVerdict, SEGMENT_GAP, SpanEvidence, SpeakerTurn, TextRule, Word,
+    cleanup_with_protected_decisions, diarize_words, echo_assessment, split_regions,
+    words_to_segments,
 };
 use tracing::{info, warn};
 
@@ -969,6 +971,217 @@ fn run_session(
     }
 }
 
+struct RawEchoSource {
+    segment: TranscriptSegment,
+    /// Raw pause-separated children supply both text comparisons and actual speech intervals.
+    /// The whole-result envelope also contains known pauses and cannot authorize acoustic overlap.
+    speech_segments: Vec<TranscriptSegment>,
+}
+
+/// Original far-end decoder polls, each possibly containing several VAD regions, bounded independently
+/// of a filing window. The two live stages
+/// use the same retention rule; a source omitted by either count or byte cap cannot authorize deletion.
+struct RawEchoSources {
+    segments: Vec<RawEchoSource>,
+    bytes: usize,
+    omitted: usize,
+    incomplete_until: f64,
+}
+
+impl Default for RawEchoSources {
+    fn default() -> Self {
+        Self {
+            segments: Vec::new(),
+            bytes: 0,
+            omitted: 0,
+            incomplete_until: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl RawEchoSources {
+    fn remember(&mut self, words: &[Word], lookback: f64) {
+        let omitted_before = self.omitted;
+        // A pause is a display boundary, not permission to split a raw critical-word comparison.
+        // Keep the complete decoder result even when it spans several pause-separated display rows.
+        for segment in words_to_segments(words, Speaker::Other("Them".to_string()), f64::INFINITY) {
+            let source = RawEchoSource {
+                segment,
+                speech_segments: words_to_segments(
+                    words,
+                    Speaker::Other("Them".to_string()),
+                    SEGMENT_GAP,
+                ),
+            };
+            let bytes = raw_source_bytes(&source);
+            if bytes > MAX_BUFFERED_TRANSCRIPT_BYTES {
+                self.omit(&source, lookback);
+                continue;
+            }
+            while self.segments.len() >= MAX_LIVE_ECHO_SOURCES
+                || self.bytes.saturating_add(bytes) > MAX_BUFFERED_TRANSCRIPT_BYTES
+            {
+                let removed = self.segments.remove(0);
+                self.bytes -= raw_source_bytes(&removed);
+                self.omit(&removed, lookback);
+            }
+            self.bytes += bytes;
+            self.segments.push(source);
+        }
+        if self.omitted != omitted_before {
+            warn!(
+                target: "corti::live",
+                omitted_sources = self.omitted - omitted_before,
+                total_omitted_sources = self.omitted,
+                "raw echo source cap reached; affected mic spans will be kept"
+            );
+        }
+    }
+
+    fn omit(&mut self, source: &RawEchoSource, lookback: f64) {
+        self.omitted = self.omitted.saturating_add(1);
+        let until = source.segment.end + lookback;
+        self.incomplete_until = self.incomplete_until.max(if until.is_finite() {
+            until
+        } else {
+            f64::INFINITY
+        });
+    }
+
+    fn prune_before(&mut self, horizon: f64) {
+        self.segments.retain(|source| source.segment.end >= horizon);
+        self.bytes = self.segments.iter().map(raw_source_bytes).sum();
+    }
+
+    /// Missing raw sources can hide a critical difference. Always query the original mic interval,
+    /// never a source interval, and never authorize deletion while that inventory is incomplete.
+    fn span_evidence(
+        &self,
+        blocks: &[corti_aec::BlockStats],
+        start: f64,
+        end: f64,
+    ) -> Option<SpanEvidence> {
+        if start <= self.incomplete_until {
+            None
+        } else {
+            crate::transcribe::span_evidence(blocks, start, end)
+        }
+    }
+
+    /// Whole raw text can protect across a pause; only an actual speech interval can supply acoustic
+    /// overlap. The shared verdict remains authoritative, with deletion attributed to that interval.
+    fn assess(
+        &self,
+        subject: &EchoCandidate,
+        cfg: &CleanupConfig,
+        evidence: Option<SpanEvidence>,
+    ) -> (EchoAssessment, Option<SpanEvidence>) {
+        let overlap = self
+            .segments
+            .iter()
+            .flat_map(|source| &source.speech_segments)
+            .find(|speech| subject.start() < speech.end && speech.start < subject.end());
+        let evidence =
+            evidence.filter(|_| subject.start() > self.incomplete_until && overlap.is_some());
+        let sources: Vec<_> = self
+            .segments
+            .iter()
+            .flat_map(|source| std::iter::once(&source.segment).chain(&source.speech_segments))
+            .map(EchoCandidate::from_segment)
+            .collect();
+        let mut assessment = echo_assessment(subject, &sources, cfg, evidence);
+        if assessment.verdict == EchoVerdict::DropAcoustic {
+            assessment.source = overlap.map(|speech| EchoSource {
+                me: false,
+                start: speech.start,
+                end: speech.end,
+            });
+        }
+        (assessment, evidence)
+    }
+
+    fn assess_mic_poll(
+        &self,
+        subject: &EchoCandidate,
+        poll: &MicPollContext,
+        cfg: &CleanupConfig,
+        evidence: Option<SpanEvidence>,
+    ) -> (EchoAssessment, Option<SpanEvidence>) {
+        let MicPollContext::Known(raw) = poll else {
+            return (EchoAssessment::default(), None);
+        };
+        // A child can outlive the missing source's horizon while its original poll still intersects it.
+        // Comparison incompleteness therefore gates acoustics at poll scope, not just child start time.
+        let evidence = evidence.filter(|_| !self.mic_comparison_incomplete(subject, poll));
+        let (whole, _) = self.assess(&EchoCandidate::from_segment(&raw.segment), cfg, None);
+        if whole.verdict == EchoVerdict::KeepCriticalDifference {
+            (whole, evidence)
+        } else {
+            self.assess(subject, cfg, evidence)
+        }
+    }
+
+    fn mic_comparison_incomplete(&self, subject: &EchoCandidate, poll: &MicPollContext) -> bool {
+        match poll {
+            MicPollContext::Omitted => true,
+            MicPollContext::Known(raw) => {
+                raw.segment.start <= self.incomplete_until
+                    || subject.start() <= self.incomplete_until
+            }
+        }
+    }
+}
+
+/// Original returned mic poll, shared by all of its pause-separated children. Omission is explicit:
+/// missing comparison context cannot authorize acoustic or automatic text deletion.
+#[derive(Clone)]
+enum MicPollContext {
+    Known(Arc<RawEchoSource>),
+    Omitted,
+}
+
+impl MicPollContext {
+    fn new(words: &[Word], available: usize) -> (Self, usize) {
+        let text_bytes = words
+            .iter()
+            .fold(words.len().saturating_sub(1), |sum, word| {
+                sum.saturating_add(word.text.len())
+            });
+        let minimum_bytes = std::mem::size_of::<RawEchoSource>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<Arc<RawEchoSource>>())
+            .saturating_add(text_bytes);
+        if words.is_empty() || minimum_bytes > available {
+            return (Self::Omitted, 0);
+        }
+        let segment = TranscriptSegment {
+            speaker: Speaker::Me,
+            start: words[0].start,
+            end: words[words.len() - 1].end,
+            text: words
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let raw = RawEchoSource {
+            segment,
+            speech_segments: words_to_segments(words, Speaker::Me, SEGMENT_GAP),
+        };
+        let bytes = raw_source_bytes(&raw)
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<Arc<RawEchoSource>>());
+        if bytes > available {
+            return (Self::Omitted, 0);
+        }
+        (Self::Known(Arc::new(raw)), bytes)
+    }
+
+    fn omitted(&self) -> bool {
+        matches!(self, Self::Omitted)
+    }
+}
+
 /// Per-recording rolling state. Every collection is bounded by either the configured time window or an
 /// independent byte cap; after a successful durable append, lengths reset to zero and allocations are reused.
 struct TranscriptWindow {
@@ -976,8 +1189,16 @@ struct TranscriptWindow {
     frame_limit: u64,
     start_frame: u64,
     frames: u64,
-    mic_words: Vec<Word>,
+    /// Released decoder regions keep their original grouping and any raw critical-word protection.
+    mic_regions: Vec<ReleasedMicRegion>,
+    /// Original mic polls, charged once to a separate 1 MiB logical payload budget. This inventory also
+    /// retains polls whose acoustic children were withheld, so far-side protection stays symmetric.
+    mic_polls: Vec<Arc<RawEchoSource>>,
+    mic_poll_bytes: usize,
+    mic_polls_omitted: usize,
     them_words: Vec<Word>,
+    /// End indices in them_words, preserving original returned polls before any pause/diarization split.
+    them_poll_ends: Vec<usize>,
     tap_audio: Vec<f32>,
     buffered_text_bytes: usize,
     diarize_far_end: bool,
@@ -986,19 +1207,23 @@ struct TranscriptWindow {
     /// The learned correction lexicon, applied as the last cleanup pass on every window. Loaded once
     /// per session, so a rule added mid-call lands on the next session (`corti --review` says so).
     lexicon: Option<std::sync::Arc<corti_lexicon::CompiledLexicon>>,
-    /// The tail of the **previous** window's appended segments — every one whose end is still inside
-    /// `echo_window_seconds` of this window's start. They are read-only echo sources: an echo whose source
-    /// landed just before the one-minute boundary is still caught. Never appended (they are already in the
-    /// note) and never mutated. Bounded by one window's segment count, so the memory contract is unchanged.
-    carry: Vec<TranscriptSegment>,
+    /// Raw far-end decoder polls, before diarization or text cleanup. Includes the current window and
+    /// every earlier source still inside the lookback, even across several short windows. Never rendered
+    /// from this inventory. Capped at 256 sources and 1 MiB; omitted sources disable acoustic deletion
+    /// over their remaining lookback and are counted without retaining transcript content.
+    carry: RawEchoSources,
     /// Live early drop (#149 phase 2). Per-recording state like `carry`, not per-window: a mic region
     /// withheld just before a boundary is still judged against far-end regions that close after it.
     early_drop: EarlyDrop,
+    /// Bounded in-memory decisions, including original regions withheld by early echo cleanup. The
+    /// evidence writer added later consumes these; no content from this buffer enters tracing.
+    cleanup_decisions: CleanupDecisions,
+    early_decision_index: usize,
     /// The live canceller's per-block echo record covering this window plus `echo_window_seconds` of
     /// lookback (#149 phase 3b), drained from `StreamingAec` after every push and trimmed at every flush.
     /// `t_start_secs` is on the cleaned timeline — the same timeline these segments are timestamped on —
     /// so a block time and a segment time compare directly. Empty when AEC is off, which simply leaves the
-    /// echo pass with its text rules.
+    /// echo pass unable to delete a suspected duplicate.
     aec_blocks: Vec<corti_aec::BlockStats>,
 }
 
@@ -1034,15 +1259,21 @@ impl TranscriptWindow {
             frame_limit,
             start_frame: 0,
             frames: 0,
-            mic_words: Vec::new(),
+            mic_regions: Vec::new(),
+            mic_polls: Vec::new(),
+            mic_poll_bytes: 0,
+            mic_polls_omitted: 0,
             them_words: Vec::new(),
+            them_poll_ends: Vec::new(),
             tap_audio,
             buffered_text_bytes: 0,
             diarize_far_end,
             early_drop: EarlyDrop::new(cleanup.clone()),
+            cleanup_decisions: CleanupDecisions::default(),
+            early_decision_index: 0,
             cleanup,
             lexicon: None,
-            carry: Vec::new(),
+            carry: RawEchoSources::default(),
             aec_blocks: Vec::new(),
         })
     }
@@ -1060,15 +1291,6 @@ impl TranscriptWindow {
     /// Seconds from call start at which the *next* window begins.
     fn next_start_sec(&self) -> f64 {
         self.start_frame.saturating_add(self.frames) as f64 / f64::from(self.sample_rate)
-    }
-
-    /// Retain the appended segments that are still inside the echo window as sources for the next flush.
-    /// Called after every successful append (including an empty one, which correctly clears a stale carry).
-    fn remember_carry(&mut self, appended: &[TranscriptSegment]) {
-        let horizon = self.next_start_sec() - self.cleanup.echo_window_seconds;
-        self.carry.clear();
-        self.carry
-            .extend(appended.iter().filter(|s| s.end >= horizon).cloned());
     }
 
     /// Take the blocks a `StreamingAec::block_stats()` drain produced. Ordered by `t_start_secs` because
@@ -1100,18 +1322,49 @@ impl TranscriptWindow {
         self.frames = self.frames.saturating_add(frames as u64);
     }
 
+    #[cfg(test)]
     fn push_mic_words(&mut self, words: Vec<Word>) {
+        self.push_mic_region(ReleasedMicRegion::kept(words));
+    }
+
+    fn push_mic_region(&mut self, region: ReleasedMicRegion) {
         self.buffered_text_bytes = self
             .buffered_text_bytes
-            .saturating_add(buffered_word_bytes(&words));
-        self.mic_words.extend(words);
+            .saturating_add(buffered_word_bytes(&region.words))
+            .saturating_add(std::mem::size_of::<ReleasedMicRegion>());
+        self.mic_regions.push(region);
+    }
+
+    fn remember_mic_poll(&mut self, words: &[Word]) -> MicPollContext {
+        let (context, bytes) = MicPollContext::new(
+            words,
+            MAX_BUFFERED_TRANSCRIPT_BYTES.saturating_sub(self.mic_poll_bytes),
+        );
+        if let MicPollContext::Known(raw) = &context {
+            self.mic_poll_bytes += bytes;
+            self.buffered_text_bytes = self.buffered_text_bytes.saturating_add(bytes);
+            self.mic_polls.push(Arc::clone(raw));
+        } else {
+            self.mic_polls_omitted = self.mic_polls_omitted.saturating_add(1);
+            if self.mic_polls_omitted == 1 {
+                warn!(target: "corti::live", "raw mic poll context cap reached; affected rows will be kept");
+            }
+        }
+        context
     }
 
     fn push_them_words(&mut self, words: Vec<Word>) {
+        if words.is_empty() {
+            return;
+        }
+        self.carry
+            .remember(&words, self.cleanup.echo_window_seconds);
         self.buffered_text_bytes = self
             .buffered_text_bytes
-            .saturating_add(buffered_word_bytes(&words));
+            .saturating_add(buffered_word_bytes(&words))
+            .saturating_add(std::mem::size_of::<usize>());
         self.them_words.extend(words);
+        self.them_poll_ends.push(self.them_words.len());
     }
 
     fn due(&self) -> bool {
@@ -1125,17 +1378,40 @@ impl TranscriptWindow {
     fn clear_after_flush(&mut self) {
         self.start_frame = self.start_frame.saturating_add(self.frames);
         self.frames = 0;
-        self.mic_words.clear();
+        self.mic_regions.clear();
+        self.mic_polls.clear();
+        self.mic_poll_bytes = 0;
+        self.mic_polls_omitted = 0;
         self.them_words.clear();
+        self.them_poll_ends.clear();
         self.tap_audio.clear();
         self.buffered_text_bytes = 0;
         self.trim_aec_blocks();
+        let horizon = self.start_sec() - self.cleanup.echo_window_seconds;
+        self.carry.prune_before(horizon);
     }
 
     #[cfg(test)]
     fn retained_bytes(&self) -> usize {
         self.tap_audio.capacity() * std::mem::size_of::<f32>() + self.buffered_text_bytes
     }
+}
+
+fn raw_source_bytes(source: &RawEchoSource) -> usize {
+    std::mem::size_of::<RawEchoSource>()
+        .saturating_add(source.segment.text.len())
+        .saturating_add(source.segment.speaker.display().len())
+        .saturating_add(
+            source
+                .speech_segments
+                .iter()
+                .fold(0usize, |bytes, segment| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<TranscriptSegment>())
+                        .saturating_add(segment.text.len())
+                        .saturating_add(segment.speaker.display().len())
+                }),
+        )
 }
 
 fn buffered_word_bytes(words: &[Word]) -> usize {
@@ -1151,12 +1427,42 @@ struct HeldMicRegion {
     /// The region's words, untouched — a late publication carries the original timestamps.
     words: Vec<Word>,
     candidate: EchoCandidate,
+    poll: MicPollContext,
     /// Call time (seconds) at which the hold expires even if the far end never closes a region.
     deadline: f64,
 }
 
+/// Every released region reaches the caller, including an acoustic echo withheld from publication.
+/// Words and their original timing are retained separately from the content-free verdict.
+struct ReleasedMicRegion {
+    words: Vec<Word>,
+    poll: MicPollContext,
+    /// Missing comparison context is sticky even if another stage later has a smaller inventory.
+    comparison_incomplete: bool,
+    assessment: EchoAssessment,
+    evidence: Option<SpanEvidence>,
+}
+
+impl ReleasedMicRegion {
+    #[cfg(test)]
+    fn kept(words: Vec<Word>) -> Self {
+        let (poll, _) = MicPollContext::new(&words, MAX_BUFFERED_TRANSCRIPT_BYTES);
+        Self::kept_with_poll(words, poll)
+    }
+
+    fn kept_with_poll(words: Vec<Word>, poll: MicPollContext) -> Self {
+        Self {
+            words,
+            comparison_incomplete: poll.omitted(),
+            poll,
+            assessment: EchoAssessment::default(),
+            evidence: None,
+        }
+    }
+}
+
 /// What the live early drop did over one session. Logged once at the end, next to the per-window
-/// [`CleanupStats`], so a reader who noticed a missing row can tell a drop from a decode failure.
+/// cleanup counts, so a reader who noticed a missing row can tell a drop from a decode failure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct EarlyDropStats {
     /// Regions withheld at least once (a held region is later either published or dropped).
@@ -1182,16 +1488,16 @@ struct EarlyDropStats {
 /// since it ended, whichever comes first — so the worst case added latency is `echo_window_seconds`, 6 s by
 /// default, and the typical case is the far end drawing breath.
 ///
-/// At release the phase-1 rule decides, through the same [`EchoCandidate`] the window pass uses: published
-/// with its original words and timestamps, or dropped and counted. Only Them→Me is judged here; the
-/// far-end channel is never delayed.
+/// At release the shared acoustic verdict decides: published with original words and timestamps, or
+/// withheld from publication and returned with its decision. Text alone never deletes a region. Only
+/// Them→Me is judged here; the far-end channel is never delayed.
 ///
 /// Publication is strictly FIFO. A long region arriving while something is held releases what is held
 /// first, so a late row can never overtake an earlier mic row.
 struct EarlyDrop {
     cfg: CleanupConfig,
     /// Recently closed far-end regions, oldest first, as read-only echo sources.
-    sources: VecDeque<EchoCandidate>,
+    sources: RawEchoSources,
     /// Withheld mic regions, oldest first.
     held: VecDeque<HeldMicRegion>,
     stats: EarlyDropStats,
@@ -1201,7 +1507,7 @@ impl EarlyDrop {
     fn new(cfg: CleanupConfig) -> Self {
         Self {
             cfg,
-            sources: VecDeque::new(),
+            sources: RawEchoSources::default(),
             held: VecDeque::new(),
             stats: EarlyDropStats::default(),
         }
@@ -1223,34 +1529,52 @@ impl EarlyDrop {
             || candidate.content_tokens() <= LIVE_HOLD_MAX_CONTENT_TOKENS
     }
 
-    /// A mic poll produced words. Returns the word groups to publish now, in order.
-    fn offer_mic(&mut self, words: Vec<Word>, now: f64) -> Vec<Vec<Word>> {
+    /// A mic poll produced words. Returns all released word groups and decisions, in order.
+    #[cfg(test)]
+    fn offer_mic(
+        &mut self,
+        words: Vec<Word>,
+        now: f64,
+        evidence: Option<AudioEvidence<'_>>,
+    ) -> Vec<ReleasedMicRegion> {
+        let (poll, _) = MicPollContext::new(&words, MAX_BUFFERED_TRANSCRIPT_BYTES);
+        self.offer_mic_with_poll(words, now, evidence, poll)
+    }
+
+    fn offer_mic_with_poll(
+        &mut self,
+        words: Vec<Word>,
+        now: f64,
+        evidence: Option<AudioEvidence<'_>>,
+        poll: MicPollContext,
+    ) -> Vec<ReleasedMicRegion> {
         if !self.enabled() || words.is_empty() {
-            return vec![words];
+            return vec![ReleasedMicRegion::kept_with_poll(words, poll)];
         }
         let regions = split_regions(&words, SEGMENT_GAP);
         if regions.is_empty() {
-            return vec![words];
+            return vec![ReleasedMicRegion::kept_with_poll(words, poll)];
         }
         let mut out = Vec::with_capacity(regions.len());
         for region in regions {
             let candidate = EchoCandidate::from_words(true, &region);
             if !self.is_short(&candidate) {
                 // A sentence publishes now — but never ahead of a region that arrived before it.
-                out.append(&mut self.drain_held());
-                out.push(region);
+                out.append(&mut self.drain_held(evidence));
+                out.push(ReleasedMicRegion::kept_with_poll(region, poll.clone()));
                 continue;
             }
             let deadline = candidate.end() + self.cfg.echo_window_seconds;
             self.held.push_back(HeldMicRegion {
                 words: region,
                 candidate,
+                poll: poll.clone(),
                 deadline,
             });
             self.stats.held += 1;
             // Everything popped here is older than what was just pushed, so order still holds.
             while self.held.len() > MAX_HELD_MIC_REGIONS {
-                self.release_oldest(&mut out);
+                self.release_oldest(&mut out, evidence);
             }
         }
         self.prune_sources(now);
@@ -1259,28 +1583,30 @@ impl EarlyDrop {
 
     /// A far-end poll produced words: they become echo sources, and a closed far-end region is exactly the
     /// event a held region was waiting for. Returns the mic word groups this released.
-    fn offer_them(&mut self, words: &[Word], now: f64) -> Vec<Vec<Word>> {
+    fn offer_them(
+        &mut self,
+        words: &[Word],
+        now: f64,
+        evidence: Option<AudioEvidence<'_>>,
+    ) -> Vec<ReleasedMicRegion> {
         if !self.enabled() || words.is_empty() {
             return Vec::new();
         }
-        for region in split_regions(words, SEGMENT_GAP) {
-            self.sources
-                .push_back(EchoCandidate::from_words(false, &region));
-        }
-        let released = self.drain_held();
+        self.sources.remember(words, self.cfg.echo_window_seconds);
+        let released = self.drain_held(evidence);
         self.prune_sources(now);
         released
     }
 
     /// Call time advanced. Releases every hold whose deadline has passed; deadlines are non-decreasing, so
     /// the front of the queue is always the next to expire.
-    fn due(&mut self, now: f64) -> Vec<Vec<Word>> {
+    fn due(&mut self, now: f64, evidence: Option<AudioEvidence<'_>>) -> Vec<ReleasedMicRegion> {
         if !self.enabled() || self.held.is_empty() {
             return Vec::new();
         }
         let mut out = Vec::new();
         while self.held.front().is_some_and(|h| h.deadline <= now) {
-            self.release_oldest(&mut out);
+            self.release_oldest(&mut out, evidence);
         }
         self.prune_sources(now);
         out
@@ -1288,37 +1614,50 @@ impl EarlyDrop {
 
     /// Release everything, whatever the deadline: a durable append is about to render the note, or the
     /// session is over. Nothing is lost, only judged with the sources that exist by then.
-    fn release_all(&mut self) -> Vec<Vec<Word>> {
+    fn release_all(&mut self, evidence: Option<AudioEvidence<'_>>) -> Vec<ReleasedMicRegion> {
         if !self.enabled() {
             return Vec::new();
         }
-        self.drain_held()
+        self.drain_held(evidence)
     }
 
-    fn drain_held(&mut self) -> Vec<Vec<Word>> {
+    fn drain_held(&mut self, evidence: Option<AudioEvidence<'_>>) -> Vec<ReleasedMicRegion> {
         let mut out = Vec::with_capacity(self.held.len());
         while !self.held.is_empty() {
-            self.release_oldest(&mut out);
+            self.release_oldest(&mut out, evidence);
         }
         out
     }
 
-    /// Judge the oldest held region against the far-end ring and either append its words to `out` or count
-    /// the drop.
-    fn release_oldest(&mut self, out: &mut Vec<Vec<Word>>) {
+    /// Judge the oldest held region against the far-end ring and return it even when publication is
+    /// suppressed. The caller can preserve every original word alongside its decision.
+    fn release_oldest(
+        &mut self,
+        out: &mut Vec<ReleasedMicRegion>,
+        evidence: Option<AudioEvidence<'_>>,
+    ) {
         let Some(held) = self.held.pop_front() else {
             return;
         };
-        let echo = self
+        let span = evidence.and_then(|get| get(held.candidate.start(), held.candidate.end()));
+        let comparison_incomplete = self
             .sources
-            .iter()
-            .any(|source| held.candidate.is_echo_of(source, &self.cfg));
-        if echo {
+            .mic_comparison_incomplete(&held.candidate, &held.poll);
+        let (assessment, span) =
+            self.sources
+                .assess_mic_poll(&held.candidate, &held.poll, &self.cfg, span);
+        if assessment.verdict == EchoVerdict::DropAcoustic {
             self.stats.released_dropped += 1;
         } else {
             self.stats.released_published += 1;
-            out.push(held.words);
         }
+        out.push(ReleasedMicRegion {
+            words: held.words,
+            poll: held.poll,
+            comparison_incomplete,
+            assessment,
+            evidence: span,
+        });
     }
 
     /// A far-end region can still source an echo up to `echo_window_seconds` after it ends, for any subject
@@ -1327,10 +1666,7 @@ impl EarlyDrop {
     fn prune_sources(&mut self, now: f64) {
         let floor = self.held.front().map_or(now, |h| h.candidate.start());
         let horizon = floor - self.cfg.echo_window_seconds;
-        self.sources.retain(|source| source.end() >= horizon);
-        while self.sources.len() > MAX_LIVE_ECHO_SOURCES {
-            self.sources.pop_front();
-        }
+        self.sources.prune_before(horizon);
     }
 }
 
@@ -1342,8 +1678,16 @@ fn publish_mic_words<P: TranscriptPublisher>(
     publisher: &P,
     words: Vec<Word>,
 ) {
+    if words.is_empty() {
+        return;
+    }
+    let poll = window.remember_mic_poll(&words);
     let now = window.next_start_sec();
-    let released = window.early_drop.offer_mic(words, now);
+    let sources = &window.carry;
+    let evidence = |start, end| sources.span_evidence(&window.aec_blocks, start, end);
+    let released = window
+        .early_drop
+        .offer_mic_with_poll(words, now, Some(&evidence), poll);
     emit_mic_words(window, publisher, released);
 }
 
@@ -1355,34 +1699,54 @@ fn publish_them_words<P: TranscriptPublisher>(
     words: Vec<Word>,
 ) {
     let now = window.next_start_sec();
-    let released = window.early_drop.offer_them(&words, now);
-    publisher.words(Speaker::Other("Them".to_string()), &words);
+    let offset = window.them_words.len();
     window.push_them_words(words);
+    let words = &window.them_words[offset..];
+    let sources = &window.carry;
+    let evidence = |start, end| sources.span_evidence(&window.aec_blocks, start, end);
+    let released = window.early_drop.offer_them(words, now, Some(&evidence));
+    publisher.words(Speaker::Other("Them".to_string()), words);
     emit_mic_words(window, publisher, released);
 }
 
 /// Call time advanced: a hold that no far-end region closed out still expires on its own.
 fn release_due_mic_words<P: TranscriptPublisher>(window: &mut TranscriptWindow, publisher: &P) {
     let now = window.next_start_sec();
-    let released = window.early_drop.due(now);
+    let sources = &window.carry;
+    let evidence = |start, end| sources.span_evidence(&window.aec_blocks, start, end);
+    let released = window.early_drop.due(now, Some(&evidence));
     emit_mic_words(window, publisher, released);
 }
 
 /// Release everything still held. Required before every [`flush_window`]: a held region is not in
-/// `window.mic_words` yet, so leaving one behind would drop it from the note.
+/// `window.mic_regions` yet, so leaving one behind would drop it from the note.
 fn release_held_mic_words<P: TranscriptPublisher>(window: &mut TranscriptWindow, publisher: &P) {
-    let released = window.early_drop.release_all();
+    let sources = &window.carry;
+    let evidence = |start, end| sources.span_evidence(&window.aec_blocks, start, end);
+    let released = window.early_drop.release_all(Some(&evidence));
     emit_mic_words(window, publisher, released);
 }
 
 fn emit_mic_words<P: TranscriptPublisher>(
     window: &mut TranscriptWindow,
     publisher: &P,
-    released: Vec<Vec<Word>>,
+    released: Vec<ReleasedMicRegion>,
 ) {
-    for words in released {
-        publisher.words(Speaker::Me, &words);
-        window.push_mic_words(words);
+    for region in released {
+        for original in words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP) {
+            window.cleanup_decisions.record_echo_assessment(
+                CleanupStage::EarlyEcho,
+                window.early_decision_index,
+                &original,
+                region.assessment,
+                region.evidence,
+            );
+            window.early_decision_index = window.early_decision_index.saturating_add(1);
+        }
+        if region.assessment.verdict != EchoVerdict::DropAcoustic {
+            publisher.words(Speaker::Me, &region.words);
+            window.push_mic_region(region);
+        }
     }
 }
 
@@ -1531,7 +1895,60 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
         window.early_drop.is_idle(),
         "every caller must release held mic regions before the window is rendered"
     );
-    let mut segments = words_to_segments(&window.mic_words, Speaker::Me, SEGMENT_GAP);
+    // Echo decisions use decoder regions and raw source identities before any display transform. A
+    // protected early region keeps that exact assessment even if its source later leaves the bounded
+    // inventory. The remaining regions use the same shared verdict as batch and early cleanup.
+    let mut segments = Vec::new();
+    let mut protected_input_indices = Vec::new();
+    let mic_candidates: Vec<_> = window
+        .mic_polls
+        .iter()
+        .flat_map(|raw| std::iter::once(&raw.segment).chain(&raw.speech_segments))
+        .map(EchoCandidate::from_segment)
+        .collect();
+    let mut echo_dropped_audio = 0usize;
+    let mut input_index = 0usize;
+    for region in &window.mic_regions {
+        for original in words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP) {
+            let candidate = EchoCandidate::from_segment(&original);
+            let (assessment, evidence) = if region.assessment.verdict
+                == EchoVerdict::KeepCriticalDifference
+            {
+                (region.assessment, region.evidence)
+            } else {
+                let evidence = window
+                    .carry
+                    .span_evidence(&window.aec_blocks, original.start, original.end)
+                    .filter(|_| !region.comparison_incomplete);
+                window
+                    .carry
+                    .assess_mic_poll(&candidate, &region.poll, &window.cleanup, evidence)
+            };
+            if assessment.verdict != EchoVerdict::Keep {
+                window.cleanup_decisions.record_echo_assessment(
+                    CleanupStage::Echo,
+                    input_index,
+                    &original,
+                    assessment,
+                    evidence,
+                );
+            }
+            input_index += 1;
+            if assessment.verdict == EchoVerdict::DropAcoustic {
+                echo_dropped_audio += 1;
+            } else {
+                if assessment.verdict == EchoVerdict::KeepCriticalDifference
+                    || region.comparison_incomplete
+                    || window
+                        .carry
+                        .mic_comparison_incomplete(&candidate, &region.poll)
+                {
+                    protected_input_indices.push(segments.len());
+                }
+                segments.push(original);
+            }
+        }
+    }
     if !window.them_words.is_empty() {
         let turns = if window.diarize_far_end {
             diarizer
@@ -1540,47 +1957,99 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
         } else {
             Vec::new()
         };
-        if window.diarize_far_end {
-            segments.extend(diarize_words(
-                &window.them_words,
-                &turns,
-                SEGMENT_GAP,
-                "Them",
-            ));
-        } else {
-            segments.extend(words_to_segments(
-                &window.them_words,
-                Speaker::Other("Them".to_string()),
-                SEGMENT_GAP,
-            ));
+        // Bind protection to the ORIGINAL returned poll before any pause or diarization split. Every
+        // displayed descendant keeps the flag; neither text lookup nor the bounded ledger is authority.
+        let mut poll_start = 0;
+        for &poll_end in &window.them_poll_ends {
+            let words = &window.them_words[poll_start..poll_end];
+            poll_start = poll_end;
+            let original = TranscriptSegment {
+                speaker: Speaker::Other("Them".to_string()),
+                start: words[0].start,
+                end: words[words.len() - 1].end,
+                text: words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            let assessment = echo_assessment(
+                &EchoCandidate::from_segment(&original),
+                &mic_candidates,
+                &window.cleanup,
+                None,
+            );
+            if assessment.verdict != EchoVerdict::Keep {
+                window.cleanup_decisions.record_echo_assessment(
+                    CleanupStage::Echo,
+                    input_index,
+                    &original,
+                    assessment,
+                    None,
+                );
+            }
+            input_index += 1;
+            // Whole-poll protection supplements child matches: unrelated speech in the same returned
+            // poll must not conceal a critical match belonging to one pause-separated child.
+            for child in split_regions(words, SEGMENT_GAP) {
+                let original_child =
+                    words_to_segments(&child, Speaker::Other("Them".to_string()), f64::INFINITY)
+                        .remove(0);
+                let child_assessment = echo_assessment(
+                    &EchoCandidate::from_segment(&original_child),
+                    &mic_candidates,
+                    &window.cleanup,
+                    None,
+                );
+                if child_assessment.verdict != EchoVerdict::Keep {
+                    window.cleanup_decisions.record_echo_assessment(
+                        CleanupStage::Echo,
+                        input_index,
+                        &original_child,
+                        child_assessment,
+                        None,
+                    );
+                }
+                input_index += 1;
+                let protected = assessment.verdict == EchoVerdict::KeepCriticalDifference
+                    || child_assessment.verdict == EchoVerdict::KeepCriticalDifference
+                    || window.mic_polls_omitted > 0;
+                let rendered = if window.diarize_far_end {
+                    diarize_words(&child, &turns, SEGMENT_GAP, "Them")
+                } else {
+                    vec![original_child]
+                };
+                for segment in rendered {
+                    if protected {
+                        protected_input_indices.push(segments.len());
+                    }
+                    segments.push(segment);
+                }
+            }
         }
     }
-    let segments = merge_by_time(segments);
-    // Cleanup runs on the merged window, with the previous window's tail as echo sources, before anything
-    // is written. Fragment merges cannot cross the append boundary (a committed row is never rewritten);
-    // echo lookback can, through `carry`.
-    // With the live canceller running, its per-block record for this window is audio evidence the text
-    // rules cannot reconstruct: a `Me` row whose mic span was measured as little more than the echo the
-    // filter was already subtracting is a ghost regardless of its wording (#149 phase 3b).
+    // Structural/text cleanup runs only after the raw echo verdict. Diarized fragments and rewritten
+    // display text must never become new echo candidates or replace the raw source inventory.
     let rule = window
         .lexicon
         .as_deref()
         .map(|lexicon| lexicon as &dyn TextRule);
-    let (segments, stats) = if window.cleanup.is_noop() && rule.is_none() {
-        (segments, CleanupStats::default())
-    } else if window.aec_blocks.is_empty() {
-        cleanup_with_rules(segments, &window.cleanup, &window.carry, None, rule)
-    } else {
-        let blocks = &window.aec_blocks;
-        let evidence = |start: f64, end: f64| crate::transcribe::span_evidence(blocks, start, end);
-        cleanup_with_rules(
-            segments,
-            &window.cleanup,
-            &window.carry,
-            Some(&evidence),
-            rule,
-        )
+    let render_cleanup = CleanupConfig {
+        echo_drop: false,
+        ..window.cleanup.clone()
     };
+    let result = cleanup_with_protected_decisions(
+        segments,
+        &render_cleanup,
+        &[],
+        None,
+        rule,
+        &protected_input_indices,
+    );
+    let segments = result.segments;
+    let mut stats = result.stats;
+    stats.echo_dropped_audio = echo_dropped_audio;
+    window.cleanup_decisions.append(result.decisions);
     if !segments.is_empty() {
         writer.append_segments(&segments)?;
         info!(
@@ -1594,11 +2063,11 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
             aec_blocks = window.aec_blocks.len(),
             merged = stats.merged,
             backchannels_dropped = stats.backchannels_dropped,
+            raw_mic_polls_omitted = window.mic_polls_omitted,
             buffered_audio_bytes = window.tap_audio.len() * std::mem::size_of::<f32>(),
             "durable live transcript chunk synced"
         );
     }
-    window.remember_carry(&segments);
     window.clear_after_flush();
     Ok(())
 }
@@ -2525,13 +2994,12 @@ mod tests {
         assert!(!final_content.contains("State: transcribing"));
     }
 
-    /// The live path applies the same cleanup the batch path does, before the append: an echo of far-end
-    /// speech, a backchannel over it, and two fragments of one mic sentence all resolve inside one window,
-    /// and an echo whose source landed in the *previous* window is still caught through `carry`.
+    /// Without acoustic evidence, duplicates within and across windows survive. The unchanged
+    /// backchannel and fragment passes still run before the append.
     ///
     /// Synthetic script — this repo is public, so the shapes are reproduced with invented words.
     #[test]
-    fn live_windows_drop_echoes_and_backchannels_and_merge_fragments() {
+    fn live_windows_keep_text_duplicates_and_drop_backchannels_and_merge_fragments() {
         let filer = TempFiler::new("cleanup");
         let note = filer.note();
         let mut writer = NoteWriter::new(filer, meta(), None);
@@ -2601,29 +3069,31 @@ mod tests {
         assert!(
             content.ends_with(
                 "**[00:02] Them:** We should rotate the widget calibration before Friday.\n\n\
+                 **[00:08] Me:** Rotate the widget calibration.\n\n\
                  **[00:40] Me:** I will send the summary after this call.\n\n\
                  **[00:57] Them:** The gateway timeout hits the queue depth.\n\n\
+                 **[01:02] Me:** Gateway timeout queue depth.\n\n\
                  **[01:10] Me:** Sending the notes now.\n\n"
             ),
             "unexpected note body:\n{content}"
         );
         assert!(!content.contains("Me:** Yeah."), "backchannel survived");
         assert!(
-            !content.contains("Me:** Rotate the widget calibration."),
-            "in-window echo survived"
+            content.contains("Me:** Rotate the widget calibration."),
+            "in-window duplicate was deleted without evidence"
         );
         assert!(
-            !content.contains("Me:** Gateway timeout queue depth."),
-            "cross-window echo survived — carry did not reach the next window"
+            content.contains("Me:** Gateway timeout queue depth."),
+            "cross-window duplicate was deleted without evidence"
         );
     }
 
-    /// A short mic region decoded while the far end is still mid-region is withheld, judged against that
-    /// region when it closes, and never reaches the reader at all (#149 phase 2).
+    /// A short mic region decoded while the far end is still mid-region is withheld, then kept when the
+    /// source closes: text similarity without acoustic evidence cannot prove that it was an echo.
     ///
     /// Synthetic script — this repo is public, so the shape is reproduced with invented words.
     #[test]
-    fn a_short_mic_ghost_inside_a_far_end_region_is_never_published() {
+    fn a_short_text_duplicate_is_published_without_acoustic_evidence() {
         let filer = TempFiler::new("early-drop-ghost");
         let note = filer.note();
         let mut writer = NoteWriter::new(filer, meta(), None);
@@ -2671,8 +3141,8 @@ mod tests {
             window.early_drop.stats,
             EarlyDropStats {
                 held: 1,
-                released_published: 0,
-                released_dropped: 1,
+                released_published: 1,
+                released_dropped: 0,
             }
         );
         assert_eq!(
@@ -2682,8 +3152,8 @@ mod tests {
                 .iter()
                 .map(|(speaker, _)| speaker.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Them"],
-            "the ghost reached the reader"
+            vec!["Them", "Me"],
+            "the duplicate was lost without acoustic evidence"
         );
 
         finish_session(
@@ -2700,9 +3170,141 @@ mod tests {
         .unwrap();
         let content = read(&note);
         assert!(
-            !content.contains("Me:**"),
+            content.contains("Me:** Settlement gateway."),
             "unexpected note body:\n{content}"
         );
+    }
+
+    /// Synthetic corrections and intentional repeats must reach the reader with their original timing,
+    /// regardless of channel order or which decoder closes its region first. Missing evidence and the
+    /// existing double-talk guard both forbid echo deletion.
+    #[test]
+    fn live_early_echo_keeps_critical_words_and_repeats_in_both_channel_orders() {
+        let cases = [
+            ("Deploy the service.", "Do not deploy the service."),
+            ("The budget is 1500 euros.", "The budget is 15000 euros."),
+            ("Publica la versión.", "No publiques la versión."),
+            ("Restart the gateway.", "Restart the gateway."),
+            ("The answer is yes.", "No."),
+            ("The count is 50.", "15."),
+            ("Check the satellite.", "The kettle is ready."),
+        ];
+        for (left, right) in cases {
+            for (far, near) in [(left, right), (right, left)] {
+                for double_talk in [false, true] {
+                    for far_first in [false, true] {
+                        let mut window =
+                            TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+                        if double_talk {
+                            window.push_aec_blocks(vec![block(1.0, 1.0, true)]);
+                        }
+                        let publisher = RecordingPublisher::default();
+                        let original = vec![word(1.0, 1.5, near)];
+                        let source = vec![word(0.0, 3.0, far)];
+                        if far_first {
+                            publish_them_words(&mut window, &publisher, source);
+                            publish_mic_words(&mut window, &publisher, original.clone());
+                        } else {
+                            publish_mic_words(&mut window, &publisher, original.clone());
+                            publish_them_words(&mut window, &publisher, source);
+                        }
+                        release_held_mic_words(&mut window, &publisher);
+                        let published = publisher.0.borrow();
+                        let mic = published.iter().find(|(speaker, _)| speaker == "Me");
+                        assert_eq!(mic.map(|(_, words)| words), Some(&original));
+                        assert_eq!(window.early_drop.stats.released_dropped, 0);
+                        assert_eq!(
+                            published
+                                .iter()
+                                .filter(|(speaker, _)| speaker == "Them")
+                                .count(),
+                            1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_early_echo_protects_raw_corrections_even_with_quiet_mic_evidence() {
+        for (left, right) in [
+            ("Deploy the service.", "Do not deploy the service."),
+            ("The budget is 1500 euros.", "The budget is 15000 euros."),
+            ("Publica el servicio.", "No publica el servicio."),
+            (
+                "Nora owns the production gateway today.",
+                "Omar owns the production gateway today.",
+            ),
+            ("Use version 1.5 now.", "Use version 1.6 now."),
+        ] {
+            for (far, near) in [(left, right), (right, left)] {
+                let mut window =
+                    TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+                window.push_aec_blocks(vec![block(1.0, 1.0, false)]);
+                let publisher = RecordingPublisher::default();
+                let original = vec![word(1.0, 1.5, near)];
+                publish_mic_words(&mut window, &publisher, original.clone());
+                publish_them_words(&mut window, &publisher, vec![word(0.0, 3.0, far)]);
+                let published = publisher.0.borrow();
+                assert_eq!(
+                    published
+                        .iter()
+                        .find(|(speaker, _)| speaker == "Me")
+                        .map(|(_, words)| words),
+                    Some(&original)
+                );
+                assert_eq!(window.early_drop.stats.released_dropped, 0);
+            }
+        }
+    }
+
+    /// Suppression changes publication, not the caller's access to the original words or the reason.
+    #[test]
+    fn live_early_echo_returns_suppressed_words_and_acoustic_source_decision() {
+        let mut early = EarlyDrop::new(CleanupConfig::default());
+        let original = vec![word(1.0, 1.5, "Restart the gateway.")];
+        let quiet = |_, _| {
+            Some(SpanEvidence {
+                mic_db: -20.0,
+                echo_estimate_db: -20.0,
+                double_talk_fraction: 0.0,
+                blocks: 1,
+            })
+        };
+        assert!(
+            early
+                .offer_mic(original.clone(), 1.5, Some(&quiet))
+                .is_empty()
+        );
+        let released =
+            early.offer_them(&[word(0.0, 3.0, "Restart the gateway.")], 3.0, Some(&quiet));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].words, original);
+        assert_eq!(released[0].assessment.verdict, EchoVerdict::DropAcoustic);
+        assert_eq!(
+            released[0]
+                .assessment
+                .source
+                .as_ref()
+                .map(|source| source.start),
+            Some(0.0)
+        );
+        assert_eq!(released[0].evidence, quiet(1.0, 1.5));
+        assert_eq!(early.stats.released_dropped, 1);
+
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        emit_mic_words(&mut window, &publisher, released);
+        assert!(publisher.0.borrow().is_empty());
+        assert!(window.mic_regions.is_empty());
+        assert_eq!(window.cleanup_decisions.entries().len(), 1);
+        let decision = &window.cleanup_decisions.entries()[0];
+        assert_eq!(decision.originals[0].text, original[0].text);
+        assert_eq!(decision.originals[0].start, original[0].start);
+        assert_eq!(decision.originals[0].end, original[0].end);
+        assert!(decision.replacements.is_empty());
+        assert_eq!(decision.stage, CleanupStage::EarlyEcho);
     }
 
     /// A short mic region that is *not* an echo is published late — after the far-end region whose closing
@@ -2710,88 +3312,92 @@ mod tests {
     /// row still lands in its place.
     #[test]
     fn a_short_genuine_answer_is_published_late_with_its_original_timestamps() {
-        let filer = TempFiler::new("early-drop-answer");
-        let note = filer.note();
-        let mut writer = NoteWriter::new(filer, meta(), None);
+        for (prompt, reply) in [
+            ("which region is the replica in?", "Frankfurt."),
+            ("Deploy the service.", "Do not deploy the service."),
+            ("The budget is 1500 euros.", "The budget is 15000 euros."),
+            ("Publica el servicio.", "No publica el servicio."),
+            ("Restart the gateway.", "Restart the gateway."),
+        ] {
+            let filer = TempFiler::new("early-drop-answer");
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
 
-        let mut them = Scripted::new(
-            vec![
-                vec![word(0.0, 1.0, "which region is the replica in?")],
+            let mut them = Scripted::new(
+                vec![
+                    vec![word(0.0, 1.0, prompt)],
+                    Vec::new(),
+                    Vec::new(),
+                    vec![word(4.0, 4.6, "Got it.")],
+                ],
                 Vec::new(),
-                Vec::new(),
-                vec![word(4.0, 4.6, "Got it.")],
-            ],
-            Vec::new(),
-        );
-        let answer = word(1.4, 1.9, "Frankfurt.");
-        let mut mic = Scripted::new(vec![Vec::new(), vec![answer.clone()]], Vec::new());
+            );
+            let answer = word(1.4, 1.9, reply);
+            let mut mic = Scripted::new(vec![Vec::new(), vec![answer.clone()]], Vec::new());
 
-        let (tx, rx) = sync_channel::<CaptureChunk>(8);
-        for _ in 0..5 {
-            tx.send(CaptureChunk {
-                mic: vec![0.0; 1],
-                tap: vec![0.0; 1],
-            })
-            .unwrap();
-        }
-        drop(tx);
-
-        let publisher = RecordingPublisher::default();
-        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
-        consume_chunks(
-            &rx,
-            1,
-            &mut None,
-            &mut mic,
-            &mut them,
-            &NoDiarizer,
-            &mut window,
-            &mut writer,
-            &publisher,
-        )
-        .unwrap();
-
-        assert_eq!(
-            window.early_drop.stats,
-            EarlyDropStats {
-                held: 1,
-                released_published: 1,
-                released_dropped: 0,
+            let (tx, rx) = sync_channel::<CaptureChunk>(8);
+            for _ in 0..5 {
+                tx.send(CaptureChunk {
+                    mic: vec![0.0; 1],
+                    tap: vec![0.0; 1],
+                })
+                .unwrap();
             }
-        );
-        let published = publisher.0.borrow();
-        assert_eq!(
-            published
-                .iter()
-                .map(|(speaker, words)| (speaker.as_str(), words[0].text.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("Them", "which region is the replica in?"),
-                ("Them", "Got it."),
-                ("Me", "Frankfurt."),
-            ],
-            "the answer was not held until the far end closed a region"
-        );
-        assert_eq!(published[2].1, vec![answer], "timestamps were rewritten");
-        drop(published);
+            drop(tx);
 
-        finish_session(
-            1,
-            None,
-            mic,
-            them,
-            NoDiarizer,
-            window,
-            FinishQuality { dropped_chunks: 0 },
-            &mut writer,
-            &publisher,
-        )
-        .unwrap();
-        let content = read(&note);
-        assert!(
-            content.contains("Me:** Frankfurt."),
-            "unexpected note body:\n{content}"
-        );
+            let publisher = RecordingPublisher::default();
+            let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+            consume_chunks(
+                &rx,
+                1,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+
+            assert_eq!(
+                window.early_drop.stats,
+                EarlyDropStats {
+                    held: 1,
+                    released_published: 1,
+                    released_dropped: 0,
+                }
+            );
+            let published = publisher.0.borrow();
+            assert_eq!(
+                published
+                    .iter()
+                    .map(|(speaker, words)| (speaker.as_str(), words[0].text.as_str()))
+                    .collect::<Vec<_>>(),
+                vec![("Them", prompt), ("Them", "Got it."), ("Me", reply),],
+                "the answer was not held until the far end closed a region"
+            );
+            assert_eq!(published[2].1, vec![answer], "timestamps were rewritten");
+            drop(published);
+
+            finish_session(
+                1,
+                None,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality { dropped_chunks: 0 },
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+            let content = read(&note);
+            assert!(
+                content.contains(&format!("Me:** {reply}")),
+                "unexpected note body:\n{content}"
+            );
+        }
     }
 
     /// A long mic region is a sentence, not residual echo: it publishes with no added latency. It still
@@ -2894,12 +3500,12 @@ mod tests {
         for i in 0..(MAX_HELD_MIC_REGIONS + 20) {
             let start = i as f64 * 0.1;
             published += early
-                .offer_mic(vec![word(start, start + 0.05, "ping")], start)
+                .offer_mic(vec![word(start, start + 0.05, "ping")], start, None)
                 .len();
         }
         assert_eq!(early.held.len(), MAX_HELD_MIC_REGIONS);
         assert_eq!(published, 20, "overflow lost the regions it evicted");
-        published += early.release_all().len();
+        published += early.release_all(None).len();
         assert!(early.is_idle());
         assert_eq!(published, MAX_HELD_MIC_REGIONS + 20);
         assert_eq!(early.stats.released_dropped, 0, "there was nothing to echo");
@@ -2908,9 +3514,10 @@ mod tests {
         // instant, which no horizon can trim.
         let mut early = EarlyDrop::new(CleanupConfig::default());
         for _ in 0..(MAX_LIVE_ECHO_SOURCES + 10) {
-            early.offer_them(&[word(0.0, 0.5, "chatter")], 0.0);
+            early.offer_them(&[word(0.0, 0.5, "chatter")], 0.0, None);
         }
-        assert_eq!(early.sources.len(), MAX_LIVE_ECHO_SOURCES);
+        assert_eq!(early.sources.segments.len(), MAX_LIVE_ECHO_SOURCES);
+        assert_eq!(early.sources.omitted, 10);
     }
 
     /// With the echo pass switched off, the early drop is a passthrough: it holds nothing and counts
@@ -2922,8 +3529,15 @@ mod tests {
             ..CleanupConfig::default()
         });
         let ghost = vec![word(1.0, 1.2, "Gateway.")];
-        early.offer_them(&[word(0.0, 3.0, "the settlement gateway rollout")], 3.0);
-        assert_eq!(early.offer_mic(ghost.clone(), 3.5), vec![ghost]);
+        early.offer_them(
+            &[word(0.0, 3.0, "the settlement gateway rollout")],
+            3.0,
+            None,
+        );
+        let released = early.offer_mic(ghost.clone(), 3.5, None);
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].words, ghost);
+        assert_eq!(released[0].assessment.verdict, EchoVerdict::Keep);
         assert!(early.is_idle());
         assert_eq!(early.stats, EarlyDropStats::default());
     }
@@ -2932,47 +3546,53 @@ mod tests {
     /// `checkpoint_and_flush` releases every held region before it flushes.
     #[test]
     fn a_hold_is_released_before_the_durable_append() {
-        let filer = TempFiler::new("early-drop-boundary");
-        let note = filer.note();
-        let mut writer = NoteWriter::new(filer, meta(), None);
+        for reply in [
+            "Frankfurt.",
+            "Do not deploy the service.",
+            "The budget is 15000 euros.",
+            "No publica el servicio.",
+            "Restart the gateway.",
+        ] {
+            let filer = TempFiler::new("early-drop-boundary");
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
 
-        let mut them = Scripted::new(Vec::new(), Vec::new());
-        // Decoded at 58 s, so the hold would not expire on its own until 64.5 s — past this window's end.
-        let mut mic = Scripted::new(
-            vec![Vec::new(), vec![word(58.0, 58.5, "Frankfurt.")]],
-            Vec::new(),
-        );
+            let mut them = Scripted::new(Vec::new(), Vec::new());
+            // Decoded at 58 s, so the hold would not expire on its own until 64.5 s — past this window's end.
+            let mut mic =
+                Scripted::new(vec![Vec::new(), vec![word(58.0, 58.5, reply)]], Vec::new());
 
-        let (tx, rx) = sync_channel::<CaptureChunk>(4);
-        for _ in 0..2 {
-            tx.send(CaptureChunk {
-                mic: vec![0.0; 30],
-                tap: vec![0.0; 30],
-            })
+            let (tx, rx) = sync_channel::<CaptureChunk>(4);
+            for _ in 0..2 {
+                tx.send(CaptureChunk {
+                    mic: vec![0.0; 30],
+                    tap: vec![0.0; 30],
+                })
+                .unwrap();
+            }
+            drop(tx);
+
+            let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+            consume_chunks(
+                &rx,
+                1,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
             .unwrap();
+
+            assert!(window.early_drop.is_idle());
+            let content = read(&note);
+            assert!(
+                content.contains(&format!("**[00:58] Me:** {reply}")),
+                "the held region missed its window:\n{content}"
+            );
         }
-        drop(tx);
-
-        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
-        consume_chunks(
-            &rx,
-            1,
-            &mut None,
-            &mut mic,
-            &mut them,
-            &NoDiarizer,
-            &mut window,
-            &mut writer,
-            &NoopPublisher,
-        )
-        .unwrap();
-
-        assert!(window.early_drop.is_idle());
-        let content = read(&note);
-        assert!(
-            content.contains("**[00:58] Me:** Frankfurt."),
-            "the held region missed its window:\n{content}"
-        );
     }
 
     /// One synthetic canceller block: `mic_energy` against `echo_estimate_energy` is the whole signal the
@@ -3108,29 +3728,817 @@ mod tests {
         let mut writer = NoteWriter::new(filer, meta(), None);
         let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
 
-        window.push_them_words(vec![
-            word(1.0, 2.0, "An early turn nobody echoes."),
-            word(57.0, 59.0, "The gateway timeout hits the queue depth."),
-        ]);
+        window.push_them_words(vec![word(1.0, 2.0, "An early turn nobody echoes.")]);
+        window.push_them_words(vec![word(
+            57.0,
+            59.0,
+            "The gateway timeout hits the queue depth.",
+        )]);
         window.frames = 60;
         flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
 
         // 60 s window, 6 s echo window ⇒ only segments ending at or after 54 s are carried.
-        assert_eq!(window.carry.len(), 1);
-        assert_eq!(window.carry[0].start, 57.0);
+        assert_eq!(window.carry.segments.len(), 1);
+        assert_eq!(window.carry.segments[0].segment.start, 57.0);
 
         // The carried segment is an echo source, not content: it is not re-appended by the next flush.
         window.push_mic_words(vec![word(62.0, 63.0, "Gateway timeout queue depth.")]);
         window.frames = 60;
         flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
         assert!(
-            window.carry.is_empty(),
+            window.carry.segments.is_empty(),
             "nothing survived the second window"
         );
     }
 
+    #[test]
+    fn raw_carry_protects_a_correction_after_the_lexicon_rewrites_its_source() {
+        let filer = TempFiler::new("raw-carry-lexicon");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let document = corti_lexicon::LexiconDocument::from_rules(
+            1,
+            vec![
+                corti_lexicon::LexiconRule::new(
+                    "rust",
+                    "REST",
+                    corti_lexicon::RuleSource::Manual,
+                    "2026-01-01T00:00:00Z",
+                )
+                .unwrap()
+                .case_sensitive(),
+            ],
+        )
+        .unwrap();
+        let lexicon = corti_lexicon::CompiledLexicon::compile(&document).unwrap();
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default())
+            .unwrap()
+            .with_lexicon(Some(std::sync::Arc::new(lexicon)));
+        let publisher = RecordingPublisher::default();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(57.0, 59.0, "We deploy the rust gateway today.")],
+        );
+        window.frames = 60;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(read(&note).contains("Them:** We deploy the REST gateway today."));
+
+        window.frames = 5;
+        window.push_aec_blocks(vec![block(61.0, 1.0, false)]);
+        let original = vec![word(61.0, 62.0, "We deploy the REST gateway today.")];
+        publish_mic_words(&mut window, &publisher, original.clone());
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(60.0, 65.0, "The unrelated weather report continues.")],
+        );
+        assert_eq!(
+            publisher.0.borrow().last(),
+            Some(&("Me".to_string(), original))
+        );
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        assert!(read(&note).contains("**[01:01] Me:** We deploy the REST gateway today."));
+        let protected = window
+            .cleanup_decisions
+            .entries()
+            .iter()
+            .filter(|decision| {
+                decision.reason
+                    == corti_transcribe::segment::CleanupReason::Echo(
+                        EchoVerdict::KeepCriticalDifference,
+                    )
+                    && decision.originals[0].speaker == Speaker::Me
+                    && decision.originals[0].start == 61.0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(protected.len(), 2, "early and flush verdicts must agree");
+        for decision in protected {
+            assert_eq!(decision.originals[0].end, 62.0);
+            assert_eq!(decision.source.unwrap().start, 57.0);
+            assert_eq!(decision.source.unwrap().end, 59.0);
+            assert!(!decision.source.unwrap().me);
+        }
+    }
+
+    #[test]
+    fn raw_source_protects_a_negation_after_diarization_splits_the_source() {
+        let filer = TempFiler::new("raw-source-diarization");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let diarizer = ScriptedDiarizer {
+            turns: vec![
+                SpeakerTurn {
+                    start: 0.0,
+                    end: 2.0,
+                    label: "Them 1".into(),
+                },
+                SpeakerTurn {
+                    start: 2.0,
+                    end: 5.0,
+                    label: "Them 2".into(),
+                },
+            ],
+            calls: RefCell::new(Vec::new()),
+        };
+        let mut window = TranscriptWindow::new(1, 1, true, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        window.push_audio(&[0.0; 5], 5);
+        window.push_aec_blocks(vec![block(3.0, 1.0, false)]);
+        let original = vec![word(
+            3.0,
+            4.0,
+            "We should not deploy the payment gateway today.",
+        )];
+        publish_mic_words(&mut window, &publisher, original.clone());
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(0.0, 2.0, "We should deploy"),
+                word(2.0, 5.0, "the payment gateway today."),
+            ],
+        );
+        assert_eq!(
+            publisher.0.borrow().last(),
+            Some(&("Me".to_string(), original))
+        );
+        flush_window(&diarizer, &mut window, &mut writer).unwrap();
+
+        let content = read(&note);
+        assert!(content.contains("Them 1:** We should deploy"));
+        assert!(content.contains("Them 2:** the payment gateway today."));
+        assert!(
+            content.contains("**[00:03] Me:** We should not deploy the payment gateway today.")
+        );
+        let protected = window
+            .cleanup_decisions
+            .entries()
+            .iter()
+            .filter(|decision| {
+                decision.reason
+                    == corti_transcribe::segment::CleanupReason::Echo(
+                        EchoVerdict::KeepCriticalDifference,
+                    )
+                    && decision.originals[0].speaker == Speaker::Me
+                    && decision.originals[0].start == 3.0
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(protected.len(), 2, "early and flush verdicts must agree");
+        for decision in protected {
+            assert_eq!(decision.originals[0].end, 4.0);
+            assert_eq!(decision.source.unwrap().start, 0.0);
+            assert_eq!(decision.source.unwrap().end, 5.0);
+            assert!(!decision.source.unwrap().me);
+        }
+    }
+
+    #[test]
+    fn raw_region_boundaries_preserve_an_early_protection_at_flush() {
+        let filer = TempFiler::new("raw-region-boundaries");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        window.frames = 8;
+        window.push_aec_blocks(vec![block(3.0, 1.0, false), block(4.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(3.0, 4.0, "Do not deploy the payment gateway today.")],
+        );
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 5.0, "Deploy the payment gateway today.")],
+        );
+        // This separate VAD region is close enough for a whole-window words_to_segments call to
+        // absorb it. Its unrelated vocabulary must not weaken the preceding region's raw match.
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(
+                4.5,
+                8.0,
+                "A separate unrelated sentence about weather and traffic.",
+            )],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+
+        assert!(read(&note).contains("Do not deploy the payment gateway today."));
+        assert!(window.cleanup_decisions.entries().iter().any(|decision| {
+            decision.stage == CleanupStage::Echo
+                && decision.originals[0].start == 3.0
+                && decision.originals[0].end == 4.0
+                && decision
+                    .source
+                    .is_some_and(|source| !source.me && source.start == 0.0 && source.end == 5.0)
+                && decision.reason
+                    == corti_transcribe::segment::CleanupReason::Echo(
+                        EchoVerdict::KeepCriticalDifference,
+                    )
+        }));
+    }
+
+    #[test]
+    fn raw_source_pause_does_not_split_critical_word_protection() {
+        let filer = TempFiler::new("raw-source-pause");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        window.frames = 5;
+        window.push_aec_blocks(vec![block(3.0, 1.0, false)]);
+        let original = vec![word(
+            3.0,
+            4.0,
+            "We should not deploy the payment gateway today.",
+        )];
+        publish_mic_words(&mut window, &publisher, original.clone());
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(0.0, 1.0, "We should deploy"),
+                word(2.75, 5.0, "the payment gateway today."),
+            ],
+        );
+        assert_eq!(
+            publisher.0.borrow().last(),
+            Some(&("Me".to_string(), original))
+        );
+        assert_eq!(window.carry.segments.len(), 1);
+        assert_eq!(window.carry.segments[0].segment.start, 0.0);
+        assert_eq!(window.carry.segments[0].segment.end, 5.0);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(
+            read(&note).contains("**[00:03] Me:** We should not deploy the payment gateway today.")
+        );
+    }
+
+    #[test]
+    fn raw_source_pause_never_supplies_acoustic_overlap_to_early_or_flush_cleanup() {
+        for early in [false, true] {
+            let filer = TempFiler::new("raw-source-pause-overlap");
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+            let publisher = RecordingPublisher::default();
+            window.frames = 5;
+            window.push_aec_blocks(vec![block(1.5, 1.0, false)]);
+            let original = vec![word(1.5, 2.0, "Gateway harness.")];
+            let far = vec![
+                word(0.0, 1.0, "An introductory statement."),
+                word(3.0, 5.0, "The unrelated weather report."),
+            ];
+            if early {
+                publish_mic_words(&mut window, &publisher, original.clone());
+                publish_them_words(&mut window, &publisher, far);
+                assert_eq!(
+                    publisher.0.borrow().last(),
+                    Some(&("Me".to_string(), original))
+                );
+            } else {
+                window.push_mic_words(original);
+                window.push_them_words(far);
+            }
+            flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+            assert!(read(&note).contains("Me:** Gateway harness."));
+            assert!(!window.cleanup_decisions.entries().iter().any(|decision| {
+                decision.reason
+                    == corti_transcribe::segment::CleanupReason::Echo(EchoVerdict::DropAcoustic)
+            }));
+        }
+    }
+
+    #[test]
+    fn raw_source_speech_overlap_authorizes_echo_deletion_with_actual_interval_attribution() {
+        for early in [false, true] {
+            let filer = TempFiler::new("raw-source-actual-overlap");
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+            let publisher = RecordingPublisher::default();
+            window.frames = 5;
+            window.push_aec_blocks(vec![block(3.5, 1.0, false)]);
+            let original = vec![word(3.5, 4.0, "Gateway harness.")];
+            let far = vec![
+                word(0.0, 1.0, "An introductory statement."),
+                word(3.0, 5.0, "The unrelated weather report."),
+            ];
+            if early {
+                publish_mic_words(&mut window, &publisher, original);
+                publish_them_words(&mut window, &publisher, far);
+                assert_eq!(window.early_drop.stats.released_dropped, 1);
+            } else {
+                window.push_mic_words(original);
+                window.push_them_words(far);
+            }
+            flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+            assert!(!read(&note).contains("Gateway harness."));
+            let decision = window
+                .cleanup_decisions
+                .entries()
+                .iter()
+                .find(|decision| {
+                    decision.reason
+                        == corti_transcribe::segment::CleanupReason::Echo(EchoVerdict::DropAcoustic)
+                })
+                .unwrap();
+            assert_eq!(decision.source.unwrap().start, 3.0);
+            assert_eq!(decision.source.unwrap().end, 5.0);
+            assert!(!decision.source.unwrap().me);
+            assert_eq!(decision.evidence.unwrap().blocks, 1);
+        }
+    }
+
+    #[test]
+    fn raw_source_interval_metadata_counts_toward_the_byte_cap() {
+        let mut sources = RawEchoSources::default();
+        let count = MAX_BUFFERED_TRANSCRIPT_BYTES / (std::mem::size_of::<(f64, f64)>() + 2) + 1;
+        let words = (0..count)
+            .map(|index| {
+                let start = index as f64 * 3.0;
+                word(start, start + 1.0, "x")
+            })
+            .collect::<Vec<_>>();
+        sources.remember(&words, 6.0);
+        assert!(sources.segments.is_empty());
+        assert_eq!(sources.bytes, 0);
+        assert_eq!(sources.omitted, 1);
+        assert!(sources.incomplete_until >= words.last().unwrap().end);
+    }
+
+    #[test]
+    fn raw_source_count_overflow_keeps_speech_until_the_missing_source_expires() {
+        let filer = TempFiler::new("raw-source-count-cap");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 5.0, "Deploy the payment gateway today.")],
+        );
+        for _ in 0..MAX_LIVE_ECHO_SOURCES {
+            publish_them_words(
+                &mut window,
+                &publisher,
+                vec![word(1.0, 5.0, "An unrelated weather report.")],
+            );
+        }
+        assert_eq!(window.carry.segments.len(), MAX_LIVE_ECHO_SOURCES);
+        assert_eq!(window.carry.omitted, 1);
+        assert_eq!(window.early_drop.sources.omitted, 1);
+        window.push_aec_blocks(vec![block(3.0, 1.0, false), block(12.0, 1.0, false)]);
+        let original = vec![word(3.0, 4.0, "Do not deploy the payment gateway today.")];
+        publish_mic_words(&mut window, &publisher, original.clone());
+        release_held_mic_words(&mut window, &publisher);
+        assert_eq!(
+            publisher.0.borrow().last(),
+            Some(&("Me".to_string(), original))
+        );
+        assert!(
+            window
+                .carry
+                .span_evidence(&window.aec_blocks, 3.0, 4.0)
+                .is_none()
+        );
+        assert!(
+            window
+                .carry
+                .span_evidence(&window.aec_blocks, 12.0, 13.0)
+                .is_some()
+        );
+        window.frames = 6;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(read(&note).contains("Do not deploy the payment gateway today."));
+    }
+
+    #[test]
+    fn raw_source_byte_overflow_keeps_the_early_protection_and_records_the_omission() {
+        let filer = TempFiler::new("raw-source-byte-cap");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        window.push_aec_blocks(vec![block(3.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(3.0, 4.0, "Do not deploy the payment gateway today.")],
+        );
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 5.0, "Deploy the payment gateway today.")],
+        );
+        let large = "x".repeat(MAX_BUFFERED_TRANSCRIPT_BYTES / 2);
+        for _ in 0..2 {
+            publish_them_words(&mut window, &publisher, vec![word(1.0, 5.0, &large)]);
+        }
+        assert_eq!(window.carry.segments.len(), 1);
+        assert!(window.carry.bytes <= MAX_BUFFERED_TRANSCRIPT_BYTES);
+        assert_eq!(window.carry.omitted, 2);
+        assert_eq!(window.early_drop.sources.omitted, 2);
+        assert!(
+            window.due(),
+            "duplicated raw storage is independently bounded"
+        );
+        window.frames = 6;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(read(&note).contains("Do not deploy the payment gateway today."));
+        assert!(window.cleanup_decisions.entries().iter().any(|decision| {
+            decision.stage == CleanupStage::Echo
+                && decision.originals[0].start == 3.0
+                && decision.source.is_some_and(|source| source.start == 0.0)
+                && decision.reason
+                    == corti_transcribe::segment::CleanupReason::Echo(
+                        EchoVerdict::KeepCriticalDifference,
+                    )
+        }));
+    }
+
+    #[test]
+    fn raw_sources_accumulate_across_short_windows_and_expire_on_source_time() {
+        let filer = TempFiler::new("raw-short-windows");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 1.0, "Deploy the payment gateway today.")],
+        );
+        window.frames = 2;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(2.0, 3.0, "The weather report continues.")],
+        );
+        window.frames = 2;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert_eq!(window.carry.segments.len(), 2);
+        assert_eq!(window.carry.segments[0].segment.start, 0.0);
+        window.push_aec_blocks(vec![block(4.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(4.0, 4.5, "Do not deploy the payment gateway today.")],
+        );
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(4.0, 5.0, "The weather report continues.")],
+        );
+        window.frames = 2;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(read(&note).contains("Do not deploy the payment gateway today."));
+        assert_eq!(
+            read(&note)
+                .matches("Them:** Deploy the payment gateway today.")
+                .count(),
+            1
+        );
+        window.frames = 6;
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(window.carry.segments.is_empty());
+        assert_eq!(window.carry.bytes, 0);
+    }
+
     /// A failed checkpoint degrades the session instead of ending it: the window is dropped, the note is
     /// marked for the batch rewrite, the reader is told once, and the next checkpoint recovers.
+    #[test]
+    fn live_far_poll_protection_survives_pause_split_units() {
+        let filer = TempFiler::new("raw-far-poll-unit");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 10.0, "The gateway dimensions are in mm today.")],
+        );
+        // Gaps exceed the default merge threshold, so merging cannot hide a lost protection flag.
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(1.0, 2.0, "The gateway dimensions are in"),
+                word(5.0, 6.0, "um"),
+                word(9.0, 10.0, "today."),
+            ],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("**[00:05] Them:** um"), "{content}");
+    }
+
+    #[test]
+    fn live_mic_poll_protection_survives_pause_split_units() {
+        for far_first in [false, true] {
+            for with_evidence in [false, true] {
+                let filer = TempFiler::new("raw-mic-poll-unit");
+                let note = filer.note();
+                let mut writer = NoteWriter::new(filer, meta(), None);
+                let mut window =
+                    TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+                if with_evidence {
+                    window.push_aec_blocks(vec![
+                        block(1.0, 1.0, false),
+                        block(5.0, 1.0, false),
+                        block(9.0, 1.0, false),
+                    ]);
+                }
+                let publisher = RecordingPublisher::default();
+                let far = vec![word(0.0, 10.0, "The gateway dimensions are in mm today.")];
+                let near = vec![
+                    word(1.0, 2.0, "The gateway dimensions are in"),
+                    word(5.0, 6.0, "um"),
+                    word(9.0, 10.0, "today."),
+                ];
+                if far_first {
+                    publish_them_words(&mut window, &publisher, far);
+                    publish_mic_words(&mut window, &publisher, near);
+                } else {
+                    publish_mic_words(&mut window, &publisher, near);
+                    publish_them_words(&mut window, &publisher, far);
+                }
+                release_held_mic_words(&mut window, &publisher);
+                flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+                let content = std::fs::read_to_string(&note).unwrap_or_default();
+                assert!(content.contains("**[00:05] Me:** um"), "{content}");
+                assert_eq!(window.early_drop.stats.released_dropped, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn live_far_poll_protection_survives_pause_split_backchannels() {
+        let filer = TempFiler::new("raw-far-poll-backchannel");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 7.0, "OKAY! Maybe we proceed.")],
+        );
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(1.0, 2.0, "Okay."), word(5.0, 6.0, "Maybe we proceed.")],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("**[00:01] Them:** Okay."), "{content}");
+    }
+
+    #[test]
+    fn missing_far_context_blocks_acoustic_deletion_after_its_time_horizon() {
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 10.0, "The gateway dimensions are in mm today.")],
+        );
+        for _ in 0..MAX_LIVE_ECHO_SOURCES {
+            publish_them_words(
+                &mut window,
+                &publisher,
+                vec![word(0.0, 10.0, "The orchard grows purple plums.")],
+            );
+        }
+        window.push_aec_blocks(vec![block(20.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(1.0, 2.0, "The gateway dimensions are in"),
+                word(20.0, 21.0, "um"),
+                word(24.0, 25.0, "today."),
+            ],
+        );
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(20.0, 26.0, "The orchard grows purple plums.")],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        assert_eq!(window.early_drop.stats.released_dropped, 0);
+        assert!(window.mic_regions.iter().any(|region| {
+            region.words.iter().any(|word| word.text == "um") && region.comparison_incomplete
+        }));
+    }
+
+    #[test]
+    fn sticky_incomplete_comparison_blocks_flush_acoustics_with_a_complete_inventory() {
+        let filer = TempFiler::new("raw-sticky-incomplete");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        let poll = window.remember_mic_poll(&[
+            word(1.0, 2.0, "The gateway dimensions are in"),
+            word(20.0, 21.0, "um"),
+            word(24.0, 25.0, "today."),
+        ]);
+        window.push_mic_region(ReleasedMicRegion {
+            words: vec![word(20.0, 21.0, "um")],
+            poll,
+            comparison_incomplete: true,
+            assessment: EchoAssessment::default(),
+            evidence: None,
+        });
+        window.push_aec_blocks(vec![block(20.0, 1.0, false)]);
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(20.0, 26.0, "The orchard grows purple plums.")],
+        );
+        assert_eq!(window.carry.omitted, 0);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("**[00:20] Me:** um"));
+    }
+
+    #[test]
+    fn raw_child_sources_protect_the_opposite_track_inside_a_broader_poll() {
+        for broad_is_mic in [false, true] {
+            let filer = TempFiler::new("raw-child-source");
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+            let publisher = RecordingPublisher::default();
+            let broad = vec![
+                word(1.0, 2.0, "Got IT."),
+                word(5.0, 6.0, "The orchard grows purple plums."),
+            ];
+            let ordinary = vec![word(0.0, 7.0, "Got it.")];
+            if broad_is_mic {
+                publish_them_words(&mut window, &publisher, ordinary);
+                publish_mic_words(&mut window, &publisher, broad);
+            } else {
+                publish_them_words(&mut window, &publisher, broad);
+                publish_mic_words(&mut window, &publisher, ordinary);
+            }
+            release_held_mic_words(&mut window, &publisher);
+            flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+            let content = std::fs::read_to_string(&note).unwrap_or_default();
+            let speaker = if broad_is_mic { "Them" } else { "Me" };
+            assert!(content.contains(&format!("**[00:00] {speaker}:** Got it.")));
+        }
+    }
+
+    #[test]
+    fn far_child_protection_is_kept_when_the_whole_poll_does_not_match() {
+        let filer = TempFiler::new("raw-far-child-protection");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_mic_words(&mut window, &publisher, vec![word(0.0, 7.0, "Got IT.")]);
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(1.0, 2.0, "Got it."),
+                word(5.0, 6.0, "The orchard grows purple plums."),
+            ],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("**[00:01] Them:** Got it."));
+    }
+
+    #[test]
+    fn omitted_far_context_preserves_mic_descendants_through_automatic_cleanup() {
+        let filer = TempFiler::new("raw-far-context-omission");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 10.0, "The gateway dimensions are in mm today.")],
+        );
+        for _ in 0..MAX_LIVE_ECHO_SOURCES {
+            publish_them_words(
+                &mut window,
+                &publisher,
+                vec![word(0.0, 10.0, "The orchard grows purple plums.")],
+            );
+        }
+        assert!(window.carry.omitted > 0);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![
+                word(1.0, 2.0, "The gateway dimensions are in"),
+                word(5.0, 6.0, "um"),
+                word(9.0, 10.0, "today."),
+            ],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("**[00:05] Me:** um"));
+    }
+
+    #[test]
+    fn mic_poll_context_is_shared_bounded_and_fails_closed_when_omitted() {
+        let filer = TempFiler::new("raw-mic-poll-context-cap");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(1.0, 2.0, "First."), word(5.0, 6.0, "Second.")],
+        );
+        assert_eq!(window.mic_polls.len(), 1);
+        assert_eq!(window.early_drop.held.len(), 2);
+        for held in &window.early_drop.held {
+            let MicPollContext::Known(raw) = &held.poll else {
+                panic!("small raw poll context was omitted");
+            };
+            assert!(Arc::ptr_eq(raw, &window.mic_polls[0]));
+        }
+        let retained_bytes = window.mic_poll_bytes;
+        window.push_aec_blocks(vec![block(8.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(8.0, 9.0, &"x".repeat(MAX_BUFFERED_TRANSCRIPT_BYTES))],
+        );
+        assert_eq!(window.mic_poll_bytes, retained_bytes);
+        assert!(window.mic_poll_bytes <= MAX_BUFFERED_TRANSCRIPT_BYTES);
+        assert_eq!(window.mic_polls_omitted, 1);
+        publish_them_words(&mut window, &publisher, vec![word(0.0, 10.0, "Okay.")]);
+        release_held_mic_words(&mut window, &publisher);
+        assert_eq!(window.early_drop.stats.released_dropped, 0);
+        assert!(
+            window
+                .mic_regions
+                .iter()
+                .any(|region| region.poll.omitted())
+        );
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        let content = std::fs::read_to_string(&note).unwrap_or_default();
+        assert!(content.contains("Them:** Okay."));
+        assert!(content.contains("xxx"));
+        assert!(window.mic_polls.is_empty());
+        assert_eq!(window.mic_poll_bytes, 0);
+        assert_eq!(window.mic_polls_omitted, 0);
+        assert!(window.them_poll_ends.is_empty());
+    }
+
+    #[test]
+    fn live_raw_protection_survives_later_backchannel_and_filler_passes() {
+        for (first, second) in [
+            ("Okay.", "OKAY!"),
+            ("Got it.", "Got IT."),
+            (
+                "Report the gateway dimensions in mm today.",
+                "Report the gateway dimensions in um, today.",
+            ),
+        ] {
+            for reverse in [false, true] {
+                let (far, near) = if reverse {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let filer = TempFiler::new("raw-protection-later-passes");
+                let note = filer.note();
+                let mut writer = NoteWriter::new(filer, meta(), None);
+                let mut window =
+                    TranscriptWindow::new(1, 1, false, CleanupConfig::default()).unwrap();
+                let publisher = RecordingPublisher::default();
+                publish_them_words(&mut window, &publisher, vec![word(0.0, 5.0, far)]);
+                publish_mic_words(&mut window, &publisher, vec![word(1.0, 2.0, near)]);
+                release_held_mic_words(&mut window, &publisher);
+                flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+                let content = std::fs::read_to_string(&note).unwrap_or_default();
+                assert!(content.contains(&format!("Them:** {far}")), "{content}");
+                assert!(content.contains(&format!("Me:** {near}")), "{content}");
+            }
+        }
+    }
+
     #[test]
     fn failed_checkpoint_drops_its_window_and_recovers() {
         let filer = FlakyFiler::new("checkpoint-retry", 1);

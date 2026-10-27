@@ -457,6 +457,9 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
     serde_json::json!({
         "rules": corti_transcribe::segment::CLEANUP_RULES_VERSION,
         "echo_drop": cleanup.echo_drop,
+        "echo_policy": "acoustic_required_mic_only",
+        "text_only_duplicates": "keep_suspected",
+        "critical_text_protection": true,
         "echo_window_seconds": cleanup.echo_window_seconds,
         "echo_containment": cleanup.echo_containment,
         "merge_gap_seconds": cleanup.merge_gap_seconds,
@@ -467,8 +470,8 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
         "lexicon": serde_json::Value::Null,
         // This CLI always files a completed recording, so there is no live publication to be early for.
         "live_early_drop": false,
-        // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult:
-        // every echo drop in a note filed here came from the text rules alone.
+        // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult.
+        // Rules 4 preserve text-only duplicates; this path performs no echo deletion.
         "audio_evidence": false,
     })
 }
@@ -492,6 +495,41 @@ fn clean_segments(
         stats.fillers_removed,
         stats.stutters_collapsed
     );
+}
+
+#[cfg(all(test, feature = "inbox"))]
+mod cleanup_tests {
+    use super::*;
+    use corti_core::{DiarizedTranscript, Speaker, TranscriptSegment};
+
+    #[test]
+    fn inbox_cleanup_preserves_corrections_without_audio_evidence() {
+        let cleanup = corti_transcribe::segment::CleanupConfig::default();
+        let mut transcript = DiarizedTranscript::new(vec![
+            TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: 0.0,
+                end: 4.0,
+                text: "We should deploy the payment gateway today.".into(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 1.0,
+                end: 3.0,
+                text: "We should not deploy the payment gateway today.".into(),
+            },
+        ]);
+        let before = transcript.segments.clone();
+        clean_segments(&mut transcript, &cleanup);
+        assert_eq!(transcript.segments, before);
+
+        let provenance = segment_cleanup_json(&cleanup);
+        assert_eq!(provenance["rules"], 4);
+        assert_eq!(provenance["audio_evidence"], false);
+        assert_eq!(provenance["echo_policy"], "acoustic_required_mic_only");
+        assert_eq!(provenance["text_only_duplicates"], "keep_suspected");
+        assert_eq!(provenance["critical_text_protection"], true);
+    }
 }
 
 #[cfg(feature = "inbox-aws")]

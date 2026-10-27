@@ -10,3 +10,6 @@ rust-version.workspace = true
 [dependencies]
 corti-core = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+corti-aec = { workspace = true }
