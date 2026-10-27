@@ -15,6 +15,8 @@ def single_test_passed(output, returncode):
 
 
 CAPTURE_REQUIRED_TESTS = (
+    "delayed_mic_poll_keeps_critical_words_after_temporal_source_eviction",
+    "temporal_source_eviction_still_allows_later_acoustic_echo_deletion",
     "small_pcm_ring_retains_a_gap_b_c_identically_in_wav_and_tee",
     "restart_after_finalize_before_completion_preserves_exact_loss_and_large_epoch_mapping",
     "explicit_stop_authorizes_completion_but_dropped_intent_keeps_exact_terminal_prefix_in_progress",

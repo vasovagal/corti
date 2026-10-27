@@ -1112,7 +1112,8 @@ struct RawEchoSource {
 
 /// Original far-end decoder polls, each possibly containing several VAD regions, bounded independently
 /// of a filing window. The two live stages
-/// use the same retention rule; a source omitted by either count or byte cap cannot authorize deletion.
+/// use the same retention rule. Missing sources cannot authorize deletion, including time-pruned
+/// context that may still overlap an earlier-starting mic poll not yet returned by its decoder.
 struct RawEchoSources {
     segments: Vec<RawEchoSource>,
     bytes: usize,
@@ -1180,8 +1181,24 @@ impl RawEchoSources {
         });
     }
 
-    fn prune_before(&mut self, horizon: f64) {
-        self.segments.retain(|source| source.segment.end >= horizon);
+    fn prune_before(&mut self, horizon: f64, lookback: f64) {
+        let mut incomplete_until = self.incomplete_until;
+        self.segments.retain(|source| {
+            if source.segment.end >= horizon {
+                return true;
+            }
+            // Decoder polls can arrive out of source-time order across tracks. Forgetting text is
+            // bounded, but cannot prove that no still-undecoded mic poll needs its raw comparison.
+            let until = source.segment.end + lookback;
+            incomplete_until = incomplete_until.max(if until.is_finite() {
+                until
+            } else {
+                f64::INFINITY
+            });
+            false
+        });
+        // Normal expiry is not a count/byte-cap omission and must not inflate that diagnostic.
+        self.incomplete_until = incomplete_until;
         self.bytes = self.segments.iter().map(raw_source_bytes).sum();
     }
 
@@ -1532,7 +1549,8 @@ impl TranscriptWindow {
         self.buffered_text_bytes = 0;
         self.trim_aec_blocks();
         let horizon = self.start_sec() - self.cleanup.echo_window_seconds;
-        self.carry.prune_before(horizon);
+        self.carry
+            .prune_before(horizon, self.cleanup.echo_window_seconds);
     }
 
     #[cfg(test)]
@@ -1804,13 +1822,14 @@ impl EarlyDrop {
         });
     }
 
-    /// A far-end region can still source an echo up to `echo_window_seconds` after it ends, for any subject
-    /// that has already been decoded — so sources are kept relative to the oldest thing still to be judged,
-    /// not to the clock.
+    /// Retain text relative to the oldest decoded hold, or the current clock when there is none.
+    /// Pruning also records its missing-context horizon: the other decoder may later return a poll
+    /// starting before this floor, and that poll must not be deleted using an incomplete comparison.
     fn prune_sources(&mut self, now: f64) {
         let floor = self.held.front().map_or(now, |h| h.candidate.start());
         let horizon = floor - self.cfg.echo_window_seconds;
-        self.sources.prune_before(horizon);
+        self.sources
+            .prune_before(horizon, self.cfg.echo_window_seconds);
     }
 }
 
@@ -5589,6 +5608,100 @@ mod tests {
                         EchoVerdict::KeepCriticalDifference,
                     )
         }));
+    }
+
+    #[test]
+    fn delayed_mic_poll_keeps_critical_words_after_temporal_source_eviction() {
+        for flush_between_polls in [false, true] {
+            for evidence in [Some(false), None, Some(true)] {
+                let filer = TempFiler::new("delayed-mic-source-expiry");
+                let note = filer.note();
+                let mut writer = NoteWriter::new(filer, meta(), None);
+                let mut window =
+                    TranscriptWindow::new(2, 30, false, CleanupConfig::default()).unwrap();
+                let publisher = RecordingPublisher::default();
+                window.frames = 11;
+                publish_them_words(
+                    &mut window,
+                    &publisher,
+                    vec![word(0.0, 5.0, "The gateway dimensions are in mm today.")],
+                );
+                if flush_between_polls {
+                    flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+                }
+                window.frames = 25 - window.start_frame;
+                publish_them_words(
+                    &mut window,
+                    &publisher,
+                    vec![word(10.0, 12.0, "The orchard grows purple plums.")],
+                );
+                assert_eq!(window.early_drop.sources.segments.len(), 1);
+                assert_eq!(window.early_drop.sources.omitted, 0);
+                if flush_between_polls {
+                    flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+                    assert_eq!(window.carry.segments.len(), 1);
+                    assert_eq!(window.carry.omitted, 0);
+                }
+                if let Some(double_talk) = evidence {
+                    window.push_aec_blocks(
+                        (10..18)
+                            .map(|time| block(f64::from(time), 1.0, double_talk))
+                            .collect(),
+                    );
+                }
+                let mic = vec![
+                    word(1.0, 2.0, "The"),
+                    word(2.0, 4.0, "gateway"),
+                    word(4.0, 7.0, "dimensions"),
+                    word(7.0, 8.0, "are"),
+                    word(8.0, 9.0, "in"),
+                    word(9.0, 12.0, "um"),
+                    word(12.0, 18.0, "today."),
+                ];
+                window.frames = 37 - window.start_frame;
+                publish_mic_words(&mut window, &publisher, mic.clone());
+                release_held_mic_words(&mut window, &publisher);
+                assert_eq!(publisher.0.borrow().last(), Some(&("Me".into(), mic)));
+                assert_eq!(window.early_drop.stats.released_dropped, 0);
+                assert!(window.mic_regions[0].comparison_incomplete);
+                flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+                assert!(
+                    read(&note).contains("**[00:01] Me:** The gateway dimensions are in um today.")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_source_eviction_still_allows_later_acoustic_echo_deletion() {
+        let filer = TempFiler::new("source-expiry-later-echo");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(2, 30, false, CleanupConfig::default()).unwrap();
+        let publisher = RecordingPublisher::default();
+        window.frames = 11;
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(0.0, 5.0, "The gateway dimensions are in mm today.")],
+        );
+        window.frames = 45;
+        publish_them_words(
+            &mut window,
+            &publisher,
+            vec![word(20.0, 22.0, "The orchard grows purple plums.")],
+        );
+        window.push_aec_blocks(vec![block(20.0, 1.0, false)]);
+        publish_mic_words(
+            &mut window,
+            &publisher,
+            vec![word(20.0, 21.0, "Transient echo.")],
+        );
+        release_held_mic_words(&mut window, &publisher);
+        assert_eq!(window.early_drop.stats.released_dropped, 1);
+        assert_eq!(window.early_drop.sources.omitted, 0);
+        flush_window(&NoDiarizer, &mut window, &mut writer).unwrap();
+        assert!(!read(&note).contains("Transient echo."));
     }
 
     #[test]
