@@ -132,6 +132,42 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(len(scored["cells"]), 26)
         self.assertEqual(len(scored["baseline_scores"]), 10)
 
+    def forced_cell(self, result):
+        return next(cell for cell in result["cells"] if cell["id"] == "continuous-forced-fence")
+
+    def scored_forced(self, seal, result):
+        scored = evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)
+        return scored, [row for row in scored["cells"] if row["id"] == "continuous-forced-fence"]
+
+    def test_forced_seam_damage_is_reported_degraded_not_silently_passed(self):
+        seal, result = synthetic_complete_run()
+        # "Ada" (5.5-6.7 s) straddles the forced cut at 6.25 s.
+        self.forced_cell(result)["tracks"]["mic"]["words"][1]["text"] = "Ad"
+        scored, rows = self.scored_forced(seal, result)
+        mic = next(row for row in rows if row["track"] == "mic")
+        self.assertTrue(mic["passed"])
+        self.assertIn("name-ada", mic["forced_gate"]["degraded_critical"])
+        self.assertTrue(scored["passed"])
+        # The same damage at a natural cut still fails the strict gate.
+        result["cells"][0]["tracks"]["mic"]["words"][1]["text"] = "Ad"
+        self.assertFalse(evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)["passed"])
+
+    def test_forced_cell_still_fails_on_loss_away_from_its_seams(self):
+        seal, result = synthetic_complete_run()
+        del self.forced_cell(result)["tracks"]["mic"]["words"][0]  # "Nora", 3-4.5 s
+        scored, rows = self.scored_forced(seal, result)
+        mic = next(row for row in rows if row["track"] == "mic")
+        self.assertFalse(mic["passed"])
+        self.assertEqual(mic["forced_gate"]["lost_critical"], ["name-nora"])
+        self.assertFalse(scored["passed"])
+
+    def test_forced_seam_edits_are_capped(self):
+        seal, result = synthetic_complete_run()
+        words = self.forced_cell(result)["tracks"]["mic"]["words"]
+        words[1:1] = [{"text": "um", "start": 5.5, "end": 5.5}] * 5
+        scored, rows = self.scored_forced(seal, result)
+        self.assertFalse(next(row for row in rows if row["track"] == "mic")["passed"])
+
     def test_one_failed_cell_cannot_be_averaged_into_success(self):
         seal, result = synthetic_complete_run()
         result["cells"][0]["tracks"]["mic"]["words"][3]["text"] = "15000"

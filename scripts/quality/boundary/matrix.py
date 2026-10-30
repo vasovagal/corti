@@ -174,6 +174,58 @@ def critical_crossings(coverage, words, frame, rate):
     return result
 
 
+# A forced or deadline cut splits a speech region without overlap re-decoding. The word straddling
+# the cut is decoded in two parts, and each part loses context, so formatting can differ elsewhere in
+# the region. The contract for such cells is no silent loss, not equality with the uncut batch:
+SEAM_SECONDS = 1.0  # damage at a marked forced cut stays within this distance of it
+SEAM_EDIT_LIMIT = 4  # edit operations per forced cut and track
+OUTSIDE_DELETION_PERCENT = 2  # deleted batch tokens away from every seam
+
+
+def forced_gate(score, reference_words, hypothesis_words, cuts):
+    """No-loss gate for a cell with forced cuts (seconds); natural-only cells keep the strict gate."""
+    from score import tokens
+    result = score["score"]
+    reference = tokens(word["text"] for word in reference_words)
+    hypothesis = tokens(word["text"] for word in hypothesis_words)
+
+    def midpoint(words, token):
+        word = words[token.word_index]
+        return (word["start"] + word["end"]) / 2
+
+    def seam(time):
+        return next((cut for cut in cuts if abs(time - cut) <= SEAM_SECONDS), None)
+
+    seam_edits, outside_deletions, deleted = {cut: 0 for cut in cuts}, 0, set()
+    for operation, r, h in result["alignment"]:
+        if operation == "equal":
+            continue
+        cut = seam(midpoint(reference_words, reference[r]) if r is not None
+                   else midpoint(hypothesis_words, hypothesis[h]))
+        if operation == "delete":
+            deleted.add(r)
+        if cut is not None:
+            seam_edits[cut] += 1
+        elif operation == "delete":
+            outside_deletions += 1
+    degraded, lost, changed = [], [], []
+    for row in score["coverage"]:
+        if result["critical_occurrences"][row["id"]]:
+            continue
+        if any(seam(midpoint(reference_words, reference[index])) is not None for index in row["indices"]):
+            degraded.append(row["id"])
+        elif all(index in deleted for index in row["indices"]):
+            lost.append(row["id"])
+        else:
+            changed.append(row["id"])
+    return {"seam_edits": {str(cut): count for cut, count in seam_edits.items()},
+            "outside_deletions": outside_deletions, "degraded_critical": degraded,
+            "lost_critical": lost, "changed_critical": changed,
+            "passed": (all(count <= SEAM_EDIT_LIMIT for count in seam_edits.values())
+                       and 100 * outside_deletions <= OUTSIDE_DELETION_PERCENT * len(reference)
+                       and not lost)}
+
+
 def unique_index(rows, expected, label):
     if not isinstance(rows, list) or any(not isinstance(row, dict) or "id" not in row for row in rows):
         raise CoverageError("invalid " + label + " inventory")
@@ -412,13 +464,17 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
                 short_crossings[track].update(row["category"] for row in nominal)
             if spec["mode"] == "explicit-forced-probe" and not forced:
                 raise CoverageError("fixed forced cell did not cross an annotated critical occurrence")
-            scores.append({"id": identifier, "track": track, "score": score,
+            cuts = [event["cut_frame"] / spec["sample_rate"] for event in events
+                     if event["kind"] in {"deadline", "explicit"}]
+            gate = forced_gate(score, baseline["batch_words"], actual["words"], cuts) if cuts else None
+            scores.append({"id": identifier, "track": track, "score": score, "forced_gate": gate,
                            "nominal_critical_crossings": nominal, "forced_critical_crossings": forced,
                            "boundary_local": [boundary_local(score, baseline["batch_words"],
                                                              event["cut_frame"], spec["sample_rate"])
                                               for event in events],
                            "decode_complete": actual["decode_complete"],
-                           "passed": score["passed"] and actual["decode_complete"]})
+                           "passed": (gate["passed"] if gate else score["passed"])
+                           and actual["decode_complete"]})
     if any(not {"name", "negation", "number"} <= categories for categories in short_crossings.values()):
         raise CoverageError("short phase matrix missed required critical crossing categories")
     return {"baseline_scores": baseline_scores, "cells": scores,

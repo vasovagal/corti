@@ -20,12 +20,28 @@ the actual irregular chunk sequence, nominal recurrence, finite settlement
 reserve, reset origins and terminal ownership for both tracks. A model-free
 positive receipt tests the validator; it is not an inference result.
 
-Every candidate and uncut control must have at most 5% ordinary word-token
-edits against its batch baseline, with no changed, deleted or duplicated raw
-critical occurrence. Forced and maintenance cells use the same gates. Missing
-or ambiguous authored coverage, missing required critical crossings, failed
-decode coverage or incomplete evidence fails the run. Boundary-local diagnostics
-reuse the whole-run alignment and do not replace it.
+Every uncut control and every cell with only natural cuts (including the
+maintenance cell) must have at most 5% ordinary word-token edits against its
+batch baseline, with no changed, deleted or duplicated raw critical occurrence.
+
+A forced or deadline cut splits a speech region without overlap re-decoding: the
+word straddling the cut is decoded in two parts, and each part has less context,
+so number formatting or a homophone can also differ elsewhere in that region.
+Cells with such cuts are held to a no-silent-loss contract instead
+(`forced_gate` in `matrix.py`): at most 4 edits within one second of each forced
+cut, at most 2% of batch tokens deleted away from every cut, and no critical
+occurrence wholly deleted away from a cut. A critical occurrence damaged within
+a cut's second is reported as `degraded_critical`; the app marks every forced cut
+with a `ForcedBoundary` quality span. Decoding resumes exactly at the cut: after
+a VAD reset, one second of already-decoded audio is replayed on the VAD window
+grid to warm the model and is never decoded again.
+
+Missing or ambiguous authored coverage, missing required critical crossings,
+failed decode coverage or incomplete evidence fails the run. Locating a critical
+occurrence ignores sentence punctuation and a leading capital; scoring compares
+raw tokens. Fixtures use the standard Samantha voice when it is installed.
+Boundary-local diagnostics reuse the whole-run alignment and do not replace it.
+On failure the run prints a `BOUNDARY_DIAGNOSTIC` report to the job log.
 
 Run the portable validator checks with:
 
