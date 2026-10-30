@@ -102,6 +102,24 @@ fn read_private_inner(
 }
 
 pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
+    atomic_write_private_with_hook(path, bytes, label, |_| Ok(()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWritePhase {
+    Write,
+    Sync,
+    Rename,
+    DirectorySync,
+}
+
+/// Test seam around actual filesystem operations; production always supplies the no-op hook.
+pub(crate) fn atomic_write_private_with_hook(
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+    mut before: impl FnMut(AtomicWritePhase) -> Result<()>,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -114,12 +132,15 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8], label: &str) -> Re
     // `mode` is filtered by the process umask. Set the exact owner-only contract before writing bytes.
     file.set_permissions(Permissions::from_mode(PRIVATE_FILE_MODE))
         .with_context(|| format!("securing temporary {label} {}", temporary.display()))?;
+    before(AtomicWritePhase::Write)?;
     file.write_all(bytes)
         .with_context(|| format!("writing temporary {label} {}", temporary.display()))?;
+    before(AtomicWritePhase::Sync)?;
     file.sync_all()
         .with_context(|| format!("syncing temporary {label} {}", temporary.display()))?;
     drop(file);
 
+    before(AtomicWritePhase::Rename)?;
     std::fs::rename(&temporary, path).with_context(|| {
         format!(
             "publishing {label} {} -> {}",
@@ -129,6 +150,7 @@ pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8], label: &str) -> Re
     })?;
     cleanup.disarm();
 
+    before(AtomicWritePhase::DirectorySync)?;
     File::open(parent)
         .with_context(|| format!("opening {label} directory {}", parent.display()))?
         .sync_all()

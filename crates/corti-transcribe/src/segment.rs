@@ -26,6 +26,76 @@ pub struct Word {
     pub text: String,
 }
 
+/// The actual rendered rows and ranges emitted by the same word loop. Ranges index the source
+/// formed by joining nonempty words with single spaces. None means the bounded trace is unavailable;
+/// rendered transcript output is still complete. Content deliberately has no Debug/Clone.
+/// ```compile_fail
+/// fn requires_debug<T: std::fmt::Debug>() {}
+/// requires_debug::<corti_transcribe::segment::SegmentedRows>();
+/// ```
+/// ```compile_fail
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<corti_transcribe::segment::SegmentedRows>();
+/// ```
+pub struct SegmentedRows {
+    pub segments: Vec<TranscriptSegment>,
+    pub source_ranges: Option<Vec<ByteSpan>>,
+}
+
+struct RangeTrace {
+    ranges: Option<Vec<ByteSpan>>,
+    offset: usize,
+}
+impl RangeTrace {
+    fn new(enabled: bool) -> Self {
+        Self {
+            ranges: enabled.then(Vec::new),
+            offset: 0,
+        }
+    }
+    fn word(&mut self, bytes: usize, continues: bool) {
+        let Some(ranges) = self.ranges.as_mut() else {
+            return;
+        };
+        let Some(end) = self
+            .offset
+            .checked_add(bytes)
+            .and_then(|end| u32::try_from(end).ok())
+        else {
+            self.ranges = None;
+            return;
+        };
+        if continues {
+            if let Some(last) = ranges.last_mut() {
+                last.end = end;
+            }
+        } else if ranges.len() < trace::TEXT_TRACE_BYTES / std::mem::size_of::<ByteSpan>() {
+            if ranges.len() == ranges.capacity() {
+                let limit = trace::TEXT_TRACE_BYTES / std::mem::size_of::<ByteSpan>();
+                let capacity = ranges.capacity().max(2).saturating_mul(2).min(limit);
+                if ranges.try_reserve_exact(capacity - ranges.len()).is_err()
+                    || ranges.capacity() > limit
+                {
+                    self.ranges = None;
+                    return;
+                }
+            }
+            ranges.push(ByteSpan {
+                start: self.offset as u32,
+                end,
+            });
+        } else {
+            self.ranges = None;
+            return;
+        }
+        if let Some(offset) = (end as usize).checked_add(1) {
+            self.offset = offset;
+        } else {
+            self.ranges = None;
+        }
+    }
+}
+
 /// A diarization speaker turn (seconds), labelled with the display name to attribute overlapping words to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerTurn {
@@ -70,8 +140,23 @@ fn region_end(region: &[Word]) -> f64 {
 /// longer than `gap`. Words are joined with single spaces (punctuation should already be glued onto the
 /// word by the caller). Empty words are skipped; empty input yields no segments.
 pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<TranscriptSegment> {
+    words_to_segments_impl(words, speaker, gap, false).segments
+}
+
+/// Optional bounded lineage emitted by the actual grouping loop, without another grouping pass.
+pub fn words_to_segments_with_ranges(words: &[Word], speaker: Speaker, gap: f64) -> SegmentedRows {
+    words_to_segments_impl(words, speaker, gap, true)
+}
+
+fn words_to_segments_impl(
+    words: &[Word],
+    speaker: Speaker,
+    gap: f64,
+    traced: bool,
+) -> SegmentedRows {
     let mut out: Vec<TranscriptSegment> = Vec::new();
     let mut cur: Option<TranscriptSegment> = None;
+    let mut trace = RangeTrace::new(traced);
 
     for w in words {
         if w.text.is_empty() {
@@ -79,11 +164,13 @@ pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<Tran
         }
         match cur.as_mut() {
             Some(seg) if continues_region(seg.end, w, gap) => {
+                trace.word(w.text.len(), true);
                 seg.text.push(' ');
                 seg.text.push_str(&w.text);
                 seg.end = w.end;
             }
             _ => {
+                trace.word(w.text.len(), false);
                 if let Some(seg) = cur.take() {
                     out.push(seg);
                 }
@@ -99,7 +186,10 @@ pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<Tran
     if let Some(seg) = cur.take() {
         out.push(seg);
     }
-    out
+    SegmentedRows {
+        segments: out,
+        source_ranges: trace.ranges,
+    }
 }
 
 /// Merge segments from multiple speakers into one timeline, sorted by start time. `total_cmp` keeps it
@@ -120,8 +210,29 @@ pub fn diarize_words(
     gap: f64,
     fallback_label: &str,
 ) -> Vec<TranscriptSegment> {
+    diarize_words_impl(words, turns, gap, fallback_label, false).segments
+}
+
+/// Optional bounded lineage emitted by the actual speaker-attribution loop, without rerunning it.
+pub fn diarize_words_with_ranges(
+    words: &[Word],
+    turns: &[SpeakerTurn],
+    gap: f64,
+    fallback_label: &str,
+) -> SegmentedRows {
+    diarize_words_impl(words, turns, gap, fallback_label, true)
+}
+
+fn diarize_words_impl(
+    words: &[Word],
+    turns: &[SpeakerTurn],
+    gap: f64,
+    fallback_label: &str,
+    traced: bool,
+) -> SegmentedRows {
     let mut out: Vec<TranscriptSegment> = Vec::new();
     let mut cur: Option<TranscriptSegment> = None;
+    let mut trace = RangeTrace::new(traced);
 
     for w in words {
         if w.text.is_empty() {
@@ -130,11 +241,13 @@ pub fn diarize_words(
         let speaker = Speaker::Other(best_turn_label(w, turns, fallback_label));
         match cur.as_mut() {
             Some(seg) if seg.speaker == speaker && w.start - seg.end <= gap => {
+                trace.word(w.text.len(), true);
                 seg.text.push(' ');
                 seg.text.push_str(&w.text);
                 seg.end = w.end;
             }
             _ => {
+                trace.word(w.text.len(), false);
                 if let Some(seg) = cur.take() {
                     out.push(seg);
                 }
@@ -150,7 +263,10 @@ pub fn diarize_words(
     if let Some(seg) = cur.take() {
         out.push(seg);
     }
-    out
+    SegmentedRows {
+        segments: out,
+        source_ranges: trace.ranges,
+    }
 }
 
 /// The label of the turn a word overlaps most; ties/no-overlap fall back to the nearest turn (by the gap
@@ -217,14 +333,32 @@ fn turn_distance(t: f64, turn: &SpeakerTurn) -> f64 {
 ///
 /// - 2: echo → merge → backchannel.
 /// - 3: sort by start first (#157), then echo → merge → backchannel → fillers/stutters (#154) → lexicon.
-pub const CLEANUP_RULES_VERSION: u32 = 3;
+/// - 4: acoustic-only mic echo deletion with critical-word protection and bounded decisions (#161).
+pub const CLEANUP_RULES_VERSION: u32 = 4;
 
 /// A deterministic text substitution applied to every surviving segment after the structural passes —
 /// the learned correction lexicon in practice. Implementations return `Some(new_text)` only when
 /// something changed, and must be idempotent (applying the result again changes nothing).
 pub trait TextRule {
     fn apply(&self, text: &str) -> Option<String>;
+
+    /// Additive trace seam. Legacy implementations keep their output and explicitly mark missing
+    /// positional/rule evidence; callers must never invent a winning rule ID from a dry run.
+    fn apply_traced(&self, text: &str) -> TracedText {
+        let replacement = self.apply(text);
+        let mut edits = PositionedEdits::default();
+        if replacement.is_some() {
+            edits.unavailable(TraceGap::UnsupportedRule);
+        }
+        TracedText { replacement, edits }
+    }
 }
+
+#[path = "segment/trace.rs"]
+mod trace;
+pub use trace::{
+    ByteSpan, EditKind, PositionedEdits, TEXT_TRACE_BYTES, TextEdit, TraceGap, TracedText,
+};
 
 /// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
 /// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
@@ -235,7 +369,8 @@ pub struct CleanupConfig {
     /// How long after a far-end utterance *starts* its echo may still be decoded on the other channel.
     pub echo_window_seconds: f64,
     /// Fraction of a segment's content tokens that must also appear in the candidate source before the
-    /// segment is judged an echo of it (segments of three or more content tokens).
+    /// segment becomes a text-match candidate (segments of three or more content tokens). A candidate
+    /// alone never authorizes deletion.
     pub echo_containment: f64,
     /// Largest silence (seconds) between two consecutive same-speaker segments that is still merged into
     /// one utterance. Non-positive disables the merge pass.
@@ -244,10 +379,10 @@ pub struct CleanupConfig {
     pub drop_backchannels: bool,
     /// How far (dB) a mic span's energy may exceed the AEC's echo estimate for that same span and still be
     /// judged "this was mostly echo". Only consulted when [`cleanup_with_evidence`] is given an
-    /// [`AudioEvidence`] accessor; a very negative value switches the audio rule off without disturbing the
-    /// text rules.
+    /// [`AudioEvidence`] accessor; a very negative value switches echo deletion off while retaining
+    /// text-match decisions.
     pub echo_audio_margin_db: f32,
-    /// Strip filler noises (`um`, `uh`, `ah`, `er`, `hmm`) and collapse repeated words and bigrams
+    /// Strip marked filler noises (`um`, `uh`, `ah`, `er`, `hmm`) and collapse repeated words and bigrams
     /// (`the the` → `the`, `I think I think` → `I think`) in every surviving segment, repairing the
     /// sentence start and a dangling comma afterwards (#154). A segment left empty is dropped.
     pub strip_fillers: bool,
@@ -286,14 +421,13 @@ impl CleanupConfig {
     }
 }
 
-/// What [`cleanup`] changed. Logged per run so a surprising transcript can be explained without rerunning
-/// ASR; the echo count is split per direction because the two directions have different causes (mic bleed
-/// vs. the far end re-decoding our own voice).
+/// What [`cleanup`] changed. Only counts, safe to log without transcript content. Version 4 retains the
+/// old text-deletion counters for source compatibility; they remain zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CleanupStats {
-    /// `Me` segments dropped as echoes of far-end speech (the #107 phantom class).
+    /// Legacy text-only mic deletion count; always zero under version 4.
     pub echo_dropped_me: usize,
-    /// Far-end segments dropped as echoes of `Me` speech.
+    /// Legacy text-only far-end deletion count; always zero under version 4.
     pub echo_dropped_them: usize,
     /// Segments absorbed into the preceding same-speaker segment.
     pub merged: usize,
@@ -351,10 +485,281 @@ pub struct SpanEvidence {
 /// timeline, the canceller's summary for that span, or `None` where nothing was recorded.
 pub type AudioEvidence<'a> = &'a dyn Fn(f64, f64) -> Option<SpanEvidence>;
 
+/// Conservative echo policy shared by batch cleanup and live early-drop. Text alone never deletes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EchoVerdict {
+    #[default]
+    Keep,
+    KeepCriticalDifference,
+    SuspectedDuplicate,
+    DropAcoustic,
+}
+
+/// Content-free source attribution. Times are on the same recording timeline as the subject.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EchoSource {
+    pub me: bool,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// An echo verdict and the source that explains it (critical match, suspected match, or overlap).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EchoAssessment {
+    pub verdict: EchoVerdict,
+    pub source: Option<EchoSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupStage {
+    Sort,
+    Echo,
+    Merge,
+    Backchannel,
+    Fillers,
+    Lexicon,
+    EarlyEcho,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupReason {
+    TimeOrder,
+    Echo(EchoVerdict),
+    SameSpeakerContinuation,
+    OverlappingBackchannel,
+    FillersOrStutters,
+    TextRule,
+}
+
+/// One reversible stage decision. Indices refer to this stage's input sequence, not the original
+/// recording's sequence; EarlyEcho uses the caller's monotonically increasing region index.
+/// Original/replacement rows preserve exact text, speaker, and span. No Debug: this contains text.
+#[derive(PartialEq)]
+pub struct CleanupDecision {
+    pub stage: CleanupStage,
+    pub input_indices: Vec<usize>,
+    pub originals: Vec<TranscriptSegment>,
+    pub replacements: Vec<TranscriptSegment>,
+    pub reason: CleanupReason,
+    pub evidence: Option<SpanEvidence>,
+    pub source: Option<EchoSource>,
+    pub edits: PositionedEdits,
+}
+
+// Preserve the legacy decision API; new evidence/trace owners deliberately have no Clone API.
+impl Clone for CleanupDecision {
+    fn clone(&self) -> Self {
+        Self {
+            stage: self.stage,
+            input_indices: self.input_indices.clone(),
+            originals: self.originals.clone(),
+            replacements: self.replacements.clone(),
+            reason: self.reason,
+            evidence: self.evidence,
+            source: self.source,
+            edits: self.edits.legacy_copy(),
+        }
+    }
+}
+
+/// Maximum retained decision payload, including row/record metadata and owned text/speaker bytes.
+/// This is a logical payload cap, excluding allocator bookkeeping and transient cleanup output.
+pub const CLEANUP_DECISION_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounded, content-bearing decisions. Overflow omits whole records and increments `omitted`;
+/// it never changes cleanup output. Append enforces the same cap across multiple live windows.
+#[derive(Clone, Default)]
+pub struct CleanupDecisions {
+    entries: Vec<CleanupDecision>,
+    pub omitted: usize,
+    bytes: usize,
+}
+
+fn segment_bytes(segment: &TranscriptSegment) -> usize {
+    std::mem::size_of::<TranscriptSegment>()
+        .saturating_add(segment.text.len())
+        .saturating_add(match &segment.speaker {
+            Speaker::Me => 0,
+            Speaker::Other(label) => label.len(),
+        })
+}
+
+impl CleanupDecisions {
+    pub fn entries(&self) -> &[CleanupDecision] {
+        &self.entries
+    }
+
+    pub fn into_entries(self) -> Vec<CleanupDecision> {
+        self.entries
+    }
+
+    /// Move the existing owners into evidence; retain the upstream omission count explicitly.
+    pub fn into_parts(self) -> (Vec<CleanupDecision>, usize) {
+        (self.entries, self.omitted)
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn append(&mut self, other: Self) {
+        self.omitted = self.omitted.saturating_add(other.omitted);
+        for entry in other.entries {
+            let bytes = std::mem::size_of::<CleanupDecision>()
+                .saturating_add(entry.edits.owned_bytes())
+                .saturating_add(
+                    entry
+                        .input_indices
+                        .len()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                )
+                .saturating_add(
+                    entry
+                        .originals
+                        .iter()
+                        .chain(&entry.replacements)
+                        .map(segment_bytes)
+                        .fold(0usize, usize::saturating_add),
+                );
+            if self.reserve_record(bytes) {
+                self.entries.reserve_exact(1);
+                self.entries.push(entry);
+            }
+        }
+    }
+
+    fn reserve_record(&mut self, bytes: usize) -> bool {
+        if bytes > CLEANUP_DECISION_BYTES.saturating_sub(self.bytes) {
+            self.omitted = self.omitted.saturating_add(1);
+            false
+        } else {
+            self.bytes += bytes;
+            true
+        }
+    }
+
+    // Borrow first and check the cap before cloning any content.
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        stage: CleanupStage,
+        indices: &[usize],
+        originals: &[&TranscriptSegment],
+        replacements: &[&TranscriptSegment],
+        reason: CleanupReason,
+        evidence: Option<SpanEvidence>,
+        source: Option<EchoSource>,
+    ) {
+        let bytes = std::mem::size_of::<CleanupDecision>()
+            .saturating_add(indices.len().saturating_mul(std::mem::size_of::<usize>()))
+            .saturating_add(
+                originals
+                    .iter()
+                    .chain(replacements)
+                    .map(|s| segment_bytes(s))
+                    .fold(0usize, usize::saturating_add),
+            );
+        if self.reserve_record(bytes) {
+            self.entries.reserve_exact(1);
+            self.entries.push(CleanupDecision {
+                stage,
+                input_indices: indices.to_vec(),
+                originals: originals.iter().map(|s| (*s).clone()).collect(),
+                replacements: replacements.iter().map(|s| (*s).clone()).collect(),
+                reason,
+                evidence,
+                source,
+                edits: PositionedEdits::default(),
+            });
+        }
+    }
+
+    fn record_text(
+        &mut self,
+        stage: CleanupStage,
+        index: usize,
+        original: &TranscriptSegment,
+        replacement: Option<&TranscriptSegment>,
+        reason: CleanupReason,
+        edits: PositionedEdits,
+    ) {
+        let needed = std::mem::size_of::<CleanupDecision>()
+            + std::mem::size_of::<usize>()
+            + segment_bytes(original)
+            + replacement.map_or(0, segment_bytes)
+            + edits.owned_bytes();
+        if needed > CLEANUP_DECISION_BYTES.saturating_sub(self.bytes) {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        match replacement {
+            Some(value) => self.record(stage, &[index], &[original], &[value], reason, None, None),
+            None => self.record(stage, &[index], &[original], &[], reason, None, None),
+        }
+        self.bytes += edits.owned_bytes();
+        if let Some(last) = self.entries.last_mut() {
+            last.edits = edits;
+        }
+    }
+
+    pub fn record_echo(
+        &mut self,
+        stage: CleanupStage,
+        input_index: usize,
+        segment: &TranscriptSegment,
+        verdict: EchoVerdict,
+        evidence: Option<SpanEvidence>,
+    ) {
+        self.record_echo_assessment(
+            stage,
+            input_index,
+            segment,
+            EchoAssessment {
+                verdict,
+                source: None,
+            },
+            evidence,
+        );
+    }
+
+    pub fn record_echo_assessment(
+        &mut self,
+        stage: CleanupStage,
+        input_index: usize,
+        segment: &TranscriptSegment,
+        assessment: EchoAssessment,
+        evidence: Option<SpanEvidence>,
+    ) {
+        let kept = [segment];
+        let replacements: &[&TranscriptSegment] = if assessment.verdict == EchoVerdict::DropAcoustic
+        {
+            &[]
+        } else {
+            &kept
+        };
+        self.record(
+            stage,
+            &[input_index],
+            &[segment],
+            replacements,
+            CleanupReason::Echo(assessment.verdict),
+            evidence,
+            assessment.source,
+        );
+    }
+}
+
+/// Cleanup output and its bounded, in-memory explanation. No Debug: decisions contain transcript text.
+pub struct CleanupResult {
+    pub segments: Vec<TranscriptSegment>,
+    pub stats: CleanupStats,
+    pub decisions: CleanupDecisions,
+}
+
 /// A span whose adaptation gate fired in at least this fraction of its blocks is not evidence of anything:
 /// the canceller froze its filter update because it judged the near end to dominate, so its echo estimate
 /// is stale for most of the span, and the comparison the audio rule makes is against a number that stopped
-/// tracking the room. Such a span falls through to the text rules.
+/// tracking the room. Such a span is kept regardless of text similarity.
 ///
 /// This is not merely a numerical scruple: "the gate fired" is the canceller's own statement that it heard
 /// near-end speech, which is precisely the case in which a `Me` segment must be kept.
@@ -371,8 +776,8 @@ const AUDIO_DOUBLE_TALK_LIMIT: f32 = 0.5;
 /// echo *sources*, never mutated, and never appear in the output — that is how the live path catches an
 /// echo whose source landed just before the one-minute append boundary.
 ///
-/// Only earlier, still-kept segments act as echo sources, so echoes never chain: a dropped copy cannot go
-/// on to kill the real utterance that follows it.
+/// All far-end overlaps can supply acoustic context, and all text matches can protect a correction.
+/// Echo deletion cannot chain onto the far-end channel, which is never eligible for acoustic deletion.
 pub fn cleanup(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
@@ -388,8 +793,8 @@ pub fn cleanup(
 /// text cannot — *was this mic span mostly echo?* — so the echo pass can drop a ghost whose wording is
 /// nowhere near the containment threshold.
 ///
-/// The audio rule runs **inside the echo pass, before the text rules**, and only on `Me` segments. A
-/// segment is dropped when all of these hold:
+/// Critical raw-text differences in any matched source protect the segment first. Otherwise a segment
+/// is dropped only when it is `Me` and all of these hold:
 ///
 /// 1. it overlaps a far-end segment (`S.start < O.end && O.start < S.end`) — the far end had the floor;
 /// 2. `evidence(S.start, S.end)` returns a span covering at least one block;
@@ -397,9 +802,9 @@ pub fn cleanup(
 /// 4. `mic_db − echo_estimate_db ≤ echo_audio_margin_db` — the mic carried little more than what the
 ///    canceller was already subtracting as echo.
 ///
-/// A span with **no blocks** falls through to the text rules unchanged. That is the AWS backend (no
+/// A span with **no blocks** is kept, as is a text-only duplicate. That is the AWS backend (no
 /// canceller), a sidecar that does not cover this recording, and a stats ring that overflowed: in all
-/// three, absence of evidence is not evidence of speech.
+/// three, missing evidence cannot authorize deletion.
 pub fn cleanup_with_evidence(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
@@ -419,33 +824,152 @@ pub fn cleanup_with_rules(
     evidence: Option<AudioEvidence<'_>>,
     rule: Option<&dyn TextRule>,
 ) -> (Vec<TranscriptSegment>, CleanupStats) {
+    let result = cleanup_with_decisions(segments, cfg, carry, evidence, rule);
+    (result.segments, result.stats)
+}
+
+/// Rich counterpart of [`cleanup_with_rules`], retaining bounded decisions for every changed stage and
+/// every echo candidate. Original spans/text are retained in memory only; callers control persistence.
+pub fn cleanup_with_decisions(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+) -> CleanupResult {
+    cleanup_with_protected_decisions(segments, cfg, carry, evidence, rule, &[])
+}
+
+/// Preserve raw text for input rows already protected by an earlier echo assessment. Indices refer to
+/// `segments` before sorting, not text or timestamps; equal rows remain distinct. Protection survives
+/// merging and automatic backchannel/filler cleanup independently of the bounded decision ledger.
+/// Explicit caller-supplied text rules still run last.
+pub fn cleanup_with_protected_decisions(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+    protected_input_indices: &[usize],
+) -> CleanupResult {
+    cleanup_impl(
+        segments,
+        cfg,
+        carry,
+        evidence,
+        rule,
+        protected_input_indices,
+        false,
+    )
+}
+
+pub(crate) fn cleanup_with_traced_decisions(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+    protected: &[usize],
+) -> CleanupResult {
+    cleanup_impl(segments, cfg, carry, evidence, rule, protected, true)
+}
+
+fn cleanup_impl(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+    protected_input_indices: &[usize],
+    traced: bool,
+) -> CleanupResult {
     let mut stats = CleanupStats::default();
-    let mut segments = merge_by_time(segments);
+    let mut decisions = CleanupDecisions::default();
+    let protected_inputs: BTreeSet<_> = protected_input_indices.iter().copied().collect();
+    let mut indexed: Vec<_> = segments
+        .into_iter()
+        .enumerate()
+        .map(|(index, segment)| (index, segment, protected_inputs.contains(&index)))
+        .collect();
+    indexed.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
+    for (output_index, (input_index, segment, _)) in indexed.iter().enumerate() {
+        if output_index != *input_index {
+            decisions.record(
+                CleanupStage::Sort,
+                &[*input_index],
+                &[segment],
+                &[segment],
+                CleanupReason::TimeOrder,
+                None,
+                None,
+            );
+        }
+    }
+    let (mut segments, mut preserve_raw): (Vec<_>, Vec<_>) = indexed
+        .into_iter()
+        .map(|(_, segment, protected)| (segment, protected))
+        .unzip();
     if cfg.echo_drop {
-        segments = drop_echoes(segments, cfg, carry, evidence, &mut stats);
+        segments = drop_echoes(
+            segments,
+            cfg,
+            carry,
+            evidence,
+            &mut stats,
+            &mut decisions,
+            &mut preserve_raw,
+        );
     }
     if cfg.merge_gap_seconds > 0.0 {
-        segments = merge_fragments(segments, cfg, &mut stats);
+        segments = merge_fragments(segments, cfg, &mut stats, &mut decisions, &mut preserve_raw);
     }
     if cfg.drop_backchannels {
-        segments = drop_backchannel_turns(segments, &mut stats);
+        segments = drop_backchannel_turns(segments, &mut stats, &mut decisions, &mut preserve_raw);
     }
     if cfg.strip_fillers {
-        segments = strip_fillers_pass(segments, &mut stats);
+        segments = strip_fillers_pass(segments, &mut stats, &mut decisions, &preserve_raw, traced);
     }
     if let Some(rule) = rule {
-        for segment in &mut segments {
-            if let Some(text) = rule.apply(&segment.text) {
-                segment.text = text;
+        for (i, segment) in segments.iter_mut().enumerate() {
+            let TracedText { replacement, edits } = if traced {
+                rule.apply_traced(&segment.text)
+            } else {
+                let replacement = rule.apply(&segment.text);
+                let mut edits = PositionedEdits::default();
+                if replacement.is_some() {
+                    edits.unavailable(TraceGap::UnsupportedRule);
+                }
+                TracedText { replacement, edits }
+            };
+            if let Some(text) = replacement {
+                let replacement = TranscriptSegment {
+                    speaker: segment.speaker.clone(),
+                    start: segment.start,
+                    end: segment.end,
+                    text,
+                };
+                decisions.record_text(
+                    CleanupStage::Lexicon,
+                    i,
+                    segment,
+                    Some(&replacement),
+                    CleanupReason::TextRule,
+                    edits,
+                );
+                *segment = replacement;
                 stats.lexicon_applied += 1;
             }
         }
     }
-    (segments, stats)
+    CleanupResult {
+        segments,
+        stats,
+        decisions,
+    }
 }
 
-/// Filler noises. Stripped before any comparison so "Um, the gateway" and "the gateway" are the same
-/// utterance to the echo detector.
+/// Possible filler noises, omitted only from loose candidate matching. Their raw spelling remains in
+/// the critical signature: `um` and `mm` may be units even without a neighboring numeric token.
 const FILLERS: &[&str] = &[
     "um", "umm", "uh", "uhh", "ah", "aah", "er", "erm", "hm", "hmm", "mm", "mmm", "mhm", "huh",
 ];
@@ -457,21 +981,51 @@ const STRIP_FILLERS: &[&str] = &[
     "um", "umm", "ummm", "uh", "uhh", "uhhh", "ah", "aah", "er", "erm", "hm", "hmm", "hmmm",
 ];
 
-/// Strip fillers and collapse stutters in one segment's text (#154). Returns the new text (possibly
+/// Strip marked fillers and collapse stutters in one segment's text (#154). Unmarked medial filler
+/// spellings are retained because they may be units or identifiers. Returns the new text (possibly
 /// empty) and how many filler tokens and repeated words/bigrams went. The walk is token-by-token so
 /// punctuation glued to a filler is not lost: a filler's sentence-ending mark moves to the word before
 /// it, a comma before a filler is dropped so "I was, uh, thinking" reads "I was thinking", the sentence
 /// start is re-capitalised when the opening filler went, and a capital the decoder left on the word
 /// after a mid-sentence filler ("I think, um, We should") is lowered.
 pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
+    strip_fillers_inner(text, None)
+}
+
+/// The existing filler/stutter pass plus positions from its actual token choices. Trace overflow
+/// never changes the returned text/counts and is explicit in PositionedEdits::gap.
+pub fn strip_fillers_text_traced(text: &str) -> (String, usize, usize, PositionedEdits) {
+    let mut trace = trace::FillerTrace::new();
+    let (output, fillers, stutters) = strip_fillers_inner(text, Some(&mut trace));
+    let edits = trace.finish(text, &output);
+    (output, fillers, stutters, edits)
+}
+
+fn strip_fillers_inner(
+    text: &str,
+    mut trace: Option<&mut trace::FillerTrace>,
+) -> (String, usize, usize) {
     let mut kept: Vec<String> = Vec::new();
     let mut kept_norm: Vec<String> = Vec::new();
+    let mut contexts = raw_token_context(text).peekable();
+    let mut first_can_recase = true;
     let mut fillers = 0usize;
     let mut stutters = 0usize;
     let mut after_filler = false;
-    for raw in text.split_whitespace() {
+    for (index, raw) in text.split_whitespace().enumerate() {
+        if let Some(trace) = &mut trace {
+            trace.token(text, raw);
+        }
+        let (protected, can_recase) = contexts
+            .next_if(|context| context.index == index)
+            .map_or((false, true), |context| {
+                (context.protected, context.can_recase)
+            });
         let norm = normalize_token(raw);
-        if STRIP_FILLERS.contains(&norm.as_str()) {
+        if !protected && STRIP_FILLERS.contains(&norm.as_str()) {
+            if let Some(trace) = &mut trace {
+                trace.filler();
+            }
             fillers += 1;
             let trailing = raw.chars().last().filter(|c| matches!(c, '.' | '?' | '!'));
             if let Some(previous) = kept.last_mut() {
@@ -489,7 +1043,11 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
         }
         let mut token = raw.to_string();
         if !norm.is_empty() {
-            if kept_norm.last().is_some_and(|previous| previous == &norm) {
+            let n = kept_norm.len();
+            if n > 0 && kept_norm[n - 1] == norm && same_stutter_value(&kept[n - 1], raw) {
+                if let Some(trace) = &mut trace {
+                    trace.stutter(kept.last().is_some_and(|p| p.ends_with(',')), false);
+                }
                 stutters += 1;
                 // "we, we roll" keeps the later copy so the stutter's comma goes with it.
                 if let Some(previous) = kept.last_mut()
@@ -497,16 +1055,27 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
                 {
                     *previous = raw.to_string();
                 }
+                if n == 1 {
+                    first_can_recase &= can_recase;
+                }
                 continue;
             }
-            let n = kept_norm.len();
-            if n >= 3 && kept_norm[n - 3] == kept_norm[n - 1] && kept_norm[n - 2] == norm {
+            if n >= 3
+                && kept_norm[n - 3] == kept_norm[n - 1]
+                && kept_norm[n - 2] == norm
+                && same_stutter_value(&kept[n - 3], &kept[n - 1])
+                && same_stutter_value(&kept[n - 2], raw)
+            {
+                if let Some(trace) = &mut trace {
+                    trace.stutter(false, true);
+                }
                 kept.pop();
                 kept_norm.pop();
                 stutters += 1;
                 continue;
             }
             if after_filler
+                && can_recase
                 && let Some(previous) = kept.last()
                 && !previous.ends_with(['.', '?', '!'])
                 && norm != "i"
@@ -516,17 +1085,40 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
             }
         }
         after_filler = false;
+        if kept.is_empty() {
+            first_can_recase = can_recase;
+        }
         kept.push(token);
         kept_norm.push(norm);
+        if let Some(trace) = &mut trace {
+            trace.keep();
+        }
     }
     let mut out = kept.join(" ");
     if fillers > 0
+        && first_can_recase
         && text.chars().next().is_some_and(char::is_uppercase)
         && out.chars().next().is_some_and(char::is_lowercase)
     {
         out = upper_first(&out);
     }
     (out, fillers, stutters)
+}
+
+fn same_stutter_value(first: &str, second: &str) -> bool {
+    let first = trim_critical_token(first);
+    let second = trim_critical_token(second);
+    if first == second {
+        return true;
+    }
+    // Only closed grammar/pronouns and the explicit intensifier acceptance "Very very" allow
+    // sentence-case equivalence. Unknown title-case words may be names ("May may", "Foo foo").
+    let lower = first.to_lowercase();
+    first == upper_first(&lower)
+        && second == lower
+        && (ECHO_GRAMMAR.contains(&lower.as_str())
+            || FILLER_RECASE_PRONOUNS.contains(&lower.as_str())
+            || lower == "very")
 }
 
 fn is_capitalised_word(token: &str) -> bool {
@@ -556,17 +1148,55 @@ fn upper_first(text: &str) -> String {
 fn strip_fillers_pass(
     segments: Vec<TranscriptSegment>,
     stats: &mut CleanupStats,
+    decisions: &mut CleanupDecisions,
+    preserve_raw: &[bool],
+    traced: bool,
 ) -> Vec<TranscriptSegment> {
     let mut out = Vec::with_capacity(segments.len());
-    for mut segment in segments {
-        let (text, fillers, stutters) = strip_fillers_text(&segment.text);
+    for (i, mut segment) in segments.into_iter().enumerate() {
+        if preserve_raw[i] {
+            out.push(segment);
+            continue;
+        }
+        let (text, fillers, stutters, edits) = if traced {
+            strip_fillers_text_traced(&segment.text)
+        } else {
+            let (text, fillers, stutters) = strip_fillers_text(&segment.text);
+            let mut edits = PositionedEdits::default();
+            if text != segment.text {
+                edits.unavailable(TraceGap::UnsupportedRule);
+            }
+            (text, fillers, stutters, edits)
+        };
         stats.fillers_removed += fillers;
         stats.stutters_collapsed += stutters;
         if text.trim().is_empty() {
+            decisions.record_text(
+                CleanupStage::Fillers,
+                i,
+                &segment,
+                None,
+                CleanupReason::FillersOrStutters,
+                edits,
+            );
             continue;
         }
         if fillers > 0 || stutters > 0 {
-            segment.text = text;
+            let replacement = TranscriptSegment {
+                speaker: segment.speaker.clone(),
+                start: segment.start,
+                end: segment.end,
+                text,
+            };
+            decisions.record_text(
+                CleanupStage::Fillers,
+                i,
+                &segment,
+                Some(&replacement),
+                CleanupReason::FillersOrStutters,
+                edits,
+            );
+            segment = replacement;
         }
         out.push(segment);
     }
@@ -678,13 +1308,15 @@ fn is_me(segment: &TranscriptSegment) -> bool {
 /// The live early-drop path (#149 phase 2) asks the same question of one mic region against a rolling ring
 /// of far-end regions **before** the region is published, so both paths ask it through this one type
 /// instead of through two copies of the thresholds.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct EchoCandidate {
     /// Near-end mic channel. Echo is only ever judged *across* this boundary.
     me: bool,
     start: f64,
     end: f64,
     tokens: BTreeSet<String>,
+    normalized: Vec<String>,
+    critical: Vec<String>,
 }
 
 impl EchoCandidate {
@@ -695,6 +1327,8 @@ impl EchoCandidate {
             start: segment.start,
             end: segment.end,
             tokens: content_tokens(&segment.text),
+            normalized: normalized_tokens(&segment.text),
+            critical: critical_tokens(&segment.text),
         }
     }
 
@@ -711,6 +1345,8 @@ impl EchoCandidate {
             start: words.first().map_or(0.0, |w| w.start),
             end: words.last().map_or(0.0, |w| w.end),
             tokens: content_tokens(&text),
+            normalized: normalized_tokens(&text),
+            critical: critical_tokens(&text),
         }
     }
 
@@ -729,20 +1365,31 @@ impl EchoCandidate {
         self.tokens.len()
     }
 
-    /// True when this region repeats what `source` said on the **other** channel, inside the echo window.
+    /// Text-only candidate match on the **other** channel, inside the echo window. This is NOT a
+    /// deletion verdict: callers must use [`echo_verdict`] or [`echo_assessment`] to decide publication.
     ///
-    /// Three or more content tokens are an echo when `echo_containment` of them appear in the source. One
+    /// Three or more content tokens match when `echo_containment` of them appear in the source. One
     /// or two are only enough when the match is total **and** this region's whole span sits inside the
     /// source's — that is the #107 phantom (`Me: Gateway` in the middle of a far-end monologue), and
     /// requiring containment of the span is what keeps a genuine one-word interjection.
+    /// An identical nonempty normalized sequence also supports a candidate, including pure
+    /// backchannels whose case differs. It still cannot authorize deletion without the shared verdict.
     pub fn is_echo_of(&self, source: &Self, cfg: &CleanupConfig) -> bool {
-        if source.me == self.me || self.tokens.is_empty() {
+        if source.me == self.me {
             return false;
         }
         // The source must have started first and still be inside the echo window.
         let in_window =
             source.start <= self.start && self.start <= source.end + cfg.echo_window_seconds;
         if !in_window {
+            return false;
+        }
+        // Case-only backchannels can have no content tokens ("Okay" / "OKAY"). A nonempty
+        // normalized sequence still establishes a text match inside the same time/channel gates.
+        if !self.normalized.is_empty() && self.normalized == source.normalized {
+            return true;
+        }
+        if self.tokens.is_empty() {
             return false;
         }
         let c = containment(&self.tokens, &source.tokens);
@@ -754,18 +1401,175 @@ impl EchoCandidate {
     }
 }
 
-/// Drop each segment that repeats what the other channel already said, inside the echo window. The text
-/// rule itself lives on [`EchoCandidate::is_echo_of`], shared with the live early-drop path (#149 phase 2).
-///
-/// When `evidence` is available the **audio** rule is tried first, on `Me` segments only: a mic span the
-/// canceller measured as carrying no more than `echo_audio_margin_db` above its own echo estimate is a
-/// ghost whatever its wording. See [`cleanup_with_evidence`] for the full predicate.
+/// A deliberately small grammar vocabulary. Every unknown token is retained, rather than guessing
+/// which tokens are names, identifiers, units, or negators. Order, case, digits, and internal punctuation
+/// survive. Grammar exemptions apply only with ordinary casing and outside numeric context, so
+/// `A`, `Ah`, `mm`, or `um` cannot disappear from a quantity. In particular, the candidate detector's
+/// STOPWORDS must never define this signature.
+const ECHO_GRAMMAR: &[&str] = &[
+    "a", "an", "the", "am", "is", "are", "was", "were", "be", "been", "being",
+];
+
+fn critical_tokens(text: &str) -> Vec<String> {
+    raw_token_context(text)
+        .filter_map(|context| {
+            let lower = context.token.to_lowercase();
+            (context.protected || !ECHO_GRAMMAR.contains(&lower.as_str()))
+                .then(|| context.token.to_owned())
+        })
+        .collect()
+}
+
+fn trim_critical_token(raw: &str) -> &str {
+    // Preserve a leading decimal point, signs, currency, %, /, # and @. A terminal full stop is
+    // sentence punctuation; internal decimal/version dots are retained.
+    raw.trim_start_matches([
+        '\"', '\'', '“', '”', '‘', '’', '(', ')', '[', ']', '{', '}', ',', '!', '?', ';', ':', '¿',
+        '¡',
+    ])
+    .trim_end_matches([
+        '\"', '\'', '“', '”', '‘', '’', '(', ')', '[', ']', '{', '}', ',', '.', '!', '?', ';', ':',
+        '¿', '¡',
+    ])
+}
+
+struct RawTokenContext<'a> {
+    index: usize,
+    token: &'a str,
+    protected: bool,
+    can_recase: bool,
+}
+
+/// Subject pronouns may recover ordinary mid-sentence case after a filler ("um, We should"). This is
+/// solely a sentence-repair allowance: it never removes a token from the raw critical signature.
+const FILLER_RECASE_PRONOUNS: &[&str] = &["i", "you", "he", "she", "it", "we", "they"];
+
+/// Raw nonempty tokens and whether context, case or punctuation protects them from lossy normalization.
+/// Indices retain the original whitespace-token positions so a caller can also preserve punctuation.
+fn raw_token_context(text: &str) -> impl Iterator<Item = RawTokenContext<'_>> {
+    let mut tokens = text
+        .split_whitespace()
+        .enumerate()
+        .map(|(index, raw)| (index, raw, trim_critical_token(raw)))
+        .filter(|(_, _, token)| !token.is_empty())
+        .peekable();
+    let mut previous_numeric = false;
+    let mut previous_comma = false;
+    let mut first = true;
+    std::iter::from_fn(move || {
+        let (index, raw, token) = tokens.next()?;
+        // Units and identifiers may precede or follow a number. Protect both neighbors before
+        // considering exemptions; no vocabulary can safely enumerate all such critical tokens.
+        let numeric_context = previous_numeric
+            || tokens
+                .peek()
+                .is_some_and(|(_, _, next)| next.chars().any(char::is_numeric));
+        let lower = token.to_lowercase();
+        let sentence_case = token == upper_first(&lower);
+        let ordinary_case = token == lower || (first && sentence_case);
+        let normalization_loss = lower != normalize_token(token);
+        // Unmarked medial fillers are ambiguous units/content. Preserve them without guessing a
+        // unit or numeral vocabulary. Leading fillers and comma-marked hesitations remain eligible
+        // for ordinary cleanup; cross-channel critical protection overrides even those removals.
+        let hesitation_context = first || raw.ends_with(',') || previous_comma;
+        let ambiguous_filler = FILLERS.contains(&lower.as_str()) && !hesitation_context;
+        previous_numeric = token.chars().any(char::is_numeric);
+        previous_comma = raw.ends_with(',');
+        first = false;
+        Some(RawTokenContext {
+            index,
+            token,
+            protected: previous_numeric
+                || numeric_context
+                || !ordinary_case
+                || normalization_loss
+                || ambiguous_filler,
+            can_recase: !previous_numeric
+                && !numeric_context
+                && !normalization_loss
+                && !ambiguous_filler
+                && (ordinary_case
+                    || (sentence_case && FILLER_RECASE_PRONOUNS.contains(&lower.as_str()))),
+        })
+    })
+}
+
+/// The shared echo deletion decision, without attribution. See [`echo_assessment`] for the policy.
+pub fn echo_verdict<'a>(
+    subject: &EchoCandidate,
+    sources: impl IntoIterator<Item = &'a EchoCandidate>,
+    cfg: &CleanupConfig,
+    evidence: Option<SpanEvidence>,
+) -> EchoVerdict {
+    echo_assessment(subject, sources, cfg, evidence).verdict
+}
+
+/// Assess all relevant opposite-channel sources before deleting anything. Any text-matched critical
+/// difference protects the subject, including a non-overlapping earlier source in the echo window or
+/// a later-starting overlapping source. Text matches without acoustic proof are only suspected.
+/// Only a mic subject with overlapping far-end speech and the existing quiet-mic/double-talk predicate
+/// can be dropped. Far-end subjects are never acoustically measured and are never echo-deleted.
+pub fn echo_assessment<'a>(
+    subject: &EchoCandidate,
+    sources: impl IntoIterator<Item = &'a EchoCandidate>,
+    cfg: &CleanupConfig,
+    evidence: Option<SpanEvidence>,
+) -> EchoAssessment {
+    if !cfg.echo_drop {
+        return EchoAssessment::default();
+    }
+    let mut matched = None;
+    let mut overlap = None;
+    for source in sources {
+        if source.me == subject.me {
+            continue;
+        }
+        let descriptor = EchoSource {
+            me: source.me,
+            start: source.start,
+            end: source.end,
+        };
+        let overlaps = subject.start < source.end && source.start < subject.end;
+        let text_matches =
+            subject.is_echo_of(source, cfg) || (overlaps && source.is_echo_of(subject, cfg));
+        if text_matches {
+            if subject.critical != source.critical {
+                return EchoAssessment {
+                    verdict: EchoVerdict::KeepCriticalDifference,
+                    source: Some(descriptor),
+                };
+            }
+            matched.get_or_insert(descriptor);
+        }
+        if overlaps && !source.me {
+            overlap.get_or_insert(descriptor);
+        }
+    }
+    if subject.me && overlap.is_some() && is_mostly_echo(evidence, cfg) {
+        EchoAssessment {
+            verdict: EchoVerdict::DropAcoustic,
+            source: overlap,
+        }
+    } else if matched.is_some() {
+        EchoAssessment {
+            verdict: EchoVerdict::SuspectedDuplicate,
+            source: matched,
+        }
+    } else {
+        EchoAssessment::default()
+    }
+}
+
+/// Apply the shared conservative verdict and retain decisions before removing acoustically supported
+/// mic echoes. Text candidates and protected corrections remain in the output.
 fn drop_echoes(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
     carry: &[TranscriptSegment],
     evidence: Option<AudioEvidence<'_>>,
     stats: &mut CleanupStats,
+    decisions: &mut CleanupDecisions,
+    preserve_raw: &mut Vec<bool>,
 ) -> Vec<TranscriptSegment> {
     let carry_sources: Vec<EchoCandidate> = carry.iter().map(EchoCandidate::from_segment).collect();
     let current: Vec<EchoCandidate> = segments.iter().map(EchoCandidate::from_segment).collect();
@@ -773,61 +1577,37 @@ fn drop_echoes(
 
     for (i, segment) in segments.iter().enumerate() {
         let subject = &current[i];
-        // The audio rule needs no tokens at all — a ghost is often one garbled word — so it runs before
-        // the text rules, which have nothing to say about a region whose wording matches nothing.
-        if let Some(evidence) = evidence
-            && subject.me
-            && overlaps_far_end(subject.start, subject.end, &current, &carry_sources)
-            && is_mostly_echo(evidence(subject.start, subject.end), cfg)
-        {
+        let reading = evidence.and_then(|get| get(subject.start, subject.end));
+        let mut assessment =
+            echo_assessment(subject, carry_sources.iter().chain(&current), cfg, reading);
+        if preserve_raw[i] && assessment.verdict != EchoVerdict::KeepCriticalDifference {
+            assessment = EchoAssessment {
+                verdict: EchoVerdict::KeepCriticalDifference,
+                source: None,
+            };
+        }
+        preserve_raw[i] |= assessment.verdict == EchoVerdict::KeepCriticalDifference;
+        if assessment.verdict != EchoVerdict::Keep {
+            decisions.record_echo_assessment(CleanupStage::Echo, i, segment, assessment, reading);
+        }
+        if assessment.verdict == EchoVerdict::DropAcoustic {
             kept[i] = false;
             stats.echo_dropped_audio += 1;
-            continue;
-        }
-        // Sources are the previous window's kept segments plus every earlier segment this pass has kept —
-        // an already-dropped copy is never allowed to kill the utterance it copied.
-        let dropped = carry_sources.iter().any(|o| subject.is_echo_of(o, cfg))
-            || (0..i).any(|j| kept[j] && subject.is_echo_of(&current[j], cfg));
-        if dropped {
-            kept[i] = false;
-            if is_me(segment) {
-                stats.echo_dropped_me += 1;
-            } else {
-                stats.echo_dropped_them += 1;
-            }
         }
     }
 
-    // `retain` visits every element once, in order, so draining the decision list alongside it filters in
-    // place without a second allocation.
+    let mut kept_flags = kept.iter();
+    preserve_raw.retain(|_| *kept_flags.next().unwrap());
     let mut kept = kept.into_iter();
     let mut out = segments;
     out.retain(|_| kept.next().unwrap_or(true));
     out
 }
 
-/// Whether `[start, end]` overlaps any far-end span on this timeline, current window or carried over. The
-/// audio rule only fires while the far end had the floor: without that clause a quiet mic passage with no
-/// echo at all (both energies near the floor, their difference small) would look exactly like a ghost.
-///
-/// Kept/dropped status is deliberately ignored. "The far end was speaking then" is a fact about the
-/// timeline, and half the segments here have not been decided yet at this point in the pass.
-fn overlaps_far_end(
-    start: f64,
-    end: f64,
-    current: &[EchoCandidate],
-    carry: &[EchoCandidate],
-) -> bool {
-    current
-        .iter()
-        .chain(carry)
-        .any(|o| !o.me && start < o.end && o.start < end)
-}
-
 /// The audio verdict for one span: `Some(evidence)` covering at least one block, whose gate stayed mostly
 /// quiet, and whose mic energy is within `echo_audio_margin_db` of the echo the canceller subtracted.
 /// Every other case — no evidence, no blocks, a gate that fired for most of the span, a mic well above the
-/// estimate — is `false`, and the segment goes on to the text rules.
+/// estimate — is `false` and cannot authorize echo deletion.
 fn is_mostly_echo(evidence: Option<SpanEvidence>, cfg: &CleanupConfig) -> bool {
     let Some(e) = evidence else {
         return false;
@@ -850,6 +1630,8 @@ fn merge_fragments(
     segments: Vec<TranscriptSegment>,
     cfg: &CleanupConfig,
     stats: &mut CleanupStats,
+    decisions: &mut CleanupDecisions,
+    preserve_raw: &mut Vec<bool>,
 ) -> Vec<TranscriptSegment> {
     let me_starts: Vec<f64> = segments
         .iter()
@@ -863,10 +1645,12 @@ fn merge_fragments(
         .collect();
 
     let mut out: Vec<TranscriptSegment> = Vec::with_capacity(segments.len());
-    for b in segments {
+    let mut merged_protection: Vec<bool> = Vec::with_capacity(segments.len());
+    let mut group_start = 0;
+    for (i, b) in segments.iter().enumerate() {
         let mergeable = match out.last() {
             Some(a) => {
-                let interrupted = if is_me(&b) { &them_starts } else { &me_starts };
+                let interrupted = if is_me(b) { &them_starts } else { &me_starts };
                 a.speaker == b.speaker
                     && b.start - a.end <= cfg.merge_gap_seconds
                     && !interrupted
@@ -880,11 +1664,62 @@ fn merge_fragments(
                 a.text = format!("{} {}", a.text.trim_end(), b.text.trim_start());
                 a.end = b.end;
                 stats.merged += 1;
+                *merged_protection.last_mut().unwrap() |= preserve_raw[i];
             }
-            _ => out.push(b),
+            _ => {
+                if i - group_start > 1 {
+                    record_merge(&segments, group_start, i, out.last().unwrap(), decisions);
+                }
+                group_start = i;
+                out.push(b.clone());
+                merged_protection.push(preserve_raw[i]);
+            }
         }
     }
+    if segments.len() - group_start > 1 {
+        record_merge(
+            &segments,
+            group_start,
+            segments.len(),
+            out.last().unwrap(),
+            decisions,
+        );
+    }
+    *preserve_raw = merged_protection;
     out
+}
+
+fn record_merge(
+    input: &[TranscriptSegment],
+    start: usize,
+    end: usize,
+    replacement: &TranscriptSegment,
+    decisions: &mut CleanupDecisions,
+) {
+    let bytes = std::mem::size_of::<CleanupDecision>()
+        .saturating_add((end - start).saturating_mul(std::mem::size_of::<usize>()))
+        .saturating_add(
+            input[start..end]
+                .iter()
+                .map(segment_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+        .saturating_add(segment_bytes(replacement));
+    if bytes > CLEANUP_DECISION_BYTES.saturating_sub(decisions.bytes) {
+        decisions.omitted = decisions.omitted.saturating_add(1);
+        return;
+    }
+    let indices: Vec<_> = (start..end).collect();
+    let originals: Vec<_> = input[start..end].iter().collect();
+    decisions.record(
+        CleanupStage::Merge,
+        &indices,
+        &originals,
+        &[replacement],
+        CleanupReason::SameSpeakerContinuation,
+        None,
+        None,
+    );
 }
 
 /// Drop pure backchannels spoken over the other channel — "Yeah." while the far end is mid-sentence is
@@ -893,10 +1728,12 @@ fn merge_fragments(
 fn drop_backchannel_turns(
     segments: Vec<TranscriptSegment>,
     stats: &mut CleanupStats,
+    decisions: &mut CleanupDecisions,
+    preserve_raw: &mut Vec<bool>,
 ) -> Vec<TranscriptSegment> {
     let mut kept = vec![true; segments.len()];
     for (i, s) in segments.iter().enumerate() {
-        if s.text.split_whitespace().count() >= 4 || !is_backchannel(&s.text) {
+        if preserve_raw[i] || s.text.split_whitespace().count() >= 4 || !is_backchannel(&s.text) {
             continue;
         }
         let over_other_speech = segments
@@ -916,8 +1753,19 @@ fn drop_backchannel_turns(
         }
         kept[i] = false;
         stats.backchannels_dropped += 1;
+        decisions.record(
+            CleanupStage::Backchannel,
+            &[i],
+            &[s],
+            &[],
+            CleanupReason::OverlappingBackchannel,
+            None,
+            None,
+        );
     }
 
+    let mut kept_flags = kept.iter();
+    preserve_raw.retain(|_| *kept_flags.next().unwrap());
     let mut kept = kept.into_iter();
     let mut out = segments;
     out.retain(|_| kept.next().unwrap_or(true));
@@ -925,8 +1773,20 @@ fn drop_backchannel_turns(
 }
 
 /// Whether the whole utterance is backchannel: a listed phrase, or nothing but backchannel words and
-/// fillers ("Yeah yeah.", "Um, okay.").
+/// fillers ("Yeah yeah.", "Um, okay."). Raw values must survive normalization before any turn can be
+/// discarded: "Okay, 15000." is an answer containing a number, not an empty acknowledgement.
 fn is_backchannel(text: &str) -> bool {
+    let single_token = raw_token_context(text).count() == 1;
+    if raw_token_context(text).any(|context| {
+        let lower = context.token.to_lowercase();
+        let single_uppercase_backchannel = single_token
+            && BACKCHANNELS.contains(&lower.as_str())
+            && context.token == lower.to_uppercase();
+        lower != normalize_token(context.token)
+            || (context.protected && !single_uppercase_backchannel)
+    }) {
+        return false;
+    }
     let tokens = normalized_tokens(text);
     if tokens.is_empty() {
         return false;
@@ -1096,7 +1956,830 @@ mod tests {
     }
 
     #[test]
-    fn later_copy_of_a_far_end_utterance_is_dropped() {
+    fn genuine_corrections_and_repeats_survive_both_channel_orders() {
+        let cases = [
+            (
+                "english_negation",
+                "We should deploy the payment gateway today.",
+                "We should not deploy the payment gateway today.",
+            ),
+            (
+                "amount",
+                "The invoice total is 1500 euros today.",
+                "The invoice total is 15000 euros today.",
+            ),
+            (
+                "spanish_negation",
+                "Debemos publicar la nueva versión mañana.",
+                "No debemos publicar la nueva versión mañana.",
+            ),
+            (
+                "repeated_command",
+                "Please restart the production gateway now.",
+                "Please restart the production gateway now.",
+            ),
+            (
+                "short_no",
+                "We should deploy the payment gateway today.",
+                "No.",
+            ),
+            (
+                "short_number",
+                "The invoice total is 1500 euros today.",
+                "15.",
+            ),
+            (
+                "unrelated",
+                "The gateway remains available today.",
+                "The orchard grows purple plums.",
+            ),
+        ];
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        let mut false_positives = 0;
+        for (label, first, second) in cases {
+            for me_first in [false, true] {
+                for evidence in [None, Some(&double_talk as AudioEvidence<'_>)] {
+                    let segments = if me_first {
+                        vec![me(10.0, 15.0, first), them(11.0, 14.0, second)]
+                    } else {
+                        vec![them(10.0, 15.0, first), me(11.0, 14.0, second)]
+                    };
+                    let (out, _) = cleanup_with_evidence(segments, &echo_only(), &[], evidence);
+                    let lost = 2 - out.len();
+                    false_positives += lost;
+                    println!(
+                        "case={label} me_first={me_first} evidence={} false_positives={lost}",
+                        evidence.is_some()
+                    );
+                }
+            }
+        }
+        println!("genuine_cases false_positives={false_positives} false_negatives=0");
+        assert_eq!(false_positives, 0);
+    }
+
+    #[test]
+    fn quiet_evidence_never_overrides_a_matched_critical_correction() {
+        let quiet = evidence_of(8, 0.0, 0.0);
+        for (first, second) in [
+            (
+                "We should deploy the payment gateway today.",
+                "We should not deploy the payment gateway today.",
+            ),
+            (
+                "The invoice total is 1500 euros today.",
+                "The invoice total is 15000 euros today.",
+            ),
+            (
+                "Debemos publicar la nueva versión mañana.",
+                "No debemos publicar la nueva versión mañana.",
+            ),
+            (
+                "Ship gateway build v1.5 to Ada today.",
+                "Ship gateway build v1.6 to Bea today.",
+            ),
+            (
+                "The gateway uses 15 mW today.",
+                "The gateway uses 15 MW today.",
+            ),
+            (
+                "The gateway is ready today.",
+                "The gateway is never ready today.",
+            ),
+        ] {
+            let (out, stats) = cleanup_with_evidence(
+                vec![them(10.0, 15.0, first), me(11.0, 14.0, second)],
+                &echo_only(),
+                &[],
+                Some(&quiet),
+            );
+            assert_eq!(out.len(), 2);
+            assert_eq!(stats.changed(), 0);
+        }
+    }
+
+    fn assert_raw_unit_corrections_survive(
+        cfg: &CleanupConfig,
+        evidence: Option<AudioEvidence<'_>>,
+    ) {
+        let cases = [
+            ("amperes_capacity", "15 A", "15 Ah"),
+            ("millimetres_missing", "15 mm", "15"),
+            ("millimetres_millimolar", "15 mm", "15 mM"),
+            ("attached_millimetres_missing", "15mm", "15"),
+            ("attached_millimetres_millimolar", "15mm", "15mM"),
+            ("ascii_micrometres_missing", "15 um", "15"),
+            ("attached_ascii_micrometres_missing", "15um", "15"),
+            ("attached_amperes_capacity", "15A", "15Ah"),
+            ("leading_unit", "A 15", "Ah 15"),
+            ("capitalized_identifier", "Ah", "A"),
+        ];
+        let mut failures = Vec::new();
+        for (label, first, second) in cases {
+            for reverse_values in [false, true] {
+                let (first, second) = if reverse_values {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let first = format!("The gateway battery uses {first} today.");
+                let second = format!("The gateway battery uses {second} today.");
+                for me_first in [false, true] {
+                    let segments = if me_first {
+                        vec![me(10.0, 15.0, &first), them(11.0, 14.0, &second)]
+                    } else {
+                        vec![them(10.0, 15.0, &first), me(11.0, 14.0, &second)]
+                    };
+                    let result = cleanup_with_decisions(segments.clone(), cfg, &[], evidence, None);
+                    let mic = segments.iter().find(|segment| is_me(segment)).unwrap();
+                    let far = segments.iter().find(|segment| !is_me(segment)).unwrap();
+                    let words: Vec<_> = mic
+                        .text
+                        .split_whitespace()
+                        .map(|text| word(mic.start, mic.end, text))
+                        .collect();
+                    let live_verdict = echo_verdict(
+                        &EchoCandidate::from_words(true, &words),
+                        [&EchoCandidate::from_segment(far)],
+                        &echo_only(),
+                        evidence.and_then(|get| get(mic.start, mic.end)),
+                    );
+                    if result.segments != segments
+                        || result.stats.changed() != 0
+                        || live_verdict != EchoVerdict::KeepCriticalDifference
+                        || !result.decisions.entries().iter().any(|decision| {
+                            decision.reason
+                                == CleanupReason::Echo(EchoVerdict::KeepCriticalDifference)
+                                && decision.originals.iter().any(is_me)
+                        })
+                    {
+                        failures.push(format!(
+                            "{label} reverse_values={reverse_values} me_first={me_first} \
+                             kept={} live_verdict={live_verdict:?}",
+                            result.segments.len()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn raw_unit_corrections_survive_quiet_evidence_in_both_channel_orders() {
+        let quiet = evidence_of(8, 0.0, 0.0);
+        assert_raw_unit_corrections_survive(&echo_only(), Some(&quiet));
+    }
+
+    #[test]
+    fn raw_unit_corrections_survive_absent_and_double_talk_evidence() {
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        for evidence in [None, Some(&double_talk as AudioEvidence<'_>)] {
+            assert_raw_unit_corrections_survive(&echo_only(), evidence);
+        }
+    }
+
+    #[test]
+    fn raw_unit_corrections_survive_the_full_cleanup_pipeline() {
+        let quiet = evidence_of(8, 0.0, 0.0);
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        for evidence in [
+            None,
+            Some(&double_talk as AudioEvidence<'_>),
+            Some(&quiet as AudioEvidence<'_>),
+        ] {
+            assert_raw_unit_corrections_survive(&CleanupConfig::default(), evidence);
+        }
+    }
+
+    #[test]
+    fn unit_corrections_without_adjacent_digits_survive_echo_and_full_cleanup() {
+        let quiet = evidence_of(8, 0.0, 0.0);
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        let mut failures = Vec::new();
+        for (first, second) in [
+            (
+                "Report the gateway dimensions in mm today.",
+                "Report the gateway dimensions in um today.",
+            ),
+            (
+                "The plate area is 15 square mm today.",
+                "The plate area is 15 square um today.",
+            ),
+            (
+                "The gateway thickness is fifteen mm today.",
+                "The gateway thickness is fifteen um today.",
+            ),
+            (
+                "The plate area is 15 square mm, today.",
+                "The plate area is 15 square um, today.",
+            ),
+        ] {
+            for (first, second) in [(first, second), (second, first)] {
+                for me_first in [false, true] {
+                    let segments = if me_first {
+                        vec![me(10.0, 15.0, first), them(11.0, 14.0, second)]
+                    } else {
+                        vec![them(10.0, 15.0, first), me(11.0, 14.0, second)]
+                    };
+                    for (mode, cfg) in [("echo", echo_only()), ("full", CleanupConfig::default())] {
+                        for (label, evidence) in [
+                            ("absent", None),
+                            ("double_talk", Some(&double_talk as AudioEvidence<'_>)),
+                            ("quiet", Some(&quiet as AudioEvidence<'_>)),
+                        ] {
+                            let result =
+                                cleanup_with_decisions(segments.clone(), &cfg, &[], evidence, None);
+                            if result.segments != segments
+                                || result.stats.changed() != 0
+                                || !result.decisions.entries().iter().any(|decision| {
+                                    decision.reason
+                                        == CleanupReason::Echo(EchoVerdict::KeepCriticalDifference)
+                                })
+                            {
+                                failures.push(format!(
+                                    "{first:?} / {second:?} me_first={me_first} \
+                                     mode={mode} evidence={label} kept={} changed={}",
+                                    result.segments.len(),
+                                    result.stats.changed()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn backchannel_case_differences_survive_full_cleanup() {
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        let mut failures = Vec::new();
+        for (first, second) in [
+            ("Got it.", "Got IT."),
+            ("I see.", "I SEE."),
+            ("Go ahead.", "Go Ahead."),
+            ("Okay.", "OKAY."),
+        ] {
+            for (first, second) in [(first, second), (second, first)] {
+                for me_first in [false, true] {
+                    for evidence in [None, Some(&double_talk as AudioEvidence<'_>)] {
+                        let segments = if me_first {
+                            vec![me(10.0, 15.0, first), them(11.0, 14.0, second)]
+                        } else {
+                            vec![them(10.0, 15.0, first), me(11.0, 14.0, second)]
+                        };
+                        let (out, stats) = cleanup_with_evidence(
+                            segments.clone(),
+                            &CleanupConfig::default(),
+                            &[],
+                            evidence,
+                        );
+                        if out != segments || stats.changed() != 0 {
+                            failures.push(format!(
+                                "{first:?} / {second:?} me_first={me_first} \
+                                 evidence={} kept={}",
+                                evidence.is_some(),
+                                out.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn sentence_initial_names_are_not_case_only_stutters() {
+        let mut failures = Vec::new();
+        for text in [
+            "May may approve the gateway today.",
+            "Foo foo updates the gateway today.",
+        ] {
+            let segments = vec![me(10.0, 15.0, text)];
+            let (out, _) = cleanup(segments.clone(), &CleanupConfig::default(), &[]);
+            if out != segments {
+                failures.push(format!("{text:?} became {:?}", texts(&out)));
+            }
+        }
+        let (out, stats) = cleanup(
+            vec![me(10.0, 15.0, "Very very important.")],
+            &CleanupConfig::default(),
+            &[],
+        );
+        assert_eq!(texts(&out), vec!["Very important."]);
+        assert_eq!(stats.stutters_collapsed, 1);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn unmarked_medial_units_survive_without_a_matching_source() {
+        for text in [
+            "The gateway thickness is fifteen um today.",
+            "The plate area is 15 square um today.",
+        ] {
+            for me_first in [false, true] {
+                let other = "The orchard grows purple plums.";
+                let segments = if me_first {
+                    vec![me(10.0, 15.0, text), them(11.0, 14.0, other)]
+                } else {
+                    vec![them(10.0, 15.0, other), me(11.0, 14.0, text)]
+                };
+                for echo_drop in [false, true] {
+                    let cfg = CleanupConfig {
+                        echo_drop,
+                        ..CleanupConfig::default()
+                    };
+                    let (out, stats) = cleanup(segments.clone(), &cfg, &[]);
+                    assert_eq!(out, segments);
+                    assert_eq!(stats.changed(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_sequence_fallback_respects_channel_time_and_nonempty_gates() {
+        let cfg = echo_only();
+        let source = EchoCandidate::from_segment(&them(0.0, 5.0, "Okay."));
+        let case_variant = EchoCandidate::from_segment(&me(1.0, 2.0, "OKAY."));
+        assert!(case_variant.is_echo_of(&source, &cfg));
+        assert_eq!(
+            echo_verdict(&case_variant, [&source], &cfg, None),
+            EchoVerdict::KeepCriticalDifference
+        );
+        for segment in [
+            me(1.0, 2.0, "Sure."),
+            me(12.0, 13.0, "OKAY."),
+            them(1.0, 2.0, "OKAY."),
+        ] {
+            assert!(!EchoCandidate::from_segment(&segment).is_echo_of(&source, &cfg));
+        }
+        assert!(
+            !EchoCandidate::from_segment(&me(1.0, 2.0, "15000."))
+                .is_echo_of(&EchoCandidate::from_segment(&them(0.0, 5.0, "1500.")), &cfg)
+        );
+        let (out, stats) = cleanup(
+            vec![
+                them(0.0, 5.0, "The orchard grows purple plums."),
+                me(1.0, 2.0, "OKAY!"),
+            ],
+            &CleanupConfig::default(),
+            &[],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.backchannels_dropped, 1);
+    }
+
+    #[test]
+    fn protected_input_indices_survive_sorting_duplicate_text_and_equal_times() {
+        let duplicate = me(10.0, 11.0, "Um, ready.");
+        let result = cleanup_with_protected_decisions(
+            vec![duplicate.clone(), them(0.0, 1.0, "Earlier."), duplicate],
+            &CleanupConfig {
+                echo_drop: false,
+                merge_gap_seconds: 0.0,
+                ..CleanupConfig::default()
+            },
+            &[],
+            None,
+            None,
+            &[2],
+        );
+        assert_eq!(
+            texts(&result.segments),
+            vec!["Earlier.", "Ready.", "Um, ready."]
+        );
+        assert_eq!(result.stats.fillers_removed, 1);
+        assert!(result.decisions.entries().iter().any(|decision| {
+            decision.stage == CleanupStage::Sort && decision.input_indices == [0]
+        }));
+    }
+
+    #[test]
+    fn merged_rows_preserve_protection_from_either_input() {
+        for protected_index in [0, 1] {
+            let result = cleanup_with_protected_decisions(
+                vec![me(0.0, 1.0, "Um,"), me(1.1, 2.0, "15 square um.")],
+                &CleanupConfig {
+                    echo_drop: false,
+                    ..CleanupConfig::default()
+                },
+                &[],
+                None,
+                None,
+                &[protected_index],
+            );
+            assert_eq!(texts(&result.segments), vec!["Um, 15 square um."]);
+            assert_eq!(result.stats.merged, 1);
+            assert_eq!(result.stats.fillers_removed, 0);
+        }
+    }
+
+    #[test]
+    fn raw_protection_survives_omitted_echo_decisions() {
+        let prefix = "x".repeat(CLEANUP_DECISION_BYTES / 2 + 1);
+        let segments = vec![
+            them(10.0, 15.0, &format!("{prefix} unit mm.")),
+            me(11.0, 14.0, &format!("{prefix} unit um.")),
+        ];
+        let quiet = evidence_of(8, 0.0, 0.0);
+        let result = cleanup_with_decisions(
+            segments.clone(),
+            &CleanupConfig::default(),
+            &[],
+            Some(&quiet),
+            None,
+        );
+        assert_eq!(result.segments, segments);
+        assert_eq!(result.stats.changed(), 0);
+        assert!(result.decisions.entries().is_empty());
+        assert_eq!(result.decisions.omitted, 2);
+        assert_eq!(result.decisions.bytes(), 0);
+    }
+
+    #[test]
+    fn full_cleanup_keeps_distinct_raw_values_during_stutter_removal() {
+        for text in [
+            "The gateway uses 15mm 15mM today.",
+            "The gateway uses v1.5 v15 today.",
+            "The gateway uses AB-15 AB-150 today.",
+            "The gateway uses mW MW today.",
+            "The gateway uses 15mm wide 15mM wide today.",
+        ] {
+            let segments = vec![me(10.0, 15.0, text)];
+            let (out, stats) = cleanup(segments.clone(), &CleanupConfig::default(), &[]);
+            assert_eq!(out, segments, "{text}");
+            assert_eq!(stats.changed(), 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn full_cleanup_preserves_raw_values_through_filler_sentence_repairs() {
+        let mut failures = Vec::new();
+        for (text, expected) in [
+            (
+                "The gateway uses um Ah 15 today.",
+                "The gateway uses um Ah 15 today.",
+            ),
+            ("Um, mM 15.", "mM 15."),
+            ("Um, mm 5.", "mm 5."),
+            ("Marker um, Ah.", "Marker Ah."),
+            ("Contact um, Ada.", "Contact Ada."),
+            ("Contact um, Will.", "Contact Will."),
+            ("Contact um, May.", "Contact May."),
+            ("Um, @ready.", "@ready."),
+            ("The ticket is @um.", "The ticket is @um."),
+            ("The ticket is #ah.", "The ticket is #ah."),
+            ("The ticket is um/.", "The ticket is um/."),
+            ("Read @ready ready now.", "Read @ready ready now."),
+            ("Read foo/bar foobar now.", "Read foo/bar foobar now."),
+        ] {
+            let (out, _) = cleanup(vec![me(10.0, 15.0, text)], &CleanupConfig::default(), &[]);
+            if out != vec![me(10.0, 15.0, expected)] {
+                failures.push(format!("{text:?} became {:?}", texts(&out)));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn full_cleanup_keeps_critical_values_in_backchannel_shaped_turns() {
+        let double_talk = evidence_of(8, 0.0, 0.75);
+        let mut failures = Vec::new();
+        for text in [
+            "Okay, 15000.",
+            "I see 15000.",
+            "Okay, 1.2.4.",
+            "I see #15000.",
+            "Okay1.",
+            "@Okay.",
+            "#Okay.",
+            "Okay mM.",
+            "Okay Ah.",
+            "Okay 15mm.",
+        ] {
+            for me_first in [false, true] {
+                for evidence in [None, Some(&double_talk as AudioEvidence<'_>)] {
+                    let source = "The gateway remains available today.";
+                    let segments = if me_first {
+                        vec![me(10.0, 15.0, source), them(11.0, 14.0, text)]
+                    } else {
+                        vec![them(10.0, 15.0, source), me(11.0, 14.0, text)]
+                    };
+                    let (out, stats) = cleanup_with_evidence(
+                        segments.clone(),
+                        &CleanupConfig::default(),
+                        &[],
+                        evidence,
+                    );
+                    if out != segments || stats.changed() != 0 {
+                        failures.push(format!(
+                            "{text} me_first={me_first} evidence={} kept={}",
+                            evidence.is_some(),
+                            out.len()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn every_matched_source_is_checked_before_acoustic_deletion() {
+        let quiet = evidence_of(8, 0.0, 0.0);
+        let subject = me(
+            12.0,
+            14.0,
+            "We should not deploy the payment gateway today.",
+        );
+        let earlier = them(10.0, 11.0, "We should deploy the payment gateway today.");
+        let overlapping = them(11.5, 15.0, &subject.text);
+        for carry in [
+            vec![earlier.clone(), overlapping.clone()],
+            vec![overlapping, earlier],
+        ] {
+            let result = cleanup_with_decisions(
+                vec![subject.clone()],
+                &echo_only(),
+                &carry,
+                Some(&quiet),
+                None,
+            );
+            assert_eq!(result.segments.len(), 1);
+            let decision = &result.decisions.entries()[0];
+            assert_eq!(
+                decision.reason,
+                CleanupReason::Echo(EchoVerdict::KeepCriticalDifference)
+            );
+            assert_eq!(decision.source.unwrap().start, 10.0);
+        }
+        // A source beginning later still overlaps the mic and must not bypass critical protection.
+        let result = cleanup_with_decisions(
+            vec![
+                subject,
+                them(13.0, 15.0, "We should deploy the payment gateway today."),
+            ],
+            &echo_only(),
+            &[],
+            Some(&quiet),
+            None,
+        );
+        assert_eq!(result.segments.len(), 2);
+        assert_eq!(result.stats.echo_dropped_audio, 0);
+    }
+
+    #[test]
+    fn raw_critical_signature_preserves_unknown_words_and_numeric_forms() {
+        for (a, b) in [
+            ("gateway build 1.5", "gateway build 15"),
+            ("gateway draw .5", "gateway draw 5"),
+            ("gateway draw 15 mW", "gateway draw 15 MW"),
+            ("gateway owner Ada", "gateway owner Bea"),
+            ("gateway ticket AB-15", "gateway ticket AB-150"),
+            ("gateway cost $15", "gateway cost 15"),
+            ("gateway nunca listo", "gateway listo"),
+            ("gateway jamás listo", "gateway listo"),
+            ("gateway without retry", "gateway with retry"),
+            ("gateway no longer ready", "gateway ready"),
+            ("gateway alpha beta", "gateway beta alpha"),
+        ] {
+            assert_ne!(critical_tokens(a), critical_tokens(b));
+        }
+        assert_eq!(
+            critical_tokens("The gateway is ready."),
+            critical_tokens("gateway ready")
+        );
+        assert_eq!(
+            critical_tokens("Um, gateway ready!"),
+            vec!["Um", "gateway", "ready"]
+        );
+    }
+
+    #[test]
+    fn generated_attenuated_echo_and_grammar_paraphrase_are_removed_with_real_aec_evidence() {
+        use corti_aec::{AecConfig, StreamingAec, span_stats};
+        let rate = 8_000;
+        let count = rate as usize * 4;
+        let mut seed = 19_u32;
+        let far: Vec<f32> = (0..count)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 0.8
+            })
+            .collect();
+        let delay = 24;
+        let mic: Vec<f32> = (0..count)
+            .map(|i| {
+                if i >= delay {
+                    0.3 * far[i - delay]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let cfg = AecConfig {
+            filter_len: 128,
+            ..AecConfig::default()
+        };
+        let mut aec = StreamingAec::new_with_lookahead(rate, cfg, rate as usize);
+        let mut clean = aec.push(&mic, &far);
+        let mut blocks = aec.block_stats();
+        let tail = aec.finish_with_stats();
+        clean.extend(tail.audio);
+        blocks.extend(tail.stats);
+        assert_eq!(clean.len(), mic.len());
+        let evidence = |start, end| {
+            span_stats(&blocks, start, end).map(|s| SpanEvidence {
+                mic_db: s.mean_mic_db,
+                echo_estimate_db: s.mean_echo_estimate_db,
+                double_talk_fraction: s.double_talk_fraction,
+                blocks: s.blocks,
+            })
+        };
+        let mut false_negatives = 0;
+        for (label, text, carry) in [
+            ("delayed_copy", "The gateway is ready today.", false),
+            ("grammar_paraphrase", "gateway ready today.", false),
+            ("window_boundary", "The gateway is ready today.", true),
+        ] {
+            let source = them(0.5, 3.0, "The gateway is ready today.");
+            let subject = me(1.0, 2.5, text);
+            let (input, carry) = if carry {
+                (vec![subject.clone()], vec![source])
+            } else {
+                (vec![source, subject.clone()], vec![])
+            };
+            let result = cleanup_with_decisions(input, &echo_only(), &carry, Some(&evidence), None);
+            false_negatives += usize::from(result.segments.iter().any(is_me));
+            assert_eq!(result.stats.echo_dropped_audio, 1);
+            let decision = result
+                .decisions
+                .entries()
+                .iter()
+                .find(|d| d.reason == CleanupReason::Echo(EchoVerdict::DropAcoustic))
+                .unwrap();
+            assert_eq!(decision.originals, vec![subject]);
+            assert!(decision.replacements.is_empty());
+            assert_eq!(decision.source.unwrap().start, 0.5);
+            assert!(decision.evidence.unwrap().blocks > 0);
+            println!("case={label} false_positives=0 false_negatives={false_negatives}");
+        }
+        println!("acoustic_cases false_positives=0 false_negatives={false_negatives}");
+        assert_eq!(false_negatives, 0);
+    }
+
+    #[test]
+    fn decisions_preserve_every_stage_input_span_text_and_replacement() {
+        struct RouterRule;
+        impl TextRule for RouterRule {
+            fn apply(&self, text: &str) -> Option<String> {
+                text.contains("gateway")
+                    .then(|| text.replace("gateway", "router"))
+            }
+        }
+        let result = cleanup_with_decisions(
+            vec![
+                me(22.0, 23.0, "responds."),
+                them(0.0, 10.0, "Our orchard holds purple plums."),
+                me(20.0, 21.0, "Um, the the gateway"),
+                me(1.0, 1.5, "Yeah."),
+            ],
+            &CleanupConfig {
+                echo_drop: false,
+                ..CleanupConfig::default()
+            },
+            &[],
+            None,
+            Some(&RouterRule),
+        );
+        assert_eq!(
+            texts(&result.segments),
+            vec!["Our orchard holds purple plums.", "The router responds."]
+        );
+        let entries = result.decisions.entries();
+        assert!(entries.iter().any(|d| d.stage == CleanupStage::Sort));
+        let merged = entries
+            .iter()
+            .find(|d| d.stage == CleanupStage::Merge)
+            .unwrap();
+        assert_eq!(merged.input_indices, vec![2, 3]);
+        assert_eq!(
+            texts(&merged.originals),
+            vec!["Um, the the gateway", "responds."]
+        );
+        assert_eq!(
+            (merged.replacements[0].start, merged.replacements[0].end),
+            (20.0, 23.0)
+        );
+        let backchannel = entries
+            .iter()
+            .find(|d| d.stage == CleanupStage::Backchannel)
+            .unwrap();
+        assert_eq!(backchannel.input_indices, vec![1]);
+        assert_eq!(texts(&backchannel.originals), vec!["Yeah."]);
+        assert!(backchannel.replacements.is_empty());
+        let filler = entries
+            .iter()
+            .find(|d| d.stage == CleanupStage::Fillers)
+            .unwrap();
+        assert_eq!(filler.input_indices, vec![1]);
+        assert_eq!(texts(&filler.replacements), vec!["The gateway responds."]);
+        let lexicon = entries
+            .iter()
+            .find(|d| d.stage == CleanupStage::Lexicon)
+            .unwrap();
+        assert_eq!(texts(&lexicon.originals), vec!["The gateway responds."]);
+        assert_eq!(texts(&lexicon.replacements), vec!["The router responds."]);
+    }
+
+    #[test]
+    fn suspected_and_early_kept_regions_are_recorded_without_losing_originals() {
+        let text = "Please restart the production gateway now.";
+        let result = cleanup_with_decisions(
+            vec![them(0.0, 5.0, text), me(1.0, 4.0, text)],
+            &echo_only(),
+            &[],
+            None,
+            None,
+        );
+        assert_eq!(result.segments.len(), 2);
+        let decision = &result.decisions.entries()[1];
+        assert_eq!(
+            decision.reason,
+            CleanupReason::Echo(EchoVerdict::SuspectedDuplicate)
+        );
+        assert_eq!(decision.input_indices, vec![1]);
+        assert_eq!(decision.originals, decision.replacements);
+        assert_eq!(
+            decision.source,
+            Some(EchoSource {
+                me: false,
+                start: 0.0,
+                end: 5.0
+            })
+        );
+        let mut decisions = CleanupDecisions::default();
+        decisions.record_echo(
+            CleanupStage::EarlyEcho,
+            42,
+            &result.segments[1],
+            EchoVerdict::Keep,
+            None,
+        );
+        assert_eq!(decisions.entries()[0].input_indices, vec![42]);
+        assert_eq!(
+            decisions.entries()[0].originals,
+            decisions.entries()[0].replacements
+        );
+    }
+
+    #[test]
+    fn decision_payload_is_bounded_before_cloning_and_across_appends() {
+        let mut decisions = CleanupDecisions::default();
+        let oversized = me(0.0, 1.0, &"x".repeat(CLEANUP_DECISION_BYTES + 1));
+        decisions.record_echo(
+            CleanupStage::EarlyEcho,
+            0,
+            &oversized,
+            EchoVerdict::Keep,
+            None,
+        );
+        assert!(decisions.entries().is_empty());
+        assert_eq!(decisions.bytes(), 0);
+        assert_eq!(decisions.omitted, 1);
+        let large = me(0.0, 1.0, &"x".repeat(CLEANUP_DECISION_BYTES / 4));
+        decisions.record_echo(CleanupStage::EarlyEcho, 1, &large, EchoVerdict::Keep, None);
+        let mut next = CleanupDecisions::default();
+        next.record_echo(CleanupStage::EarlyEcho, 2, &large, EchoVerdict::Keep, None);
+        next.record_echo(
+            CleanupStage::EarlyEcho,
+            3,
+            &oversized,
+            EchoVerdict::Keep,
+            None,
+        );
+        decisions.append(next);
+        assert_eq!(decisions.entries().len(), 1);
+        assert_eq!(decisions.omitted, 3);
+        assert!(decisions.bytes() <= CLEANUP_DECISION_BYTES);
+        // A large record does not prevent a subsequent small decision from being retained.
+        decisions.record_echo(
+            CleanupStage::EarlyEcho,
+            4,
+            &me(1.0, 2.0, "No."),
+            EchoVerdict::Keep,
+            None,
+        );
+        assert_eq!(decisions.entries().len(), 2);
+        assert_eq!(decisions.omitted, 3);
+    }
+
+    #[test]
+    fn later_copy_of_a_far_end_utterance_is_kept_without_evidence() {
         let segments = vec![
             them(
                 10.0,
@@ -1108,14 +2791,17 @@ mod tests {
         let (out, stats) = cleanup(segments, &echo_only(), &[]);
         assert_eq!(
             texts(&out),
-            vec!["We should rotate the widget calibration before Friday."]
+            vec![
+                "We should rotate the widget calibration before Friday.",
+                "Rotate the widget calibration."
+            ]
         );
-        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(stats.echo_dropped_me, 0);
         assert_eq!(stats.echo_dropped_them, 0);
     }
 
     #[test]
-    fn one_source_kills_every_copy_inside_its_window() {
+    fn one_source_keeps_every_copy_without_evidence() {
         let segments = vec![
             them(
                 10.0,
@@ -1126,8 +2812,8 @@ mod tests {
             me(18.0, 19.0, "Widget calibration rotate."),
         ];
         let (out, stats) = cleanup(segments, &echo_only(), &[]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(stats.echo_dropped_me, 2);
+        assert_eq!(out.len(), 3);
+        assert_eq!(stats.echo_dropped_me, 0);
     }
 
     /// Two of three content tokens shared is 0.67 — below the 0.7 threshold, so a genuinely different
@@ -1149,17 +2835,17 @@ mod tests {
         assert_eq!(out.len(), 2, "0.67 containment must not be an echo");
         assert_eq!(stats.echo_dropped_me, 0);
 
-        // …and it is genuinely a threshold, not an accident of the fixture.
+        // Lowering the text-match threshold still cannot authorize deletion.
         let loose = CleanupConfig {
             echo_containment: 0.6,
             ..echo_only()
         };
         let (out, _) = cleanup(near_miss_fixture(), &loose, &[]);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
-    fn one_word_phantom_inside_a_far_end_span_is_dropped_but_a_later_one_is_kept() {
+    fn one_word_candidates_inside_and_after_a_far_end_span_are_kept_without_evidence() {
         let segments = vec![
             them(
                 20.0,
@@ -1170,9 +2856,9 @@ mod tests {
             me(31.0, 31.5, "Gateway."),
         ];
         let (out, stats) = cleanup(segments, &echo_only(), &[]);
-        assert_eq!(stats.echo_dropped_me, 1, "only the contained span is echo");
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[1].start, 31.0);
+        assert_eq!(stats.echo_dropped_me, 0);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].start, 31.0);
     }
 
     #[test]
@@ -1282,33 +2968,35 @@ mod tests {
         let (out, stats) = cleanup(segments, &echo_only(), &carry);
         assert_eq!(
             texts(&out),
-            vec!["The dashboard still renders yesterday's totals."],
+            vec![
+                "Rotate the widget calibration.",
+                "The dashboard still renders yesterday's totals."
+            ],
             "the carried source must not be re-emitted"
         );
-        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(stats.echo_dropped_me, 0);
         assert_eq!(carry.len(), 1, "carry is read-only");
     }
 
-    /// A dropped copy must not become a source: the far end repeating itself right after our echo is real
-    /// speech and has to survive.
+    /// A text match cannot start a deletion chain; all repeats survive without acoustic evidence.
     #[test]
-    fn echoes_do_not_chain_through_a_dropped_copy() {
+    fn text_only_candidates_never_start_a_deletion_chain() {
         let segments = vec![
             them(10.0, 12.0, "Rotate the widget calibration."),
             me(13.0, 14.0, "Rotate the widget calibration."),
             them(15.0, 17.0, "Rotate the widget calibration, yes."),
         ];
         let (out, stats) = cleanup(segments, &echo_only(), &[]);
-        assert_eq!(out.len(), 2);
-        assert_eq!(stats.echo_dropped_me, 1);
+        assert_eq!(out.len(), 3);
+        assert_eq!(stats.echo_dropped_me, 0);
         assert_eq!(stats.echo_dropped_them, 0);
-        assert!(!is_me(&out[1]));
+        assert!(!is_me(&out[2]));
     }
 
     #[test]
-    fn stats_count_every_pass_and_both_echo_directions() {
+    fn stats_count_structural_changes_without_text_only_echo_deletions() {
         let segments = vec![
-            // Me first, so this pair counts as a far-end echo of us.
+            // Me first; the far-end repetition must survive.
             me(0.0, 3.0, "The retention sweep runs hourly now."),
             them(4.0, 5.5, "Retention sweep hourly."),
             // A far-end utterance echoed back onto the mic.
@@ -1328,8 +3016,8 @@ mod tests {
         assert_eq!(
             stats,
             CleanupStats {
-                echo_dropped_me: 1,
-                echo_dropped_them: 1,
+                echo_dropped_me: 0,
+                echo_dropped_them: 0,
                 merged: 1,
                 backchannels_dropped: 1,
                 echo_dropped_audio: 0,
@@ -1342,7 +3030,9 @@ mod tests {
             texts(&out),
             vec![
                 "The retention sweep runs hourly now.",
+                "Retention sweep hourly.",
                 "The gateway is what times out when the queue backs up.",
+                "Gateway.",
                 "I will send the summary after this call.",
             ]
         );
@@ -1412,8 +3102,8 @@ mod tests {
         ];
         let (out, stats) = cleanup(segments, &structural(), &[]);
         assert_eq!(
-            stats.echo_dropped_me, 1,
-            "the out-of-order echo is still caught"
+            stats.echo_dropped_me, 0,
+            "the out-of-order candidate is kept without evidence"
         );
         assert_eq!(stats.merged, 1, "the out-of-order fragments still merge");
         assert_eq!(
@@ -1421,11 +3111,12 @@ mod tests {
             vec![
                 "Let's start.",
                 "The gateway is what times out when the queue backs up.",
+                "Gateway.",
                 "I will send the summary after this call.",
             ]
         );
         let starts: Vec<f64> = out.iter().map(|s| s.start).collect();
-        assert_eq!(starts, vec![5.0, 20.0, 60.0]);
+        assert_eq!(starts, vec![5.0, 20.0, 22.0, 60.0]);
     }
 
     #[test]
@@ -1433,6 +3124,8 @@ mod tests {
         for (input, expected, fillers, stutters) in [
             ("Um, the gateway is down.", "The gateway is down.", 1, 0),
             ("the the gateway", "the gateway", 0, 1),
+            ("15mm 15mm", "15mm", 0, 1),
+            ("15mm wide 15mm wide", "15mm wide", 0, 1),
             (
                 "I think I think we should ship",
                 "I think we should ship",
@@ -1549,6 +3242,7 @@ mod tests {
     fn backchannel_recognition_covers_phrases_and_combinations() {
         for text in [
             "Yeah.",
+            "OKAY!",
             "Yeah, yeah.",
             "Okay yeah.",
             "Uh-huh.",
@@ -1700,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    fn a_span_with_no_blocks_falls_through_to_the_text_rules() {
+    fn a_span_with_no_blocks_is_kept_even_when_text_matches() {
         let segments = vec![
             them(
                 10.0,
@@ -1714,13 +3408,14 @@ mod tests {
         let empty = evidence_of(0, -40.0, 0.0);
         let (out, stats) = cleanup_with_evidence(segments.clone(), &echo_only(), &[], Some(&empty));
         assert_eq!(stats.echo_dropped_audio, 0);
-        // The text echo rule still fires on the row that repeats the far end.
-        assert_eq!(stats.echo_dropped_me, 1);
+        // A text match is recorded but cannot delete the repeated row.
+        assert_eq!(stats.echo_dropped_me, 0);
         assert_eq!(
             texts(&out),
             vec![
                 "The calibration jig arrives from Toronto on Tuesday.",
                 "Gateway harness.",
+                "Calibration jig from Toronto.",
             ]
         );
 
@@ -1728,8 +3423,8 @@ mod tests {
         let absent = |_s: f64, _e: f64| None;
         let (out, stats) = cleanup_with_evidence(segments, &echo_only(), &[], Some(&absent));
         assert_eq!(stats.echo_dropped_audio, 0);
-        assert_eq!(stats.echo_dropped_me, 1);
-        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_me, 0);
+        assert_eq!(out.len(), 3);
     }
 
     #[test]
@@ -1823,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn a_very_negative_margin_switches_the_audio_rule_off_without_touching_the_text_rules() {
+    fn a_very_negative_margin_switches_echo_deletion_off() {
         let segments = vec![
             them(
                 10.0,
@@ -1840,7 +3535,7 @@ mod tests {
         let quiet_mic = evidence_of(4, 0.0, 0.0);
         let (out, stats) = cleanup_with_evidence(segments, &cfg, &[], Some(&quiet_mic));
         assert_eq!(stats.echo_dropped_audio, 0);
-        assert_eq!(stats.echo_dropped_me, 1);
-        assert_eq!(out.len(), 2);
+        assert_eq!(stats.echo_dropped_me, 0);
+        assert_eq!(out.len(), 3);
     }
 }

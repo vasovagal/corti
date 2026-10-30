@@ -14,3 +14,5 @@ screenshots/test-results/
 screenshots/playwright-report/
 # tauri_build-generated ACL/capability schemas (regenerated each build)
 app/gen/
+# Python bytecode from the quality and boundary scripts
+__pycache__/

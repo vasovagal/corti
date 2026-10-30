@@ -99,6 +99,27 @@ bounded queue (`AUDIO_BACKLOG`, `live.rs:294`) and, when the decoder falls behin
 it (`LiveSink::dropped_chunks`) rather than growing unbounded. Dropping the sink flushes and ends the stream;
 reaching `None` joins the worker thread (`live.rs:337`).
 
+EOF means the worker has ended; it is not a completeness certificate. After EOF,
+`LiveWordStream::completion()` exposes a bounded `LiveStreamCompletion`: its
+`decode_report()` retains typed region outcomes and omission counts,
+`decode_complete()` describes decoding of admitted input, `worker_failed()`
+identifies a worker failure, and `dropped_chunks()` retains the existing
+rejected-send count. That count does not measure source frames or buffered audio
+abandoned by a failed worker; the independent worker-failure flag discloses that
+failure. Metadata-only omissions do not turn successful decoding into failure.
+An incomplete decode, worker failure, or known queue drop emits one fixed,
+content-free terminal diagnostic. Surviving words keep their original order and
+timestamps; no failure is represented by an invented word or an automatic retry.
+
+Report spans and word times use the worker's admitted-input coordinates. Queue
+drops are separately counted; those coordinates must not be treated as an exact
+source timeline after a drop. A recording owner can bind known admitted input to
+its existing capture epochs and shared quality record. The adapter does not
+invent that source mapping. The constructor and `Stream<Item = Vec<Word>>`
+remain unchanged; consumers that need completion information must inspect the
+terminal record. The adapter never logs a panic payload; Rust's process panic
+hook is a separate runtime facility and is not replaced.
+
 **Design stance: sync core, async at the edge (guardrail 9).** The engine has no runtime — the same reason the
 capture HAL callbacks only ever hand work to a channel. `tokio`/`futures-core` are pulled **only** by
 `corti-transcribe-local`'s `stream` feature — never its default build — and are pinned in the workspace root

@@ -5,10 +5,22 @@
 //! single VAD speech region is behind this enum, so switching engines isolates exactly the ASR runtime
 //! (ONNX Runtime CPU vs GGML/Metal) for an apples-to-apples benchmark.
 
+use corti_transcribe::decode::RegionStatus;
 use corti_transcribe::segment::Word;
 use sherpa_onnx::OfflineRecognizer;
 
 use crate::engine;
+
+/// Content stays on the word path; the report carries only the status and input interval.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DecodedRegion {
+    pub(crate) words: Vec<Word>,
+    pub(crate) status: RegionStatus,
+}
+
+pub(crate) trait RegionDecoder: Send + Sync {
+    fn decode(&self, samples_16k: &[f32], offset_sec: f64) -> DecodedRegion;
+}
 
 /// One loaded ASR engine, shared across channels via `Arc` (both variants are `Send + Sync`).
 pub enum Asr {
@@ -20,16 +32,22 @@ pub enum Asr {
     Ggml(crate::ggml::GgmlAsr),
 }
 
-impl Asr {
+impl RegionDecoder for Asr {
     /// Decode one 16 kHz mono VAD speech region and lift its word timestamps to absolute time.
-    /// Engine trouble on a region yields no words (logged), never an error — one bad region must not
-    /// sink the whole job.
-    pub(crate) fn asr_segment(&self, samples_16k: &[f32], offset_sec: f64) -> Vec<Word> {
+    /// A failed region does not discard words decoded from other regions.
+    fn decode(&self, samples_16k: &[f32], offset_sec: f64) -> DecodedRegion {
         match self {
             Asr::Sherpa(rec) => engine::asr_segment(rec, samples_16k, offset_sec),
             #[cfg(feature = "ggml")]
             Asr::Ggml(g) => g.asr_segment(samples_16k, offset_sec),
         }
+    }
+}
+
+#[cfg(test)]
+impl Asr {
+    pub(crate) fn asr_segment(&self, samples_16k: &[f32], offset_sec: f64) -> Vec<Word> {
+        self.decode(samples_16k, offset_sec).words
     }
 }
 

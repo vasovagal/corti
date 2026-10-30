@@ -18,7 +18,7 @@ webview), where a file is IPC across a boundary that doesn't exist. Here the rea
 
 ## Decision
 
-corti may perform exactly four writes beyond `add-note`, all confined to `corti-vagus` and only
+corti may perform the following bounded writes beyond `add-note`, all confined to `corti-vagus` and only
 against a path `vagus add-note --print-path` returned for a recording corti is processing:
 
 1. **Append** body content: transcript segments while the recording is live, and a terse
@@ -34,12 +34,15 @@ against a path `vagus add-note --print-path` returned for a recording corti is p
    operation replace/insert only Corti's `corti:` frontmatter field with the durable batch provenance before
    writing the canonical body. Never a second note.
 4. **Delete** the note when its recording is discarded (too short / capture error).
+5. **Refresh only Corti's provenance field** on the current recording's owned note, preserving the
+   existing body bytes and inode. The capture-quality amendment to ADR 0014 defines the prefix/buffer
+   limits, failure behavior, and recovery authority. This cannot expose a general vault read API.
 
 Nothing else in the vault, ever — no index writes, no other files, no notes corti didn't create.
 
 ## Consequences
 
-- ADR 0001's boundary widens by these four operations but stays in one crate (`corti-vagus/src/note.rs`);
+- ADR 0001's boundary widens by these operations but stays in one crate (`corti-vagus/src/note.rs`);
   everything else remains unaware of vagus.
 - ADR 0008's "no live on-disk transcript" stance holds for the in-process window; it no longer covers
   external readers.

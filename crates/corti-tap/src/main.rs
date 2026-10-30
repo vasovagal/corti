@@ -8,6 +8,15 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "inbox")]
+mod inbox_quality;
+#[cfg(all(feature = "live", any(target_os = "macos", test)))]
+mod live_quality;
+#[cfg(all(feature = "live", target_os = "macos", not(test)))]
+use corti_capture::CaptureChunk as LiveCaptureChunk;
+#[cfg(all(feature = "live", test))]
+use live_quality::tests::capture::CaptureChunk as LiveCaptureChunk;
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
@@ -72,21 +81,26 @@ fn run() -> anyhow::Result<()> {
     }
 
     eprintln!("\nstopping capture…");
-    let wav = if args.no_mic {
-        recorder.finish_tap_only().context("finishing capture")?
+    let finished = if args.no_mic {
+        recorder
+            .finish_tap_only_with_processing()
+            .context("finishing capture")?
     } else {
-        recorder.finish().context("finishing capture")?
+        recorder
+            .finish_with_processing()
+            .context("finishing capture")?
     };
-    eprintln!("wrote {}", wav.display());
+    eprintln!("wrote {}", finished.path.display());
 
     #[cfg(feature = "inbox")]
     if args.inbox {
-        file_to_inbox(&args.label, &wav)?;
+        file_to_inbox(&args.label, &finished)?;
     }
 
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 struct Args {
     label: String,
     no_mic: bool,
@@ -96,7 +110,9 @@ struct Args {
     inbox: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Args {
+    #[cfg(target_os = "macos")]
     fn parse() -> Self {
         let mut label = "System audio".to_string();
         let mut no_mic = false;
@@ -156,6 +172,7 @@ impl Args {
 }
 
 fn install_sigint_handler() {
+    #[cfg(not(test))]
     unsafe {
         libc::signal(
             libc::SIGINT,
@@ -164,6 +181,7 @@ fn install_sigint_handler() {
     }
 }
 
+#[cfg(not(test))]
 extern "C" fn sigint_handler(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
@@ -172,13 +190,20 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 /// stdout as they arrive. The mic channel is echo-cancelled and labelled `Me`; the tap channel is a second
 /// transcriber labelled `Them`. AEC warm-up (`CORTI_AEC_LOOKAHEAD_SECS`, default 5 s) delays the first mic
 /// words.
-#[cfg(all(feature = "live", target_os = "macos"))]
+#[cfg(all(feature = "live", any(target_os = "macos", test)))]
 fn run_live(args: &Args) -> anyhow::Result<()> {
     use anyhow::Context;
     use corti_aec::{AecConfig, StreamingAec};
-    use corti_capture::{CaptureChunk, CaptureTee, Recorder};
+    #[cfg(not(test))]
+    use corti_capture::{CaptureTee, Recorder};
     use corti_core::OwningApp;
+    #[cfg(not(test))]
     use corti_transcribe_local::{LocalConfig, LocalTranscriber};
+    #[cfg(test)]
+    use live_quality::tests::{
+        capture::{CaptureTee, Recorder},
+        native::{LocalConfig, LocalTranscriber},
+    };
     use std::sync::mpsc::{RecvTimeoutError, sync_channel};
     use std::time::Duration;
 
@@ -186,15 +211,15 @@ fn run_live(args: &Args) -> anyhow::Result<()> {
     let engine = LocalTranscriber::new(LocalConfig::default())
         .live_engine()
         .context("loading local models (run crates/corti-transcribe-local/fetch-models.sh)")?;
-    let mut mic_live = if args.no_mic {
+    let mic_live = if args.no_mic {
         None
     } else {
         Some(engine.channel()?)
     };
-    let mut them_live = engine.channel()?;
+    let them_live = engine.channel()?;
 
     // Bounded, lossy tee: ~32 chunks ≈ 2.7 s of slack at 48 kHz before it starts dropping.
-    let (tx, rx) = sync_channel::<CaptureChunk>(32);
+    let (tx, rx) = sync_channel::<LiveCaptureChunk>(32);
     let tee = CaptureTee::new(tx);
     let dropped = tee.dropped_counter();
 
@@ -211,7 +236,7 @@ fn run_live(args: &Args) -> anyhow::Result<()> {
     let rate = recorder.sample_rate();
 
     // Streaming AEC on the mic (skipped under --no-mic). Honors CORTI_AEC_LOOKAHEAD_SECS.
-    let mut aec = if args.no_mic {
+    let aec = if args.no_mic {
         None
     } else {
         Some(StreamingAec::new(rate, AecConfig::default()))
@@ -224,12 +249,13 @@ fn run_live(args: &Args) -> anyhow::Result<()> {
             "  note: AEC lookahead delays the first mic words (~CORTI_AEC_LOOKAHEAD_SECS, default 5 s)"
         );
     }
+    let mut preview = live_quality::Preview::new(mic_live, them_live, aec);
 
     install_sigint_handler();
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(chunk) => {
-                process_live_chunk(chunk, aec.as_mut(), mic_live.as_mut(), &mut them_live, rate);
+                process_live_chunk(chunk, &mut preview, rate);
                 // Chunks arrive continuously (~85 ms), so the Timeout arm rarely fires — check STOP here
                 // too or Ctrl-C could never break the loop.
                 if STOP.load(Ordering::Relaxed) {
@@ -246,29 +272,26 @@ fn run_live(args: &Args) -> anyhow::Result<()> {
     }
 
     eprintln!("\nstopping capture…");
-    let wav = if args.no_mic {
-        recorder.finish_tap_only()
+    let wav = recorder.output_path().to_path_buf();
+    let finished = if args.no_mic {
+        recorder.finish_tap_only_with_processing()
     } else {
-        recorder.finish()
-    }
-    .context("finishing capture")?;
+        recorder.finish_with_processing()
+    };
 
     // Drain chunks teed after STOP (stopping the recorder drops the tee sender).
     while let Ok(chunk) = rx.try_recv() {
-        process_live_chunk(chunk, aec.as_mut(), mic_live.as_mut(), &mut them_live, rate);
+        process_live_chunk(chunk, &mut preview, rate);
     }
 
-    // Flush the AEC tail into the mic transcriber, then finish both channels.
-    if let (Some(aec), Some(mic)) = (aec.take(), mic_live.as_mut()) {
-        let tail = aec.finish();
-        if !tail.is_empty() {
-            mic.push(&tail, rate);
-        }
-    }
-    if let Some(mic) = mic_live.as_mut() {
-        print_words("Me", &mic.finish());
-    }
-    print_words("Them", &them_live.finish());
+    // Flush real tails and drain their typed reports before publishing settled history. No decoder
+    // retry or batch backend is involved; the retained WAV remains available even after a failure.
+    preview.finish(rate, &mut print_words);
+    let capture = finished
+        .as_ref()
+        .ok()
+        .and_then(|recording| recording.processing.quality.as_ref());
+    let settled = preview.settle_and_persist(&wav, capture);
 
     let n = dropped.load(Ordering::Relaxed);
     if n > 0 {
@@ -276,47 +299,46 @@ fn run_live(args: &Args) -> anyhow::Result<()> {
             "warning: dropped {n} live tee chunk(s) — transcript may have gaps (consumer fell behind)"
         );
     }
-    eprintln!("wrote {}", wav.display());
-    Ok(())
+    if finished.is_err() {
+        if let Ok(quality) = &settled {
+            let _ = live_quality::terminal_status(quality, n);
+        } else {
+            eprintln!(
+                "live quality history could not be retained after capture finalization failed"
+            );
+        }
+    }
+    let finished = finished.context("finishing capture")?;
+    eprintln!("wrote {}", finished.path.display());
+    let quality = settled?;
+    live_quality::terminal_status(&quality, n)
 }
 
 /// Feed one downmixed capture chunk to the live transcribers, printing any words that fell out. The mic side
 /// is echo-cancelled first (empty output while the filter warms); the tap side is transcribed raw.
-#[cfg(all(feature = "live", target_os = "macos"))]
-fn process_live_chunk(
-    chunk: corti_capture::CaptureChunk,
-    aec: Option<&mut corti_aec::StreamingAec>,
-    mic_live: Option<&mut corti_transcribe_local::LiveTranscriber>,
-    them_live: &mut corti_transcribe_local::LiveTranscriber,
+#[cfg(all(feature = "live", any(target_os = "macos", test)))]
+fn process_live_chunk<C: live_quality::Channel>(
+    chunk: LiveCaptureChunk,
+    preview: &mut live_quality::Preview<C>,
     rate: u32,
 ) {
-    if let Some(mic) = mic_live {
-        // Gate the AEC/mic side on the actual data, not `--no-mic`: a mic-mode capture can still deliver an
-        // empty (or length-mismatched) mic channel, and `StreamingAec::push` asserts `mic.len() == far.len()`.
-        let clean = match aec {
-            Some(aec) if !chunk.mic.is_empty() && chunk.mic.len() == chunk.tap.len() => {
-                aec.push(&chunk.mic, &chunk.tap) // cleaned mic (empty while warming up)
-            }
-            Some(_) => Vec::new(), // no usable mic data this chunk — skip so the assert stays unreachable
-            None => chunk.mic.clone(),
-        };
-        if !clean.is_empty() {
-            mic.push(&clean, rate);
-        }
-        if let Some(words) = mic.poll_words() {
-            print_words("Me", &words);
-        }
-    }
-    them_live.push(&chunk.tap, rate);
-    if let Some(words) = them_live.poll_words() {
-        print_words("Them", &words);
-    }
+    preview.process(
+        chunk.epoch,
+        chunk.retained_start_frame,
+        &chunk.mic,
+        &chunk.tap,
+        &chunk.unavailable,
+        rate,
+        &mut print_words,
+    );
 }
 
 /// Print each recognized word on its own line, `[Label   sec] text`, flushing so it appears live.
-#[cfg(all(feature = "live", target_os = "macos"))]
+#[cfg(all(feature = "live", any(target_os = "macos", test)))]
 fn print_words(label: &str, words: &[corti_transcribe_local::Word]) {
     use std::io::Write;
+    #[cfg(test)]
+    live_quality::tests::record_words(label, words);
     let mut out = std::io::stdout().lock();
     for w in words {
         let _ = writeln!(out, "[{label} {:>7.2}] {}", w.start, w.text);
@@ -392,10 +414,11 @@ fn preflight_inbox() -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "inbox")]
-fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
+fn file_to_inbox(label: &str, finished: &corti_capture::FinishedRecording) -> anyhow::Result<()> {
     use corti_core::{OwningApp, RecordingMeta};
     use corti_vagus::Vagus;
 
+    let wav = &finished.path;
     let meta = RecordingMeta {
         started_at: chrono::Local::now(),
         ended_at: Some(chrono::Local::now()),
@@ -406,16 +429,35 @@ fn file_to_inbox(label: &str, wav: &std::path::Path) -> anyhow::Result<()> {
         audio_path: wav.to_path_buf(),
     };
 
-    let (transcript, provenance) = match inbox_backend()? {
+    let capture_quality = finished.processing.quality.clone().unwrap_or_default();
+    let (mut result, mut provenance): (
+        corti_transcribe::TranscriptionOutcome,
+        corti_vagus::provenance::TranscriptProvenance,
+    ) = match inbox_backend()? {
         #[cfg(feature = "inbox-local")]
-        InboxBackend::Local => transcribe_local(wav, &meta)?,
+        InboxBackend::Local => transcribe_local(wav, &meta, &capture_quality)?,
         #[cfg(feature = "inbox-aws")]
-        InboxBackend::Aws => transcribe_aws(wav, &meta)?,
+        InboxBackend::Aws => transcribe_aws(wav, &meta, &capture_quality)?,
     };
+    if !result.decode_complete && !result.quality.requires_batch_recovery() {
+        result.quality.record_omitted_spans(
+            corti_core::QualityClass::ProcessingLoss,
+            corti_core::QualityResolution::Outstanding,
+            1,
+        )?;
+    }
+    let body = inbox_quality::prepare(&meta, &result.transcript, &result.quality, &mut provenance)?;
+    let identity = wav
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid capture recording identity"))?;
+    // This command owns a newly finalized recording. Preserve decoder history in that same mandatory
+    // authority before filing; a concurrent update fails closed instead of erasing its facts.
+    corti_core::quality_store::persist_settled_quality(wav, identity, None, &result.quality)?;
 
     eprintln!("filing note…");
     let vagus = Vagus::discover()?;
-    let note = vagus.file_recording(&meta, &transcript, &provenance)?;
+    let note = vagus.add_note(&meta.note_title(), &meta.source(), &body, &provenance)?;
     eprintln!("note: {}", note.display());
 
     Ok(())
@@ -457,6 +499,9 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
     serde_json::json!({
         "rules": corti_transcribe::segment::CLEANUP_RULES_VERSION,
         "echo_drop": cleanup.echo_drop,
+        "echo_policy": "acoustic_required_mic_only",
+        "text_only_duplicates": "keep_suspected",
+        "critical_text_protection": true,
         "echo_window_seconds": cleanup.echo_window_seconds,
         "echo_containment": cleanup.echo_containment,
         "merge_gap_seconds": cleanup.merge_gap_seconds,
@@ -467,8 +512,8 @@ fn segment_cleanup_json(cleanup: &corti_transcribe::segment::CleanupConfig) -> s
         "lexicon": serde_json::Value::Null,
         // This CLI always files a completed recording, so there is no live publication to be early for.
         "live_early_drop": false,
-        // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult:
-        // every echo drop in a note filed here came from the text rules alone.
+        // `--inbox` never runs AEC, so there are no per-block statistics for the echo pass to consult.
+        // Rules 4 preserve text-only duplicates; this path performs no echo deletion.
         "audio_evidence": false,
     })
 }
@@ -494,12 +539,48 @@ fn clean_segments(
     );
 }
 
+#[cfg(all(test, feature = "inbox"))]
+mod cleanup_tests {
+    use super::*;
+    use corti_core::{DiarizedTranscript, Speaker, TranscriptSegment};
+
+    #[test]
+    fn inbox_cleanup_preserves_corrections_without_audio_evidence() {
+        let cleanup = corti_transcribe::segment::CleanupConfig::default();
+        let mut transcript = DiarizedTranscript::new(vec![
+            TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: 0.0,
+                end: 4.0,
+                text: "We should deploy the payment gateway today.".into(),
+            },
+            TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 1.0,
+                end: 3.0,
+                text: "We should not deploy the payment gateway today.".into(),
+            },
+        ]);
+        let before = transcript.segments.clone();
+        clean_segments(&mut transcript, &cleanup);
+        assert_eq!(transcript.segments, before);
+
+        let provenance = segment_cleanup_json(&cleanup);
+        assert_eq!(provenance["rules"], 4);
+        assert_eq!(provenance["audio_evidence"], false);
+        assert_eq!(provenance["echo_policy"], "acoustic_required_mic_only");
+        assert_eq!(provenance["text_only_duplicates"], "keep_suspected");
+        assert_eq!(provenance["critical_text_protection"], true);
+    }
+}
+
 #[cfg(feature = "inbox-aws")]
 fn transcribe_aws(
     wav: &std::path::Path,
     meta: &corti_core::RecordingMeta,
+    quality: &corti_core::QualityRecord,
 ) -> anyhow::Result<(
-    corti_core::DiarizedTranscript,
+    corti_transcribe::TranscriptionOutcome,
     corti_vagus::provenance::TranscriptProvenance,
 )> {
     use anyhow::Context;
@@ -523,12 +604,12 @@ fn transcribe_aws(
         language: language.clone(),
         ..AwsOptions::new(bucket)
     };
-    let mut transcript = AwsTranscriber::new(&sdk, opts)
-        .transcribe(wav, meta)
+    let mut result = AwsTranscriber::new(&sdk, opts)
+        .transcribe_with_quality(wav, meta, quality)
         .context("transcription failed")?;
 
     let cleanup = corti_transcribe::segment::CleanupConfig::default();
-    clean_segments(&mut transcript, &cleanup);
+    clean_segments(&mut result.transcript, &cleanup);
 
     let mut configuration = base_configuration(Some(&language), &cleanup);
     configuration.insert(
@@ -546,15 +627,16 @@ fn transcribe_aws(
         },
         configuration,
     );
-    Ok((transcript, provenance))
+    Ok((result, provenance))
 }
 
 #[cfg(feature = "inbox-local")]
 fn transcribe_local(
     wav: &std::path::Path,
     meta: &corti_core::RecordingMeta,
+    quality: &corti_core::QualityRecord,
 ) -> anyhow::Result<(
-    corti_core::DiarizedTranscript,
+    corti_transcribe::TranscriptionOutcome,
     corti_vagus::provenance::TranscriptProvenance,
 )> {
     use anyhow::Context;
@@ -580,12 +662,12 @@ fn transcribe_local(
         "transcribing locally via Parakeet ({})…",
         if wants_ggml { "Metal" } else { "CPU" }
     );
-    let mut transcript = LocalTranscriber::new(cfg)
-        .transcribe(wav, meta)
+    let mut result = LocalTranscriber::new(cfg)
+        .transcribe_with_quality(wav, meta, quality)
         .context("transcription failed")?;
 
     let cleanup = corti_transcribe::segment::CleanupConfig::default();
-    clean_segments(&mut transcript, &cleanup);
+    clean_segments(&mut result.transcript, &cleanup);
 
     let mut configuration = base_configuration(None, &cleanup);
     configuration.insert(
@@ -617,5 +699,5 @@ fn transcribe_local(
         },
         configuration,
     );
-    Ok((transcript, provenance))
+    Ok((result, provenance))
 }

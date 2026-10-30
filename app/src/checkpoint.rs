@@ -108,6 +108,9 @@ impl AwsStaging {
 pub(crate) struct FilingCheckpoint {
     version: u32,
     pub(crate) transcript: DiarizedTranscript,
+    /// Optional local-file generation receipt. Never embeds evidence text or authorizes ASR replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<crate::evidence::Status>,
     /// Existing partial live note, or the path returned by `vagus add-note` before queue completion.
     pub(crate) note_path: Option<PathBuf>,
     /// `true` once the note body is canonical. Completion retries must trust this path even if vagus has
@@ -130,6 +133,13 @@ pub(crate) struct FilingCheckpoint {
     /// Bounded, content-free provider-call identities associated with the settled final attempt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) final_attempt_call_ids: Vec<CallId>,
+    /// Settled quality is separate from the immutable queue capture snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quality: Option<corti_core::QualityRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quality_storage: Option<crate::transcribe::RecordingStorageStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) original_backend: Option<crate::transcribe::FirstAsrBackend>,
 }
 
 impl FilingCheckpoint {
@@ -141,6 +151,7 @@ impl FilingCheckpoint {
         Self {
             version: VERSION,
             transcript,
+            evidence: None,
             note_path,
             note_canonical: false,
             provenance: legacy_batch_provenance(),
@@ -148,6 +159,9 @@ impl FilingCheckpoint {
             applied_postprocess: AppliedPostprocessProvenance::none(),
             source_transcript_fingerprint: None,
             final_attempt_call_ids: Vec::new(),
+            quality: None,
+            quality_storage: None,
+            original_backend: None,
         }
     }
 
@@ -244,6 +258,59 @@ impl FilingCheckpoint {
     }
 
     fn validate_and_reconcile(&mut self) -> Result<()> {
+        if let Some(original_backend) = self.original_backend {
+            if let Some(persisted) = self.provenance.configuration.get("original_backend") {
+                let persisted: crate::transcribe::FirstAsrBackend =
+                    serde_json::from_value(persisted.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid_checkpoint_backend_origin"))?;
+                anyhow::ensure!(
+                    persisted == original_backend,
+                    "conflicting_checkpoint_backend_origin"
+                );
+            }
+            self.provenance.configuration.insert(
+                "original_backend".into(),
+                serde_json::to_value(original_backend)?,
+            );
+        }
+        if let Some(quality) = &self.quality {
+            quality
+                .validate()
+                .context("validating checkpoint quality")?;
+            if let Some(persisted) = self.provenance.configuration.get("quality") {
+                let persisted: corti_core::QualityRecord =
+                    serde_json::from_value(persisted.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid_checkpoint_quality"))?;
+                let projection = crate::provenance::quality_frontmatter_projection(quality)?;
+                anyhow::ensure!(
+                    &persisted == quality
+                        || persisted == projection
+                            && self
+                                .provenance
+                                .configuration
+                                .get("quality_projection_truncated")
+                                .and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                            && self
+                                .provenance
+                                .configuration
+                                .get("quality_full_span_count")
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(quality.spans.len() as u64),
+                    "conflicting checkpoint quality histories"
+                );
+            }
+            if let Some(persisted) = self.provenance.configuration.get("quality_storage") {
+                let persisted: crate::transcribe::RecordingStorageStatus =
+                    serde_json::from_value(persisted.clone())
+                        .map_err(|_| anyhow::anyhow!("invalid_checkpoint_quality_storage"))?;
+                anyhow::ensure!(
+                    self.quality_storage == Some(persisted),
+                    "conflicting checkpoint storage histories"
+                );
+            }
+            crate::provenance::attach_quality(&mut self.provenance, quality, self.quality_storage)?;
+        }
         self.applied_postprocess
             .validate()
             .context("validating checkpoint applied postprocess provenance")?;
@@ -326,7 +393,7 @@ fn load_json<T: for<'de> Deserialize<'de>>(
 ) -> Result<T> {
     let bytes = crate::private_file::read_private_migrating_mode(path, label, max_bytes)?
         .with_context(|| format!("opening {label} {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {label} {}", path.display()))
+    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid {label}"))
 }
 
 /// Temporary checkpoint files left by a process death before the atomic rename.
@@ -341,13 +408,17 @@ pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let prefixes: Vec<String> = [checkpoint, aws_staging_path_for(audio)]
-        .into_iter()
-        .filter_map(|path| {
-            path.file_name()
-                .map(|name| format!("{}.tmp-", name.to_string_lossy()))
-        })
-        .collect();
+    let prefixes: Vec<String> = [
+        checkpoint,
+        aws_staging_path_for(audio),
+        crate::evidence::path_for(audio),
+    ]
+    .into_iter()
+    .filter_map(|path| {
+        path.file_name()
+            .map(|name| format!("{}.tmp-", name.to_string_lossy()))
+    })
+    .collect();
 
     let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,
@@ -514,6 +585,9 @@ mod tests {
         assert!(loaded.applied_postprocess.is_unrecorded_none());
         assert_eq!(loaded.source_transcript_fingerprint, None);
         assert!(loaded.final_attempt_call_ids.is_empty());
+        assert!(loaded.quality.is_none());
+        assert!(loaded.quality_storage.is_none());
+        assert!(loaded.original_backend.is_none());
 
         loaded.store(&audio).unwrap();
         let rewritten: serde_json::Value =
@@ -596,6 +670,48 @@ mod tests {
             "{err}"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_retains_settled_quality_and_first_backend_without_changing_version() {
+        let dir = dir("quality");
+        let audio = dir.join("recording.wav");
+        let mut expected = checkpoint(None);
+        expected.quality = Some(corti_core::QualityRecord::default());
+        expected.quality_storage = Some(crate::transcribe::RecordingStorageStatus::Finalizing);
+        expected.original_backend = Some(crate::transcribe::FirstAsrBackend::Local);
+        expected.store(&audio).unwrap();
+        let loaded = FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.quality, expected.quality);
+        assert_eq!(loaded.quality_storage, expected.quality_storage);
+        assert_eq!(loaded.original_backend, expected.original_backend);
+        assert_eq!(
+            loaded.provenance.configuration["quality"]["coverage"],
+            "legacy_unknown"
+        );
+        assert_eq!(
+            loaded.provenance.configuration["quality_storage"],
+            "finalizing"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_rejects_conflicting_quality_and_redacts_malformed_carriers() {
+        let dir = dir("quality-conflict");
+        let audio = dir.join("recording.wav");
+        let mut conflicting = checkpoint(None);
+        conflicting.quality = Some(corti_core::QualityRecord::default());
+        conflicting.provenance.configuration.insert(
+            "quality".into(),
+            serde_json::to_value(corti_core::QualityRecord::observed()).unwrap(),
+        );
+        assert!(conflicting.store(&audio).is_err());
+        std::fs::write(path_for(&audio), r#"{"version":2,"transcript":{"segments":[]},"note_path":null,"aws_staging":null,"quality_storage":"SYNTHETIC_PRIVATE_SENTINEL"}"#).unwrap();
+        let error = FilingCheckpoint::load(&audio).unwrap_err();
+        assert!(!format!("{error:#}").contains("SYNTHETIC_PRIVATE_SENTINEL"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

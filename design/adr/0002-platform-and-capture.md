@@ -28,6 +28,27 @@ tap fed into an aggregate device alongside the mic (one synchronized graph).
 
 ## Consequences
 
+### Capture format observations (#162; 2026-10-27)
+
+The capture graph and device-selection policy remain unchanged. Format notifications only invalidate a
+fixed atomic mailbox on the HAL listener thread; they never query a property, allocate, lock, or wait.
+One owned control worker checks that mailbox at a bounded 5 ms interval and publishes a validated
+rate/generation snapshot. The IO callback takes a bounded snapshot before and after copying a block;
+an invalidated/unstable format is recorded as unavailable, never guessed from an old rate. This is the
+capture-specific off-HAL alternative to the detection listeners' existing async-channel handoff in
+guardrail 9. It does not promise that a HAL notification precisely precedes a physical format change;
+device transition precision remains an own-Mac acceptance check.
+
+The validated initial rate is retained separately for startup; no later snapshot unwrap can panic during
+a notification. Microphone-only transport classifies every input buffer as microphone, including planar
+multi-buffer input. Aggregate mic/tap routing is unchanged. Normal stop alone authorizes durable capture
+completion after teardown and terminal accounting; Drop or teardown failure preserves an incomplete
+quality envelope. If native IO/listener destruction fails, retain the still-owned callback state/device
+instead of freeing a pointer HAL may invoke. This failure is reported and cannot certify completion.
+An atomic admission gate closes before every teardown attempt, so retained state cannot accept later
+audio if native stop/destruction fails. An already-running callback still requires the native destruction
+barrier before its state can be freed; disabling admission does not claim that the device itself stopped.
+
 - Detection (`kAudioDevicePropertyDeviceIsRunningSomewhere`), attribution (process-object family), and
   capture (process tap + aggregate device) all live in one owned crate, since all three are CoreAudio HAL.
 - The single highest-risk item is the synchronized mic+tap aggregate-device capture; it is gated behind a

@@ -12,17 +12,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use corti_transcribe::decode::{DecodeErrorCategory, RegionStatus};
 use corti_transcribe::segment::{SpeakerTurn, Word};
 use sherpa_onnx::{
-    FastClusteringConfig, LinearResampler, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
-    OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-    OfflineTransducerModelConfig, SileroVadModelConfig, SpeakerEmbeddingExtractorConfig,
-    VadModelConfig, VoiceActivityDetector,
+    FastClusteringConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
+    OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
+    OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
+    SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
 };
 
+use crate::asr::DecodedRegion;
 use crate::live::LiveTranscriber;
 use crate::models::Models;
+use crate::resample::Resampler;
 
 /// All ONNX models run at 16 kHz mono.
 pub(crate) const TARGET_RATE: i32 = 16_000;
@@ -46,14 +48,18 @@ fn vad_buffer_seconds(min_silence: f32) -> f32 {
     MAX_SPEECH_SECONDS + trailing + (2 * VAD_WINDOW) as f32 / TARGET_RATE as f32
 }
 
-/// Resample a mono channel to 16 kHz (no-op if already there). Uses sherpa's `LinearResampler`.
+/// Resample a mono channel to 16 kHz (no-op if already there), using the same fixed source packets and
+/// final flush as live transcription. Native filter settings are unchanged; packet-edge rounding is
+/// deliberately canonical rather than preserving the old one-shot call's low sample bits.
 pub fn resample_to_16k(samples: &[f32], from_hz: i32) -> Result<Vec<f32>> {
     if from_hz == TARGET_RATE || samples.is_empty() {
         return Ok(samples.to_vec());
     }
-    let resampler = LinearResampler::create(from_hz, TARGET_RATE)
+    let mut resampler = Resampler::new(from_hz)
         .with_context(|| format!("creating resampler {from_hz} → {TARGET_RATE} Hz"))?;
-    Ok(resampler.resample(samples, true))
+    let mut output = resampler.push(samples);
+    output.extend(resampler.finish());
+    Ok(output)
 }
 
 /// Build the Parakeet-TDT offline recognizer.
@@ -185,20 +191,35 @@ pub fn build_diarizer(
 
 /// Transcribe one 16 kHz mono channel by driving the shared live engine over the whole buffer: push it in a
 /// single shot, then flush. Batch and live share exactly one decode path ([`LiveTranscriber`]) — the only
-/// difference is that batch feeds the entire channel at once, so a single push then finish is byte-identical
-/// to the old `.chunks(512)` loop (same VAD window sequence, same regions, same words). `vad` is consumed
+/// difference is that batch feeds the entire already-resampled channel at once. Both callers use the same
+/// source-packet resampler and VAD window sequence. `vad` is consumed
 /// (one stateful VAD per channel); `rec` is shared across both channels via the `Arc`.
 ///
 /// [`LiveTranscriber`]: crate::LiveTranscriber
+#[cfg(test)]
 pub fn transcribe_channel(
     rec: Arc<crate::Asr>,
     vad: VoiceActivityDetector,
     samples_16k: &[f32],
 ) -> Vec<Word> {
-    let mut live = LiveTranscriber::new(rec, vad);
+    let mut live = LiveTranscriber::from_pinned_vad(rec, vad);
     // The channel is already at 16 kHz (the caller resampled), so `push` does no resampling.
     live.push(samples_16k, TARGET_RATE as u32);
     live.finish()
+}
+
+pub(crate) fn transcribe_resampled_channel(
+    rec: Arc<crate::Asr>,
+    vad: VoiceActivityDetector,
+    samples_16k: &[f32],
+    source_frames: usize,
+    source_rate: u32,
+) -> (Vec<Word>, corti_transcribe::decode::DecodeReport, bool) {
+    let mut live = LiveTranscriber::from_pinned_vad(rec, vad);
+    live.push_resampled(samples_16k, source_frames, source_rate);
+    let words = live.finish();
+    let complete = live.decode_complete();
+    (words, live.take_decode_report(), complete)
 }
 
 /// Run far-end diarization on a 16 kHz mono channel → time-ordered speaker turns labelled `Them N`.
@@ -222,23 +243,55 @@ pub(crate) fn asr_segment(
     rec: &OfflineRecognizer,
     samples_16k: &[f32],
     offset_sec: f64,
-) -> Vec<Word> {
+) -> DecodedRegion {
     let stream = rec.create_stream();
     stream.accept_waveform(TARGET_RATE, samples_16k);
     rec.decode(&stream);
-    match stream.get_result() {
-        Some(r) => tokens_to_words(
-            &r.tokens,
-            r.timestamps.as_deref(),
-            r.durations.as_deref(),
-            offset_sec,
-        ),
-        None => Vec::new(),
+    sherpa_result(stream.get_result(), offset_sec)
+}
+
+fn sherpa_result(
+    result: Option<sherpa_onnx::OfflineRecognizerResult>,
+    offset_sec: f64,
+) -> DecodedRegion {
+    match result {
+        Some(r) => {
+            let mut words = tokens_to_words(
+                &r.tokens,
+                r.timestamps.as_deref(),
+                r.durations.as_deref(),
+                offset_sec,
+            );
+            let count = words.len();
+            words.retain(|word| {
+                word.start.is_finite()
+                    && word.end.is_finite()
+                    && word.start >= offset_sec
+                    && word.end >= word.start
+            });
+            let has_text = !r.text.trim().is_empty()
+                || r.tokens
+                    .iter()
+                    .any(|token| !token.replace('\u{2581}', " ").trim().is_empty());
+            let status = if words.len() != count || (has_text && words.is_empty()) {
+                RegionStatus::Partial(DecodeErrorCategory::UnmappableResult)
+            } else if words.is_empty() {
+                RegionStatus::RecognizedEmpty
+            } else {
+                RegionStatus::Complete
+            };
+            DecodedRegion { words, status }
+        }
+        None => DecodedRegion {
+            words: Vec::new(),
+            status: RegionStatus::Failed(DecodeErrorCategory::NoResult),
+        },
     }
 }
 
 /// Reassemble Parakeet sentencepiece tokens into whole [`Word`]s. A new word starts at a token prefixed
-/// with the sentencepiece word-boundary marker `▁` (U+2581); the marker becomes a space. Token timestamps
+/// with the sentencepiece word-boundary marker `▁` (U+2581), or the leading ASCII space sherpa uses after
+/// normalizing that marker. Token timestamps
 /// (relative to the segment) are shifted by `offset_sec`; a word's end is the last token's start + its
 /// duration. Pure (no sherpa types) so it is unit-tested directly.
 pub fn tokens_to_words(
@@ -258,7 +311,7 @@ pub fn tokens_to_words(
         let end = start + dur.get(i).copied().unwrap_or(0.0) as f64;
         let piece = tok.replace(WORD_BOUNDARY, " ");
 
-        if tok.starts_with(WORD_BOUNDARY) {
+        if tok.starts_with(WORD_BOUNDARY) || tok.starts_with(' ') {
             if let Some(w) = cur.take() {
                 push_word(&mut words, w);
             }
@@ -302,6 +355,38 @@ mod tests {
 
     fn toks(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sherpa_missing_result_is_failure_but_valid_blank_is_complete() {
+        assert_eq!(
+            sherpa_result(None, 0.0).status,
+            RegionStatus::Failed(DecodeErrorCategory::NoResult)
+        );
+        let blank = sherpa_result(
+            Some(sherpa_onnx::OfflineRecognizerResult {
+                text: " ".into(),
+                tokens: vec![],
+                timestamps: None,
+                durations: None,
+            }),
+            0.0,
+        );
+        assert_eq!(blank.status, RegionStatus::RecognizedEmpty);
+        assert!(blank.words.is_empty());
+        let unmapped = sherpa_result(
+            Some(sherpa_onnx::OfflineRecognizerResult {
+                text: "synthetic speech".into(),
+                tokens: vec![],
+                timestamps: None,
+                durations: None,
+            }),
+            0.0,
+        );
+        assert_eq!(
+            unmapped.status,
+            RegionStatus::Partial(DecodeErrorCategory::UnmappableResult)
+        );
     }
 
     #[test]
@@ -385,6 +470,86 @@ mod tests {
         assert_eq!(words[1].text, "world");
         assert!((words[1].start - 0.5).abs() < 1e-6);
         assert!((words[1].end - 0.8).abs() < 1e-6); // 0.6 + 0.2
+    }
+
+    #[test]
+    fn normalized_ascii_boundaries_preserve_words_punctuation_and_times() {
+        let normalized = toks(&[" Hel", "lo", ",", " wor", "ld", "!"]);
+        let original = toks(&["▁Hel", "lo", ",", "▁wor", "ld", "!"]);
+        let timestamps = [0.0, 0.125, 0.25, 0.5, 0.625, 0.75];
+        let durations = [0.125; 6];
+        let expected = vec![
+            Word {
+                start: 10.0,
+                end: 10.375,
+                text: "Hello,".into(),
+            },
+            Word {
+                start: 10.5,
+                end: 10.875,
+                text: "world!".into(),
+            },
+        ];
+        for tokens in [&normalized, &original] {
+            assert_eq!(
+                tokens_to_words(tokens, Some(&timestamps), Some(&durations), 10.0),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_boundaries_preserve_separator_only_timing_and_content() {
+        let tokens = toks(&["Hi", " ", " ", "there", "!", "▁again", " "]);
+        let timestamps = [0.0, 0.125, 0.25, 0.375, 0.5, 0.75, 0.875];
+        let durations = [0.125; 7];
+        assert_eq!(
+            tokens_to_words(&tokens, Some(&timestamps), Some(&durations), 5.0),
+            vec![
+                Word {
+                    start: 5.0,
+                    end: 5.125,
+                    text: "Hi".into(),
+                },
+                Word {
+                    // Preserve the existing standalone-marker rule: the last empty boundary supplies
+                    // the start, and subsequent subwords/punctuation supply the end.
+                    start: 5.25,
+                    end: 5.625,
+                    text: "there!".into(),
+                },
+                Word {
+                    start: 5.75,
+                    end: 5.875,
+                    text: "again".into(),
+                },
+            ]
+        );
+        assert!(tokens_to_words(&toks(&[" ", " ", "▁"]), None, None, 5.0).is_empty());
+    }
+
+    #[test]
+    fn normalized_boundaries_keep_legacy_missing_timestamp_and_duration_rules() {
+        let normalized = toks(&[" Hel", "lo", " world"]);
+        let original = toks(&["▁Hel", "lo", "▁world"]);
+        let timestamps = [0.25];
+        let durations = [0.125, 0.25];
+        for (ts, dur) in [
+            (None, None),
+            (Some(timestamps.as_slice()), None),
+            (None, Some(durations.as_slice())),
+            (Some(timestamps.as_slice()), Some(durations.as_slice())),
+        ] {
+            let words = tokens_to_words(&normalized, ts, dur, 10.0);
+            assert_eq!(words, tokens_to_words(&original, ts, dur, 10.0));
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[0].text, "Hello");
+            assert_eq!(words[1].text, "world");
+            assert_eq!(words[0].start, if ts.is_some() { 10.25 } else { 10.0 });
+            assert_eq!(words[0].end, if dur.is_some() { 10.25 } else { 10.0 });
+            assert_eq!(words[1].start, 10.0);
+            assert_eq!(words[1].end, 10.0);
+        }
     }
 
     #[test]

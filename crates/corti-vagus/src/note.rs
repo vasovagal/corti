@@ -5,6 +5,8 @@
 //! annotation), **flip** the state line in place when the transcript is final, **rewrite** the body
 //! when the batch path supersedes a partial live note, and **delete** the note when its recording is
 //! discarded (a plain `remove_file` at the call site — the first three live here).
+//! The capture-quality amendment also permits refreshing only Corti's provenance on that same owned
+//! note, preserving its existing body and inode.
 //!
 //! ## The state-line contract (issue #87)
 //! The first corti-authored body line (right under vagus's `# <title>` heading) is exactly
@@ -26,6 +28,9 @@ pub const STATE_TRANSCRIBING: &str = "State: transcribing";
 /// Final state line. The trailing space pads it to the byte width of [`STATE_TRANSCRIBING`] so the
 /// flip is a same-width in-place overwrite.
 pub const STATE_TRANSCRIBED: &str = "State: transcribed ";
+
+const MAX_PREFIX_BYTES: usize = 64 * 1024;
+const BODY_MOVE_BYTES: usize = 64 * 1024;
 
 /// Opaque authority for the one note path returned for the current recording.
 ///
@@ -57,6 +62,17 @@ impl CurrentNote {
         provenance: &TranscriptProvenance,
     ) -> Result<()> {
         rewrite_body_with_provenance(&self.path, new_body, provenance)
+    }
+
+    /// Refresh only Corti's frontmatter on this owned note, keeping its title, state and arbitrary body
+    /// bytes intact. Prefix validation is bounded to 64 KiB and finishes before mutation. If the prefix
+    /// changes length, the body is moved internally with one 64 KiB buffer; no text is returned or logged.
+    ///
+    /// This shares the existing same-inode rewrite's durability window: a write/sync failure or crash
+    /// during the move can leave an incomplete rewrite. It is not an atomic replacement. The caller must
+    /// serialize this operation with appends/state flips for this recording.
+    pub fn refresh_provenance(&self, provenance: &TranscriptProvenance) -> Result<()> {
+        refresh_provenance_in_place(&self.path, provenance)
     }
 }
 
@@ -147,9 +163,8 @@ fn rewrite_body_inner(
         // The fallback only covers a hand-edited note (the title heading is lost — acceptable for repair).
         None => frontmatter_end_in_file(path)?,
     };
-    const MAX_PREFIX_BYTES: u64 = 64 * 1024;
     ensure!(
-        keep <= MAX_PREFIX_BYTES,
+        keep <= MAX_PREFIX_BYTES as u64,
         "refusing to retain an unexpectedly large note prefix ({keep} bytes) while rewriting {}",
         path.display()
     );
@@ -162,7 +177,7 @@ fn rewrite_body_inner(
         prefix = upsert_provenance(&prefix, provenance)
             .with_context(|| format!("updating transcript provenance in {}", path.display()))?;
         ensure!(
-            prefix.len() as u64 <= MAX_PREFIX_BYTES,
+            prefix.len() <= MAX_PREFIX_BYTES,
             "refusing an unexpectedly large note prefix ({} bytes) after adding provenance to {}",
             prefix.len(),
             path.display()
@@ -178,6 +193,157 @@ fn rewrite_body_inner(
     f.sync_all()
         .with_context(|| format!("syncing rewritten body in {}", path.display()))?;
     Ok(())
+}
+
+/// Read through the closing frontmatter delimiter only. `Take` bounds even a malformed, newline-free
+/// prefix; unlike a state-line search, this can never walk the recording's growing transcript body.
+fn bounded_frontmatter_prefix(file: &mut std::fs::File) -> Result<Vec<u8>> {
+    let mut reader = BufReader::new(file.take(MAX_PREFIX_BYTES as u64));
+    let mut prefix = Vec::with_capacity(MAX_PREFIX_BYTES);
+    let mut first = true;
+    loop {
+        let start = prefix.len();
+        ensure!(
+            reader.read_until(b'\n', &mut prefix)? != 0,
+            "current-note frontmatter is missing, unterminated or exceeds the prefix limit"
+        );
+        let line = &prefix[start..];
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if first {
+            ensure!(line == b"---", "current-note frontmatter is missing");
+            first = false;
+        } else if line == b"---" {
+            return Ok(prefix);
+        }
+    }
+}
+
+fn refresh_provenance_in_place(path: &Path, provenance: &TranscriptProvenance) -> Result<()> {
+    refresh_provenance_with_io(path, provenance, &mut RefreshIo::default())
+}
+
+#[derive(Default)]
+struct RefreshIo {
+    #[cfg(test)]
+    writes_before_failure: Option<usize>,
+}
+
+impl RefreshIo {
+    fn before_write(&mut self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(remaining) = &mut self.writes_before_failure {
+            if *remaining == 0 {
+                return Err(std::io::Error::other("injected current-note write failure"));
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+}
+
+fn refresh_provenance_with_io(
+    path: &Path,
+    provenance: &TranscriptProvenance,
+    io: &mut RefreshIo,
+) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .context("opening current note for provenance refresh")?;
+    let old_len = file
+        .metadata()
+        .context("reading current-note length")?
+        .len();
+    let prefix = bounded_frontmatter_prefix(&mut file)
+        .context("validating current-note prefix before provenance refresh")?;
+    let replacement = upsert_provenance(&prefix, provenance)
+        .map_err(|_| anyhow::anyhow!("invalid_current_note_provenance_prefix"))?;
+    ensure!(
+        replacement.len() <= MAX_PREFIX_BYTES,
+        "current-note provenance exceeds the prefix limit"
+    );
+    let old_prefix = u64::try_from(prefix.len()).context("current-note prefix length overflow")?;
+    let new_prefix =
+        u64::try_from(replacement.len()).context("current-note prefix length overflow")?;
+    let body_len = old_len
+        .checked_sub(old_prefix)
+        .context("current-note prefix exceeds its file length")?;
+    let new_len = new_prefix
+        .checked_add(body_len)
+        .context("current-note length overflow")?;
+    if replacement == prefix {
+        return Ok(());
+    }
+
+    // Every validation and final-length calculation above completes before the first write. Moving
+    // backwards on growth and forwards on shrinkage prevents an overlapping write from consuming bytes
+    // that a later chunk still needs. Only this fixed buffer ever contains body bytes.
+    let mut buffer = [0_u8; BODY_MOVE_BYTES];
+    if new_prefix > old_prefix {
+        let mut remaining = body_len;
+        while remaining != 0 {
+            let chunk_len = remaining.min(BODY_MOVE_BYTES as u64);
+            let offset = remaining - chunk_len;
+            move_body_chunk(
+                &mut file,
+                &mut buffer[..chunk_len as usize],
+                old_prefix,
+                new_prefix,
+                offset,
+                io,
+            )?;
+            remaining = offset;
+        }
+    } else if new_prefix < old_prefix {
+        let mut copied = 0_u64;
+        while copied < body_len {
+            let chunk_len = (body_len - copied).min(BODY_MOVE_BYTES as u64);
+            move_body_chunk(
+                &mut file,
+                &mut buffer[..chunk_len as usize],
+                old_prefix,
+                new_prefix,
+                copied,
+                io,
+            )?;
+            copied = copied
+                .checked_add(chunk_len)
+                .context("current-note body offset overflow")?;
+        }
+    }
+    file.seek(SeekFrom::Start(0))?;
+    io.before_write()?;
+    file.write_all(&replacement)
+        .context("writing current-note provenance prefix")?;
+    file.set_len(new_len)
+        .context("setting refreshed current-note length")?;
+    file.sync_all()
+        .context("syncing current-note provenance refresh")
+}
+
+fn move_body_chunk(
+    file: &mut std::fs::File,
+    buffer: &mut [u8],
+    old_prefix: u64,
+    new_prefix: u64,
+    offset: u64,
+    io: &mut RefreshIo,
+) -> Result<()> {
+    let source = old_prefix
+        .checked_add(offset)
+        .context("current-note source offset overflow")?;
+    let target = new_prefix
+        .checked_add(offset)
+        .context("current-note target offset overflow")?;
+    file.seek(SeekFrom::Start(source))?;
+    file.read_exact(buffer)
+        .context("reading current-note body during provenance refresh")?;
+    file.seek(SeekFrom::Start(target))?;
+    io.before_write()?;
+    file.write_all(buffer)
+        .context("moving current-note body during provenance refresh")
 }
 
 /// Replace or insert the top-level `corti:` field in a bounded note prefix. Current Vagus writes the value
@@ -206,6 +372,10 @@ fn upsert_provenance(prefix: &[u8], provenance: &TranscriptProvenance) -> Result
         .find(|(_, (_, _, line))| line.trim_end_matches(['\r', '\n']) == "---")
         .map(|(index, _)| index)
         .context("note has unterminated YAML frontmatter")?;
+    // Preflight without allocating the serialized value. The subsequent string and rewritten prefix
+    // are each at most 64 KiB, even if a caller supplies an oversized configuration object.
+    serde_json::to_writer(&mut PrefixSizeLimit(8), provenance)
+        .context("transcript provenance exceeds the prefix limit")?;
     let replacement = provenance
         .frontmatter_line()
         .context("serializing transcript provenance")?;
@@ -229,11 +399,37 @@ fn upsert_provenance(prefix: &[u8], provenance: &TranscriptProvenance) -> Result
         (lines[close].0, lines[close].0)
     };
 
-    let mut out = Vec::with_capacity(prefix.len() + replacement.len());
+    let output_len = prefix
+        .len()
+        .checked_sub(end - start)
+        .and_then(|retained| retained.checked_add(replacement.len()))
+        .context("note prefix length overflow")?;
+    ensure!(
+        output_len <= MAX_PREFIX_BYTES,
+        "transcript provenance exceeds the prefix limit"
+    );
+    let mut out = Vec::with_capacity(output_len);
     out.extend_from_slice(&prefix[..start]);
     out.extend_from_slice(replacement.as_bytes());
     out.extend_from_slice(&prefix[end..]);
     Ok(out)
+}
+
+struct PrefixSizeLimit(usize);
+
+impl Write for PrefixSizeLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_PREFIX_BYTES)
+            .ok_or_else(|| std::io::Error::other("note prefix limit exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Streaming state-line scanner. It retains one line rather than the complete, growing note.
@@ -418,6 +614,257 @@ mod tests {
         assert!(got.ends_with("State: transcribed \n\nsynthetic final body\n"));
         let debug = format!("{current:?}");
         assert!(!debug.contains(p.to_string_lossy().as_ref()));
+    }
+
+    fn body_bytes(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let prefix = frontmatter_end_in_file(path).unwrap() as usize;
+        bytes[prefix..].to_vec()
+    }
+
+    #[test]
+    fn provenance_refresh_grows_shrinks_and_preserves_large_utf8_and_binary_body() {
+        let path = test_note("refresh-moves", &live_note_content());
+        let mut tail = "SYNTHETIC_BODY_SENTINEL — café 日本語\n"
+            .repeat(8_000)
+            .into_bytes();
+        tail.extend_from_slice(&[0, 0xff, 0xfe, b'\n']);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&tail)
+            .unwrap();
+        let original_body = body_bytes(&path);
+        assert!(original_body.len() > 3 * BODY_MOVE_BYTES);
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let current = CurrentNote::from_returned_path(path.clone()).unwrap();
+        let mut large = TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        large.configuration.insert(
+            "fixture".into(),
+            serde_json::json!("metadata".repeat(2_000)),
+        );
+
+        current.refresh_provenance(&large).unwrap();
+        let grown = std::fs::read(&path).unwrap();
+        assert!(grown.len() as u64 > original_len);
+        assert_eq!(body_bytes(&path), original_body);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        // An identical replacement does not move the body or change any byte.
+        current.refresh_provenance(&large).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), grown);
+
+        let small = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+        current.refresh_provenance(&small).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < grown.len() as u64);
+        assert_eq!(body_bytes(&path), original_body);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let prefix = bounded_frontmatter_prefix(&mut file).unwrap();
+        let prefix = String::from_utf8(prefix).unwrap();
+        assert!(prefix.contains("created: 2026-07-08T10:00"));
+        assert!(prefix.contains("source: Zoom · 2026-07-08 10:00"));
+        assert_eq!(prefix.matches("\ncorti:").count(), 1);
+        assert!(prefix.contains(r#""mode":"batch""#));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn same_size_provenance_refresh_preserves_every_body_byte_and_inode() {
+        let path = test_note("refresh-same-size", &live_note_content());
+        let current = CurrentNote::from_returned_path(path.clone()).unwrap();
+        let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        provenance
+            .configuration
+            .insert("fixture".into(), serde_json::json!("first"));
+        current.refresh_provenance(&provenance).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let body = body_bytes(&path);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        provenance
+            .configuration
+            .insert("fixture".into(), serde_json::json!("other"));
+        current.refresh_provenance(&provenance).unwrap();
+        let updated = std::fs::read(&path).unwrap();
+        assert_eq!(updated.len(), original.len());
+        assert_ne!(updated, original);
+        assert_eq!(body_bytes(&path), body);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn refresh_rejects_oversized_or_malformed_prefixes_without_mutation_or_text_exposure() {
+        let provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        for (index, bytes) in [
+            b"SYNTHETIC_PREFIX_SENTINEL\nno frontmatter\n".to_vec(),
+            b"---\nSYNTHETIC_PREFIX_SENTINEL\nunterminated\n".to_vec(),
+            b"---\ninvalid: \xff\n---\nSYNTHETIC_BODY_SENTINEL".to_vec(),
+            format!(
+                "---\nSYNTHETIC_PREFIX_SENTINEL:{}\n---\nbody",
+                "x".repeat(MAX_PREFIX_BYTES)
+            )
+            .into_bytes(),
+            format!(
+                "---\nnear_limit: {}\n---\nbody",
+                "x".repeat(MAX_PREFIX_BYTES - 32)
+            )
+            .into_bytes(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = test_note(&format!("refresh-invalid-{index}"), "");
+            std::fs::write(&path, &bytes).unwrap();
+            let inode = std::fs::metadata(&path).unwrap().ino();
+            let current = CurrentNote::from_returned_path(path.clone()).unwrap();
+            let error = current.refresh_provenance(&provenance).unwrap_err();
+            // No content-bearing logging API is called by refresh. These are the only diagnostics its
+            // caller can log, and neither reveals the private prefix/body sentinel.
+            for diagnostic in [format!("{error:#}"), format!("{current:?}")] {
+                assert!(!diagnostic.contains("SYNTHETIC_PREFIX_SENTINEL"));
+                assert!(!diagnostic.contains("SYNTHETIC_BODY_SENTINEL"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+        let path = test_note("refresh-oversized-provenance", &live_note_content());
+        let original = std::fs::read(&path).unwrap();
+        let mut oversized = provenance;
+        oversized.configuration.insert(
+            "fixture".into(),
+            serde_json::json!("SYNTHETIC_METADATA_SENTINEL".repeat(MAX_PREFIX_BYTES)),
+        );
+        let error = CurrentNote::from_returned_path(path.clone())
+            .unwrap()
+            .refresh_provenance(&oversized)
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("SYNTHETIC_METADATA_SENTINEL"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn interrupted_provenance_move_reports_io_failure_and_can_be_rewritten_from_authority() {
+        let path = test_note("refresh-io-failure", &live_note_content());
+        append(&path, &"SYNTHETIC_BODY_SENTINEL\n".repeat(12_000)).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let authority = path.with_file_name("recording-quality.json");
+        std::fs::write(&authority, b"synthetic durable quality authority").unwrap();
+        let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+        provenance.configuration.insert(
+            "fixture".into(),
+            serde_json::json!("metadata".repeat(2_000)),
+        );
+        let mut io = RefreshIo {
+            writes_before_failure: Some(1),
+        };
+        let error = refresh_provenance_with_io(&path, &provenance, &mut io).unwrap_err();
+        assert!(format!("{error:#}").contains("injected current-note write failure"));
+        assert!(!format!("{error:#}").contains("SYNTHETIC_BODY_SENTINEL"));
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(&authority).unwrap(),
+            b"synthetic durable quality authority"
+        );
+        // A partial move is intentionally not claimed atomic. The existing canonical fallback rewrite
+        // repairs this owned note using its separately durable transcript/quality authority.
+        let recovered = "State: transcribed \n\nSynthetic recovered transcript.\n";
+        CurrentNote::from_returned_path(path.clone())
+            .unwrap()
+            .rewrite_transcript(recovered, &provenance)
+            .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with(recovered));
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn maximum_width_quality_requires_a_bounded_same_record_projection() {
+        let epochs = (0..64_u64)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index,
+                    "source_start_ns": u64::MAX - 64_000_000_000 + index * 1_000_000_000,
+                    "source_rate_hz": u32::MAX, "source_frame_base": u64::MAX - 1_000,
+                    "retained_start_frame": u64::MAX - 1_000 + index * 10,
+                    "retained_rate_hz": u32::MAX, "mic_channels": 1, "tap_channels": 1,
+                    "reason": if index == 0 { "start" } else { "host_discontinuity" }
+                })
+            })
+            .collect::<Vec<_>>();
+        let spans =
+            (0..64_u64)
+                .flat_map(|epoch| {
+                    (0..4_u64).map(move |index| serde_json::json!({
+            "epoch": epoch, "start_frame": u64::MAX - 1_000 + index * 2,
+            "end_frame": u64::MAX - 999 + index * 2, "track":"both",
+            "cause":"mic_tap_mismatch", "class":"processing_loss", "stage":"capture",
+            "resolution":"recovered_by_batch"
+        }))
+                })
+                .collect::<Vec<_>>();
+        let full: corti_core::QualityRecord = serde_json::from_value(serde_json::json!({
+            "schema_version":1, "coverage":"observed", "epochs":epochs, "spans":spans,
+            "overflow": corti_core::QualityOverflow::default()
+        }))
+        .unwrap();
+        full.validate().unwrap();
+        let full_bytes = serde_json::to_vec(&full).unwrap().len();
+        assert!(full_bytes > MAX_PREFIX_BYTES);
+        let path = test_note("maximum-quality-prefix", &live_note_content());
+        let current = CurrentNote::from_returned_path(path.clone()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let body = body_bytes(&path);
+        let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Live);
+        provenance
+            .configuration
+            .insert("quality".into(), serde_json::to_value(&full).unwrap());
+        assert!(current.refresh_provenance(&provenance).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        // Mirror the app's explicitly labelled display budget, without changing the complete authority.
+        let mut projection = full.clone();
+        while serde_json::to_vec(&projection).unwrap().len() > 48 * 1024 {
+            let span = projection.spans.pop().unwrap();
+            projection
+                .record_omitted_spans(span.class, span.resolution, 1)
+                .unwrap();
+        }
+        let projected_bytes = serde_json::to_vec(&projection).unwrap().len();
+        assert_eq!(projection.epochs, full.epochs);
+        assert_eq!(projection.overflow.outstanding_omitted_spans[1], 0);
+        provenance
+            .configuration
+            .insert("quality".into(), serde_json::to_value(&projection).unwrap());
+        provenance.configuration.insert(
+            "quality_projection_truncated".into(),
+            serde_json::json!(true),
+        );
+        provenance
+            .configuration
+            .insert("quality_full_span_count".into(), serde_json::json!(256));
+        current.refresh_provenance(&provenance).unwrap();
+        assert_eq!(body_bytes(&path), body);
+        assert_eq!(full.spans.len(), 256);
+        assert_eq!(full.epochs.len(), 64);
+        let fresh = format!(
+            "---\n{}---\nSynthetic fresh body.\n",
+            provenance.frontmatter_line().unwrap()
+        );
+        let fresh_path = test_note("maximum-quality-fresh", &fresh);
+        CurrentNote::from_returned_path(fresh_path.clone())
+            .unwrap()
+            .refresh_provenance(&provenance)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh_path).unwrap(), fresh);
+        println!(
+            "quality prefix fixture: full_bytes={full_bytes} projected_bytes={projected_bytes} full_spans=256 epochs=64"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(fresh_path.parent().unwrap()).unwrap();
     }
 
     #[test]

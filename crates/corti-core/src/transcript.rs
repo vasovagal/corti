@@ -3,6 +3,10 @@
 //! This is the common output shape every transcription backend produces (`corti-transcribe`), and the
 //! input to note filing (`corti-vagus`). The type renders its own Markdown so that filing depends only on
 //! `corti-core`, not on any particular backend.
+//!
+//! Markdown is display-only: it rounds starts and does not carry end times. The local versioned
+//! evidence record in `corti-transcribe::evidence` is the canonical timing/pre-cleanup store; never
+//! reconstruct precise source timing or original ASR text from a rendered or rewritten note.
 
 use serde::{Deserialize, Serialize};
 

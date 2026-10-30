@@ -1,8 +1,8 @@
 //! A deliberately small durable background-job layer: a `jobs` table living in corti's queue.db,
 //! drained by the pipeline worker between (and after) its channel messages.
 //!
-//! Shape: kinds are strings, payloads are JSON — this crate knows nothing about corti's job semantics;
-//! the app defines kind constants and handlers. One-shot jobs retry with exponential backoff up to
+//! Shape: kinds are strings, payloads are JSON; the app defines kind constants and handlers. The narrow
+//! recording APIs additionally preserve typed quality evidence and immutable origin. One-shot jobs retry with exponential backoff up to
 //! `max_attempts`, then park as `failed` (row kept for inspection/GC). Periodic jobs are per-kind
 //! singletons that reschedule themselves on completion *and* on failure — a broken sweep must tick at
 //! its period, not backoff-spam.
@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -85,6 +85,96 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state, next_run_at);
 ";
 
+/// Optional settled live quality in a recording payload. Errors never include untrusted JSON values.
+pub fn settled_quality(payload: &serde_json::Value) -> Result<Option<corti_core::QualityRecord>> {
+    match payload.get("settled_quality") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("invalid_recording_quality")),
+    }
+}
+
+/// Add facts using the shared bounded record, without mutating the payload on validation/conflict.
+pub fn merge_settled_quality(
+    payload: &mut serde_json::Value,
+    incoming: &corti_core::QualityRecord,
+) -> Result<()> {
+    ensure!(payload.is_object(), "invalid_recording_job_payload");
+    incoming
+        .validate()
+        .map_err(|_| anyhow::anyhow!("invalid_recording_quality"))?;
+    let merged = match settled_quality(payload)? {
+        Some(mut previous) => {
+            previous
+                .merge_snapshot(incoming)
+                .map_err(|_| anyhow::anyhow!("conflicting_recording_quality"))?;
+            previous
+        }
+        None => incoming.clone(),
+    };
+    let value =
+        serde_json::to_value(merged).map_err(|_| anyhow::anyhow!("invalid_recording_quality"))?;
+    payload["settled_quality"] = value;
+    Ok(())
+}
+
+fn merge_recording_payload(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let id = existing
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("invalid_recording_job_payload")?;
+    ensure!(
+        incoming.get("id").and_then(serde_json::Value::as_str) == Some(id),
+        "conflicting_recording_job_identity"
+    );
+    settled_quality(existing)?;
+    let mut merged = existing.clone();
+    if let Some(quality) = settled_quality(incoming)? {
+        merge_settled_quality(&mut merged, &quality)?;
+    }
+    let promote = incoming
+        .get("preferred_note")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && (existing
+            .get("preferred_note")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+            || incoming["note_canonical"].as_bool() == Some(true)
+                && existing["note_canonical"].as_bool() != Some(true));
+    if promote {
+        merged["preferred_note"] = incoming["preferred_note"].clone();
+        merged["note_canonical"] =
+            serde_json::Value::Bool(incoming["note_canonical"].as_bool().unwrap_or(false));
+    }
+    Ok(merged)
+}
+
+fn recording_claim(conn: &Connection, job: &ClaimedJob) -> Result<ClaimedJob> {
+    let (raw, state, attempts, max_attempts): (String, String, u32, u32) = conn
+        .query_row(
+            "SELECT payload,state,attempts,max_attempts FROM jobs WHERE id=?1 AND kind=?2",
+            params![job.id, job.kind],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .context("reading recording claim")?;
+    ensure!(
+        job.period_secs.is_none() && state == "running" && attempts == job.attempts,
+        "stale_recording_claim"
+    );
+    let existing =
+        serde_json::from_str(&raw).map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+    let mut merged = job.clone();
+    merged.payload = merge_recording_payload(&existing, &job.payload)?;
+    merged.max_attempts = max_attempts;
+    Ok(merged)
+}
+
 impl<'c> Jobs<'c> {
     pub fn new(conn: &'c Connection) -> Self {
         Self { conn }
@@ -114,6 +204,160 @@ impl<'c> Jobs<'c> {
             )
             .context("enqueueing job")?;
         Ok((n == 1).then(|| self.conn.last_insert_rowid()))
+    }
+
+    /// Arm existing recording work before its first side effect. Unlike generic [`Self::enqueue`],
+    /// identity is `(kind, payload.id)`, so adding origin/note metadata never creates a second active
+    /// retry. An existing origin (including its absence), first-attempt flag, claim, budget and due time
+    /// are immutable here. Note ownership and settled quality merge monotonically, including into a
+    /// parked failed job; incidental delivery never restarts exhausted work.
+    pub fn enqueue_recording(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        self.enqueue_recording_inner(kind, payload, max_attempts, run_at, false)
+    }
+
+    /// Explicit manual retry: atomically preserve the recording payload and rearm a parked failure.
+    /// Active claims/backoff remain untouched; only an already failed job gets the authorized new budget.
+    /// First-attempt permission is consumed even if the historical job was originally fresh.
+    pub fn rearm_failed_recording(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        self.enqueue_recording_inner(kind, payload, max_attempts, run_at, true)
+    }
+
+    /// Queue-owned manual retry, on the same transaction as its recording-row reset. Requiring an
+    /// existing transaction prevents callers from accidentally splitting those durability authorities.
+    pub fn rearm_recording_in_transaction(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+    ) -> Result<Option<i64>> {
+        ensure!(
+            !self.conn.is_autocommit(),
+            "recording_rearm_requires_transaction"
+        );
+        self.enqueue_recording_in_transaction(kind, payload, max_attempts, run_at, true)
+    }
+
+    fn enqueue_recording_inner(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+        rearm_failed: bool,
+    ) -> Result<Option<i64>> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .context("starting recording enqueue")?;
+        let inserted = Jobs::new(&transaction).enqueue_recording_in_transaction(
+            kind,
+            payload,
+            max_attempts,
+            run_at,
+            rearm_failed,
+        )?;
+        transaction
+            .commit()
+            .context("persisting recording job origin")?;
+        Ok(inserted)
+    }
+
+    fn enqueue_recording_in_transaction(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        max_attempts: u32,
+        run_at: DateTime<Utc>,
+        rearm_failed: bool,
+    ) -> Result<Option<i64>> {
+        settled_quality(payload)?;
+        let recording_id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .context("recording job requires an identity")?;
+        let existing = {
+            let mut statement = self.conn.prepare("SELECT id, payload, state FROM jobs WHERE kind = ?1 AND state IN ('pending','running','failed') ORDER BY CASE WHEN state = 'failed' THEN 1 ELSE 0 END, id DESC")?;
+            let mut rows = statement.query(params![kind])?;
+            let mut found = None;
+            while let Some(row) = rows.next()? {
+                let raw: String = row.get(1)?;
+                let candidate: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+                if candidate.get("id").and_then(serde_json::Value::as_str) == Some(recording_id) {
+                    let state: String = row.get(2)?;
+                    if found.is_some() {
+                        ensure!(state == "failed", "conflicting_active_recording_jobs");
+                    } else {
+                        found = Some((row.get::<_, i64>(0)?, candidate, state));
+                    }
+                }
+            }
+            found
+        };
+        let inserted = if let Some((job_id, existing, state)) = existing {
+            let mut merged = merge_recording_payload(&existing, payload)?;
+            if rearm_failed {
+                merged["first_batch"] = serde_json::Value::Bool(false);
+            }
+            if rearm_failed && state == "failed" {
+                self.conn.execute(
+                    "UPDATE jobs SET payload=?2,state='pending',attempts=0,max_attempts=?3,next_run_at=?4,last_error=NULL,updated_at=?5 WHERE id=?1",
+                    params![job_id, merged.to_string(), max_attempts, fmt_utc(run_at), fmt_utc(Utc::now())],
+                ).context("rearming recording retry")?;
+            } else if merged != existing {
+                self.conn.execute(
+                    "UPDATE jobs SET payload = ?2 WHERE id = ?1",
+                    params![job_id, merged.to_string()],
+                )?;
+            }
+            None
+        } else {
+            let now = fmt_utc(Utc::now());
+            let mut payload = payload.clone();
+            if rearm_failed {
+                payload["first_batch"] = serde_json::Value::Bool(false);
+            }
+            self.conn.execute(
+                "INSERT INTO jobs (kind, payload, max_attempts, next_run_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![kind, payload.to_string(), max_attempts, fmt_utc(run_at), now],
+            ).context("arming recording job")?;
+            Some(self.conn.last_insert_rowid())
+        };
+        Ok(inserted)
+    }
+
+    /// Read the durable recording payload without changing its claim/backoff. Active ownership takes
+    /// precedence over failed history; completed one-shot jobs retain their normal deletion behavior.
+    pub fn recording_payload(
+        &self,
+        kind: &str,
+        recording_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut statement = self.conn.prepare("SELECT payload FROM jobs WHERE kind = ?1 AND state IN ('pending','running','failed') ORDER BY CASE WHEN state = 'failed' THEN 1 ELSE 0 END, id DESC")?;
+        let mut rows = statement.query(params![kind])?;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            let payload: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+            if payload.get("id").and_then(serde_json::Value::as_str) == Some(recording_id) {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
     }
 
     /// Ensure the per-kind periodic singleton exists, due **now** (so it also fires at startup), with
@@ -254,6 +498,22 @@ impl<'c> Jobs<'c> {
         }
     }
 
+    /// Settle recording work without letting a stale claim erase newly merged quality or ownership.
+    pub fn fail_recording(
+        &self,
+        job: &ClaimedJob,
+        error: &str,
+        backoff: &Backoff,
+    ) -> Result<FailOutcome> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let merged = recording_claim(&transaction, job)?;
+        let outcome = self.fail(&merged, error, backoff)?;
+        transaction
+            .commit()
+            .context("persisting recording failure")?;
+        Ok(outcome)
+    }
+
     /// Requeue a claimed one-shot even after its nominal attempt budget. Used when the artifact's terminal
     /// state could not be persisted: parking the only active job first would violate durability.
     pub fn reschedule(
@@ -279,6 +539,22 @@ impl<'c> Jobs<'c> {
                 ],
             )
             .context("rescheduling unsettled job")?;
+        Ok(next)
+    }
+
+    /// Recording variant of [`Self::reschedule`], preserving evidence merged after the claim.
+    pub fn reschedule_recording(
+        &self,
+        job: &ClaimedJob,
+        error: &str,
+        backoff: &Backoff,
+    ) -> Result<DateTime<Utc>> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let merged = recording_claim(&transaction, job)?;
+        let next = self.reschedule(&merged, error, backoff)?;
+        transaction
+            .commit()
+            .context("persisting recording reschedule")?;
         Ok(next)
     }
 
@@ -376,6 +652,300 @@ mod tests {
         cap: Duration::from_secs(3600),
     };
 
+    fn recording_quality(start: u64, source_loss: bool) -> serde_json::Value {
+        json!({
+            "schema_version": 1, "coverage": "observed",
+            "epochs": [{"id": 0, "source_start_ns": 0, "source_rate_hz": 48000,
+                "source_frame_base": 0, "retained_start_frame": 0, "retained_rate_hz": 48000,
+                "mic_channels": 1, "tap_channels": 1, "reason": "start"}],
+            "spans": [{"epoch": 0, "start_frame": start, "end_frame": start + 2,
+                "track": "both", "cause": if source_loss { "ring_overflow" } else { "mic_tap_mismatch" },
+                "class": if source_loss { "source_loss" } else { "processing_loss" },
+                "stage": "live", "resolution": "outstanding"}],
+            "overflow": {"omitted_spans": [0,0,0], "outstanding_omitted_spans": [0,0,0],
+                "omitted_epochs": 0, "counter_saturated": false}
+        })
+    }
+
+    #[test]
+    fn recording_quality_merge_survives_duplicate_stale_claim_and_reopen_without_reset() {
+        let path =
+            std::env::temp_dir().join(format!("corti-job-quality-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        Jobs::ensure_schema(&conn).unwrap();
+        let jobs = Jobs::new(&conn);
+        let now = Utc::now();
+        let initial = json!({"id":"recording", "original_backend":"local", "first_batch":false,
+            "capture_finished":true, "settled_quality": recording_quality(0, true)});
+        jobs.enqueue_recording("retry", &initial, 3, now).unwrap();
+        let mut claimed = jobs.claim_due(now).unwrap().unwrap();
+        let state = || {
+            conn.query_row(
+                "SELECT state,attempts,max_attempts,next_run_at FROM jobs WHERE id=?1",
+                params![claimed.id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, u32>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let before = state();
+        let duplicate = json!({"id":"recording", "original_backend":"aws", "first_batch":true,
+            "settled_quality": recording_quality(8, false)});
+        for _ in 0..2 {
+            assert_eq!(
+                jobs.enqueue_recording("retry", &duplicate, 99, now + chrono::Duration::days(1))
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(state(), before);
+        let merged = jobs
+            .recording_payload("retry", "recording")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged["settled_quality"]["spans"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(merged["original_backend"], "local");
+        assert_eq!(merged["first_batch"], false);
+        // The app may add note ownership using an older claimed payload after a newer quality merge.
+        claimed.payload = json!({"id":"recording", "preferred_note":"/synthetic/owned.md", "note_canonical":true});
+        let FailOutcome::Rescheduled { next_run_at } = jobs
+            .fail_recording(&claimed, "synthetic_retry", &BACKOFF)
+            .unwrap()
+        else {
+            panic!("retry remains available")
+        };
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let jobs = Jobs::new(&conn);
+        assert!(jobs.claim_due(now).unwrap().is_none());
+        let reopened = jobs
+            .claim_due(next_run_at + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!((reopened.attempts, reopened.max_attempts), (2, 3));
+        assert_eq!(
+            reopened.payload["settled_quality"],
+            merged["settled_quality"]
+        );
+        assert_eq!(reopened.payload["original_backend"], "local");
+        assert_eq!(reopened.payload["first_batch"], false);
+        assert_eq!(reopened.payload["capture_finished"], true);
+        assert_eq!(reopened.payload["preferred_note"], "/synthetic/owned.md");
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn malformed_recording_quality_fails_before_mutation_without_payload_diagnostics() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        let payload = json!({"id":"recording", "settled_quality": {
+            "coverage":"SYNTHETIC-PRIVATE-QUALITY-SENTINEL"}});
+        let error = jobs
+            .enqueue_recording("retry", &payload, 5, Utc::now())
+            .unwrap_err();
+        assert!(!format!("{error:#} {error:?}").contains("SYNTHETIC-PRIVATE-QUALITY-SENTINEL"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let valid = json!({"id":"recording", "settled_quality":recording_quality(0, false)});
+        jobs.enqueue_recording("retry", &valid, 5, Utc::now())
+            .unwrap();
+        let prior = jobs
+            .recording_payload("retry", "recording")
+            .unwrap()
+            .unwrap();
+        let error = jobs
+            .enqueue_recording("retry", &payload, 99, Utc::now())
+            .unwrap_err();
+        assert!(!format!("{error:#} {error:?}").contains("SYNTHETIC-PRIVATE-QUALITY-SENTINEL"));
+        assert_eq!(
+            jobs.recording_payload("retry", "recording")
+                .unwrap()
+                .unwrap(),
+            prior
+        );
+        let mut conflict = valid.clone();
+        conflict["settled_quality"]["epochs"][0]["mic_channels"] = json!(2);
+        assert!(
+            jobs.enqueue_recording("retry", &conflict, 99, Utc::now())
+                .is_err()
+        );
+        assert_eq!(
+            jobs.recording_payload("retry", "recording")
+                .unwrap()
+                .unwrap(),
+            prior
+        );
+        conn.execute("UPDATE jobs SET payload=?1", params![payload.to_string()])
+            .unwrap();
+        let error = jobs
+            .enqueue_recording("retry", &valid, 5, Utc::now())
+            .unwrap_err();
+        assert!(!format!("{error:#} {error:?}").contains("SYNTHETIC-PRIVATE-QUALITY-SENTINEL"));
+    }
+
+    #[test]
+    fn failed_recording_quality_merge_and_manual_rearm_are_atomic_without_implicit_restart() {
+        for original in [None, Some("local")] {
+            let conn = jobs_conn();
+            let jobs = Jobs::new(&conn);
+            let now = Utc::now();
+            let mut initial = json!({"id":"recording", "first_batch":false,
+                "preferred_note":"/synthetic/owned.md", "note_canonical":true,
+                "settled_quality":recording_quality(0,true)});
+            if let Some(original) = original {
+                initial["original_backend"] = json!(original);
+            }
+            assert!(
+                jobs.rearm_recording_in_transaction("retry", &initial, 5, now)
+                    .is_err(),
+                "recording resets must share an explicit queue transaction"
+            );
+            jobs.enqueue_recording("retry", &initial, 1, now).unwrap();
+            let claimed = jobs.claim_due(now).unwrap().unwrap();
+            assert_eq!(
+                jobs.fail_recording(&claimed, "synthetic_exhausted", &BACKOFF)
+                    .unwrap(),
+                FailOutcome::Exhausted
+            );
+            let state = || {
+                conn.query_row(
+                    "SELECT state,attempts,max_attempts,next_run_at FROM jobs WHERE id=?1",
+                    params![claimed.id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, u32>(1)?,
+                            r.get::<_, u32>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+            let parked = state();
+            let duplicate = json!({"id":"recording","original_backend":"aws","first_batch":true,
+                "settled_quality":recording_quality(8,false)});
+            assert_eq!(
+                jobs.enqueue_recording("retry", &duplicate, 99, now)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(state(), parked);
+            assert!(
+                jobs.claim_due(now + chrono::Duration::days(1))
+                    .unwrap()
+                    .is_none()
+            );
+            let evidence = jobs
+                .recording_payload("retry", "recording")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                evidence["settled_quality"]["spans"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            conn.execute_batch("CREATE TEMP TRIGGER reject_rearm BEFORE UPDATE OF state ON jobs WHEN NEW.state='pending' BEGIN SELECT RAISE(ABORT,'synthetic_rearm_fault'); END;").unwrap();
+            assert!(
+                jobs.rearm_failed_recording("retry", &duplicate, 5, now)
+                    .is_err()
+            );
+            assert_eq!(state(), parked);
+            assert_eq!(
+                jobs.recording_payload("retry", "recording")
+                    .unwrap()
+                    .unwrap(),
+                evidence
+            );
+            conn.execute_batch("DROP TRIGGER reject_rearm;").unwrap();
+            jobs.rearm_failed_recording("retry", &duplicate, 5, now)
+                .unwrap();
+            let resumed = jobs.claim_due(now).unwrap().unwrap();
+            assert_eq!(
+                (resumed.id, resumed.attempts, resumed.max_attempts),
+                (claimed.id, 1, 5)
+            );
+            assert_eq!(resumed.payload, evidence);
+            assert_eq!(
+                resumed
+                    .payload
+                    .get("original_backend")
+                    .and_then(serde_json::Value::as_str),
+                original
+            );
+            assert_eq!(resumed.payload["first_batch"], false);
+            let running = state();
+            jobs.rearm_failed_recording("retry", &duplicate, 88, now + chrono::Duration::days(1))
+                .unwrap();
+            assert_eq!(state(), running);
+        }
+    }
+
+    #[test]
+    fn recording_reschedule_merges_new_quality_and_rejects_stale_claims() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        let now = Utc::now();
+        jobs.enqueue_recording(
+            "retry",
+            &json!({"id":"recording", "settled_quality":recording_quality(0,true)}),
+            1,
+            now,
+        )
+        .unwrap();
+        let claimed = jobs.claim_due(now).unwrap().unwrap();
+        jobs.enqueue_recording(
+            "retry",
+            &json!({"id":"recording", "settled_quality":recording_quality(8,false)}),
+            5,
+            now,
+        )
+        .unwrap();
+        let next = jobs
+            .reschedule_recording(&claimed, "synthetic_terminal_write_failed", &BACKOFF)
+            .unwrap();
+        let persisted = jobs
+            .recording_payload("retry", "recording")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted["settled_quality"]["spans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(jobs.fail_recording(&claimed, "stale", &BACKOFF).is_err());
+        assert_eq!(
+            jobs.recording_payload("retry", "recording")
+                .unwrap()
+                .unwrap(),
+            persisted
+        );
+        let resumed = jobs
+            .claim_due(next + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!((resumed.attempts, resumed.max_attempts), (2, 1));
+        assert_eq!(resumed.payload, persisted);
+    }
+
     #[test]
     fn backoff_doubles_and_caps() {
         let delays: Vec<u64> = (1..=5).map(|n| BACKOFF.delay(n).as_secs()).collect();
@@ -417,6 +987,159 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn recording_enqueue_preserves_origin_claim_budget_and_backoff() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        let now = Utc::now();
+        let original = json!({"id":"recording","original_backend":"local","first_batch":true,"preferred_note":"partial.md","note_canonical":false});
+        jobs.enqueue_recording("retry", &original, 6, now).unwrap();
+        let changed = json!({"id":"recording","original_backend":"aws","first_batch":false,"preferred_note":"canonical.md","note_canonical":true});
+        assert!(
+            jobs.enqueue_recording("retry", &changed, 99, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(jobs.active_for("retry").unwrap().len(), 1);
+        let claimed = jobs
+            .claim_due(now + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.payload["original_backend"], "local");
+        assert_eq!(claimed.payload["first_batch"], true);
+        assert_eq!(claimed.payload["preferred_note"], "canonical.md");
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(claimed.max_attempts, 6);
+        assert!(
+            jobs.enqueue_recording("retry", &changed, 100, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.claim_due(now + chrono::Duration::hours(1))
+                .unwrap()
+                .is_none(),
+            "claimed ownership must not reset"
+        );
+        let FailOutcome::Rescheduled { next_run_at } =
+            jobs.fail(&claimed, "synthetic failure", &BACKOFF).unwrap()
+        else {
+            panic!("first attempt should back off")
+        };
+        jobs.enqueue_recording("retry", &changed, 101, now).unwrap();
+        assert_eq!(
+            jobs.next_due_at().unwrap(),
+            Some(
+                DateTime::parse_from_rfc3339(&fmt_utc(next_run_at))
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        let retried = jobs
+            .claim_due(next_run_at + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.id, claimed.id);
+        assert_eq!(retried.attempts, 2);
+        assert_eq!(retried.max_attempts, 6);
+        assert_eq!(retried.payload["original_backend"], "local");
+    }
+
+    #[test]
+    fn recording_enqueue_cannot_authorize_an_unknown_existing_origin() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        jobs.enqueue("retry", &json!({"id":"legacy"}), 5, Utc::now())
+            .unwrap();
+        jobs.enqueue_recording(
+            "retry",
+            &json!({"id":"legacy","original_backend":"aws","first_batch":true}),
+            6,
+            Utc::now(),
+        )
+        .unwrap();
+        let payload = jobs.recording_payload("retry", "legacy").unwrap().unwrap();
+        assert!(payload.get("original_backend").is_none());
+        assert!(payload.get("first_batch").is_none());
+        assert_eq!(jobs.active_for("retry").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recording_origin_survives_reopening_before_and_after_claim() {
+        let dir = std::env::temp_dir().join(format!("corti-jobs-origin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jobs.db");
+        let conn = Connection::open(&path).unwrap();
+        Jobs::ensure_schema(&conn).unwrap();
+        Jobs::new(&conn)
+            .enqueue_recording(
+                "retry",
+                &json!({"id":"recording","original_backend":"aws","first_batch":true}),
+                6,
+                Utc::now(),
+            )
+            .unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let first = Jobs::new(&conn)
+            .claim_due(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.payload["original_backend"], "aws");
+        assert_eq!(first.attempts, 1);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        let jobs = Jobs::new(&conn);
+        assert_eq!(jobs.recover_running().unwrap(), 1);
+        let resumed = jobs
+            .claim_due(Utc::now() + chrono::Duration::seconds(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.id, first.id);
+        assert_eq!(resumed.attempts, 2);
+        assert_eq!(resumed.max_attempts, 6);
+        assert_eq!(resumed.payload["original_backend"], "aws");
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_budgets_allow_exactly_first_plus_five_or_existing_five_attempts() {
+        for budget in [5_u32, 6] {
+            let conn = jobs_conn();
+            let jobs = Jobs::new(&conn);
+            let payload = json!({"id":"recording","original_backend":"local"});
+            jobs.enqueue_recording("retry", &payload, budget, Utc::now())
+                .unwrap();
+            for expected in 1..=budget {
+                let claimed = jobs
+                    .claim_due(Utc::now() + chrono::Duration::days(1))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claimed.attempts, expected);
+                jobs.enqueue_recording("retry", &payload, 99, Utc::now())
+                    .unwrap();
+                let outcome = jobs.fail(&claimed, "synthetic failure", &BACKOFF).unwrap();
+                assert_eq!(
+                    matches!(outcome, FailOutcome::Exhausted),
+                    expected == budget
+                );
+            }
+            assert!(
+                jobs.claim_due(Utc::now() + chrono::Duration::days(2))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                jobs.recording_payload("retry", "recording")
+                    .unwrap()
+                    .unwrap()["original_backend"],
+                "local"
+            );
+        }
     }
 
     #[test]

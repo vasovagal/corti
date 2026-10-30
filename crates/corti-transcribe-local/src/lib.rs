@@ -19,23 +19,36 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use corti_core::{DiarizedTranscript, RecordingMeta, Speaker};
-use corti_transcribe::Transcriber;
+use corti_core::{
+    DiarizedTranscript, QualityClass, QualityRecord, QualityResolution, QualityStage, QualityTrack,
+    RecordingMeta, Speaker, insert_retained_processing_loss,
+};
+use corti_transcribe::decode::{
+    DecodeErrorCategory, DecodeReport, InputSpan, RegionOutcome, RegionStatus,
+};
 use corti_transcribe::segment::{SEGMENT_GAP, diarize_words, merge_by_time, words_to_segments};
+use corti_transcribe::{Transcriber, TranscriptionOutcome};
 
 mod asr;
 mod audio;
 mod engine;
 #[cfg(feature = "ggml")]
 pub mod ggml;
+mod input_clock;
 mod live;
 pub mod models;
+mod resample;
 
 pub use asr::Asr;
 pub use corti_transcribe::segment::Word;
+#[doc(hidden)]
+pub use live::{
+    BoundaryCapacity, BoundaryError, BoundaryInput, BoundaryKind, BoundaryLimits, BoundaryProgress,
+    BoundaryResamplerBounds, BoundarySnapshot, BoundaryToken, boundary_resampler_bounds,
+};
 pub use live::{LiveEngine, LiveTranscriber};
 #[cfg(feature = "stream")]
-pub use live::{LiveSink, LiveWordStream, live_word_stream};
+pub use live::{LiveSink, LiveStreamCompletion, LiveWordStream, live_word_stream};
 
 /// Where the local models live and how to run them. Built by the app from its config.
 #[derive(Debug, Clone)]
@@ -225,7 +238,20 @@ impl LocalTranscriber {
 }
 
 impl Transcriber for LocalTranscriber {
-    fn transcribe(&self, audio: &Path, _meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+    fn transcribe(&self, audio: &Path, meta: &RecordingMeta) -> Result<DiarizedTranscript> {
+        let outcome = self.transcribe_with_quality(audio, meta, &QualityRecord::default())?;
+        anyhow::ensure!(outcome.decode_complete, "local transcription incomplete");
+        Ok(outcome.transcript)
+    }
+
+    fn transcribe_with_quality(
+        &self,
+        audio: &Path,
+        _meta: &RecordingMeta,
+        quality: &QualityRecord,
+    ) -> Result<TranscriptionOutcome> {
+        let mut quality = quality.clone();
+        let mut decode_complete = true;
         let job_started = std::time::Instant::now();
         tracing::info!(
             target: "corti::transcribe::local",
@@ -253,33 +279,74 @@ impl Transcriber for LocalTranscriber {
 
         // ch0 (mic) → Me. Channel = speaker; no diarizer needed.
         if !track.mic.is_empty() {
-            let mic = engine::resample_to_16k(&track.mic, track.sample_rate)?;
-            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
-            let words = engine::transcribe_channel(rec.clone(), vad, &mic);
-            segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
+            match engine::resample_to_16k(&track.mic, track.sample_rate) {
+                Ok(mic) => {
+                    let vad =
+                        engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
+                    let (words, report, complete) = engine::transcribe_resampled_channel(
+                        rec.clone(),
+                        vad,
+                        &mic,
+                        track.mic.len(),
+                        track.sample_rate as u32,
+                    );
+                    decode_complete &= complete;
+                    apply_batch_report(&mut quality, QualityTrack::Mic, report)?;
+                    segments.extend(words_to_segments(&words, Speaker::Me, SEGMENT_GAP));
+                }
+                Err(_) => {
+                    decode_complete = false;
+                    apply_batch_report(
+                        &mut quality,
+                        QualityTrack::Mic,
+                        resampler_failure(track.mic.len()),
+                    )?;
+                }
+            }
         }
 
         // ch1 (system tap) → far end.
         if !track.them.is_empty() {
-            let them = engine::resample_to_16k(&track.them, track.sample_rate)?;
-            let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
-            let words = engine::transcribe_channel(rec.clone(), vad, &them);
-            if self.cfg.diarize_far_end {
-                // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
-                let diar = engine::build_diarizer(
-                    &m,
-                    threads,
-                    self.cfg.diarize_threshold,
-                    self.cfg.diarize_num_clusters,
-                    self.cfg.diarize_min_duration_on,
-                    self.cfg.diarize_min_duration_off,
-                )?;
-                let turns = engine::diarize_channel(&diar, &them);
-                segments.extend(diarize_words(&words, &turns, SEGMENT_GAP, "Them"));
-            } else {
-                // Default: attribute the whole far end to a single speaker (like the AWS backend).
-                let them_speaker = Speaker::Other("Them".to_string());
-                segments.extend(words_to_segments(&words, them_speaker, SEGMENT_GAP));
+            let them = match engine::resample_to_16k(&track.them, track.sample_rate) {
+                Ok(them) => Some(them),
+                Err(_) => {
+                    decode_complete = false;
+                    apply_batch_report(
+                        &mut quality,
+                        QualityTrack::Tap,
+                        resampler_failure(track.them.len()),
+                    )?;
+                    None
+                }
+            };
+            if let Some(them) = them {
+                let vad = engine::build_vad(&m, self.cfg.vad_threshold, self.cfg.vad_min_silence)?;
+                let (words, report, complete) = engine::transcribe_resampled_channel(
+                    rec.clone(),
+                    vad,
+                    &them,
+                    track.them.len(),
+                    track.sample_rate as u32,
+                );
+                decode_complete &= complete;
+                apply_batch_report(&mut quality, QualityTrack::Tap, report)?;
+                if self.cfg.diarize_far_end {
+                    // Opt-in: split the far end into per-speaker labels (Them 1/2/…).
+                    let diar = engine::build_diarizer(
+                        &m,
+                        threads,
+                        self.cfg.diarize_threshold,
+                        self.cfg.diarize_num_clusters,
+                        self.cfg.diarize_min_duration_on,
+                        self.cfg.diarize_min_duration_off,
+                    )?;
+                    let turns = engine::diarize_channel(&diar, &them);
+                    segments.extend(diarize_words(&words, &turns, SEGMENT_GAP, "Them"));
+                } else {
+                    // Default: attribute the whole far end to a single speaker (like the AWS backend).
+                    let them_speaker = Speaker::Other("Them".to_string());
+                    segments.extend(words_to_segments(&words, them_speaker, SEGMENT_GAP));
+                }
             }
         }
 
@@ -290,7 +357,221 @@ impl Transcriber for LocalTranscriber {
             segments = transcript.segments.len(),
             "local transcription finished"
         );
-        Ok(transcript)
+        Ok(TranscriptionOutcome {
+            transcript,
+            quality,
+            decode_complete,
+        })
+    }
+}
+
+fn resampler_failure(frames: usize) -> DecodeReport {
+    let mut report = DecodeReport::default();
+    report.record(RegionOutcome {
+        span: InputSpan {
+            start_frame: 0,
+            end_frame: frames as u64,
+        },
+        status: RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable),
+    });
+    report
+}
+
+fn apply_batch_report(
+    quality: &mut QualityRecord,
+    track: QualityTrack,
+    report: DecodeReport,
+) -> Result<()> {
+    quality.record_omitted_spans(
+        QualityClass::DegradedOnly,
+        QualityResolution::Outstanding,
+        report.omitted_metadata(),
+    )?;
+    quality.record_omitted_spans(
+        QualityClass::ProcessingLoss,
+        QualityResolution::Outstanding,
+        report.omitted_failures(),
+    )?;
+    for outcome in report.outcomes() {
+        if let RegionStatus::Failed(category) | RegionStatus::Partial(category) = outcome.status {
+            insert_retained_processing_loss(
+                quality,
+                outcome.span.start_frame,
+                outcome.span.end_frame,
+                track,
+                category.quality_cause(),
+                QualityStage::Batch,
+            )?;
+        }
+    }
+    if report.counter_saturated() {
+        quality.overflow.counter_saturated = true;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use corti_core::{CaptureEpoch, CaptureEpochReason, QualityCause};
+
+    #[test]
+    fn batch_cap_metadata_accumulates_both_channels_without_processing_loss() {
+        let mut quality = QualityRecord::observed();
+        quality
+            .record_omitted_spans(
+                QualityClass::DegradedOnly,
+                QualityResolution::Outstanding,
+                7,
+            )
+            .unwrap();
+        for (track, status) in [
+            (QualityTrack::Mic, RegionStatus::Complete),
+            (QualityTrack::Tap, RegionStatus::RecognizedEmpty),
+        ] {
+            let mut report = DecodeReport::default();
+            for frame in 0..257 {
+                report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: frame,
+                        end_frame: frame + 1,
+                    },
+                    status,
+                });
+            }
+            assert!(report.is_complete());
+            apply_batch_report(&mut quality, track, report).unwrap();
+        }
+        assert_eq!(quality.overflow.outstanding_omitted_spans, [0, 0, 9]);
+        assert_eq!(quality.overflow.omitted_spans, [0, 0, 9]);
+        assert!(!quality.requires_batch_recovery());
+        assert_eq!(
+            quality.completeness(),
+            corti_core::SourceCompleteness::Complete
+        );
+        assert!(quality.spans.is_empty());
+        apply_batch_report(&mut quality, QualityTrack::Mic, DecodeReport::default()).unwrap();
+        assert_eq!(quality.overflow.outstanding_omitted_spans, [0, 0, 9]);
+    }
+
+    #[test]
+    fn batch_metadata_cap_preserves_existing_source_and_decode_failure_facts() {
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 16_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 16_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        quality
+            .record_omitted_spans(QualityClass::SourceLoss, QualityResolution::Outstanding, 2)
+            .unwrap();
+        quality
+            .record_omitted_spans(
+                QualityClass::DegradedOnly,
+                QualityResolution::Outstanding,
+                3,
+            )
+            .unwrap();
+        for track in [QualityTrack::Mic, QualityTrack::Tap] {
+            let mut report = DecodeReport::default();
+            for frame in 0..256 {
+                report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: frame,
+                        end_frame: frame + 1,
+                    },
+                    status: RegionStatus::RecognizedEmpty,
+                });
+            }
+            report.record(RegionOutcome {
+                span: InputSpan {
+                    start_frame: 300,
+                    end_frame: 301,
+                },
+                status: RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
+            });
+            assert!(!report.is_complete());
+            apply_batch_report(&mut quality, track, report).unwrap();
+        }
+        assert_eq!(quality.overflow.outstanding_omitted_spans, [2, 0, 5]);
+        assert_eq!(quality.spans.len(), 2);
+        assert!(
+            quality
+                .spans
+                .iter()
+                .all(|span| span.class == QualityClass::ProcessingLoss)
+        );
+        assert!(quality.requires_batch_recovery());
+    }
+
+    #[test]
+    fn batch_decode_loss_extends_the_capture_record_without_resolving_history() {
+        let mut quality = QualityRecord::observed();
+        quality
+            .insert_epoch(CaptureEpoch {
+                id: 0,
+                source_start_ns: Some(0),
+                source_rate_hz: 48_000,
+                source_frame_base: 0,
+                retained_start_frame: 0,
+                retained_rate_hz: 48_000,
+                mic_channels: 1,
+                tap_channels: 1,
+                reason: CaptureEpochReason::Start,
+            })
+            .unwrap();
+        insert_retained_processing_loss(
+            &mut quality,
+            10,
+            20,
+            QualityTrack::Mic,
+            QualityCause::TeeDrop,
+            QualityStage::Live,
+        )
+        .unwrap();
+        let historical = quality.spans.clone();
+        let mut report = DecodeReport::default();
+        report.record(RegionOutcome {
+            span: InputSpan {
+                start_frame: 48_000,
+                end_frame: 96_000,
+            },
+            status: RegionStatus::Partial(DecodeErrorCategory::Aborted),
+        });
+        apply_batch_report(&mut quality, QualityTrack::Tap, report).unwrap();
+        assert!(historical.iter().all(|span| quality.spans.contains(span)));
+        assert!(quality.spans.iter().any(|span| span.start_frame == 48_000
+            && span.end_frame == 96_000
+            && span.stage == QualityStage::Batch
+            && span.track == QualityTrack::Tap
+            && span.cause == QualityCause::DecodeFailure
+            && span.resolution == QualityResolution::Outstanding));
+        let before = quality.clone();
+        apply_batch_report(&mut quality, QualityTrack::Tap, DecodeReport::default()).unwrap();
+        assert_eq!(
+            quality, before,
+            "successful backend decoding has no storage/recovery authority"
+        );
+    }
+
+    #[test]
+    fn batch_resampler_failure_without_capture_mapping_is_an_omitted_loss() {
+        let mut quality = QualityRecord::default();
+        apply_batch_report(&mut quality, QualityTrack::Tap, resampler_failure(44_100)).unwrap();
+        assert!(quality.epochs.is_empty());
+        assert!(quality.spans.is_empty());
+        assert_eq!(
+            quality.overflow.outstanding_omitted_spans[QualityClass::ProcessingLoss.index()],
+            1
+        );
     }
 }
 

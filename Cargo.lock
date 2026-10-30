@@ -1486,6 +1486,7 @@ version = "0.17.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1502,6 +1503,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "rtrb",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1522,6 +1524,7 @@ version = "0.17.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "corti-core",
  "rusqlite",
  "serde_json",
 ]
@@ -1612,7 +1615,10 @@ name = "corti-transcribe"
 version = "0.17.0"
 dependencies = [
  "anyhow",
+ "corti-aec",
  "corti-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -5,7 +5,8 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
 1. **The Vagus boundary lives only in `corti-vagus`.** Create notes through `vagus add-note` (including
    ADR 0014's safe child-only provenance input); never write the Vagus index or SQLite DB. Against only a
    note path returned for the current recording, ADR 0010 permits bounded append/state/body/delete writes,
-   ADR 0014 lets the fallback body rewrite replace/insert only Corti's own `corti:` frontmatter field, and
+   ADR 0014 lets the fallback body rewrite replace/insert only Corti's own `corti:` frontmatter field,
+   and its capture-quality amendment permits a bounded metadata-only refresh preserving body/inode;
    ADR 0015 permits the one current-note read/final rewrite needed to publish validated hosted text before
    the state flip. Provider adapters receive typed text/metadata and never a Vagus path. Vagus alone derives
    searchable metadata chunks. Never touch any other vault path. (ADRs 0001, 0010, 0014, 0015)
@@ -27,11 +28,13 @@ Binding invariants. Changing one requires updating the matching ADR in `adr/`.
    mid-upload/transcribe/file resumes rather than loses the note. *(#85 restored durability via `corti-jobs`:
    a transient transcribe/file failure schedules a durable retry job (backoff, ≤5 attempts) that survives
    restarts, orphaned jobs are re-queued at startup (`recover_running`), and an hourly sweep enforces audio
-   retention. Job-level, not full first-attempt resume — a crash mid-first-transcribe still strands that row.)*
+   retention. #162 arms that existing job before first batch ASR, preserving original backend and retry
+   budget across crashes; unknown or changed automatic origins fail closed before staging/ASR.)*
 8. **Attribution is best-effort and must never block capture.** Prefer a known conferencing app; skip
    `com.apple.*` audio helpers; fall back to the frontmost app, then "Unknown app".
 9. **CoreAudio listener callbacks run on a HAL thread** — they must not block and must only hand work to
-   the async runtime via a channel.
+   the async runtime via a channel, or invalidate the fixed atomic capture-format mailbox consumed by
+   its owned off-HAL control worker (ADR 0002's #162 amendment). No property queries or allocation on HAL.
 10. **Audio capture needs a TCC identity.** Any binary that captures (process tap or mic) MUST carry an
     `Info.plist` with `NSAudioCaptureUsageDescription` + `NSMicrophoneUsageDescription` and be code-signed,
     or macOS silently denies it (no prompt, zero IO callbacks). CLI binaries embed the plist via

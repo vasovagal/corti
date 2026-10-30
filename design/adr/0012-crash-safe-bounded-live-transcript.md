@@ -59,3 +59,58 @@ duration.
   than blocking capture or allocating without limit.
 - Manual webinar captures still have no live hook and remain on the batch path. This ADR changes the existing
   detector-recording live path only.
+
+## Amendment: pause-aware live ownership (#155)
+
+The configured `live_buffer_minutes`, its default, and the existing nominal audio-cap due point stay
+unchanged. Once due, filing waits for a common source-frame ownership interval certified by both
+established channels: no open or queued VAD region, all attempted regions behind the cut, and a
+proved lower bound on every future region start. A never-present channel is neutral; a late channel
+keeps its original source origin. Natural filing retires only the selected PCM prefix and leaves
+VAD, resampler, AEC, cleanup carry, and their clocks running.
+
+The maximum additional source ownership is the configured 20-second speech maximum plus the
+actual minimum silence plus one second of slack: **22 seconds** at the unchanged one-second silence
+setting. That speech maximum is not itself proof of a hard native split. If no common natural cut
+is available at the deadline, a fixed source fence gates decoding before it can cross the cut.
+Old polls are drained and filed or accounted as lost before acknowledgement permits suffix replay.
+The existing text-cap escape remains immediate. A forced cut is recorded as `ForcedBoundary` /
+`DegradedOnly`; it alone does not trigger batch transcription or make a recording partial.
+
+Source ownership and filing latency are distinct. Real input beyond a forced fence may be needed
+to settle native state. Checked reserve arithmetic includes the actual AEC output lag, 4096-frame
+source admission, resampler packet/filter tails, and the native future-start guard. EOF finishes
+the real AEC and resampler tails once. If real input still cannot settle a pending fence, only the
+actually unfiled old and next source intervals become `WindowNotFiled` processing loss, and the
+existing one-backend whole-file fallback rewrites the same note. A partial batch cannot certify
+those intervals complete; no live words are spliced into that batch result.
+
+After ownership is acknowledged, terminal processing of a fresh, pinned Silero detector admits
+at most 5727 synthetic zero samples to the VAD alone. The locked detector's 575-sample remainder
+and 5152-sample future-onset bound then prove that it has processed the real EOF. Padding does
+not advance source time or enter retained PCM or ASR; emitted regions are clipped to the real
+EOF before mapping and decoding. A processed VAD-negative suffix remains valid empty output.
+Unknown detector provenance, insufficient native headroom, invalid mapping, or unresolved
+ownership cannot grant this certificate. Legacy destructive checkpoints preserve uncertainty
+about their unresolved suffix instead of silently discarding it. This is a processing guarantee,
+not a guarantee that ASR recognizes every word; native word and critical-span gates still apply.
+
+The optional tap allocation retains its **total 128 MiB limit**, including the nominal window,
+deferral, and settlement reserve, reserved fallibly in one backing vector. The reserve component
+also has its own 32 MiB bound. A configuration that leaves insufficient room fails live setup and
+uses the existing batch route; it never shortens nominal ownership or enlarges the tap cap. This
+affects unusually high-rate configurations whose nominal window already consumes that cap; the
+ordinary 60-second and 600-second windows at 48 kHz still fit. Native retained
+canonical PCM is independently limited to 128 MiB per channel; replay is bounded by the checked
+settlement allowance. These are component limits, not a total-process RSS claim. Raw poll admission
+reserves its retained text and child/context cost before inserting or cloning it against the
+existing 1 MiB budget. Impossible capacity or omitted output produces truthful processing loss
+instead of shrinking the nominal window or silently growing a queue.
+
+Native signed-counter maintenance arms early, with enough headroom for the entire next ordinary
+window and its settlement. It never makes a window due earlier or changes the selected source cut.
+At a certified natural maintenance cut C, VAD resets only after old ownership is retired and replays
+the retained, never-attempted suffix from the certified future-start bound U, while preserving C
+and the source/resampler clocks. Exact PCM ownership does not prove inference equivalence after
+reset. Natural, forced, and maintenance runs therefore share the same native word and critical-span
+acceptance gates. The legacy public checkpoint/finish API remains available to existing callers.

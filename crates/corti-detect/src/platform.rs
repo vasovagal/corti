@@ -57,6 +57,15 @@ pub trait LiveHook: Send + 'static {
     /// matching [`DetectorEvent::RecordingFinished`] is emitted, so a recording-specific live verdict is
     /// never delayed behind the serial pipeline.
     fn finished(&self, _meta: &RecordingMeta) {}
+    /// The same immutable quality authority already synced beside the WAV. Delivered before the
+    /// completion event; the default preserves existing hook implementations.
+    fn finished_with_processing(
+        &self,
+        meta: &RecordingMeta,
+        _processing: &corti_capture::CaptureProcessing,
+    ) {
+        self.finished(meta);
+    }
     /// The recording was discarded below the keep threshold. Called after the recorder closes the tee and
     /// before [`DetectorEvent::RecordingDiscarded`] is emitted.
     fn discarded(&self, _meta: &RecordingMeta) {}
@@ -177,12 +186,12 @@ fn deliver_finished(
     emit: impl FnOnce(DetectorEvent),
 ) {
     if let Some(hook) = live {
-        hook.finished(&meta);
+        hook.finished_with_processing(&meta, &finished.processing);
     }
     emit(DetectorEvent::RecordingFinished {
         meta,
         audio_path: finished.path,
-        capture_processing: finished.processing,
+        capture_processing: Box::new(finished.processing),
     });
 }
 
@@ -527,6 +536,60 @@ mod tests {
                 "discard verdict",
                 "discarded event"
             ]
+        );
+    }
+
+    #[test]
+    fn exact_capture_quality_reaches_live_finish_before_the_completion_event() {
+        struct QualityHook(Arc<Mutex<Option<corti_core::QualityRecord>>>);
+        impl LiveHook for QualityHook {
+            fn attach(&self, _: &OwningApp) -> Option<corti_capture::CaptureTee> {
+                None
+            }
+            fn started(&self, _: &RecordingMeta, _: u32) {}
+            fn finished(&self, _: &RecordingMeta) {
+                panic!("quality handoff must use additive hook");
+            }
+            fn finished_with_processing(
+                &self,
+                _: &RecordingMeta,
+                processing: &corti_capture::CaptureProcessing,
+            ) {
+                *self.0.lock().unwrap() = processing.quality.clone();
+            }
+            fn discarded(&self, _: &RecordingMeta) {}
+            fn aborted(&self) {}
+            fn failed(&self, _: &RecordingMeta) {}
+        }
+        let mut quality = corti_core::QualityRecord::observed();
+        quality
+            .record_omitted_spans(
+                corti_core::QualityClass::SourceLoss,
+                corti_core::QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        let seen = Arc::new(Mutex::new(None));
+        let hook = QualityHook(seen.clone());
+        let mut processing = corti_capture::CaptureProcessing::disabled();
+        processing.quality = Some(quality.clone());
+        deliver_finished(
+            Some(&hook),
+            meta(),
+            FinishedRecording {
+                path: PathBuf::from("/tmp/corti-quality-ordering.wav"),
+                processing,
+            },
+            |event| {
+                assert_eq!(*seen.lock().unwrap(), Some(quality.clone()));
+                let DetectorEvent::RecordingFinished {
+                    capture_processing, ..
+                } = event
+                else {
+                    panic!("expected completion event");
+                };
+                assert_eq!(capture_processing.quality, Some(quality));
+            },
         );
     }
 }
