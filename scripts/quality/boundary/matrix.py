@@ -192,8 +192,12 @@ def formatting_key(text):
     return " ".join(piece.strip(".,!?;:") for piece in text.split())
 
 
-def forced_gate(score, reference_words, hypothesis_words, cuts):
-    """Gate for a cell with forced cuts (seconds); natural-only cells keep the strict gate."""
+def forced_gate(score, reference_words, hypothesis_words, cuts, declared=()):
+    """Gate for a cell with forced cuts (seconds); natural-only cells keep the strict gate.
+
+    `declared` lists this cell and track's authored expected differences (#168). Each must be
+    observed exactly as declared; anything else still fails.
+    """
     from score import tokens
     result = score["score"]
     reference = tokens(word["text"] for word in reference_words)
@@ -211,6 +215,7 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
         return next((cut for cut in cuts if abs(time - cut) <= SEAM_SECONDS), None)
 
     exempt, degraded, lost, changed, formatting, changed_text = set(), [], [], [], [], {}
+    matched = []
     for row in score["coverage"]:
         if result["critical_occurrences"][row["id"]]:
             continue
@@ -226,10 +231,24 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
             formatting.append(row["id"])
             exempt.update(span)
         else:
-            changed.append(row["id"])
-            changed_text[row["id"]] = (
-                " ".join(reference[index].raw for index in row["indices"]) + " -> "
-                + " ".join(hypothesis[path[index][2]].raw for index in span if path[index][2] is not None))
+            text = (" ".join(reference[index].raw for index in row["indices"]) + " -> "
+                    + " ".join(hypothesis[path[index][2]].raw for index in span if path[index][2] is not None))
+            entry = {"occurrence": row["id"], "change": text}
+            if entry in declared:
+                matched.append(entry)
+                exempt.update(span)
+            else:
+                changed.append(row["id"])
+                changed_text[row["id"]] = text
+    introduced = []
+    for index, (_, _, h) in enumerate(path):
+        if h in result["introduced_critical_indices"] and index not in exempt and seam(path[index]) is None:
+            entry = {"introduced": hypothesis[h].raw, "hypothesis_index": h}
+            if entry in declared:
+                matched.append(entry)
+                exempt.add(index)
+            else:
+                introduced.append({"index": h, "token": hypothesis[h].raw})
     seam_edits, outside_edits = {cut: 0 for cut in cuts}, 0
     for index, step in enumerate(path):
         if step[0] == "equal":
@@ -239,16 +258,38 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
             seam_edits[cut] += 1
         elif index not in exempt:
             outside_edits += 1
-    introduced = [h for index, (_, _, h) in enumerate(path)
-                  if h in result["introduced_critical_indices"] and index not in exempt
-                  and seam(path[index]) is None]
+    unused = [entry for entry in declared if entry not in matched]
     return {"seam_edits": {str(cut): count for cut, count in seam_edits.items()},
             "outside_edits": outside_edits, "degraded_critical": degraded,
             "lost_critical": lost, "changed_critical": changed, "changed_text": changed_text,
             "formatting_only_critical": formatting, "introduced_critical": introduced,
+            "declared_differences": matched, "unused_declared": unused,
             "passed": (all(count <= SEAM_EDIT_LIMIT for count in seam_edits.values())
                        and 100 * outside_edits <= OUTSIDE_EDIT_PERCENT * len(reference)
-                       and not lost and not changed and not introduced)}
+                       and not lost and not changed and not introduced and not unused)}
+
+
+def declared_differences(definition):
+    """Authored expected differences at forced cuts, keyed by (cell, track); #168 removes them."""
+    block = definition.get("expected_differences")
+    if block is None:
+        return {}
+    specs = {row["id"]: row for row in definition["matrix"]}
+    if block.get("issue") != "#168" or not block.get("justification"):
+        raise CoverageError("declared differences must cite #168 and a justification")
+    grouped = {}
+    for row in block["entries"]:
+        spec = specs.get(row.get("cell"))
+        if spec is None or spec["waveform"] != "continuous" or row.get("track") not in ("mic", "tap"):
+            raise CoverageError("declared difference names no forced-cut cell and track")
+        entry = {key: value for key, value in row.items() if key not in ("cell", "track")}
+        if set(entry) not in ({"occurrence", "change"}, {"introduced", "hypothesis_index"}):
+            raise CoverageError("malformed declared difference")
+        rows = grouped.setdefault((row["cell"], row["track"]), [])
+        if entry in rows:
+            raise CoverageError("duplicate declared difference")
+        rows.append(entry)
+    return grouped
 
 
 def unique_index(rows, expected, label):
@@ -333,7 +374,9 @@ def diagnose(seal, result, context_seconds=1.5):
                     cuts = [event["cut_frame"] / spec["sample_rate"] for event in cell["boundaries"]
                             if event["kind"] in {"deadline", "explicit"}]
                     if cuts:
-                        gate = forced_gate(scored, reference, hypothesis, cuts)
+                        gate = forced_gate(scored, reference, hypothesis, cuts,
+                                           declared_differences(seal["definition"]).get(
+                                               (cell["id"], track), []))
                         lines.append(f"  verdict forced_gate passed={gate['passed']} " + json.dumps(
                             {key: value for key, value in gate.items() if key != "passed"}, sort_keys=True))
                     else:
@@ -374,6 +417,7 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
             or not seal["synthetic_only"]):
         raise CoverageError("unbound native fixture identity")
     specs = {row["id"]: row for row in definition["matrix"]}
+    declared, declared_seen = declared_differences(definition), []
     fixtures = {row["id"]: row for row in seal["fixtures"]}
     required_fixtures = {f"{cell['waveform']}-{cell['sample_rate']}-{track}"
                          for cell in specs.values() for track in ("mic", "tap")}
@@ -523,7 +567,14 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
                 raise CoverageError("fixed forced cell did not cross an annotated critical occurrence")
             cuts = [event["cut_frame"] / spec["sample_rate"] for event in events
                      if event["kind"] in {"deadline", "explicit"}]
-            gate = forced_gate(score, baseline["batch_words"], actual["words"], cuts) if cuts else None
+            expected = declared.get((identifier, track), [])
+            if expected and not cuts:
+                raise CoverageError("declared difference names a cell run without forced cuts")
+            gate = (forced_gate(score, baseline["batch_words"], actual["words"], cuts, expected)
+                    if cuts else None)
+            if gate:
+                declared_seen.extend({"cell": identifier, "track": track, **entry}
+                                for entry in gate["declared_differences"])
             scores.append({"id": identifier, "track": track, "score": score, "forced_gate": gate,
                            "nominal_critical_crossings": nominal, "forced_critical_crossings": forced,
                            "boundary_local": [boundary_local(score, baseline["batch_words"],
@@ -534,6 +585,6 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
                            and actual["decode_complete"]})
     if any(not {"name", "negation", "number"} <= categories for categories in short_crossings.values()):
         raise CoverageError("short phase matrix missed required critical crossing categories")
-    return {"baseline_scores": baseline_scores, "cells": scores,
+    return {"baseline_scores": baseline_scores, "cells": scores, "declared_differences": declared_seen,
             "passed": all(row["passed"] for row in scores)
             and all(row["passed"] for row in baseline_scores.values())}

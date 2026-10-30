@@ -121,5 +121,16 @@
     "crossing_coverage": "across the paused short-phase matrix, each track must have a baseline name, negator and multi-token-number occurrence strictly straddling an observed nominal due frame; each track of the explicit forced probe must have a critical occurrence strictly straddling at least one fixed forced frame; actual deferred natural cuts need not divide a critical word",
     "maintenance": "arm in advance and reset only at an ordinary selected boundary; never move nominal due or shorten the window; impossible native epoch capacity fails before inference",
     "required_structure": ["every matrix cell and both tracks present", "no duplicate or missing required result", "source time monotonic", "attempted canonical PCM owned once", "source fence within unchanged nominal plus22seconds unless explicitly forced earlier", "at least one natural cut in paused ordinary cells", "at least one cut in real60 cell", "both explicit forced fences observed", "at least one proactive maintenance reset", "no AEC/VAD/model default changes", "raw words and timestamps retained", "every loss/metadata/cut/settlement record retained within declared bounded evidence"]
+  },
+  "expected_differences": {
+    "issue": "#168",
+    "justification": "Observed on macOS at 4d899f8 (run 41035747092). No audio is lost: decoding resumes exactly at each forced cut. In continuous-phase0/mic the pre-cut region has the batch region's start and samples and ends 268 ms earlier (1.030-26.000 s vs 1.030-26.268 s); Parakeet attends over the whole region, so the shorter extent flips the borderline unit 'euros' about 20 s before the cut. The explicit probe's 8.5 s region between its fences loses the same context. Only right-context decoding at forced cuts (#168) can remove these. Each entry is exact, scoped to one cell, track and occurrence, and must be observed exactly; every other difference still fails.",
+    "entries": [
+      {"cell": "continuous-phase0", "track": "mic", "occurrence": "0:continuous:amount", "change": "1,500 euros -> 1,500"},
+      {"cell": "continuous-phase0", "track": "mic", "occurrence": "0:continuous:contrast", "change": "15,000 euros, -> 15,000"},
+      {"cell": "continuous-forced-fence", "track": "tap", "occurrence": "0:continuous:contrast", "change": "15,000 euros -> 15,000,"},
+      {"cell": "continuous-forced-fence", "track": "tap", "occurrence": "0:continuous:amount-unit", "change": "15mm -> millimeters"},
+      {"cell": "continuous-forced-fence", "track": "tap", "introduced": "15", "hypothesis_index": 28}
+    ]
   }
 }

@@ -33,7 +33,17 @@ a critical occurrence damaged there is reported as `degraded_critical`, and the
 app marks every forced cut with a `ForcedBoundary` quality span. Away from the
 cuts, every critical occurrence must be unchanged except for formatting (case,
 sentence punctuation, digit grouping, euro sign versus "euros"), no negator or
-digit token may be introduced, and other edits stay within the ordinary 5%. Decoding resumes exactly at the cut: after
+digit token may be introduced, and other edits stay within the ordinary 5%.
+
+`expected_differences` in `fixtures.json` lists the exact differences observed
+on macOS that only overlap re-decoding can remove (#168). The full-context model
+can flip a borderline unit ("euros") far from a forced cut, because the pre-cut
+region ends earlier than the batch region. Each entry names one cell, track and
+occurrence (or introduced token and its index) with the exact change. It must be
+observed exactly; an unused entry fails. Every other difference still fails.
+Accepted entries print as `BOUNDARY_DECLARED_DIFFERENCE` on every run.
+
+Decoding resumes exactly at the cut: after
 a VAD reset, one second of already-decoded audio is replayed on the VAD window
 grid to warm the model and is never decoded again.
 

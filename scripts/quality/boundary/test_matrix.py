@@ -13,6 +13,8 @@ RUNTIME_IDENTITY = {"synthetic_runner": "known"}
 
 def synthetic_complete_run():
     definition = json.loads(Path(__file__).with_name("fixtures.json").read_text())
+    # Declared differences describe real-model output on authored speech, not this synthetic run.
+    definition.pop("expected_differences", None)
     fixtures, baselines = {}, {}
     for cell in definition["matrix"]:
         for track in ("mic", "tap"):
@@ -197,6 +199,89 @@ class MatrixTests(unittest.TestCase):
                         "Nora has 1,500 euros and not more 7 today"):  # digit introduced
             with self.subTest(changed=changed):
                 self.assertFalse(gate(changed)["passed"])
+
+    def test_declared_forced_difference_passes_only_exactly_as_declared(self):
+        from coverage import compare_cell
+        from matrix import forced_gate
+
+        def words(text):
+            return [{"text": word, "start": index, "end": index + 0.5}
+                    for index, word in enumerate(text.split())]
+
+        reference = words("Nora has 1,500 euros and not more today")
+        annotations = [{"id": "amount", "authored": ["1,500", "euros"],
+                        "alternatives": [["1,500", "euros"]], "source_window": [0, 10000]},
+                       {"id": "negation", "authored": ["not"], "alternatives": [["not"]],
+                        "source_window": [0, 10000]}]
+        dropped = {"occurrence": "amount", "change": "1,500 euros -> 1,500"}
+
+        def gate(text, declared=()):
+            score = compare_cell(reference, words(text), annotations, 10000, 1000, ("Nora",))
+            return forced_gate(score, reference, words(text), [50.0], declared)
+
+        self.assertFalse(gate("Nora has 1,500 and not more today")["passed"])
+        declared = gate("Nora has 1,500 and not more today", [dropped])
+        self.assertTrue(declared["passed"])
+        self.assertEqual(declared["declared_differences"], [dropped])
+        self.assertEqual(declared["changed_critical"], [])
+        # An undeclared change in the same cell and track still fails.
+        for changed in ("Nora has 1,500 and dot more today",       # negation flipped
+                        "Nora has 1,500 and not more 7 today",     # digit introduced
+                        "Nora has 1,600 and not more today"):      # a different change
+            with self.subTest(changed=changed):
+                self.assertFalse(gate(changed, [dropped])["passed"])
+        # A declaration that is not observed exactly fails, so stale entries cannot linger.
+        unused = gate("Nora has 1,500 euros and not more today", [dropped])
+        self.assertFalse(unused["passed"])
+        self.assertEqual(unused["unused_declared"], [dropped])
+        # An introduced digit passes only when declared with its exact index and token.
+        self.assertFalse(gate("Nora has 1,500 euros and not 7 more today")["passed"])
+        self.assertEqual(gate("Nora has 1,500 euros and not 7 more today")["introduced_critical"],
+                         [{"index": 6, "token": "7"}])
+        self.assertTrue(gate("Nora has 1,500 euros and not 7 more today",
+                             [{"introduced": "7", "hypothesis_index": 6}])["passed"])
+        self.assertFalse(gate("Nora has 1,500 euros and not 8 more today",
+                              [{"introduced": "7", "hypothesis_index": 6}])["passed"])
+
+    def test_declared_differences_are_scoped_to_their_cell_and_track(self):
+        seal, result = synthetic_complete_run()
+        entry = {"cell": "continuous-forced-fence", "track": "mic", "occurrence": "name-nora",
+                 "change": "Nora -> Nara"}
+        seal["definition"]["expected_differences"] = {
+            "issue": "#168", "justification": "synthetic", "entries": [entry]}
+
+        def reseal():
+            result["fixture_seal_sha256"] = hashlib.sha256(
+                (json.dumps(seal, indent=2, sort_keys=True) + "\n").encode()).hexdigest()
+
+        reseal()
+        self.forced_cell(result)["tracks"]["mic"]["words"][0]["text"] = "Nara"  # 3-4.5 s, off the seams
+        scored, rows = self.scored_forced(seal, result)
+        mic = next(row for row in rows if row["track"] == "mic")
+        self.assertTrue(mic["passed"])
+        self.assertEqual(scored["declared_differences"], [entry])
+        self.assertTrue(scored["passed"])
+        # The same change on the other track of the same cell is not covered.
+        self.forced_cell(result)["tracks"]["tap"]["words"][0]["text"] = "Nara"
+        self.assertFalse(evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)["passed"])
+        # A declaration for a cell without forced cuts, or an unknown cell, is rejected outright.
+        for cell in ("paused-16-phase0", "no-such-cell"):
+            with self.subTest(cell=cell):
+                seal["definition"]["expected_differences"]["entries"] = [dict(entry, cell=cell)]
+                reseal()
+                with self.assertRaises(CoverageError):
+                    evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)
+
+    def test_authored_declarations_cite_168_and_name_only_forced_cells(self):
+        definition = json.loads(Path(__file__).with_name("fixtures.json").read_text())
+        block = definition["expected_differences"]
+        self.assertEqual(block["issue"], "#168")
+        self.assertIn("268 ms", block["justification"])
+        cells = {row["id"]: row for row in definition["matrix"]}
+        self.assertEqual({(row["cell"], row["track"]) for row in block["entries"]},
+                         {("continuous-phase0", "mic"), ("continuous-forced-fence", "tap")})
+        for row in block["entries"]:
+            self.assertEqual(cells[row["cell"]]["waveform"], "continuous")
 
     def test_formatting_key_folds_unit_abbreviation_but_not_unit_case(self):
         from matrix import formatting_key

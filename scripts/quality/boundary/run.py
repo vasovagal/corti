@@ -269,6 +269,8 @@ def main():
         print("\n".join(["BOUNDARY_DIAGNOSTIC", *diagnose(seal, result)]), flush=True)
     (args.output_dir / "scores.json").write_text(json.dumps(scored, indent=2, sort_keys=True,
         default=lambda value: asdict(value) if is_dataclass(value) else value) + "\n")
+    for row in scored["declared_differences"]:  # stay visible on every run until #168 removes them
+        print("BOUNDARY_DECLARED_DIFFERENCE " + json.dumps(row, sort_keys=True), flush=True)
     print("BOUNDARY_MATRIX " + ("PASS" if scored["passed"] else "FAIL"), flush=True)
     return 0 if scored["passed"] else 1
 
