@@ -94,7 +94,8 @@ pub struct RowId {
     pub slot: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+// Identities carry hashes, never transcript text, so copying them is safe.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Identity {
     // None is an explicit unavailable identity, never a fabricated fingerprint of an unknown model.
@@ -124,7 +125,7 @@ pub enum SignalSource {
     UnattributedContext,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignalIdentity {
     pub source: SignalSource,

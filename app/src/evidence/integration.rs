@@ -236,12 +236,7 @@ impl Run {
                     .iter()
                     .find(|group| group.stages.iter().any(|stage| stage.id == parent))
                     .ok_or(corti_transcribe::evidence::Error::InvalidLink)?;
-                SignalIdentity {
-                    source: previous_group.signal.source,
-                    aec: previous_group.signal.aec,
-                    source_rate_hz: previous_group.signal.source_rate_hz,
-                    lookahead_frames: previous_group.signal.lookahead_frames,
-                }
+                previous_group.signal
             };
             let group = Group {
                 window: self.window,
