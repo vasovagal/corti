@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 from coverage import CoverageError
-from matrix import critical_crossings, evaluate, expected_runtime, unique_index
+from matrix import critical_crossings, diagnose, evaluate, expected_runtime, unique_index
 
 RUNTIME_IDENTITY = {"synthetic_runner": "known"}
 
@@ -307,6 +307,31 @@ class MatrixTests(unittest.TestCase):
             result["baselines"][0]["native"][role]["quality"] = []
             with self.subTest(role=role), self.assertRaises(CoverageError):
                 evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)
+
+
+    def test_failure_report_names_unbound_occurrence_and_cut_context(self):
+        seal, result = synthetic_complete_run()
+        baseline = result["baselines"][0]
+        for words in (baseline["batch_words"], baseline["uncut_live_words"],
+                      baseline["native"]["batch"]["words"], baseline["native"]["uncut"]["words"]):
+            words[1]["text"] = "Eda"
+        with self.assertRaises(CoverageError):
+            evaluate(seal, result, result["verified_models"], RUNTIME_IDENTITY)
+        report = "\n".join(diagnose(seal, result))
+        self.assertIn(f"baseline {baseline['id']}: unbound name-ada", report)
+        self.assertIn("Eda", report)
+        forced = next(cell for cell in result["cells"] if cell["id"] == "continuous-forced-fence")
+        forced["tracks"]["tap"]["words"][1]["text"] = "Ad"
+        report = "\n".join(diagnose(seal, result))
+        self.assertIn("cell continuous-forced-fence/tap", report)
+        self.assertIn("explicit cut", report)
+        self.assertIn("hyp: Nora Ad", report)
+
+    def test_failure_report_never_raises_on_malformed_evidence(self):
+        seal, result = synthetic_complete_run()
+        del result["cells"][0]["tracks"]
+        result["baselines"][1]["batch_words"] = None
+        self.assertTrue(any("unreadable" in line for line in diagnose(seal, result)))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ import tarfile
 
 from coverage import CoverageError
 from generate import digest, frame_count, validate_definition, validate_seal
-from matrix import evaluate
+from matrix import diagnose, evaluate
 
 NATIVE_SOURCE_FILES = (
     "Cargo.lock", "crates/corti-transcribe/src/boundary.rs", "crates/corti-transcribe/src/decode.rs",
@@ -260,7 +260,13 @@ def main():
         raise CoverageError("native boundary matrix did not execute successfully")
     result = parse_native(native_output, seal, models, expected, execution_seal)
     (args.output_dir / "native-results.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    scored = evaluate(seal, result, models, execution_seal)
+    try:
+        scored = evaluate(seal, result, models, execution_seal)
+    except CoverageError:
+        print("\n".join(["BOUNDARY_DIAGNOSTIC", *diagnose(seal, result)]), flush=True)
+        raise
+    if not scored["passed"]:
+        print("\n".join(["BOUNDARY_DIAGNOSTIC", *diagnose(seal, result)]), flush=True)
     (args.output_dir / "scores.json").write_text(json.dumps(scored, indent=2, sort_keys=True,
         default=lambda value: asdict(value) if is_dataclass(value) else value) + "\n")
     print("BOUNDARY_MATRIX " + ("PASS" if scored["passed"] else "FAIL"), flush=True)

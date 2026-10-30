@@ -5,8 +5,9 @@ import math
 import re
 import struct
 
-from coverage import CoverageError, compare_cell
+from coverage import CoverageError, bind_occurrences, compare_cell
 from generate import frame_count
+from score import compare
 
 
 def expected_runtime(spec, chunks):
@@ -183,6 +184,52 @@ def boundary_local(score, words, frame, rate):
             "alignment": [row for row in score["score"]["alignment"] if row[1] in indices],
             "critical_occurrences": {row["id"]: score["score"]["critical_occurrences"][row["id"]]
                                      for row in score["coverage"] if set(row["indices"]) & indices}}
+
+
+def diagnose(seal, result, context_seconds=1.5):
+    """Read-only CI log report for a failed run. It never raises and never affects acceptance."""
+    lines = []
+    try:
+        fixtures = {row["id"]: row for row in seal["fixtures"]}
+        specs = {row["id"]: row for row in seal["definition"]["matrix"]}
+        baselines = {row["id"]: row for row in result["baselines"]}
+    except Exception as error:
+        return [f"diagnostic: unreadable seal or result ({error!r})"]
+
+    def text(words, low, high):
+        return " ".join(word["text"] for word in words if word["end"] > low and word["start"] < high)
+
+    for identifier, baseline in sorted(baselines.items()):
+        try:
+            fixture, words = fixtures[identifier], baseline["batch_words"]
+            rate = fixture["sample_rate"]
+            for occurrence in fixture["occurrences"]:
+                try:
+                    bind_occurrences(words, [occurrence], fixture["frames"], rate)
+                except CoverageError as error:
+                    low, high = (frame / rate for frame in occurrence["source_window"])
+                    lines.append(f"baseline {identifier}: unbound {occurrence['id']} ({error}); "
+                                 f"alternatives {occurrence['alternatives']}; window {low:.2f}-{high:.2f}s; "
+                                 f"batch: {text(words, low - 0.5, high + 0.5)}")
+        except Exception as error:
+            lines.append(f"baseline {identifier}: unreadable ({error!r})")
+    for cell in result["cells"]:
+        try:
+            spec = specs[cell["id"]]
+            for track, actual in sorted(cell["tracks"].items()):
+                fixture_id = f"{spec['waveform']}-{spec['sample_rate']}-{track}"
+                reference, hypothesis = baselines[fixture_id]["batch_words"], actual["words"]
+                score = compare([word["text"] for word in reference], [word["text"] for word in hypothesis], [])
+                lines.append(f"cell {cell['id']}/{track}: {score['edits']} edits / {score['denominator']} "
+                             f"tokens {score['counts']}; decode_complete={actual['decode_complete']}")
+                for event in cell["boundaries"]:
+                    at = event["cut_frame"] / spec["sample_rate"]
+                    low, high = at - context_seconds, at + context_seconds
+                    lines.append(f"  {event['kind']} cut {at:.3f}s ref: {text(reference, low, high)}")
+                    lines.append(f"  {event['kind']} cut {at:.3f}s hyp: {text(hypothesis, low, high)}")
+        except Exception as error:
+            lines.append(f"cell {cell.get('id', '?') if isinstance(cell, dict) else '?'}: unreadable ({error!r})")
+    return lines
 
 
 def evaluate(seal, result, expected_models, expected_runtime_identity):
