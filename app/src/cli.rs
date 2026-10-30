@@ -637,15 +637,35 @@ fn run_redo(args: RedoArgs) -> Result<()> {
 
     let provenance_cfg = cfg.clone();
     let backend = Backend::init(cfg);
-    let (decoded, used, aec_outcome, audio_evidence) = crate::transcribe::transcribe_recording(
-        &backend,
-        offline_aec.as_ref(),
-        crate::transcribe::TranscriptionAttempt::fresh(&resolved.id)
-            .with_quality(&recording_quality.quality),
-        &resolved.meta,
-        &resolved.audio,
-    )
-    .context("transcription failed")?;
+    let mut evidence = None;
+    let evidence_request = (!args.print_only
+        && resolved.had_row
+        && provenance_cfg.evidence.enabled)
+        .then_some(crate::evidence::integration::BatchRequest {
+            output: &mut evidence,
+            capture: resolved.capture_processing.as_ref(),
+            already_clean,
+            kind: corti_transcribe::evidence::StageKind::FallbackAsr,
+        });
+    let (decoded, used, aec_outcome, audio_evidence) =
+        crate::transcribe::transcribe_recording_with_evidence(
+            &backend,
+            offline_aec.as_ref(),
+            crate::transcribe::TranscriptionAttempt::fresh(&resolved.id)
+                .with_capture_processing(resolved.capture_processing.as_ref())
+                .with_quality(&mut recording_quality.quality),
+            &resolved.meta,
+            &resolved.audio,
+            evidence_request,
+        )
+        .map_err(|error| {
+            recording_quality.retain_failed_attempt(
+                error,
+                &resolved.id,
+                &resolved.audio,
+                args.print_only,
+            )
+        })?;
     recording_quality.quality = decoded.quality;
     let transcript = decoded.transcript;
     eprintln!(
@@ -678,6 +698,11 @@ fn run_redo(args: RedoArgs) -> Result<()> {
         &resolved.audio,
         &recording_quality,
     )?;
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.final_prose(&transcript, false);
+        evidence.settle_quality(&recording_quality.quality);
+        let _ = evidence.persist(&resolved.meta.audio_path);
+    }
 
     let aec_execution = redo_aec_execution(
         resolved.capture_processing.as_ref(),
@@ -894,11 +919,13 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         &backend,
         offline_aec.as_ref(),
         crate::transcribe::TranscriptionAttempt::fresh(&job_id)
-            .with_quality(&recording_quality.quality),
+            .with_quality(&mut recording_quality.quality),
         &meta,
         input,
     )
-    .context("transcription failed")?;
+    .map_err(|error| {
+        recording_quality.retain_failed_attempt(error, &job_id, input, args.print_only)
+    })?;
     recording_quality.quality = decoded.quality;
     let transcript = decoded.transcript;
     eprintln!(

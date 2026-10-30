@@ -1503,6 +1503,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "rtrb",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -1616,6 +1617,8 @@ dependencies = [
  "anyhow",
  "corti-aec",
  "corti-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

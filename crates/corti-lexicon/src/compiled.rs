@@ -1,6 +1,6 @@
 //! One idempotent substitution pass over text.
 
-use corti_transcribe::segment::TextRule;
+use corti_transcribe::segment::{PositionedEdits, TextRule, TracedText};
 
 use crate::document::{LexiconDocument, LexiconError, LexiconRule};
 
@@ -115,6 +115,25 @@ impl CompiledLexicon {
 
     /// [`apply`](Self::apply) plus how many matches were replaced.
     pub fn apply_counting(&self, text: &str) -> (String, usize) {
+        self.apply_counting_inner(text, None)
+    }
+
+    /// Actual winning replacements, with input/output UTF-8 offsets and selected rule IDs.
+    /// A capped trace can be incomplete; the substitution output remains identical to apply.
+    pub fn apply_traced(&self, text: &str) -> TracedText {
+        let mut edits = PositionedEdits::default();
+        let (out, applied) = self.apply_counting_inner(text, Some(&mut edits));
+        TracedText {
+            replacement: (applied > 0 && out != text).then_some(out),
+            edits,
+        }
+    }
+
+    fn apply_counting_inner(
+        &self,
+        text: &str,
+        mut edits: Option<&mut PositionedEdits>,
+    ) -> (String, usize) {
         if self.rules.is_empty() || text.is_empty() {
             return (text.to_owned(), 0);
         }
@@ -123,6 +142,7 @@ impl CompiledLexicon {
         let mut out = String::with_capacity(text.len());
         let mut applied = 0usize;
         let mut index = 0usize;
+        let mut source_byte = 0usize;
         while index < chars.len() {
             let at_boundary = index == 0 || !is_word_char(chars[index - 1]);
             let matched = at_boundary
@@ -145,16 +165,29 @@ impl CompiledLexicon {
             match matched {
                 Some(rule) => {
                     let end = index + rule.pattern.len();
+                    let source_end = source_byte
+                        + chars[index..end]
+                            .iter()
+                            .map(|c| c.len_utf8())
+                            .sum::<usize>();
+                    let output_start = out.len();
                     out.push_str(&adapt_case(
                         &rule.to,
                         &chars[index..end],
                         rule.case_insensitive,
                     ));
+                    if let Some(edits) = &mut edits
+                        && text[source_byte..source_end] != out[output_start..]
+                    {
+                        edits.lexicon(source_byte..source_end, output_start..out.len(), &rule.id);
+                    }
+                    source_byte = source_end;
                     applied += 1;
                     index = end;
                 }
                 None => {
                     out.push(chars[index]);
+                    source_byte += chars[index].len_utf8();
                     index += 1;
                 }
             }
@@ -187,6 +220,10 @@ impl CompiledLexicon {
 impl TextRule for CompiledLexicon {
     fn apply(&self, text: &str) -> Option<String> {
         CompiledLexicon::apply(self, text)
+    }
+
+    fn apply_traced(&self, text: &str) -> TracedText {
+        CompiledLexicon::apply_traced(self, text)
     }
 }
 
@@ -323,5 +360,130 @@ mod tests {
         assert_eq!(lexicon.revision(), 2);
         assert_eq!(lexicon.digest(), document.content_digest());
         assert!(CompiledLexicon::empty().is_empty());
+    }
+
+    #[test]
+    fn trace_records_selected_phrase_winners_and_utf8_output_offsets() {
+        let document = LexiconDocument::from_rules(
+            1,
+            vec![
+                rule("settle ment", "settlement"),
+                rule("settle ment gateway", "SettlementGateway"),
+                rule("corty", "Corti"),
+            ],
+        )
+        .unwrap();
+        let lexicon = CompiledLexicon::compile(&document).unwrap();
+        let before = "é settle ment gateway and CORTY";
+        let trace = lexicon.apply_traced(before);
+        assert_eq!(trace.replacement, lexicon.apply(before));
+        assert_eq!(trace.edits.gap(), None);
+        assert_eq!(trace.edits.edits().len(), 2);
+        let mut left = 0;
+        let mut right = 0;
+        let after = trace.replacement.as_ref().unwrap();
+        for edit in trace.edits.edits() {
+            assert_eq!(
+                &before[left..edit.before.start as usize],
+                &after[right..edit.after.start as usize]
+            );
+            let corti_transcribe::segment::EditKind::Lexicon { rule_id } = &edit.action else {
+                panic!("unexpected category")
+            };
+            let expected = if edit.before.start == 3 {
+                "settle ment gateway"
+            } else {
+                "corty"
+            };
+            assert_eq!(
+                rule_id,
+                &document
+                    .rules()
+                    .iter()
+                    .find(|r| r.from == expected)
+                    .unwrap()
+                    .id
+            );
+            left = edit.before.end as usize;
+            right = edit.after.end as usize;
+        }
+        assert_eq!(&before[left..], &after[right..]);
+        assert!(lexicon.apply_traced(after).edits.edits().is_empty());
+    }
+
+    #[test]
+    fn actual_correct_and_incorrect_rust_hint_reconstruct_the_original_input() {
+        use corti_core::{Speaker, TranscriptSegment};
+        use corti_transcribe::evidence::*;
+        use corti_transcribe::segment::CleanupConfig;
+        let document = LexiconDocument::from_rules(1, vec![rule("rust", "REST")]).unwrap();
+        let lexicon = CompiledLexicon::compile(&document).unwrap();
+        for before in ["Use the rust endpoint.", "We write this service in rust."] {
+            let config = CleanupConfig {
+                echo_drop: false,
+                merge_gap_seconds: 0.0,
+                drop_backchannels: false,
+                strip_fillers: false,
+                ..CleanupConfig::default()
+            };
+            let mut ledger = Ledger::new(DEFAULT_CAP).unwrap();
+            let original = TranscriptSegment {
+                speaker: Speaker::Me,
+                start: 1.234,
+                end: 2.987,
+                text: before.into(),
+            };
+            let result = ledger.cleanup(
+                RecordingIdentity {
+                    window: 8,
+                    kind: StageKind::TrueAsr,
+                    identity: Identity {
+                        configuration_hash: Some(lexicon.digest().into()),
+                        model_hash: None,
+                        runtime_hash: None,
+                    },
+                    signal: SignalIdentity {
+                        source: SignalSource::OfflineInput,
+                        aec: AecOrigin::None,
+                        source_rate_hz: Some(48_000),
+                        lookahead_frames: None,
+                    },
+                },
+                vec![original],
+                &config,
+                CleanupInput {
+                    origins: &[],
+                    source_links: None,
+                    carry: &[],
+                    carry_links: None,
+                    protected_input_indices: &[],
+                },
+                None,
+                Some(&lexicon),
+            );
+            let recorded = result.evidence.unwrap();
+            assert_eq!(recorded.retained, Append::Retained);
+            assert_eq!(result.segments[0].text, before.replace("rust", "REST"));
+            let mut bytes = Vec::new();
+            ledger.write_json(&mut bytes).unwrap();
+            let loaded = Ledger::read_json(&bytes, DEFAULT_CAP).unwrap();
+            assert_eq!(
+                loaded
+                    .reconstruct_input(recorded.final_stage.unwrap())
+                    .unwrap()[0]
+                    .segment
+                    .text,
+                before
+            );
+            let edit = &loaded.groups().last().unwrap().stages[0].decisions[0].edits[0];
+            let corti_transcribe::segment::EditKind::Lexicon { rule_id } = &edit.action else {
+                panic!("unexpected category")
+            };
+            assert_eq!(rule_id, &document.rules()[0].id);
+            assert_eq!(
+                &before[edit.before.start as usize..edit.before.end as usize],
+                "rust"
+            );
+        }
     }
 }

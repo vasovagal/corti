@@ -553,8 +553,13 @@ fn cleanup_aws_staging(ctx: &mut Ctx, job: &ClaimedJob) -> Result<()> {
 /// sibling, and any leftover transcript checkpoint. The checkpoint normally disappears at completion;
 /// sweeping it here contains crash leftovers.
 fn sweep_expired(ctx: &mut Ctx) -> Result<()> {
+    let config = ctx.config.lock().unwrap().clone();
+    let retention_days = i64::from(config.retention_days);
+    // Opt-out is independent of age, terminal state, and outstanding AWS cleanup ownership.
+    if !config.evidence.enabled {
+        remove_disabled_evidence(&ctx.queue)?;
+    }
     enqueue_terminal_aws_cleanup(&ctx.queue)?;
-    let retention_days = i64::from(ctx.config.lock().unwrap().retention_days);
     // One instant defines both horizons. In particular, the row-GC set can never be a few milliseconds
     // larger than the artifact-deletion set at equal (90–365 day) retention.
     let now = Local::now();
@@ -624,6 +629,7 @@ fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
         corti_capture::aec_stats_path(audio),
         crate::checkpoint::path_for(audio),
         crate::checkpoint::aws_staging_path_for(audio),
+        crate::evidence::path_for(audio),
     ];
     let mut all_absent = true;
     match (
@@ -652,6 +658,27 @@ fn remove_recording_artifacts(id: &str, audio: &Path) -> (usize, bool) {
     paths.dedup();
     let (removed, paths_absent) = remove_paths(id, paths);
     (removed, all_absent && paths_absent)
+}
+
+fn remove_disabled_evidence(queue: &Queue) -> Result<usize> {
+    // The first live window can persist raw evidence without producing a note/queue row. Discover
+    // those capture-owned files directly, including after a restart, before consulting queue state.
+    let mut removed = match crate::evidence::remove_capture_evidence() {
+        Ok(count) => count,
+        Err(_) => {
+            warn!(target: "corti::evidence", status = "unavailable", "evidence removal unavailable");
+            0
+        }
+    };
+    for row in queue.all()? {
+        match crate::evidence::remove(&row.audio_path) {
+            Ok(count) => removed += count,
+            Err(_) => {
+                warn!(target: "corti::evidence", status = "unavailable", "evidence removal unavailable")
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn remove_stale_checkpoint_temps(id: &str, audio: &Path) -> (usize, bool) {

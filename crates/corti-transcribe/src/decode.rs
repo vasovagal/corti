@@ -2,6 +2,7 @@
 //! Input frames count all samples supplied to one channel, cumulatively across input-rate changes.
 //! They are neither VAD-rate frames nor retained-WAV positions; received chunks bind those clocks.
 
+use corti_core::quality_mapping::insert_retained_forced_boundary;
 use corti_core::{
     CaptureEpoch, MAX_QUALITY_SPANS, QualityCause, QualityClass, QualityError, QualityRecord,
     QualityResolution, QualityStage, QualityTrack, insert_retained_processing_loss,
@@ -251,28 +252,62 @@ impl ReceivedAudioMap {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RetainedFailure {
+struct RetainedFact {
     epoch: Option<CaptureEpoch>,
     start: u64,
     end: u64,
     track: QualityTrack,
     cause: QualityCause,
+    class: QualityClass,
 }
 
-/// Keeps bounded failure facts until the Finish capture authority is available. In particular, a
+impl RetainedFact {
+    fn class(self) -> QualityClass {
+        self.class
+    }
+}
+
+fn fact_class(cause: QualityCause) -> QualityClass {
+    if cause == QualityCause::ForcedBoundary {
+        QualityClass::DegradedOnly
+    } else {
+        QualityClass::ProcessingLoss
+    }
+}
+
+/// Keeps bounded processing-loss and boundary facts until Finish capture authority is available. A
 /// first received epoch greater than zero stays exactly bound even though a provisional record
 /// cannot describe it without the missing Start epoch. Only `settle` creates durable quality spans.
 #[derive(Debug, Default)]
 pub struct DecodeQualityTracker {
     mic: ReceivedAudioMap,
     tap: ReceivedAudioMap,
-    failures: Vec<RetainedFailure>,
+    facts: Vec<RetainedFact>,
     omitted_failures: u64,
     omitted_metadata: u64,
     counter_saturated: bool,
 }
 
 impl DecodeQualityTracker {
+    /// Mark the last received input frame before an established nonempty cut: `[cut - 1, cut)`.
+    /// This is a boundary location, not the extent of affected speech or lost audio. `input_frame`
+    /// uses this track's cumulative input clock, never the common app clock without origin mapping.
+    /// Zero means no owned input and records nothing. Use each track separately with unequal origins;
+    /// `Both` is valid only for equal local input cuts. Call once when selecting a forced fence;
+    /// repeated settlement uses the same original capture authority and preserves the marker.
+    pub fn mark_forced_boundary(&mut self, track: QualityTrack, input_frame: u64) {
+        if let Some(start_frame) = input_frame.checked_sub(1) {
+            self.record_input_fact(
+                track,
+                InputSpan {
+                    start_frame,
+                    end_frame: input_frame,
+                },
+                QualityCause::ForcedBoundary,
+            );
+        }
+    }
+
     pub fn input_frames(&self, track: QualityTrack) -> u64 {
         match track {
             QualityTrack::Mic => self.mic.input_frames(),
@@ -315,7 +350,7 @@ impl DecodeQualityTracker {
             match outcome.status {
                 RegionStatus::Complete | RegionStatus::RecognizedEmpty => {}
                 RegionStatus::Failed(category) | RegionStatus::Partial(category) => {
-                    self.record_input_loss(track, outcome.span, category.quality_cause());
+                    self.record_input_fact(track, outcome.span, category.quality_cause());
                 }
             }
         }
@@ -327,7 +362,7 @@ impl DecodeQualityTracker {
         if span.start_frame == span.end_frame {
             return;
         }
-        self.record_input_loss(track, span, QualityCause::WindowNotFiled);
+        self.record_input_fact(track, span, QualityCause::WindowNotFiled);
     }
 
     /// For callers already holding a WAV interval. Unlike logical-input failures, no received-run
@@ -339,23 +374,24 @@ impl DecodeQualityTracker {
         end: u64,
         cause: QualityCause,
     ) {
-        self.remember_failure(RetainedFailure {
+        self.remember_fact(RetainedFact {
             epoch: None,
             start,
             end,
             track,
             cause,
+            class: QualityClass::ProcessingLoss,
         });
     }
 
-    fn record_input_loss(&mut self, track: QualityTrack, span: InputSpan, cause: QualityCause) {
+    fn record_input_fact(&mut self, track: QualityTrack, span: InputSpan, cause: QualityCause) {
         if track == QualityTrack::Both {
-            self.record_input_loss(QualityTrack::Mic, span, cause);
-            self.record_input_loss(QualityTrack::Tap, span, cause);
+            self.record_input_fact(QualityTrack::Mic, span, cause);
+            self.record_input_fact(QualityTrack::Tap, span, cause);
             return;
         }
         if span.start_frame >= span.end_frame {
-            self.omit_failure();
+            self.omit_fact(fact_class(cause));
             return;
         }
         let map = if track == QualityTrack::Mic {
@@ -373,14 +409,15 @@ impl DecodeQualityTracker {
                 continue;
             }
             if cursor < start {
-                self.omit_failure();
+                self.omit_fact(fact_class(cause));
             }
-            self.remember_failure(RetainedFailure {
+            self.remember_fact(RetainedFact {
                 epoch: Some(run.epoch),
                 start: run.retained_start + (start - run.input.start_frame),
                 end: run.retained_start + (end - run.input.start_frame),
                 track,
                 cause,
+                class: fact_class(cause),
             });
             cursor = end;
             if cursor == span.end_frame {
@@ -388,7 +425,7 @@ impl DecodeQualityTracker {
             }
         }
         if cursor < span.end_frame {
-            self.omit_failure();
+            self.omit_fact(fact_class(cause));
         }
     }
 
@@ -396,22 +433,31 @@ impl DecodeQualityTracker {
         add_count(&mut self.omitted_failures, 1, &mut self.counter_saturated);
     }
 
-    fn remember_failure(&mut self, failure: RetainedFailure) {
-        if failure.start >= failure.end {
+    fn omit_fact(&mut self, class: QualityClass) {
+        if class == QualityClass::DegradedOnly {
+            add_count(&mut self.omitted_metadata, 1, &mut self.counter_saturated);
+        } else {
             self.omit_failure();
+        }
+    }
+
+    fn remember_fact(&mut self, failure: RetainedFact) {
+        if failure.start >= failure.end {
+            self.omit_fact(failure.class());
             return;
         }
-        if let Some(previous) = self.failures.last_mut()
+        if let Some(previous) = self.facts.last_mut()
             && previous.epoch == failure.epoch
             && previous.track == failure.track
             && previous.cause == failure.cause
+            && previous.class == failure.class
             && previous.end == failure.start
         {
             previous.end = failure.end;
-        } else if self.failures.len() < MAX_QUALITY_SPANS {
-            self.failures.push(failure);
+        } else if self.facts.len() < MAX_QUALITY_SPANS {
+            self.facts.push(failure);
         } else {
-            self.omit_failure();
+            self.omit_fact(failure.class());
         }
     }
 
@@ -434,7 +480,7 @@ impl DecodeQualityTracker {
             self.omitted_failures,
         )?;
         quality.overflow.counter_saturated |= self.counter_saturated || metadata_counter_saturated;
-        for failure in &self.failures {
+        for failure in &self.facts {
             let binding_valid = failure.epoch.is_none_or(|epoch| {
                 capture
                     .epochs
@@ -449,20 +495,25 @@ impl DecodeQualityTracker {
                     })
             });
             if binding_valid {
-                insert_retained_processing_loss(
-                    &mut quality,
-                    failure.start,
-                    failure.end,
-                    failure.track,
-                    failure.cause,
-                    QualityStage::Live,
-                )?;
+                if failure.class() == QualityClass::DegradedOnly {
+                    insert_retained_forced_boundary(
+                        &mut quality,
+                        failure.start,
+                        failure.end,
+                        failure.track,
+                    )?;
+                } else {
+                    insert_retained_processing_loss(
+                        &mut quality,
+                        failure.start,
+                        failure.end,
+                        failure.track,
+                        failure.cause,
+                        QualityStage::Live,
+                    )?;
+                }
             } else {
-                quality.record_omitted_spans(
-                    QualityClass::ProcessingLoss,
-                    QualityResolution::Outstanding,
-                    1,
-                )?;
+                quality.record_omitted_spans(failure.class(), QualityResolution::Outstanding, 1)?;
             }
         }
         Ok(quality)
@@ -501,10 +552,17 @@ impl DecodeQualityTracker {
             let mut quality = QualityRecord::observed();
             let mut omitted = self.omitted_failures;
             let mut saturated = self.counter_saturated;
-            add_count(&mut omitted, self.failures.len() as u64, &mut saturated);
+            let (mut omitted_metadata, metadata_counter_saturated) = self.metadata_omissions();
+            for fact in &self.facts {
+                let count = if fact.class() == QualityClass::DegradedOnly {
+                    &mut omitted_metadata
+                } else {
+                    &mut omitted
+                };
+                add_count(count, 1, &mut saturated);
+            }
             quality.overflow.omitted_spans[1] = omitted;
             quality.overflow.outstanding_omitted_spans[1] = omitted;
-            let (omitted_metadata, metadata_counter_saturated) = self.metadata_omissions();
             quality.overflow.omitted_spans[2] = omitted_metadata;
             quality.overflow.outstanding_omitted_spans[2] = omitted_metadata;
             quality.overflow.counter_saturated = saturated || metadata_counter_saturated;
@@ -558,6 +616,184 @@ mod tests {
             RegionStatus::Failed(DecodeErrorCategory::BackendFailure),
         ));
         tracker.record_report(track, report);
+    }
+
+    #[test]
+    fn forced_boundary_marks_preceding_frame_at_epoch_cut_and_late_track_origin() {
+        let later = CaptureEpoch {
+            id: 1,
+            source_start_ns: Some(10_000_000_000),
+            source_frame_base: 480_000,
+            retained_start_frame: 10,
+            reason: CaptureEpochReason::HostDiscontinuity,
+            ..epoch()
+        };
+        let authority = capture(&[epoch(), later]);
+        let mut tracker = DecodeQualityTracker::default();
+        tracker.observe_input(QualityTrack::Mic, epoch(), 0, 10);
+        tracker.observe_input(QualityTrack::Mic, later, 10, 10);
+        tracker.observe_input(QualityTrack::Tap, later, 15, 10);
+        tracker.mark_forced_boundary(QualityTrack::Mic, 10);
+        tracker.mark_forced_boundary(QualityTrack::Mic, 11);
+        tracker.mark_forced_boundary(QualityTrack::Tap, 3);
+        let settled = tracker.settle(&authority).unwrap();
+        assert_eq!(
+            settled
+                .spans
+                .iter()
+                .map(|s| (s.epoch, s.start_frame, s.end_frame, s.track))
+                .collect::<Vec<_>>(),
+            [
+                (0, 9, 10, QualityTrack::Mic),
+                (1, 480_000, 480_001, QualityTrack::Mic),
+                (1, 480_007, 480_008, QualityTrack::Tap)
+            ]
+        );
+        assert!(
+            settled
+                .spans
+                .iter()
+                .all(|s| s.cause == QualityCause::ForcedBoundary
+                    && s.class == QualityClass::DegradedOnly
+                    && s.stage == QualityStage::Live)
+        );
+        assert_eq!(settled.completeness(), SourceCompleteness::Complete);
+        assert!(!settled.requires_batch_recovery());
+        assert_eq!(tracker.settle(&authority).unwrap(), settled);
+        let mut merged = settled.clone();
+        merged.merge_snapshot(&settled).unwrap();
+        assert_eq!(merged, settled);
+    }
+
+    #[test]
+    fn forced_boundary_zero_cut_and_provisional_late_epoch_do_not_invent_prefix() {
+        let later = CaptureEpoch {
+            id: 1,
+            source_start_ns: Some(10_000_000_000),
+            source_frame_base: 480_000,
+            retained_start_frame: 10,
+            reason: CaptureEpochReason::HostDiscontinuity,
+            ..epoch()
+        };
+        let authority = capture(&[epoch(), later]);
+        let mut tracker = DecodeQualityTracker::default();
+        tracker.mark_forced_boundary(QualityTrack::Both, 0);
+        assert_eq!(tracker.settle(&authority).unwrap(), authority);
+        tracker.observe_input(QualityTrack::Tap, later, 15, 10);
+        tracker.mark_forced_boundary(QualityTrack::Tap, 3);
+        let provisional = tracker.provisional_quality();
+        assert!(provisional.spans.is_empty());
+        assert_eq!(provisional.overflow.outstanding_omitted_spans, [0, 0, 1]);
+        let settled = tracker.settle(&authority).unwrap();
+        assert_eq!(settled.spans.len(), 1);
+        assert_eq!(
+            (settled.spans[0].start_frame, settled.spans[0].end_frame),
+            (480_007, 480_008)
+        );
+        assert_eq!(settled.overflow.outstanding_omitted_spans, [0, 0, 0]);
+    }
+
+    #[test]
+    fn forced_boundary_unmapped_and_conflicting_binding_are_degraded_not_processing_loss() {
+        let mut tracker = DecodeQualityTracker::default();
+        tracker.mark_forced_boundary(QualityTrack::Mic, 5);
+        let authority = capture(&[epoch()]);
+        let settled = tracker.settle(&authority).unwrap();
+        assert!(settled.spans.is_empty());
+        assert_eq!(settled.overflow.outstanding_omitted_spans, [0, 0, 1]);
+        assert!(!settled.requires_batch_recovery());
+        tracker.observe_input(QualityTrack::Tap, epoch(), 0, 10);
+        tracker.mark_forced_boundary(QualityTrack::Tap, 5);
+        let mut conflict = authority.clone();
+        conflict.epochs[0].tap_channels = 2;
+        let settled = tracker.settle(&conflict).unwrap();
+        assert!(settled.spans.is_empty());
+        assert_eq!(settled.overflow.outstanding_omitted_spans, [0, 0, 2]);
+        assert!(!settled.requires_batch_recovery());
+    }
+
+    #[test]
+    fn forced_boundary_fact_and_mapping_caps_keep_class_without_hiding_real_failure() {
+        let authority = capture(&[epoch()]);
+        let mut tracker = DecodeQualityTracker::default();
+        tracker.observe_input(QualityTrack::Mic, epoch(), 0, 2000);
+        for cut in (1..).step_by(2).take(MAX_QUALITY_SPANS + 2) {
+            tracker.mark_forced_boundary(QualityTrack::Mic, cut);
+        }
+        let settled = tracker.settle(&authority).unwrap();
+        assert_eq!(settled.spans.len(), MAX_QUALITY_SPANS);
+        assert_eq!(settled.overflow.outstanding_omitted_spans, [0, 0, 2]);
+        assert!(!settled.requires_batch_recovery());
+        fail(&mut tracker, QualityTrack::Mic, 1990, 1991);
+        let failed = tracker.settle(&authority).unwrap();
+        assert_eq!(failed.overflow.outstanding_omitted_spans, [0, 1, 2]);
+        assert!(failed.requires_batch_recovery());
+        let mut mapping_capped = DecodeQualityTracker::default();
+        for index in 0..=MAX_QUALITY_SPANS as u64 {
+            mapping_capped.observe_input(QualityTrack::Tap, epoch(), 2 * index, 1);
+        }
+        mapping_capped.mark_forced_boundary(QualityTrack::Tap, MAX_QUALITY_SPANS as u64 + 1);
+        let capped = mapping_capped.settle(&authority).unwrap();
+        assert!(capped.spans.is_empty());
+        assert_eq!(capped.overflow.outstanding_omitted_spans, [0, 0, 2]);
+        assert!(!capped.requires_batch_recovery());
+        assert_eq!(mapping_capped.settle(&authority).unwrap(), capped);
+    }
+
+    #[test]
+    fn forced_boundary_preserves_source_and_processing_history_without_reclassification() {
+        let mut authority = capture(&[epoch()]);
+        authority
+            .insert_span(corti_core::QualitySpan {
+                epoch: 0,
+                start_frame: 0,
+                end_frame: 2,
+                track: QualityTrack::Both,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        let mut tracker = DecodeQualityTracker::default();
+        tracker.observe_input(QualityTrack::Mic, epoch(), 0, 20);
+        fail(&mut tracker, QualityTrack::Mic, 5, 6);
+        let prior = tracker.settle(&authority).unwrap();
+        tracker.mark_forced_boundary(QualityTrack::Mic, 10);
+        let settled = tracker.settle(&authority).unwrap();
+        assert_eq!(settled.spans.len(), 3);
+        assert!(prior.spans.iter().all(|span| settled.spans.contains(span)));
+        assert_eq!(settled.completeness(), SourceCompleteness::Incomplete);
+        assert!(settled.requires_batch_recovery());
+        assert_eq!(tracker.settle(&authority).unwrap(), settled);
+        // The existing loss API must not silently accept a degraded-only cause.
+        let mut wrong_api = DecodeQualityTracker::default();
+        wrong_api.record_retained_processing_loss(
+            QualityTrack::Mic,
+            9,
+            10,
+            QualityCause::ForcedBoundary,
+        );
+        assert_eq!(
+            wrong_api.settle(&authority),
+            Err(QualityError::InvalidClassification)
+        );
+    }
+
+    #[test]
+    fn forced_boundary_saturated_degradation_remains_unknown_without_recovery() {
+        let authority = capture(&[epoch()]);
+        let mut tracker = DecodeQualityTracker {
+            omitted_metadata: u64::MAX,
+            ..Default::default()
+        };
+        tracker.mark_forced_boundary(QualityTrack::Mic, 1);
+        let quality = tracker.settle(&authority).unwrap();
+        assert_eq!(quality.overflow.outstanding_omitted_spans, [0, 0, u64::MAX]);
+        assert!(quality.overflow.counter_saturated);
+        assert_eq!(quality.completeness(), SourceCompleteness::Unknown);
+        assert!(!quality.requires_batch_recovery());
+        assert_eq!(tracker.settle(&authority).unwrap(), quality);
     }
 
     #[test]
@@ -898,7 +1134,7 @@ mod tests {
             0,
             MAX_QUALITY_SPANS as u64 + 2,
         );
-        assert_eq!(tracker.failures.len(), MAX_QUALITY_SPANS);
+        assert_eq!(tracker.facts.len(), MAX_QUALITY_SPANS);
         let settled = tracker.settle(&capture(&[epoch()])).unwrap();
         assert_eq!(settled.spans.len(), MAX_QUALITY_SPANS);
         assert_eq!(settled.overflow.outstanding_omitted_spans[1], 1);

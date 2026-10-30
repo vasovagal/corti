@@ -1,5 +1,7 @@
 # Decoder failure accounting (#163)
 
+The dependent #164 app evidence persistence gate is documented in [local transcript evidence](local-transcript-evidence.md) and its [actual-function test guide](../app/tests/evidence/README.md). It reuses the existing checkpoint/retry contract and mandatory quality authority.
+
 This change starts from `3b3b89941ddfeaa5f943654df5202e30e820dac3`. All examples, fault injections and native speech fixtures are authored synthetic data. No model, VAD, AEC, cleanup or retry defaults change.
 
 ## Contracts and choices

@@ -27,15 +27,40 @@ use crate::engine::{self, TARGET_RATE, VAD_WINDOW};
 use crate::input_clock::{InputClock, MappingError, SkippedClock};
 use crate::resample::Resampler;
 
+#[path = "boundary.rs"]
+mod boundary;
+use boundary::BoundaryState;
+#[path = "terminal.rs"]
+mod terminal;
+pub use boundary::{
+    BoundaryCapacity, BoundaryError, BoundaryInput, BoundaryKind, BoundaryLimits, BoundaryProgress,
+    BoundaryResamplerBounds, BoundarySnapshot, BoundaryToken, boundary_resampler_bounds,
+};
+use terminal::TerminalState;
+
+#[cfg(test)]
+#[path = "native_boundary_matrix.rs"]
+mod native_boundary_matrix;
+
 /// Visit borrowed completed PCM before popping it, avoiding an extra region-sized allocation.
 pub(crate) trait Segmenter: Send {
     fn accept(&mut self, samples: &[f32]);
     fn flush(&mut self);
     fn reset(&mut self);
     fn drain_completed(&mut self, visit: &mut dyn FnMut(u64, &[f32]));
+    fn boundary_idle(&self) -> bool {
+        false
+    }
+    /// Fresh-state processing contract for deterministic adapters. Arbitrary native VADs are unknown.
+    fn terminal_guard(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl Segmenter for VoiceActivityDetector {
+    fn boundary_idle(&self) -> bool {
+        !self.detected() && self.is_empty()
+    }
     fn accept(&mut self, samples: &[f32]) {
         self.accept_waveform(samples);
     }
@@ -122,6 +147,8 @@ pub struct LiveTranscriber {
     decode_complete: bool,
     /// If an input clock is unrepresentable, later words cannot carry trustworthy timestamps.
     clock_available: bool,
+    boundary: Option<BoundaryState>,
+    terminal: TerminalState,
     #[cfg(test)]
     resampler_factory: Box<dyn FnMut(i32) -> Option<Resampler> + Send>,
 }
@@ -130,11 +157,21 @@ impl LiveTranscriber {
     /// Wrap a resident ASR engine and a fresh (per-channel) Silero VAD. Build them via
     /// [`crate::Asr`] plus a VAD built by the crate, or use [`crate::LiveEngine`] to load once and spawn
     /// a transcriber per channel.
+    /// An externally supplied detector has unknown configuration/state provenance, so terminal
+    /// completeness cannot be certified. LiveEngine establishes the pinned fresh-state contract.
     pub fn new(rec: Arc<Asr>, vad: VoiceActivityDetector) -> Self {
         Self::with_parts(rec, Box::new(vad))
     }
 
+    /// Only for a fresh detector just constructed by engine::build_vad with the pinned configuration.
+    pub(crate) fn from_pinned_vad(rec: Arc<Asr>, vad: VoiceActivityDetector) -> Self {
+        let mut live = Self::new(rec, vad);
+        live.terminal.guard = Some(terminal::PINNED_GUARD);
+        live
+    }
+
     pub(crate) fn with_parts(rec: Arc<dyn RegionDecoder>, vad: Box<dyn Segmenter>) -> Self {
+        let terminal = TerminalState::new(vad.terminal_guard());
         Self {
             rec,
             vad,
@@ -150,6 +187,8 @@ impl LiveTranscriber {
             report: DecodeReport::default(),
             decode_complete: true,
             clock_available: true,
+            boundary: None,
+            terminal,
             #[cfg(test)]
             resampler_factory: Box::new(Resampler::new),
         }
@@ -169,6 +208,35 @@ impl LiveTranscriber {
             self.clock_available = false;
             return;
         };
+        if let Some(boundary) = &mut self.boundary {
+            if boundary.failed.is_some() {
+                self.report.omit_failure();
+                self.decode_complete = false;
+                return;
+            }
+            let error = if crate::input_clock::boundary_tick_frequency(sample_rate).is_none() {
+                Some(BoundaryError::UnsupportedRate)
+            } else if samples.len() > boundary.limits.max_source_push
+                || self.input_clock.frames > i64::MAX as u64 / 16_000
+            {
+                Some(BoundaryError::AdmissionLimit)
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                boundary.failed = Some(error);
+                if error == BoundaryError::UnsupportedRate {
+                    self.report.record(RegionOutcome {
+                        span: input_span,
+                        status: RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable),
+                    });
+                } else {
+                    self.report.omit_failure();
+                }
+                self.decode_complete = false;
+                return;
+            }
+        }
         if !self.clock_available {
             self.report.omit_failure();
             return;
@@ -211,7 +279,20 @@ impl LiveTranscriber {
                 // Close any valid speech preceding the loss before advancing the timeline. Reusing an
                 // open VAD region here would join unrelated speech across the missing chunk.
                 self.flush_decode_tail();
+                if let Some(boundary) = &mut self.boundary {
+                    // The opt-in owner cannot reset away a pending fence or its source mappings.
+                    // Terminate this live path truthfully; the ordinary compatibility path below is unchanged.
+                    boundary.failed = Some(BoundaryError::ResamplerUnavailable);
+                    self.report.record(RegionOutcome {
+                        span: input_span,
+                        status: RegionStatus::Failed(DecodeErrorCategory::ResamplerUnavailable),
+                    });
+                    self.decode_complete = false;
+                    return;
+                }
+                self.preserve_reset_uncertainty();
                 self.vad.reset();
+                self.terminal.reset_epoch();
                 self.input_clock.reset_vad();
                 self.report.record(RegionOutcome {
                     span: input_span,
@@ -311,7 +392,9 @@ impl LiveTranscriber {
             return std::mem::take(&mut self.pending);
         }
         self.flush_decode_tail();
+        self.preserve_reset_uncertainty();
         self.vad.reset();
+        self.terminal.reset_epoch();
         self.vad_base_samples = self.win.fed;
         self.input_clock.reset_vad();
         std::mem::take(&mut self.pending)
@@ -321,8 +404,26 @@ impl LiveTranscriber {
     /// words — those from the flush plus anything queued but not yet polled. Idempotent: a second call
     /// returns whatever has accumulated since (normally empty).
     pub fn finish(&mut self) -> Vec<Word> {
+        if self.boundary.is_some() {
+            match self.advance_boundary(BoundaryInput::SourceEnded) {
+                BoundaryProgress::Ended => {}
+                BoundaryProgress::TerminalUnsettled(error) => {
+                    self.refuse_compatibility_finish(error)
+                }
+                BoundaryProgress::OldSettled(_) | BoundaryProgress::Waiting => {
+                    self.refuse_compatibility_finish(BoundaryError::InvalidTransition);
+                }
+            }
+            return std::mem::take(&mut self.pending);
+        }
         if !self.finished {
-            self.flush_decode_tail();
+            self.flush_resampler_tail();
+            let remainder = self.win.take_remainder();
+            if !remainder.is_empty() {
+                self.accept_native_pcm(&remainder);
+                self.drain_regions();
+            }
+            self.finalize_terminal_vad();
             self.finished = true;
         }
         std::mem::take(&mut self.pending)
@@ -332,9 +433,22 @@ impl LiveTranscriber {
     /// cumulative across epochs and supplies the next checkpoint's absolute timestamp base.
     fn flush_decode_tail(&mut self) {
         self.flush_resampler_tail();
+        if self.boundary.is_some() {
+            self.accept_boundary_remainder();
+            if self
+                .boundary
+                .as_ref()
+                .is_some_and(|state| state.failed.is_some())
+            {
+                return;
+            }
+            self.vad.flush();
+            self.drain_regions();
+            return;
+        }
         let remainder = self.win.take_remainder();
         if !remainder.is_empty() {
-            self.vad.accept(&remainder);
+            self.accept_native_pcm(&remainder);
         }
         self.vad.flush();
         self.drain_regions();
@@ -343,12 +457,17 @@ impl LiveTranscriber {
     /// Feed already-16 kHz samples: buffer to whole VAD windows, then for each window accept + drain any
     /// regions the VAD closed.
     fn feed_16k(&mut self, samples_16k: &[f32]) {
+        self.retain_reset_tail(samples_16k);
+        if self.boundary.is_some() {
+            self.feed_boundary_16k(samples_16k);
+            return;
+        }
         // Zero-copy batch path: with nothing carried, feed whole windows straight from the input slice and
         // buffer only the sub-window remainder — a whole-channel push copies just the tail, not the channel.
         if self.win.buf.is_empty() {
             let (windows, remainder) = samples_16k.as_chunks::<VAD_WINDOW>();
             for window in windows {
-                self.vad.accept(window);
+                self.accept_native_pcm(window);
                 self.drain_regions();
             }
             self.win.fed += (samples_16k.len() - remainder.len()) as u64;
@@ -361,7 +480,7 @@ impl LiveTranscriber {
         }
         let block = self.win.take_windows();
         for window in block.as_chunks::<VAD_WINDOW>().0 {
-            self.vad.accept(window);
+            self.accept_native_pcm(window);
             self.drain_regions();
         }
     }
@@ -396,9 +515,67 @@ impl LiveTranscriber {
             skipped_clock,
             report,
             decode_complete,
+            boundary,
+            terminal,
             ..
         } = self;
         vad.drain_completed(&mut |relative_start, samples| {
+            let canonical = vad_base_samples
+                .checked_add(relative_start)
+                .and_then(|start| {
+                    start
+                        .checked_add(samples.len() as u64)
+                        .map(|end| (start, end))
+                });
+            let Some((start, full_end)) = canonical else {
+                terminal.ownership_valid = false;
+                report.omit_failure();
+                *decode_complete = false;
+                if let Some(state) = boundary {
+                    state.failed = Some(BoundaryError::MappingUnavailable);
+                }
+                return;
+            };
+            // Native-only terminal padding never owns source samples or reaches ASR.
+            let full_end = terminal.clip_end.map_or(full_end, |end| full_end.min(end));
+            if full_end <= start {
+                return;
+            }
+            if terminal.clip_end.is_some() && start < terminal.last_attempt_end {
+                terminal.ownership_valid = false;
+                report.omit_failure();
+                *decode_complete = false;
+                return;
+            }
+            if boundary.is_some()
+                && input_clock.input_span(start, full_end) == Err(MappingError::Invalid)
+            {
+                terminal.ownership_valid = false;
+                report.omit_failure();
+                *decode_complete = false;
+                if let Some(state) = boundary {
+                    state.failed = Some(BoundaryError::MappingUnavailable);
+                }
+                return;
+            }
+            let end = if let Some(state) = boundary {
+                match state.allowed_end(input_clock, start, full_end) {
+                    Ok(end) => end,
+                    Err(error) => {
+                        terminal.ownership_valid = false;
+                        state.failed = Some(error);
+                        report.omit_failure();
+                        *decode_complete = false;
+                        return;
+                    }
+                }
+            } else {
+                full_end
+            };
+            if end <= start {
+                return;
+            }
+            let samples = &samples[..(end - start) as usize];
             let span = vad_base_samples
                 .checked_add(relative_start)
                 .and_then(|start| {
@@ -409,6 +586,7 @@ impl LiveTranscriber {
                 .ok_or(MappingError::Invalid)
                 .and_then(|(start, end)| input_clock.input_span(start, end));
             if span == Err(MappingError::Invalid) {
+                terminal.ownership_valid = false;
                 // No backend call or timed words can be trusted for invalid native coordinates.
                 report.omit_failure();
                 *decode_complete = false;
@@ -418,6 +596,21 @@ impl LiveTranscriber {
             // sample. Apply that remainder immediately, including after recovery and checkpoints.
             let offset = absolute_offset_sec(*vad_base_samples, relative_start)
                 + skipped_clock.fractional_seconds();
+            if let Some(state) = boundary {
+                state.last_attempt_end = state.last_attempt_end.max(end);
+                match span {
+                    Ok(span) => {
+                        state.last_attempt_source_end = Some(
+                            state
+                                .last_attempt_source_end
+                                .unwrap_or(0)
+                                .max(span.end_frame),
+                        )
+                    }
+                    Err(_) => state.proof_available = false,
+                }
+            }
+            terminal.last_attempt_end = terminal.last_attempt_end.max(end);
             let decoded = rec.decode(samples, offset);
             pending.extend(decoded.words);
             if matches!(
@@ -480,7 +673,7 @@ impl LiveEngine {
     /// Spawn a [`LiveTranscriber`] for one channel: a fresh Silero VAD sharing the resident recognizer.
     pub fn channel(&self) -> Result<LiveTranscriber> {
         let vad = engine::build_vad(&self.models, self.vad_threshold, self.vad_min_silence)?;
-        Ok(LiveTranscriber::new(self.rec.clone(), vad))
+        Ok(LiveTranscriber::from_pinned_vad(self.rec.clone(), vad))
     }
 
     /// Whether this engine loaded the optional far-end diarizer.
@@ -892,6 +1085,9 @@ mod stream {
             flushes: Arc<AtomicUsize>,
         }
         impl Segmenter for SegmenterFixture {
+            fn terminal_guard(&self) -> Option<usize> {
+                Some(0)
+            }
             fn accept(&mut self, pcm: &[f32]) {
                 let region = (self.position, pcm.to_vec());
                 self.position += pcm.len() as u64;
@@ -1338,6 +1534,9 @@ mod tests {
     }
 
     impl Segmenter for FakeSegmenter {
+        fn terminal_guard(&self) -> Option<usize> {
+            Some(0)
+        }
         fn accept(&mut self, samples: &[f32]) {
             if self.join
                 && let Some((_, pending)) = &mut self.pending
@@ -1993,6 +2192,7 @@ mod tests {
             baseline.clone(),
             Box::new(engine::build_vad(&models, 0.5, 1.0).expect("baseline VAD")),
         );
+        live.terminal.guard = Some(terminal::PINNED_GUARD);
         live.push(&three, rate);
         let baseline_words = live.finish();
         assert!(live.decode_complete());
@@ -2021,6 +2221,7 @@ mod tests {
             injected.clone(),
             Box::new(engine::build_vad(&models, 0.5, 1.0).expect("injected VAD")),
         );
+        live.terminal.guard = Some(terminal::PINNED_GUARD);
         live.push(&three, rate);
         let surviving = live.finish();
         let actual = injected.receipts.lock().unwrap();
@@ -2434,14 +2635,18 @@ mod tests {
         let (m, rec) = verify_engine(&dir);
 
         // Whole-channel live push, compared with both irregular pushes and the real batch entry below.
-        let mut whole =
-            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
+        let mut whole = LiveTranscriber::from_pinned_vad(
+            rec.clone(),
+            engine::build_vad(&m, 0.5, 1.0).expect("vad"),
+        );
         whole.push(&mono, rate);
         let words_whole = whole.finish();
 
         // Same audio in irregular chunks straddling 512-sample window boundaries.
-        let mut chunked =
-            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
+        let mut chunked = LiveTranscriber::from_pinned_vad(
+            rec.clone(),
+            engine::build_vad(&m, 0.5, 1.0).expect("vad"),
+        );
         let mut i = 0;
         for (n, step) in VERIFY_CHUNKS.iter().cloned().cycle().enumerate() {
             if i >= mono.len() {
@@ -2526,7 +2731,8 @@ mod tests {
         let rec = Arc::new(Asr::Ggml(
             crate::ggml::GgmlAsr::load(&path, 4).expect("GGML recognizer"),
         ));
-        let mut live = LiveTranscriber::new(rec, engine::build_vad(&m, 0.5, 1.0).expect("vad"));
+        let mut live =
+            LiveTranscriber::from_pinned_vad(rec, engine::build_vad(&m, 0.5, 1.0).expect("vad"));
 
         let boundary = (rate as usize * 60).min(mono.len() / 2);
         let end = (boundary + rate as usize * 60).min(mono.len());
@@ -2574,8 +2780,10 @@ mod tests {
         );
 
         let (m, rec) = verify_engine(&dir);
-        let mut live =
-            LiveTranscriber::new(rec.clone(), engine::build_vad(&m, 0.5, 1.0).expect("vad"));
+        let mut live = LiveTranscriber::from_pinned_vad(
+            rec.clone(),
+            engine::build_vad(&m, 0.5, 1.0).expect("vad"),
+        );
 
         // First half at the source rate (builds a resampler), then the rest pre-resampled to 16 kHz and
         // pushed as 16 kHz — the switch that must flush the resampler's held tail in order.

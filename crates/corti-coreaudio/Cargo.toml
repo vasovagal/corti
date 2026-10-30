@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 corti-core = { workspace = true }
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-sys = "0.2"

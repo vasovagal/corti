@@ -1,9 +1,31 @@
-//! Checked projection of processing losses from retained WAV frames into capture epochs.
+//! Checked projection of processing losses and forced-boundary locations into capture epochs.
 
 use crate::{
     CaptureEpoch, QualityCause, QualityClass, QualityError, QualityRecord, QualityResolution,
     QualitySpan, QualityStage, QualityTrack,
 };
+
+/// Project a forced-boundary location envelope, not an assertion of lost audio or speech extent.
+/// The live tracker supplies the final retained input frame before its nonempty cut. This helper
+/// applies the same epoch splitting and conservative rounding as processing-loss projection, but
+/// unavailable/capped locations count only as degraded omissions and never as processing loss.
+pub fn insert_retained_forced_boundary(
+    record: &mut QualityRecord,
+    retained_start: u64,
+    retained_end: u64,
+    track: QualityTrack,
+) -> Result<(), QualityError> {
+    record.validate()?;
+    insert_retained_fact(
+        record,
+        retained_start,
+        retained_end,
+        track,
+        QualityCause::ForcedBoundary,
+        QualityStage::Live,
+        QualityClass::DegradedOnly,
+    )
+}
 
 /// Append a processing loss in fixed-rate retained-WAV coordinates to the existing quality record.
 /// Split at actual retained epoch boundaries; compressed-away source time is never included. Starts
@@ -30,8 +52,28 @@ pub fn insert_retained_processing_loss(
     {
         return Err(QualityError::InvalidClassification);
     }
+    insert_retained_fact(
+        record,
+        retained_start,
+        retained_end,
+        track,
+        cause,
+        stage,
+        QualityClass::ProcessingLoss,
+    )
+}
+
+fn insert_retained_fact(
+    record: &mut QualityRecord,
+    retained_start: u64,
+    retained_end: u64,
+    track: QualityTrack,
+    cause: QualityCause,
+    stage: QualityStage,
+    class: QualityClass,
+) -> Result<(), QualityError> {
     if retained_start >= retained_end {
-        return omit(record);
+        return omit(record, class);
     }
     let mut cursor = retained_start;
     // At most MAX_QUALITY_EPOCHS entries. Clone the bindings so insertion may coalesce spans.
@@ -46,7 +88,7 @@ pub fn insert_retained_processing_loss(
             continue;
         }
         if cursor < start {
-            omit(record)?;
+            omit(record, class)?;
         }
         // An omitted boundary could have changed the mapping anywhere after this known epoch.
         let unknown_boundary = next.map_or(record.overflow.omitted_epochs != 0, |next| {
@@ -61,12 +103,12 @@ pub fn insert_retained_processing_loss(
                 end_frame,
                 track,
                 cause,
-                class: QualityClass::ProcessingLoss,
+                class,
                 stage,
                 resolution: QualityResolution::Outstanding,
             });
         if span.is_none_or(|span| record.insert_span(span).is_err()) {
-            omit(record)?;
+            omit(record, class)?;
         }
         cursor = end;
         if cursor == retained_end {
@@ -74,20 +116,16 @@ pub fn insert_retained_processing_loss(
         }
     }
     if cursor < retained_end {
-        omit(record)?;
+        omit(record, class)?;
     }
     Ok(())
 }
 
-fn omit(record: &mut QualityRecord) -> Result<(), QualityError> {
-    record.record_omitted_spans(
-        QualityClass::ProcessingLoss,
-        QualityResolution::Outstanding,
-        1,
-    )
+fn omit(record: &mut QualityRecord, class: QualityClass) -> Result<(), QualityError> {
+    record.record_omitted_spans(class, QualityResolution::Outstanding, 1)
 }
 
-fn source_interval(
+pub(crate) fn source_interval(
     epoch: CaptureEpoch,
     next: Option<CaptureEpoch>,
     retained_start: u64,
@@ -276,5 +314,107 @@ mod tests {
         assert_eq!(record.spans.len(), MAX_QUALITY_SPANS);
         assert!(record.spans.contains(&source));
         assert_eq!(record.overflow.outstanding_omitted_spans[1], 1);
+    }
+
+    #[test]
+    fn forced_boundary_projection_splits_epochs_without_labelling_compressed_gap_as_loss() {
+        let mut record = capture();
+        record
+            .insert_epoch(CaptureEpoch {
+                id: 1,
+                source_start_ns: Some(100_000_000_000),
+                source_frame_base: 4_800_000,
+                retained_start_frame: 48_000,
+                reason: CaptureEpochReason::HostDiscontinuity,
+                ..epoch()
+            })
+            .unwrap();
+        insert_retained_forced_boundary(&mut record, 47_990, 48_010, QualityTrack::Tap).unwrap();
+        assert_eq!(
+            record
+                .spans
+                .iter()
+                .map(|s| (s.epoch, s.start_frame, s.end_frame))
+                .collect::<Vec<_>>(),
+            [(0, 47_990, 48_000), (1, 4_800_000, 4_800_010)]
+        );
+        assert!(
+            record
+                .spans
+                .iter()
+                .all(|s| s.cause == QualityCause::ForcedBoundary
+                    && s.class == QualityClass::DegradedOnly
+                    && s.stage == QualityStage::Live
+                    && s.resolution == QualityResolution::Outstanding)
+        );
+        assert!(!record.requires_batch_recovery());
+        assert_eq!(record.completeness(), crate::SourceCompleteness::Complete);
+    }
+
+    #[test]
+    fn forced_boundary_unknown_mapping_and_span_cap_remain_degraded_only() {
+        let mut unknown = QualityRecord::default();
+        insert_retained_forced_boundary(&mut unknown, 2, 3, QualityTrack::Mic).unwrap();
+        assert_eq!(unknown.overflow.outstanding_omitted_spans, [0, 0, 1]);
+        assert!(!unknown.requires_batch_recovery());
+        let mut capped = capture();
+        for index in 0..MAX_QUALITY_SPANS as u64 {
+            loss(&mut capped, 4 * index, 4 * index + 1);
+        }
+        let existing = capped.spans.clone();
+        insert_retained_forced_boundary(&mut capped, 7, 8, QualityTrack::Tap).unwrap();
+        assert_eq!(capped.spans, existing);
+        assert_eq!(capped.overflow.outstanding_omitted_spans, [0, 0, 1]);
+        assert!(
+            capped.requires_batch_recovery(),
+            "preexisting failures are preserved"
+        );
+    }
+
+    #[test]
+    fn processing_projector_still_rejects_forced_classification() {
+        let mut record = capture();
+        let original = record.clone();
+        assert_eq!(
+            insert_retained_processing_loss(
+                &mut record,
+                2,
+                3,
+                QualityTrack::Mic,
+                QualityCause::ForcedBoundary,
+                QualityStage::Live
+            ),
+            Err(QualityError::InvalidClassification)
+        );
+        assert_eq!(record, original);
+    }
+
+    #[test]
+    fn forced_boundary_rounding_and_unavailable_epoch_use_the_existing_projection() {
+        let mut rounded = QualityRecord::observed();
+        rounded
+            .insert_epoch(CaptureEpoch {
+                source_rate_hz: 11_025,
+                retained_rate_hz: 8_000,
+                source_frame_base: 100,
+                retained_start_frame: 8,
+                ..epoch()
+            })
+            .unwrap();
+        insert_retained_forced_boundary(&mut rounded, 11, 12, QualityTrack::Mic).unwrap();
+        assert_eq!(
+            (rounded.spans[0].start_frame, rounded.spans[0].end_frame),
+            (104, 106)
+        );
+        let mut omitted = capture();
+        omitted.record_omitted_epochs(1);
+        insert_retained_forced_boundary(&mut omitted, 1, 2, QualityTrack::Mic).unwrap();
+        assert!(omitted.spans.is_empty());
+        assert_eq!(omitted.overflow.outstanding_omitted_spans, [0, 0, 1]);
+        assert!(!omitted.requires_batch_recovery());
+        let mut overflow = capture();
+        overflow.epochs[0].source_frame_base = u64::MAX - 1;
+        insert_retained_forced_boundary(&mut overflow, 1, 3, QualityTrack::Mic).unwrap();
+        assert_eq!(overflow.overflow.outstanding_omitted_spans, [0, 0, 1]);
     }
 }

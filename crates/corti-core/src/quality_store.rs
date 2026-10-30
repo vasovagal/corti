@@ -947,6 +947,115 @@ mod tests {
         record
     }
 
+    #[test]
+    fn activity_summary_and_terminal_proof_survive_store_without_promoting_storage() {
+        use crate::{ActivityBlock, ActivityInput, ActivityScope, ChannelActivity, FarReference};
+
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let mut capture = initial();
+        let mut store = QualityStore::begin(&audio, "synthetic", &capture).unwrap();
+        let mut tracker = ChannelActivity::new(
+            ActivityScope::Capture,
+            ActivityInput::new([1; 32], 48_000).unwrap(),
+        )
+        .unwrap();
+        tracker
+            .push(
+                ActivityBlock {
+                    epoch: capture.epochs[0],
+                    retained_start: 0,
+                    mic: &[0.1; 16],
+                    tap: &[0.0; 16],
+                    unavailable: Some(&[]),
+                },
+                &mut capture,
+            )
+            .unwrap();
+        store.persist_before_audio(&capture, 16).unwrap();
+        synthetic_wav(&audio, 16);
+        let open = load_quality(&audio, "synthetic", Some(16)).unwrap();
+        assert_eq!(open.quality(), Some(&capture));
+        assert!(!open.permits_completion());
+        tracker.finish(Some(16), &mut capture).unwrap();
+        assert_eq!(
+            capture.activity.get(ActivityScope::Capture).far_reference(),
+            FarReference::Absent
+        );
+        store.prepare_finalization(&capture, 16).unwrap();
+        let terminal = load_quality(&audio, "synthetic", Some(16)).unwrap();
+        assert_eq!(terminal.quality(), Some(&capture));
+        assert!(!terminal.permits_completion());
+        store.complete_after_audio_sync(16).unwrap();
+        let durable = load_quality(&audio, "synthetic", Some(16)).unwrap();
+        assert!(durable.permits_completion());
+        assert_eq!(durable.quality(), Some(&capture));
+        assert_no_temporary(&audio);
+    }
+
+    #[test]
+    fn activity_summary_only_settlement_is_durable_and_cannot_regress_on_retry() {
+        use crate::{ActivityBlock, ActivityInput, ActivityScope, ChannelActivity, FarReference};
+
+        let fixture = Fixture::new();
+        let audio = fixture.audio();
+        let capture = initial();
+        let mut store = QualityStore::begin(&audio, "synthetic", &capture).unwrap();
+        synthetic_wav(&audio, 16);
+        store.prepare_finalization(&capture, 16).unwrap();
+        store.complete_after_audio_sync(16).unwrap();
+        let mut settled = capture.clone();
+        let mut tracker = ChannelActivity::new(
+            ActivityScope::Live,
+            ActivityInput::new([2; 32], 48_000).unwrap(),
+        )
+        .unwrap();
+        tracker
+            .push(
+                ActivityBlock {
+                    epoch: capture.epochs[0],
+                    retained_start: 0,
+                    mic: &[0.1; 16],
+                    tap: &[0.2; 16],
+                    unavailable: Some(&[]),
+                },
+                &mut settled,
+            )
+            .unwrap();
+        tracker.finish(None, &mut settled).unwrap();
+        assert!(settled.spans.is_empty());
+        persist_settled_quality(&audio, "synthetic", None, &settled).unwrap();
+        let before = fs::read(quality_sidecar_path(&audio).unwrap()).unwrap();
+        assert_eq!(
+            persist_settled_quality(&audio, "synthetic", Some(&settled), &capture),
+            Err(QualityStoreError::HistoryRegression)
+        );
+        assert_eq!(
+            fs::read(quality_sidecar_path(&audio).unwrap()).unwrap(),
+            before
+        );
+        let restarted = load_quality(&audio, "synthetic", Some(16))
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert_eq!(restarted.quality(), &capture);
+        assert_eq!(restarted.settled_quality(), Some(&settled));
+        assert_eq!(
+            settled.activity.get(ActivityScope::Live).far_reference(),
+            FarReference::Present
+        );
+        assert!(settled.activity.get(ActivityScope::Live).uncertain());
+        let mut recovered = settled.clone();
+        recovered
+            .resolve_processing_after_batch(
+                crate::BatchRecoveryOutcome::SameBackendWholeFileSuccess,
+            )
+            .unwrap();
+        persist_settled_quality(&audio, "synthetic", Some(&settled), &recovered).unwrap();
+        assert_eq!(recovered, settled);
+        assert_no_temporary(&audio);
+    }
+
     fn jumped_record() -> QualityRecord {
         let mut record = with_loss();
         record

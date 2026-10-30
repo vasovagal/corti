@@ -26,6 +26,76 @@ pub struct Word {
     pub text: String,
 }
 
+/// The actual rendered rows and ranges emitted by the same word loop. Ranges index the source
+/// formed by joining nonempty words with single spaces. None means the bounded trace is unavailable;
+/// rendered transcript output is still complete. Content deliberately has no Debug/Clone.
+/// ```compile_fail
+/// fn requires_debug<T: std::fmt::Debug>() {}
+/// requires_debug::<corti_transcribe::segment::SegmentedRows>();
+/// ```
+/// ```compile_fail
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<corti_transcribe::segment::SegmentedRows>();
+/// ```
+pub struct SegmentedRows {
+    pub segments: Vec<TranscriptSegment>,
+    pub source_ranges: Option<Vec<ByteSpan>>,
+}
+
+struct RangeTrace {
+    ranges: Option<Vec<ByteSpan>>,
+    offset: usize,
+}
+impl RangeTrace {
+    fn new(enabled: bool) -> Self {
+        Self {
+            ranges: enabled.then(Vec::new),
+            offset: 0,
+        }
+    }
+    fn word(&mut self, bytes: usize, continues: bool) {
+        let Some(ranges) = self.ranges.as_mut() else {
+            return;
+        };
+        let Some(end) = self
+            .offset
+            .checked_add(bytes)
+            .and_then(|end| u32::try_from(end).ok())
+        else {
+            self.ranges = None;
+            return;
+        };
+        if continues {
+            if let Some(last) = ranges.last_mut() {
+                last.end = end;
+            }
+        } else if ranges.len() < trace::TEXT_TRACE_BYTES / std::mem::size_of::<ByteSpan>() {
+            if ranges.len() == ranges.capacity() {
+                let limit = trace::TEXT_TRACE_BYTES / std::mem::size_of::<ByteSpan>();
+                let capacity = ranges.capacity().max(2).saturating_mul(2).min(limit);
+                if ranges.try_reserve_exact(capacity - ranges.len()).is_err()
+                    || ranges.capacity() > limit
+                {
+                    self.ranges = None;
+                    return;
+                }
+            }
+            ranges.push(ByteSpan {
+                start: self.offset as u32,
+                end,
+            });
+        } else {
+            self.ranges = None;
+            return;
+        }
+        if let Some(offset) = (end as usize).checked_add(1) {
+            self.offset = offset;
+        } else {
+            self.ranges = None;
+        }
+    }
+}
+
 /// A diarization speaker turn (seconds), labelled with the display name to attribute overlapping words to.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpeakerTurn {
@@ -70,8 +140,23 @@ fn region_end(region: &[Word]) -> f64 {
 /// longer than `gap`. Words are joined with single spaces (punctuation should already be glued onto the
 /// word by the caller). Empty words are skipped; empty input yields no segments.
 pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<TranscriptSegment> {
+    words_to_segments_impl(words, speaker, gap, false).segments
+}
+
+/// Optional bounded lineage emitted by the actual grouping loop, without another grouping pass.
+pub fn words_to_segments_with_ranges(words: &[Word], speaker: Speaker, gap: f64) -> SegmentedRows {
+    words_to_segments_impl(words, speaker, gap, true)
+}
+
+fn words_to_segments_impl(
+    words: &[Word],
+    speaker: Speaker,
+    gap: f64,
+    traced: bool,
+) -> SegmentedRows {
     let mut out: Vec<TranscriptSegment> = Vec::new();
     let mut cur: Option<TranscriptSegment> = None;
+    let mut trace = RangeTrace::new(traced);
 
     for w in words {
         if w.text.is_empty() {
@@ -79,11 +164,13 @@ pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<Tran
         }
         match cur.as_mut() {
             Some(seg) if continues_region(seg.end, w, gap) => {
+                trace.word(w.text.len(), true);
                 seg.text.push(' ');
                 seg.text.push_str(&w.text);
                 seg.end = w.end;
             }
             _ => {
+                trace.word(w.text.len(), false);
                 if let Some(seg) = cur.take() {
                     out.push(seg);
                 }
@@ -99,7 +186,10 @@ pub fn words_to_segments(words: &[Word], speaker: Speaker, gap: f64) -> Vec<Tran
     if let Some(seg) = cur.take() {
         out.push(seg);
     }
-    out
+    SegmentedRows {
+        segments: out,
+        source_ranges: trace.ranges,
+    }
 }
 
 /// Merge segments from multiple speakers into one timeline, sorted by start time. `total_cmp` keeps it
@@ -120,8 +210,29 @@ pub fn diarize_words(
     gap: f64,
     fallback_label: &str,
 ) -> Vec<TranscriptSegment> {
+    diarize_words_impl(words, turns, gap, fallback_label, false).segments
+}
+
+/// Optional bounded lineage emitted by the actual speaker-attribution loop, without rerunning it.
+pub fn diarize_words_with_ranges(
+    words: &[Word],
+    turns: &[SpeakerTurn],
+    gap: f64,
+    fallback_label: &str,
+) -> SegmentedRows {
+    diarize_words_impl(words, turns, gap, fallback_label, true)
+}
+
+fn diarize_words_impl(
+    words: &[Word],
+    turns: &[SpeakerTurn],
+    gap: f64,
+    fallback_label: &str,
+    traced: bool,
+) -> SegmentedRows {
     let mut out: Vec<TranscriptSegment> = Vec::new();
     let mut cur: Option<TranscriptSegment> = None;
+    let mut trace = RangeTrace::new(traced);
 
     for w in words {
         if w.text.is_empty() {
@@ -130,11 +241,13 @@ pub fn diarize_words(
         let speaker = Speaker::Other(best_turn_label(w, turns, fallback_label));
         match cur.as_mut() {
             Some(seg) if seg.speaker == speaker && w.start - seg.end <= gap => {
+                trace.word(w.text.len(), true);
                 seg.text.push(' ');
                 seg.text.push_str(&w.text);
                 seg.end = w.end;
             }
             _ => {
+                trace.word(w.text.len(), false);
                 if let Some(seg) = cur.take() {
                     out.push(seg);
                 }
@@ -150,7 +263,10 @@ pub fn diarize_words(
     if let Some(seg) = cur.take() {
         out.push(seg);
     }
-    out
+    SegmentedRows {
+        segments: out,
+        source_ranges: trace.ranges,
+    }
 }
 
 /// The label of the turn a word overlaps most; ties/no-overlap fall back to the nearest turn (by the gap
@@ -225,7 +341,24 @@ pub const CLEANUP_RULES_VERSION: u32 = 4;
 /// something changed, and must be idempotent (applying the result again changes nothing).
 pub trait TextRule {
     fn apply(&self, text: &str) -> Option<String>;
+
+    /// Additive trace seam. Legacy implementations keep their output and explicitly mark missing
+    /// positional/rule evidence; callers must never invent a winning rule ID from a dry run.
+    fn apply_traced(&self, text: &str) -> TracedText {
+        let replacement = self.apply(text);
+        let mut edits = PositionedEdits::default();
+        if replacement.is_some() {
+            edits.unavailable(TraceGap::UnsupportedRule);
+        }
+        TracedText { replacement, edits }
+    }
 }
+
+#[path = "segment/trace.rs"]
+mod trace;
+pub use trace::{
+    ByteSpan, EditKind, PositionedEdits, TEXT_TRACE_BYTES, TextEdit, TraceGap, TracedText,
+};
 
 /// Tuning for [`cleanup`]. Defaults are the shipping values; the app persists them under `[cleanup]` in
 /// `config.toml` and overrides them with `CORTI_CLEANUP_*`.
@@ -401,7 +534,7 @@ pub enum CleanupReason {
 /// One reversible stage decision. Indices refer to this stage's input sequence, not the original
 /// recording's sequence; EarlyEcho uses the caller's monotonically increasing region index.
 /// Original/replacement rows preserve exact text, speaker, and span. No Debug: this contains text.
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub struct CleanupDecision {
     pub stage: CleanupStage,
     pub input_indices: Vec<usize>,
@@ -410,6 +543,23 @@ pub struct CleanupDecision {
     pub reason: CleanupReason,
     pub evidence: Option<SpanEvidence>,
     pub source: Option<EchoSource>,
+    pub edits: PositionedEdits,
+}
+
+// Preserve the legacy decision API; new evidence/trace owners deliberately have no Clone API.
+impl Clone for CleanupDecision {
+    fn clone(&self) -> Self {
+        Self {
+            stage: self.stage,
+            input_indices: self.input_indices.clone(),
+            originals: self.originals.clone(),
+            replacements: self.replacements.clone(),
+            reason: self.reason,
+            evidence: self.evidence,
+            source: self.source,
+            edits: self.edits.legacy_copy(),
+        }
+    }
 }
 
 /// Maximum retained decision payload, including row/record metadata and owned text/speaker bytes.
@@ -443,6 +593,11 @@ impl CleanupDecisions {
         self.entries
     }
 
+    /// Move the existing owners into evidence; retain the upstream omission count explicitly.
+    pub fn into_parts(self) -> (Vec<CleanupDecision>, usize) {
+        (self.entries, self.omitted)
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -451,6 +606,7 @@ impl CleanupDecisions {
         self.omitted = self.omitted.saturating_add(other.omitted);
         for entry in other.entries {
             let bytes = std::mem::size_of::<CleanupDecision>()
+                .saturating_add(entry.edits.owned_bytes())
                 .saturating_add(
                     entry
                         .input_indices
@@ -513,7 +669,36 @@ impl CleanupDecisions {
                 reason,
                 evidence,
                 source,
+                edits: PositionedEdits::default(),
             });
+        }
+    }
+
+    fn record_text(
+        &mut self,
+        stage: CleanupStage,
+        index: usize,
+        original: &TranscriptSegment,
+        replacement: Option<&TranscriptSegment>,
+        reason: CleanupReason,
+        edits: PositionedEdits,
+    ) {
+        let needed = std::mem::size_of::<CleanupDecision>()
+            + std::mem::size_of::<usize>()
+            + segment_bytes(original)
+            + replacement.map_or(0, segment_bytes)
+            + edits.owned_bytes();
+        if needed > CLEANUP_DECISION_BYTES.saturating_sub(self.bytes) {
+            self.omitted = self.omitted.saturating_add(1);
+            return;
+        }
+        match replacement {
+            Some(value) => self.record(stage, &[index], &[original], &[value], reason, None, None),
+            None => self.record(stage, &[index], &[original], &[], reason, None, None),
+        }
+        self.bytes += edits.owned_bytes();
+        if let Some(last) = self.entries.last_mut() {
+            last.edits = edits;
         }
     }
 
@@ -667,6 +852,37 @@ pub fn cleanup_with_protected_decisions(
     rule: Option<&dyn TextRule>,
     protected_input_indices: &[usize],
 ) -> CleanupResult {
+    cleanup_impl(
+        segments,
+        cfg,
+        carry,
+        evidence,
+        rule,
+        protected_input_indices,
+        false,
+    )
+}
+
+pub(crate) fn cleanup_with_traced_decisions(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+    protected: &[usize],
+) -> CleanupResult {
+    cleanup_impl(segments, cfg, carry, evidence, rule, protected, true)
+}
+
+fn cleanup_impl(
+    segments: Vec<TranscriptSegment>,
+    cfg: &CleanupConfig,
+    carry: &[TranscriptSegment],
+    evidence: Option<AudioEvidence<'_>>,
+    rule: Option<&dyn TextRule>,
+    protected_input_indices: &[usize],
+    traced: bool,
+) -> CleanupResult {
     let mut stats = CleanupStats::default();
     let mut decisions = CleanupDecisions::default();
     let protected_inputs: BTreeSet<_> = protected_input_indices.iter().copied().collect();
@@ -711,25 +927,34 @@ pub fn cleanup_with_protected_decisions(
         segments = drop_backchannel_turns(segments, &mut stats, &mut decisions, &mut preserve_raw);
     }
     if cfg.strip_fillers {
-        segments = strip_fillers_pass(segments, &mut stats, &mut decisions, &preserve_raw);
+        segments = strip_fillers_pass(segments, &mut stats, &mut decisions, &preserve_raw, traced);
     }
     if let Some(rule) = rule {
         for (i, segment) in segments.iter_mut().enumerate() {
-            if let Some(text) = rule.apply(&segment.text) {
+            let TracedText { replacement, edits } = if traced {
+                rule.apply_traced(&segment.text)
+            } else {
+                let replacement = rule.apply(&segment.text);
+                let mut edits = PositionedEdits::default();
+                if replacement.is_some() {
+                    edits.unavailable(TraceGap::UnsupportedRule);
+                }
+                TracedText { replacement, edits }
+            };
+            if let Some(text) = replacement {
                 let replacement = TranscriptSegment {
                     speaker: segment.speaker.clone(),
                     start: segment.start,
                     end: segment.end,
                     text,
                 };
-                decisions.record(
+                decisions.record_text(
                     CleanupStage::Lexicon,
-                    &[i],
-                    &[segment],
-                    &[&replacement],
+                    i,
+                    segment,
+                    Some(&replacement),
                     CleanupReason::TextRule,
-                    None,
-                    None,
+                    edits,
                 );
                 *segment = replacement;
                 stats.lexicon_applied += 1;
@@ -764,6 +989,22 @@ const STRIP_FILLERS: &[&str] = &[
 /// start is re-capitalised when the opening filler went, and a capital the decoder left on the word
 /// after a mid-sentence filler ("I think, um, We should") is lowered.
 pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
+    strip_fillers_inner(text, None)
+}
+
+/// The existing filler/stutter pass plus positions from its actual token choices. Trace overflow
+/// never changes the returned text/counts and is explicit in PositionedEdits::gap.
+pub fn strip_fillers_text_traced(text: &str) -> (String, usize, usize, PositionedEdits) {
+    let mut trace = trace::FillerTrace::new();
+    let (output, fillers, stutters) = strip_fillers_inner(text, Some(&mut trace));
+    let edits = trace.finish(text, &output);
+    (output, fillers, stutters, edits)
+}
+
+fn strip_fillers_inner(
+    text: &str,
+    mut trace: Option<&mut trace::FillerTrace>,
+) -> (String, usize, usize) {
     let mut kept: Vec<String> = Vec::new();
     let mut kept_norm: Vec<String> = Vec::new();
     let mut contexts = raw_token_context(text).peekable();
@@ -772,6 +1013,9 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
     let mut stutters = 0usize;
     let mut after_filler = false;
     for (index, raw) in text.split_whitespace().enumerate() {
+        if let Some(trace) = &mut trace {
+            trace.token(text, raw);
+        }
         let (protected, can_recase) = contexts
             .next_if(|context| context.index == index)
             .map_or((false, true), |context| {
@@ -779,6 +1023,9 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
             });
         let norm = normalize_token(raw);
         if !protected && STRIP_FILLERS.contains(&norm.as_str()) {
+            if let Some(trace) = &mut trace {
+                trace.filler();
+            }
             fillers += 1;
             let trailing = raw.chars().last().filter(|c| matches!(c, '.' | '?' | '!'));
             if let Some(previous) = kept.last_mut() {
@@ -798,6 +1045,9 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
         if !norm.is_empty() {
             let n = kept_norm.len();
             if n > 0 && kept_norm[n - 1] == norm && same_stutter_value(&kept[n - 1], raw) {
+                if let Some(trace) = &mut trace {
+                    trace.stutter(kept.last().is_some_and(|p| p.ends_with(',')), false);
+                }
                 stutters += 1;
                 // "we, we roll" keeps the later copy so the stutter's comma goes with it.
                 if let Some(previous) = kept.last_mut()
@@ -816,6 +1066,9 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
                 && same_stutter_value(&kept[n - 3], &kept[n - 1])
                 && same_stutter_value(&kept[n - 2], raw)
             {
+                if let Some(trace) = &mut trace {
+                    trace.stutter(false, true);
+                }
                 kept.pop();
                 kept_norm.pop();
                 stutters += 1;
@@ -837,6 +1090,9 @@ pub fn strip_fillers_text(text: &str) -> (String, usize, usize) {
         }
         kept.push(token);
         kept_norm.push(norm);
+        if let Some(trace) = &mut trace {
+            trace.keep();
+        }
     }
     let mut out = kept.join(" ");
     if fillers > 0
@@ -894,6 +1150,7 @@ fn strip_fillers_pass(
     stats: &mut CleanupStats,
     decisions: &mut CleanupDecisions,
     preserve_raw: &[bool],
+    traced: bool,
 ) -> Vec<TranscriptSegment> {
     let mut out = Vec::with_capacity(segments.len());
     for (i, mut segment) in segments.into_iter().enumerate() {
@@ -901,18 +1158,26 @@ fn strip_fillers_pass(
             out.push(segment);
             continue;
         }
-        let (text, fillers, stutters) = strip_fillers_text(&segment.text);
+        let (text, fillers, stutters, edits) = if traced {
+            strip_fillers_text_traced(&segment.text)
+        } else {
+            let (text, fillers, stutters) = strip_fillers_text(&segment.text);
+            let mut edits = PositionedEdits::default();
+            if text != segment.text {
+                edits.unavailable(TraceGap::UnsupportedRule);
+            }
+            (text, fillers, stutters, edits)
+        };
         stats.fillers_removed += fillers;
         stats.stutters_collapsed += stutters;
         if text.trim().is_empty() {
-            decisions.record(
+            decisions.record_text(
                 CleanupStage::Fillers,
-                &[i],
-                &[&segment],
-                &[],
+                i,
+                &segment,
+                None,
                 CleanupReason::FillersOrStutters,
-                None,
-                None,
+                edits,
             );
             continue;
         }
@@ -923,14 +1188,13 @@ fn strip_fillers_pass(
                 end: segment.end,
                 text,
             };
-            decisions.record(
+            decisions.record_text(
                 CleanupStage::Fillers,
-                &[i],
-                &[&segment],
-                &[&replacement],
+                i,
+                &segment,
+                Some(&replacement),
                 CleanupReason::FillersOrStutters,
-                None,
-                None,
+                edits,
             );
             segment = replacement;
         }

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Run exact native checks against authored synthetic fixtures, never user audio."""
 import argparse
+import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -196,6 +198,148 @@ CAPTURE_REQUIRED_TESTS = (
     "good_start_epoch_keeps_a_later_mismatch_exact_before_finish",
     "observed_epoch_inventory_is_bounded_and_conflicts_remain_counted_loss",
     "provisional_processing_facts_merge_only_with_independent_capture_authority",
+    "activity_publishes_open_run_before_finish_with_exact_degraded_stage_and_levels",
+    "activity_actual_span_cap_counts_each_run_once_and_preserves_summary_before_finish",
+    "activity_same_input_retry_keeps_omission_lower_bound_and_stages_remain_distinct",
+    "activity_span_dropped_by_merge_cap_is_not_recounted_by_same_input_retry",
+    "activity_distinct_scope_merges_preserve_summed_lower_bounds_and_generic_history",
+    "activity_supplement_uses_authoritative_epochs_without_changing_source_authority",
+    "activity_actual_epoch_cap_retains_suspected_facts_and_one_omission_per_run",
+    "activity_projection_uses_observed_epoch_and_outward_source_rounding",
+    "activity_legacy_unknown_availability_does_not_observe_numerical_fill",
+    "activity_complete_zero_proof_conflicts_with_nonzero_and_never_erases_uncertainty",
+    "activity_partial_union_never_certifies_absence_and_stage_bindings_do_not_pool",
+    "activity_complete_retry_preserves_uncertainty_but_supplies_its_own_extent",
+    "activity_conflicting_input_rate_or_extent_is_conservative_and_merge_is_associative",
+    "activity_actual_record_serde_defaults_and_fixed_memory_reject_malformed_proofs",
+    "activity_omission_saturation_does_not_change_source_completeness_or_recovery",
+    "activity_invalid_proofs_reject_on_both_record_serde_paths_without_payload_diagnostics",
+    "dead_tap_active_mic_opens_at_five_seconds_and_finishes_once",
+    "both_quiet_is_not_suspected_and_levels_are_measured",
+    "intermittent_keeps_global_evidence_and_partial_nonzero_closes_run",
+    "quiet_zero_stretch_is_intermittent_without_suspicion",
+    "short_zero_stretches_do_not_sum_into_sustained_silence",
+    "unavailable_fill_is_unknown_and_a_later_observed_run_can_trigger",
+    "invalid_and_short_tracks_never_become_silence_or_active_mic",
+    "observed_tap_zero_streak_survives_nonfinite_mic",
+    "observed_tap_zero_streak_survives_missing_mic",
+    "mic_invalidity_breaks_suspicion_but_preserves_reference_history",
+    "invalid_tap_missing_tap_and_unavailable_fill_still_break_zero_history",
+    "empty_mask_matches_explicit_all_available_without_an_adapter_bitmap",
+    "one_missing_tap_frame_cannot_be_padded_to_the_threshold",
+    "activity_accepted_minus_sixty_dbfs_threshold_has_exact_f32_boundary_controls",
+    "threshold_is_mean_square_not_peak_and_is_explicitly_uncalibrated",
+    "waveform_partition_sweep_keeps_identical_levels_runs_and_facts",
+    "rate_and_epoch_changes_restart_bins_without_bridging_source_jumps",
+    "conflicting_or_reused_epoch_is_rejected_without_counting_samples",
+    "final_partial_second_neither_opens_nor_extends_suspicion",
+    "retained_holes_close_runs_in_constant_state_without_synthetic_seconds",
+    "leading_or_trailing_holes_missing_verdict_and_empty_input_cannot_certify_absent",
+    "structurally_absent_tracks_are_not_observed_zeros_and_never_suspected",
+    "absent_layout_then_positive_tap_is_intermittent",
+    "bounded_sink_counts_each_omitted_run_once_including_a_long_run",
+    "external_epoch_binding_cap_rejects_once_per_run_without_growing_tracker",
+    "replayed_positions_do_not_double_count_and_empty_pushes_do_not_reset",
+    "counter_overflow_saturates_and_does_not_wrap_or_erase_positive_facts",
+    "malformed_input_and_position_overflow_fail_without_admission",
+    "observed_pcm_is_borrowed_and_extreme_finite_levels_stay_finite",
+    "activity_schema_one_wire_round_trip_preserves_summary_only_observations",
+    "activity_saturation_preserves_later_source_processing_and_generic_degraded_authority",
+    "activity_stage_sum_saturates_only_diagnostic_authority_and_preserves_serde_history",
+    "activity_summary_and_terminal_proof_survive_store_without_promoting_storage",
+    "activity_summary_only_settlement_is_durable_and_cannot_regress_on_retry",
+    "activity_is_pre_filter_and_keeps_raw_tee_and_retained_pcm_unchanged",
+    "activity_open_run_persistence_precedes_dependent_pcm_and_failure_never_certifies",
+    "offline_observation_requires_affirmative_matching_raw_processing_authority",
+    "offline_conflicts_cannot_authorize_input_but_historical_uncertainty_can",
+    "offline_tap_only_observation_preserves_not_applicable_and_creates_no_derivative",
+    "offline_activity_uses_pre_aec_samples_without_changing_wav_bytes_or_retry_counts",
+    "offline_activity_keeps_valid_tap_history_across_mic_only_source_loss",
+    "offline_activity_legacy_input_remains_unknown_and_failed_output_keeps_observations",
+    "every_aec_execution_arm_keeps_disposition_and_projects_only_its_input_scope",
+    "live_activity_projection_requires_actual_execution_and_keeps_short_lookahead",
+    "legacy_aec_disposition_survives_refresh_without_borrowing_new_capture_observations",
+    "offline_observations_survive_backend_error_and_print_retention_is_read_only",
+    "activity_live_observes_raw_input_across_windows_and_refreshes_owned_note",
+    "activity_live_requires_matching_terminal_authority_and_never_observes_fill",
+    "activity_live_epoch_cap_is_diagnostic_and_source_projection_stays_exact",
+    "activity_live_execution_refresh_requires_actual_mic_input",
+    "activity_live_unknown_authority_keeps_empty_asr_note_free",
+    "trace_records_selected_phrase_winners_and_utf8_output_offsets",
+    "actual_correct_and_incorrect_rust_hint_reconstruct_the_original_input",
+    "actual_early_echo_context_keeps_exact_raw_and_carry_parents_and_seals_bad_or_excess_links",
+    "actual_poll_echo_split_child_echo_diarization_and_cleanup_keep_one_asr_lineage",
+    "lineage_shared_append_and_readback_reject_lost_duplicated_fabricated_ranges_or_protection",
+    "lineage_full_unchanged_duplicate_rows_keep_distinct_owners_and_empty_derived_stages_work",
+    "lineage_bad_caller_map_seals_evidence_and_keeps_borrowed_outputs_and_quality",
+    "lineage_raw_echo_consumes_exact_decisions_context_and_cannot_restore_a_withheld_row",
+    "lineage_new_owner_and_range_vectors_obey_identical_limits_on_readback",
+    "actual_word_range_emitters_match_legacy_rows_and_cover_unicode_empty_words_and_trace_cap",
+    "actual_filler_trace_preserves_utf8_preimages_and_stutter_positions",
+    "actual_structural_passes_keep_explicit_duplicate_row_identity",
+    "actual_echo_queries_each_input_once_and_keeps_every_candidate_decision",
+    "actual_critical_echo_protection_and_fallback_identity_survive_readback",
+    "actual_legacy_rule_runs_once_and_seals_missing_evidence_without_losing_output",
+    "actual_early_echo_retains_withheld_inputs_and_source_ordinals",
+    "actual_upstream_decision_omission_seals_evidence_but_preserves_known_input",
+    "actual_protection_survives_sort_merge_and_skipped_filler_pass",
+    "actual_carry_uses_caller_links_or_explicit_unattributed_snapshot",
+    "production_preflight_rejects_small_wire_large_owner_expansion_before_decode",
+    "actual_backchannel_deletion_keeps_its_preimage_and_caller_protection",
+    "actual_trace_and_capture_caps_preserve_cleanup_output_and_mark_missing_evidence",
+    "actual_early_echo_rejects_ambiguous_ordinals_instead_of_matching_identical_text",
+    "actual_filler_position_corpus_covers_punctuation_unicode_and_repeated_bigrams",
+    "actual_early_rows_assemble_for_cleanup_without_reminting_asr_or_copying_text",
+    "actual_assembly_missing_or_omitted_parents_never_change_cleanup_output",
+    "production_dense_source_round_trips_at_the_same_minimum_owned_limit",
+    "review_invalid_carry_seals_the_missing_suffix_across_readback_and_later_windows",
+    "review_source_and_assembly_errors_before_admission_remain_durable_omissions",
+    "review_late_text_trace_error_keeps_prior_stages_and_seals_only_missing_suffix",
+    "review_early_echo_errors_seal_source_and_decision_omissions",
+    "review_cleanup_assembly_inherits_protection_on_append_and_read_in_both_link_forms",
+    "review_cleanup_assembly_rejects_minted_rows_but_retains_genuinely_empty_assembly",
+    "rereview_admitted_document_reloads_with_the_same_owned_limit",
+    "rereview_valid_unicode_case_expansion_from_existing_cleanup_is_recordable",
+    "rereview_nested_ownership_and_settled_quality_reload_at_identical_limits",
+    "rereview_external_capacity_is_not_corruption_and_invalid_groups_are_not_omitted",
+    "rereview_unicode_case_mapping_keeps_positions_and_rejects_non_case_rewrites",
+    "review_multiple_retained_windows_preserve_ordered_provider_ancestry",
+    "review_lexicon_rejects_no_rule_id_on_append_and_read",
+    "review_echo_keep_rejects_untraced_rewrite_on_append_and_read",
+    "review_sort_requires_every_moved_row_decision_on_append_and_read",
+    "review_tiny_wire_record_cannot_retain_unbudgeted_string_capacity",
+    "review_text_pass_reason_must_match_the_recorded_pass",
+    "review_valid_sort_covers_moved_rows_and_preserves_unchanged_rows",
+    "rereview_time_valid_sort_still_requires_each_moved_row_decision",
+    "review_merge_has_exact_structural_preimages_and_keeps_unmerged_row",
+    "review_protected_echo_and_acoustic_drop_keep_exact_row_identity",
+    "review_backchannel_drop_cannot_resurrect_via_a_later_parent_reference",
+    "review_omitted_parent_and_assembled_group_are_unavailable_not_reminted",
+    "review_fillers_allow_positioned_case_and_whitespace_without_metadata_changes",
+    "review_every_nested_owned_capacity_is_budgeted_even_when_not_serialized",
+    "review_owned_budget_is_exact_across_growth_and_reserves_final_quality",
+    "borrowed_row_index_and_budget_fallback_preserve_unordered_ids_and_missing_rows",
+    "exact_subseconds_speaker_and_track_round_trip_without_markdown",
+    "source_frame_derived_timing_corpus_round_trips_every_f64_bit",
+    "finite_nonnegative_timing_bits_survive_json_without_a_custom_time_representation",
+    "very_very_stutter_keeps_the_deleted_position_and_preimage",
+    "filler_position_and_separate_case_repair_cover_the_actual_output",
+    "fully_deleted_filler_row_remains_reconstructable_without_an_empty_output_clone",
+    "early_echo_region_ordinal_is_not_a_stage_local_index_or_a_u32",
+    "changed_cleanup_cannot_silently_omit_its_decision_or_position_trace",
+    "identical_text_and_time_in_different_windows_never_join_invocations",
+    "later_provider_and_prose_invocations_link_retained_rows_without_copying_asr",
+    "local_input_indices_select_the_right_identical_row_and_bad_links_are_rejected",
+    "exact_escaped_byte_boundary_keeps_or_omits_the_whole_linked_group",
+    "group_cannot_retain_only_its_source_when_its_linked_decision_does_not_fit",
+    "final_shared_quality_fits_reserved_room_after_content_is_full_and_truncated",
+    "invalid_utf8_range_unreported_edit_and_nonfinite_time_are_rejected",
+    "processed_wav_cannot_claim_to_be_the_exact_live_aec_input",
+    "unknown_identity_is_explicit_and_never_fabricated",
+    "malformed_truncation_counts_and_future_versions_are_rejected",
+    "maximum_width_truncation_metadata_fits_its_reserved_room",
+    "codec_errors_are_category_only_and_do_not_expose_authored_sentinel",
+    "actual_owned_and_temporary_allocations_stay_within_documented_envelopes",
 )
 
 
@@ -203,11 +347,12 @@ def capture_suite_passed(output, returncode):
     summaries = re.findall(r"(?m)^test result: ([A-Za-z]+)\. (\d+) passed; (\d+) failed;.*$", output)
     return (returncode == 0 and bool(summaries)
             and all(status == "ok" and failed == "0" for status, _, failed in summaries)
-            and all(re.search(r"(?m)^test [^\n]*::" + re.escape(name) + r" \.\.\. ok$", output)
+            and all(re.search(r"(?m)^test (?:[^ \n]*::)?" + re.escape(name) + r" \.\.\. ok$", output)
                     for name in CAPTURE_REQUIRED_TESTS))
 
 
 APP_PATH_REQUIRED_TESTS = (
+    "unfiled_boundary_recovers_once_and_retains_source_intervals_after_restart",
     "production_recording_path_invokes_scripted_backend_once_and_keeps_partial_output",
     "full_production_chain_counts_backend_and_replays_checkpoint_without_audio",
     "successful_live_quality_survives_completion_replay_and_publication_failure",
@@ -238,6 +383,41 @@ def app_path_receipt(output, returncode):
     return receipts[0]
 
 
+EVIDENCE_SOURCE_FILES = {
+    *(f"app/src/{name}.rs" for name in APP_PATH_SOURCE_MODULES | {"cli", "evidence"}),
+    "app/src/evidence/integration.rs", "app/src/evidence/live.rs", "app/src/evidence/tests.rs",
+    "app/tests/decode_quality/run.py", "app/tests/decode_quality/boundaries.rs",
+    "app/tests/decode_quality/full_path.rs", "app/tests/decode_quality/retention.rs",
+    "app/tests/evidence/run.py", "app/tests/evidence/verify_receipt.py",
+    "app/tests/evidence/test_receipt.py", "app/tests/evidence/live_harness.py",
+    "app/tests/evidence/retention.rs", "app/tests/evidence/batch.rs",
+    "app/tests/evidence/live.rs", "app/tests/evidence/live_optout.rs", "app/tests/evidence/tracing.rs",
+    "app/tests/evidence/allocations.rs", "app/tests/evidence/hosted_boundary.rs",
+    "app/tests/evidence/scheduling.rs", "crates/corti-transcribe/tests/evidence_allocations.rs",
+    "crates/corti-coreaudio/src/capture.rs", "crates/corti-capture/src/lib.rs",
+}
+
+
+def evidence_receipt(output, returncode, root):
+    """Reuse the harness's named-test authority and bind its receipt to this checkout."""
+    spec = importlib.util.spec_from_file_location(
+        "evidence_receipt", root / "app/tests/evidence/verify_receipt.py")
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    validator.require_complete(output, returncode)
+    prefix = "evidence-persistence source sha256: "
+    receipts = [json.loads(line.removeprefix(prefix)) for line in output.splitlines()
+                if line.startswith(prefix)]
+    if (len(receipts) != 1 or not isinstance(receipts[0], dict)
+            or receipts[0].keys() != EVIDENCE_SOURCE_FILES):
+        raise RuntimeError("evidence source receipt is missing, duplicate or incomplete")
+    current = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+               for name in EVIDENCE_SOURCE_FILES}
+    if receipts[0] != current:
+        raise RuntimeError("evidence source receipt does not match this checkout")
+    return receipts[0]
+
+
 def capture_rate_receipt(output, returncode):
     rows = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
     measurements = [row for row in rows if row.get("type") == "throughput"]
@@ -253,6 +433,8 @@ def capture_rate_receipt(output, returncode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--cache-dir", type=Path,
+                        help="verified model archive directory; defaults to the native job sibling cache")
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
@@ -268,6 +450,7 @@ def main():
     resample_comparison = []
     capture_rate = []
     app_path_sources = {}
+    evidence_sources = {}
 
     def run_test(name, label, features=(), release=False):
         command = ["cargo", "test", "--locked", "--lib", "-p", "corti-transcribe-local"]
@@ -290,10 +473,32 @@ def main():
     metal = "not probed"
     failed = False
     try:
+        boundary_output = args.output_dir / "boundary"
+        boundary_fixtures = boundary_output / "fixtures"
+        cache = args.cache_dir or args.model_dir.parent / "quality-model-archives"
+        for label, command in (
+            ("boundary-generate", [sys.executable, "scripts/quality/boundary/generate.py",
+                "--output-dir", str(boundary_fixtures)]),
+            ("boundary-native-matrix", [sys.executable, "scripts/quality/boundary/run.py",
+                "--repo", str(Path.cwd()), "--seal", str(boundary_fixtures / "boundary-fixtures.json"),
+                "--model-dir", str(args.model_dir), "--cache-dir", str(cache),
+                "--output-dir", str(boundary_output)]),
+        ):
+            print("+ " + " ".join(command), flush=True)
+            boundary = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT)
+            print(boundary.stdout, flush=True)
+            (args.output_dir / f"{label}.log").write_text(boundary.stdout)
+            passed = boundary.returncode == 0
+            if label == "boundary-native-matrix":
+                passed = passed and re.findall(r"(?m)^BOUNDARY_MATRIX (PASS|FAIL)$", boundary.stdout) == ["PASS"]
+            results.append({"check": label, "passed": passed})
+            if not passed:
+                raise RuntimeError(f"authored boundary fixture or all-run word gate failed: {label}")
         command = ["cargo", "test", "--locked", "-p", "corti-core", "-p", "corti-coreaudio",
                    "-p", "corti-capture", "-p", "corti-detect", "-p", "corti-app",
                    "-p", "corti-jobs", "-p", "corti-queue", "-p", "corti-transcribe",
-                   "-p", "corti-transcribe-local", "-p", "corti-tap"]
+                   "-p", "corti-lexicon", "-p", "corti-transcribe-local", "-p", "corti-tap"]
         print("+ " + " ".join(command), flush=True)
         capture_tests = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
                                        stderr=subprocess.STDOUT)
@@ -340,6 +545,26 @@ def main():
         (args.output_dir / "decode-quality-app-path.log").write_text(app_path.stdout)
         app_path_sources = app_path_receipt(app_path.stdout, app_path.returncode)
         results.append({"check": "decode-quality-app-orchestration", "passed": True})
+        for label, command in (
+            ("evidence-receipt-controls", [sys.executable, "app/tests/evidence/test_receipt.py"]),
+            ("evidence-app-orchestration", [sys.executable, "app/tests/evidence/run.py", "--clippy",
+                "--output-dir", str(args.output_dir / "evidence-harness")]),
+        ):
+            # Evidence persistence is required even when the later Metal probe is unavailable.
+            check = {"check": label, "passed": False}
+            results.append(check)
+            print("+ " + " ".join(command), flush=True)
+            evidence = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT)
+            print(evidence.stdout, flush=True)
+            (args.output_dir / f"{label}.log").write_text(evidence.stdout)
+            if label == "evidence-app-orchestration":
+                evidence_sources = evidence_receipt(evidence.stdout, evidence.returncode, Path.cwd())
+            elif (evidence.returncode != 0
+                  or re.findall(r"(?m)^Ran (\d+) tests? in .+$", evidence.stdout) != ["2"]
+                  or re.findall(r"(?m)^OK.*$", evidence.stdout) != ["OK"]):
+                raise RuntimeError("evidence receipt controls failed or did not execute both tests")
+            check["passed"] = True
         run_test("ggml::tests::quality_probe_metal", "metal-probe", ("ggml",))
         metal = result_path.read_text().strip()
         if metal not in {"available", "unavailable"}:
@@ -399,7 +624,8 @@ def main():
     finally:
         report = {"metal": metal, "spanish_available": fixture_set["spanish_available"],
                   "results": results, "resample_comparison": resample_comparison,
-                  "capture_rate": capture_rate, "app_path_source_sha256": app_path_sources}
+                  "capture_rate": capture_rate, "app_path_source_sha256": app_path_sources,
+                  "evidence_source_sha256": evidence_sources}
         (args.output_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:

@@ -13,9 +13,10 @@ use corti_core::capture_accounting::{
 use corti_core::capture_normalizer::{CaptureRateNormalizer, NormalizationFailure};
 use corti_core::quality_store::{QualityStore, QualityStoreError};
 use corti_core::{
-    CaptureEpoch, QualityCause, QualityClass, QualityRecord, QualityResolution, QualitySpan,
-    QualityStage, QualityTrack,
+    ActivityBlock, ActivityInput, ActivityScope, CaptureEpoch, ChannelActivity, QualityCause,
+    QualityClass, QualityRecord, QualityResolution, QualitySpan, QualityStage, QualityTrack,
 };
+use sha2::{Digest, Sha256};
 
 use super::{
     CaptureChunk, CaptureFilterDisposition, CaptureFilterFactory, CaptureTee, FilterStage,
@@ -188,6 +189,14 @@ fn run_writer_with_sink_and_intent<S: QualitySink>(
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow!("invalid capture recording identity"))?;
     let quality = QualityRecord::observed();
+    // The existing recording identity is immutable within the mandatory quality authority. The
+    // domain identifies normalized/downmixed input before any AEC, never the retained clean mic.
+    let mut binding = Sha256::new();
+    binding.update(b"corti.pre-aec.downmix.v1\0");
+    binding.update(identity.as_bytes());
+    let activity = ActivityInput::new(binding.finalize().into(), retained_rate_hz)
+        .and_then(|input| ChannelActivity::new(ActivityScope::Capture, input))
+        .ok(); // Unsupported diagnostic rates remain unknown; they cannot alter capture behavior.
     // This must succeed before even WavWriter::create: Hound finalizes its header on Drop.
     let sink = begin(&out, identity, &quality)?;
     let mut state = Writer {
@@ -196,6 +205,7 @@ fn run_writer_with_sink_and_intent<S: QualitySink>(
         retained_rate_hz,
         sink,
         quality,
+        activity,
         completion,
         wave: None,
         spec: None,
@@ -274,6 +284,7 @@ struct Writer<S> {
     retained_rate_hz: u32,
     sink: S,
     quality: QualityRecord,
+    activity: Option<ChannelActivity>,
     completion: CompletionIntent,
     wave: Option<Wave>,
     spec: Option<hound::WavSpec>,
@@ -582,22 +593,41 @@ impl<S: QualitySink> Writer<S> {
     }
 
     fn emit(&mut self, frame: &[f32], unavailable: bool) -> Result<()> {
-        let (start, _) = self
+        let (start, epoch) = self
             .current
             .ok_or_else(|| anyhow!("normalized capture has no epoch"))?;
         let mic = start.format.mic_channels as usize;
         let total = mic + start.format.tap_channels as usize;
         ensure!(frame.len() == total, "normalized capture channel mismatch");
+        let mic_mean = [frame_mean(frame, 0, mic)];
+        let tap_mean = [frame_mean(frame, mic, total - mic)];
+        if let Some(activity) = &mut self.activity {
+            let previous = self.quality.activity;
+            let previous_level = activity.latest_levels();
+            // Observe the real downmixed samples before padding/filtering/writing. A diagnostic
+            // refusal is uncertainty in this same record, never permission to lose captured PCM.
+            let _ = activity.push(
+                ActivityBlock {
+                    epoch,
+                    retained_start: self.retained_frames,
+                    mic: if mic == 0 { &[] } else { &mic_mean },
+                    tap: if total == mic { &[] } else { &tap_mean },
+                    unavailable: Some(&[unavailable]),
+                },
+                &mut self.quality,
+            );
+            if self.quality.activity != previous || activity.latest_levels() != previous_level {
+                // This also persists each open-run extension before the corresponding PCM can
+                // escape. No per-sample writes once the fixed facts and current bin are unchanged.
+                self.persist()?;
+            }
+        }
         let wave = self
             .wave
             .as_mut()
             .ok_or_else(|| anyhow!("normalized capture has no WAV"))?;
         if let Some(stage) = &mut self.filter_stage {
-            stage.stage_with_availability(
-                frame_mean(frame, 0, mic),
-                frame_mean(frame, mic, total - mic),
-                unavailable,
-            );
+            stage.stage_with_availability(mic_mean[0], tap_mean[0], unavailable);
             if stage.is_full() {
                 self.written_frames = self
                     .written_frames
@@ -729,6 +759,9 @@ impl<S: QualitySink> Writer<S> {
             bail!("capture ended without retained audio");
         };
         let complete = self.completion.is_authorized();
+        if let Some(activity) = &mut self.activity {
+            let _ = activity.finish(complete.then_some(self.retained_frames), &mut self.quality);
+        }
         if complete {
             self.sink.finalizing(&self.quality, self.written_frames)?;
         } else {
@@ -1659,6 +1692,147 @@ mod tests {
     }
 
     #[test]
+    fn activity_is_pre_filter_and_keeps_raw_tee_and_retained_pcm_unchanged() {
+        struct QuietFilter;
+        impl super::super::CaptureFilter for QuietFilter {
+            fn max_output_lag_samples(&self) -> usize {
+                0
+            }
+            fn push(&mut self, mic: &[f32], _: &[f32]) -> Vec<f32> {
+                vec![0.0; mic.len()]
+            }
+            fn finish(self: Box<Self>) -> Vec<f32> {
+                Vec::new()
+            }
+        }
+        let rate = 8_000;
+        let frames = rate * 5;
+        let pcm: Vec<_> = (0..frames).flat_map(|_| [0.01, 0.0]).collect();
+        for filtered in [false, true] {
+            let fixture = Fixture::new();
+            let (pcm_rx, descriptors) = rings(
+                &[epoch(0, 0, 0, rate), audio(0, 0, u64::from(frames), rate)],
+                &pcm,
+            );
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let filter: Option<CaptureFilterFactory> = filtered.then(|| {
+                Box::new(|_| Box::new(QuietFilter) as Box<dyn super::super::CaptureFilter>)
+                    as CaptureFilterFactory
+            });
+            let outcome = run_writer(
+                pcm_rx,
+                descriptors,
+                fixture.0.clone(),
+                OutputLayout::TwoTrack,
+                rate,
+                Some(CaptureTee::new(tx)),
+                filter,
+            )
+            .unwrap();
+            let expected: Vec<_> = (0..frames)
+                .flat_map(|_| [if filtered { 0.0 } else { 0.01 }, 0.0])
+                .collect();
+            assert_eq!(fixture.samples(), expected);
+            let chunks: Vec<_> = rx.into_iter().collect();
+            assert!(chunks.iter().all(|chunk| chunk.unavailable.is_empty()));
+            assert_eq!(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.mic.iter().copied())
+                    .collect::<Vec<_>>(),
+                vec![0.01; frames as usize]
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.tap.iter().copied())
+                    .collect::<Vec<_>>(),
+                vec![0.0; frames as usize]
+            );
+            let activity = outcome.quality.activity.get(ActivityScope::Capture);
+            assert!(activity.suspected());
+            assert_eq!(activity.far_reference(), corti_core::FarReference::Absent);
+            assert_eq!(activity.complete_end_frame(), Some(u64::from(frames)));
+            let span = outcome
+                .quality
+                .spans
+                .iter()
+                .find(|span| span.cause == QualityCause::FarReferenceSilent)
+                .unwrap();
+            assert_eq!(
+                (span.start_frame, span.end_frame, span.class, span.track),
+                (
+                    0,
+                    u64::from(frames),
+                    QualityClass::DegradedOnly,
+                    QualityTrack::Tap
+                )
+            );
+            assert_eq!(outcome.quality.completeness(), SourceCompleteness::Complete);
+            assert!(!outcome.quality.requires_batch_recovery());
+            assert_eq!(fixture.read().quality(), Some(&outcome.quality));
+        }
+    }
+
+    #[test]
+    fn activity_open_run_persistence_precedes_dependent_pcm_and_failure_never_certifies() {
+        struct RejectSuspected(QualityStore);
+        impl QualitySink for RejectSuspected {
+            fn before_audio(
+                &mut self,
+                quality: &QualityRecord,
+                frames: u64,
+            ) -> Result<(), QualityStoreError> {
+                if quality.activity.get(ActivityScope::Capture).suspected() {
+                    return Err(QualityStoreError::Write);
+                }
+                self.0.persist_before_audio(quality, frames)
+            }
+            fn finalizing(
+                &mut self,
+                quality: &QualityRecord,
+                frames: u64,
+            ) -> Result<(), QualityStoreError> {
+                self.0.prepare_finalization(quality, frames)
+            }
+            fn audio_durable(&mut self, frames: u64) -> Result<(), QualityStoreError> {
+                self.0.complete_after_audio_sync(frames)
+            }
+        }
+        let fixture = Fixture::new();
+        let rate = 8_000;
+        let frames = rate * 5;
+        let samples: Vec<_> = (0..frames).flat_map(|_| [0.01, 0.0]).collect();
+        let (pcm, descriptors) = rings(
+            &[epoch(0, 0, 0, rate), audio(0, 0, u64::from(frames), rate)],
+            &samples,
+        );
+        assert!(
+            run_writer_with_sink(
+                pcm,
+                descriptors,
+                fixture.0.clone(),
+                OutputLayout::TwoTrack,
+                rate,
+                None,
+                None,
+                |path, id, quality| QualityStore::begin(path, id, quality).map(RejectSuspected)
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.samples().len() / 2, frames as usize - 1);
+        let persisted = fixture.read();
+        assert!(!persisted.permits_completion());
+        let activity = persisted
+            .quality()
+            .unwrap()
+            .activity
+            .get(ActivityScope::Capture);
+        assert_eq!(activity.complete_end_frame(), None);
+        assert!(!activity.suspected());
+    }
+
+    #[test]
     fn initial_persistence_failure_creates_no_wav() {
         let fixture = Fixture::new();
         let (pcm, descriptors) =
@@ -1701,7 +1875,7 @@ mod tests {
                 Ok(FailingSink {
                     store: QualityStore::begin(path, id, quality)?,
                     before_calls: 0,
-                    fail_before: Some(2),
+                    fail_before: Some(3), // Epoch, first activity fact, then the loss.
                     fail_complete: false,
                 })
             },
@@ -1989,7 +2163,7 @@ mod tests {
             } else {
                 assert_eq!(
                     calls[0].load(Ordering::Relaxed),
-                    3,
+                    5, // Epoch, first activity, loss, unavailable activity, abort snapshot.
                     "abort must persist the exact final prefix without entering finalizing"
                 );
             }
@@ -2016,7 +2190,7 @@ mod tests {
                 Ok(FailingSink {
                     store: QualityStore::begin(path, id, quality)?,
                     before_calls: 0,
-                    fail_before: Some(3),
+                    fail_before: Some(5), // Preserve the activity writes and fail the abort snapshot.
                     fail_complete: false,
                 })
             },

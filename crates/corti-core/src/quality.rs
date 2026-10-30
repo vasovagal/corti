@@ -9,6 +9,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::quality_activity::QualityActivity;
+
 pub const QUALITY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_QUALITY_EPOCHS: usize = 64;
 pub const MAX_QUALITY_SPANS: usize = 256;
@@ -215,17 +217,20 @@ pub struct QualityOverflow {
 }
 
 impl QualityOverflow {
-    fn omit_span(&mut self, class: QualityClass, resolution: QualityResolution, count: u64) {
-        saturating_count(
-            &mut self.omitted_spans[class.index()],
-            count,
-            &mut self.counter_saturated,
-        );
+    fn omit_span(
+        &mut self,
+        class: QualityClass,
+        resolution: QualityResolution,
+        count: u64,
+        activity_saturated: Option<&mut bool>,
+    ) {
+        let saturated = activity_saturated.unwrap_or(&mut self.counter_saturated);
+        saturating_count(&mut self.omitted_spans[class.index()], count, saturated);
         if resolution == QualityResolution::Outstanding {
             saturating_count(
                 &mut self.outstanding_omitted_spans[class.index()],
                 count,
-                &mut self.counter_saturated,
+                saturated,
             );
         }
     }
@@ -260,6 +265,7 @@ pub struct QualityRecord {
     pub epochs: Vec<CaptureEpoch>,
     pub spans: Vec<QualitySpan>,
     pub overflow: QualityOverflow,
+    pub activity: QualityActivity,
 }
 
 impl Default for QualityRecord {
@@ -270,6 +276,7 @@ impl Default for QualityRecord {
             epochs: Vec::new(),
             spans: Vec::new(),
             overflow: QualityOverflow::default(),
+            activity: QualityActivity::default(),
         }
     }
 }
@@ -311,6 +318,7 @@ pub enum QualityError {
     InvalidClassification,
     InvalidResolution,
     InvalidOverflow,
+    InvalidActivity,
     ArithmeticOverflow,
 }
 
@@ -331,6 +339,7 @@ impl fmt::Display for QualityError {
             Self::InvalidClassification => "invalid quality cause classification",
             Self::InvalidResolution => "invalid quality resolution",
             Self::InvalidOverflow => "invalid quality overflow counters",
+            Self::InvalidActivity => "invalid quality activity evidence",
             Self::ArithmeticOverflow => "quality frame arithmetic overflow",
         })
     }
@@ -355,6 +364,13 @@ impl QualityRecord {
             return Err(QualityError::CapacityExceeded);
         }
         validate_epochs(&self.epochs)?;
+        self.activity.validate()?;
+        let (activity_omissions, activity_saturated) = activity_omission_sum(&self.activity);
+        if self.overflow.omitted_spans[QualityClass::DegradedOnly.index()] < activity_omissions
+            || (activity_saturated && !self.activity.omission_counter_saturated)
+        {
+            return Err(QualityError::InvalidActivity);
+        }
         for span in &self.spans {
             self.validate_span(span)?;
         }
@@ -437,11 +453,25 @@ impl QualityRecord {
     /// Add a positioned fact. Matching adjacent/overlapping intervals coalesce before the cap.
     /// `false` means its class and resolution were retained in the overflow summary instead.
     pub fn insert_span(&mut self, span: QualitySpan) -> Result<bool, QualityError> {
+        if !self.try_insert_span(span)? {
+            if span.cause == QualityCause::FarReferenceSilent {
+                self.record_omitted_activity_run()?;
+            } else {
+                self.overflow
+                    .omit_span(span.class, span.resolution, 1, None);
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The same bounded insertion/coalescing used by insert_span. The activity tracker owns its
+    /// per-traversal lower bound and accounts a rejected run once through observe_activity_omissions.
+    pub(crate) fn try_insert_span(&mut self, span: QualitySpan) -> Result<bool, QualityError> {
         self.validate()?;
         self.validate_span(&span)?;
         let span = coalesce(&mut self.spans, span);
         if self.spans.len() == MAX_QUALITY_SPANS {
-            self.overflow.omit_span(span.class, span.resolution, 1);
             return Ok(false);
         }
         self.spans.push(span);
@@ -459,8 +489,114 @@ impl QualityRecord {
     ) -> Result<(), QualityError> {
         self.validate()?;
         validate_resolution(class, resolution)?;
-        self.overflow.omit_span(class, resolution, count);
+        self.overflow.omit_span(class, resolution, count, None);
         Ok(())
+    }
+
+    /// Activity counter saturation is diagnostic; it cannot revoke capture completeness. Keep
+    /// the existing degraded overflow lower bound and record its saturation in the fixed activity
+    /// summary, independently of source/processing accounting saturation.
+    pub(crate) fn record_omitted_activity_run(&mut self) -> Result<(), QualityError> {
+        self.validate()?;
+        self.overflow.omit_span(
+            QualityClass::DegradedOnly,
+            QualityResolution::Outstanding,
+            1,
+            Some(&mut self.activity.omission_counter_saturated),
+        );
+        Ok(())
+    }
+
+    /// Only a newly raised per-scope lower bound advances the shared degraded total. A fresh retry
+    /// starts its local count at zero, so carrying already settled quality cannot recount old runs.
+    /// Incompatible input bindings remain explicit conflicts; their counts are conservative maxima.
+    pub(crate) fn observe_activity_omissions(
+        &mut self,
+        scope: crate::ActivityScope,
+        input: crate::ActivityInput,
+        omitted_runs: u64,
+        saturated: bool,
+    ) -> Result<(), QualityError> {
+        self.validate()?;
+        let delta = omitted_runs.saturating_sub(self.activity.get(scope).omitted_runs());
+        self.overflow.omit_span(
+            QualityClass::DegradedOnly,
+            QualityResolution::Outstanding,
+            delta,
+            Some(&mut self.activity.omission_counter_saturated),
+        );
+        self.activity.omission_counter_saturated |= saturated;
+        self.activity.observe(
+            scope,
+            crate::quality_activity::ActivityEvidence {
+                input: Some(input),
+                omitted_runs,
+                ..Default::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// Merge supplementary activity against this record's epoch authority. Activity cannot supply
+    /// capture coverage or epochs: a conflicting/missing mapping keeps its summary and counts the
+    /// unpositioned diagnostic through the existing per-scope lower bound. Repeated snapshots are
+    /// idempotent, including when the authoritative record has reached either capacity limit.
+    pub fn merge_activity_snapshot(&mut self, snapshot: &Self) -> Result<(), QualityError> {
+        self.validate()?;
+        snapshot.validate()?;
+        let mut activity = Self {
+            coverage: self.coverage,
+            epochs: self.epochs.clone(),
+            activity: snapshot.activity,
+            ..Self::default()
+        };
+        let (omitted, saturated) = activity_omission_sum(&activity.activity);
+        activity.overflow.omitted_spans[2] = omitted;
+        activity.overflow.outstanding_omitted_spans[2] = omitted;
+        activity.activity.omission_counter_saturated |= saturated;
+        let mut unmapped = [0_u64; 3];
+        for span in &snapshot.spans {
+            if span.cause != QualityCause::FarReferenceSilent {
+                continue;
+            }
+            let exact_epoch = snapshot
+                .epochs
+                .iter()
+                .find(|epoch| epoch.id == span.epoch)
+                .is_some_and(|epoch| self.epochs.contains(epoch));
+            if exact_epoch && activity.validate_span(span).is_ok() {
+                activity.insert_span(*span)?;
+            } else {
+                unmapped[match span.stage {
+                    QualityStage::Capture => 0,
+                    QualityStage::Batch => 1,
+                    QualityStage::Live => 2,
+                }] += 1; // At most MAX_QUALITY_SPANS.
+            }
+        }
+        for (scope, count) in [
+            crate::ActivityScope::Capture,
+            crate::ActivityScope::Offline,
+            crate::ActivityScope::Live,
+        ]
+        .into_iter()
+        .zip(unmapped)
+        {
+            if let Some(input) = activity.activity.get(scope).input() {
+                let previous = activity.activity.get(scope).omitted_runs();
+                activity.observe_activity_omissions(
+                    scope,
+                    input,
+                    previous.saturating_add(count),
+                    previous.checked_add(count).is_none(),
+                )?;
+            } else {
+                for _ in 0..count {
+                    activity.record_omitted_activity_run()?;
+                }
+            }
+        }
+        self.merge_snapshot(&activity)
     }
 
     /// Accounting loss makes completeness unknown even when no positioned loss survived.
@@ -494,7 +630,11 @@ impl QualityRecord {
         }
         epochs.sort_unstable_by_key(|epoch| epoch.id);
         validate_epochs(&epochs)?;
-        let mut merged = Self::default();
+        let mut merged = Self {
+            activity: self.activity,
+            ..Self::default()
+        };
+        merged.activity.merge(other.activity);
         if self.coverage == QualityCoverage::Observed && other.coverage == QualityCoverage::Observed
         {
             merged.coverage = QualityCoverage::Observed;
@@ -508,17 +648,52 @@ impl QualityRecord {
             spans.push(span);
         }
         spans.sort_unstable();
+        let mut omitted_activity = [0_u64; 3];
         for span in spans {
             if merged.spans.len() < MAX_QUALITY_SPANS
                 && merged.epochs.iter().any(|epoch| epoch.id == span.epoch)
             {
                 merged.spans.push(span);
             } else {
-                merged.overflow.omit_span(span.class, span.resolution, 1);
+                merged
+                    .overflow
+                    .omit_span(span.class, span.resolution, 1, None);
+                if span.cause == QualityCause::FarReferenceSilent {
+                    omitted_activity[match span.stage {
+                        QualityStage::Capture => 0,
+                        QualityStage::Batch => 1,
+                        QualityStage::Live => 2,
+                    }] += 1; // At most twice MAX_QUALITY_SPANS in this temporary union.
+                }
+            }
+        }
+        for (scope, count) in [
+            crate::ActivityScope::Capture,
+            crate::ActivityScope::Offline,
+            crate::ActivityScope::Live,
+        ]
+        .into_iter()
+        .zip(omitted_activity)
+        {
+            if let Some(input) = merged.activity.get(scope).input() {
+                merged.activity.observe(
+                    scope,
+                    crate::quality_activity::ActivityEvidence {
+                        input: Some(input),
+                        omitted_runs: count,
+                        ..Default::default()
+                    },
+                );
             }
         }
         merged.overflow.merge_lower_bounds(&self.overflow);
         merged.overflow.merge_lower_bounds(&other.overflow);
+        // Stage observations are distinct even when their snapshots were made independently.
+        // Generic degraded history remains max-merged; adding it would recount shared histories.
+        let (activity_omissions, activity_saturated) = activity_omission_sum(&merged.activity);
+        merged.overflow.omitted_spans[2] = merged.overflow.omitted_spans[2].max(activity_omissions);
+        merged.overflow.outstanding_omitted_spans[2] = merged.overflow.omitted_spans[2];
+        merged.activity.omission_counter_saturated |= activity_saturated;
         merged.validate()?;
         *self = merged;
         Ok(())
@@ -657,6 +832,23 @@ impl QualityRecord {
     }
 }
 
+fn activity_omission_sum(activity: &QualityActivity) -> (u64, bool) {
+    let mut count = 0;
+    let mut saturated = false;
+    for scope in [
+        crate::ActivityScope::Capture,
+        crate::ActivityScope::Offline,
+        crate::ActivityScope::Live,
+    ] {
+        saturating_count(
+            &mut count,
+            activity.get(scope).omitted_runs(),
+            &mut saturated,
+        );
+    }
+    (count, saturated)
+}
+
 fn validate_resolution(
     class: QualityClass,
     resolution: QualityResolution,
@@ -724,12 +916,13 @@ fn coalesce(spans: &mut Vec<QualitySpan>, mut span: QualitySpan) -> QualitySpan 
 impl Serialize for QualityRecord {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut record = serializer.serialize_struct("QualityRecord", 5)?;
+        let mut record = serializer.serialize_struct("QualityRecord", 6)?;
         record.serialize_field("schema_version", &self.schema_version)?;
         record.serialize_field("coverage", &self.coverage)?;
         record.serialize_field("epochs", &self.epochs)?;
         record.serialize_field("spans", &self.spans)?;
         record.serialize_field("overflow", &self.overflow)?;
+        record.serialize_field("activity", &self.activity)?;
         record.end()
     }
 }
@@ -745,6 +938,8 @@ impl<'de> Deserialize<'de> for QualityRecord {
             #[serde(deserialize_with = "bounded_vec::<_, _, MAX_QUALITY_SPANS>")]
             spans: Vec<QualitySpan>,
             overflow: QualityOverflow,
+            #[serde(default)]
+            activity: QualityActivity,
         }
         // Derived enum/type errors can include arbitrary payload values. The record crosses durable
         // carriers whose callers report errors, so its boundary must retain only a static category.
@@ -756,6 +951,7 @@ impl<'de> Deserialize<'de> for QualityRecord {
             epochs: wire.epochs,
             spans: wire.spans,
             overflow: wire.overflow,
+            activity: wire.activity,
         };
         record.validate().map_err(de::Error::custom)?;
         Ok(record)
@@ -874,6 +1070,132 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<QualityRecord>(value).unwrap(),
             record
+        );
+    }
+
+    #[test]
+    fn activity_schema_one_wire_round_trip_preserves_summary_only_observations() {
+        // Uses only the pre-existing record API so this same assertion exercises the old reader.
+        let mut value = serde_json::to_value(observed()).unwrap();
+        value["activity"] = json!({"live": {
+            "input": {"identity": ([1; 32]), "retained_rate_hz": 48_000},
+            "observed_tap": true,
+            "nonzero_tap": true,
+            "sustained_zero_tap": false,
+            "absent_tap_layout": false,
+            "suspected": false,
+            "uncertain": true,
+            "binding_conflict": false,
+            "proof_conflict": false,
+            "complete": null
+        }});
+        let decoded: QualityRecord = serde_json::from_value(value).unwrap();
+        let output = serde_json::to_value(decoded).unwrap();
+        assert_eq!(output["schema_version"], 1);
+        assert_eq!(output["activity"]["live"]["nonzero_tap"], true);
+        assert_eq!(output["activity"]["live"]["uncertain"], true);
+        assert_eq!(output["spans"], json!([]));
+    }
+
+    #[test]
+    fn activity_saturation_preserves_later_source_processing_and_generic_degraded_authority() {
+        let mut activity = full_spans();
+        activity
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        activity.overflow.omitted_spans[2] = u64::MAX;
+        activity.overflow.outstanding_omitted_spans[2] = u64::MAX;
+        let mut suspected = span(2_000, 2_020, QualityClass::DegradedOnly);
+        suspected.cause = QualityCause::FarReferenceSilent;
+        suspected.track = QualityTrack::Tap;
+        assert!(!activity.insert_span(suspected).unwrap());
+        assert!(activity.activity.omissions_saturated());
+        assert!(!activity.overflow.counter_saturated);
+        assert_eq!(activity.completeness(), SourceCompleteness::Complete);
+        assert_eq!(activity.overflow.omitted_spans[2], u64::MAX);
+        assert_eq!(activity.overflow.outstanding_omitted_spans[2], u64::MAX);
+
+        let mut processing = activity.clone();
+        processing
+            .record_omitted_spans(
+                QualityClass::ProcessingLoss,
+                QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        assert!(processing.requires_batch_recovery());
+        assert_eq!(
+            processing.source_completeness(),
+            SourceCompleteness::Complete
+        );
+        assert_eq!(processing.completeness(), SourceCompleteness::Incomplete);
+        processing
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        assert_eq!(processing.completeness(), SourceCompleteness::Complete);
+        assert!(processing.activity.omissions_saturated());
+
+        let mut source = activity.clone();
+        source
+            .record_omitted_spans(QualityClass::SourceLoss, QualityResolution::Outstanding, 1)
+            .unwrap();
+        source
+            .resolve_processing_after_batch(BatchRecoveryOutcome::SameBackendWholeFileSuccess)
+            .unwrap();
+        assert_eq!(source.completeness(), SourceCompleteness::Incomplete);
+        assert!(source.activity.omissions_saturated());
+
+        let mut generic = activity.clone();
+        generic
+            .record_omitted_spans(
+                QualityClass::DegradedOnly,
+                QualityResolution::Outstanding,
+                1,
+            )
+            .unwrap();
+        assert!(generic.overflow.counter_saturated);
+        assert_eq!(generic.source_completeness(), SourceCompleteness::Unknown);
+        generic.merge_snapshot(&activity).unwrap();
+        assert!(generic.overflow.counter_saturated && generic.activity.omissions_saturated());
+        let wire = serde_json::to_vec(&generic).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<QualityRecord>(&wire).unwrap(),
+            generic
+        );
+    }
+
+    #[test]
+    fn activity_stage_sum_saturates_only_diagnostic_authority_and_preserves_serde_history() {
+        let mut capture = observed();
+        capture
+            .observe_activity_omissions(
+                crate::ActivityScope::Capture,
+                crate::ActivityInput::new([1; 32], 48_000).unwrap(),
+                u64::MAX,
+                false,
+            )
+            .unwrap();
+        let mut live = observed();
+        live.observe_activity_omissions(
+            crate::ActivityScope::Live,
+            crate::ActivityInput::new([1; 32], 48_000).unwrap(),
+            1,
+            false,
+        )
+        .unwrap();
+        capture.merge_snapshot(&live).unwrap();
+        assert_eq!(capture.overflow.omitted_spans, [0, 0, u64::MAX]);
+        assert!(capture.activity.omissions_saturated());
+        assert!(!capture.overflow.counter_saturated);
+        assert_eq!(capture.completeness(), SourceCompleteness::Complete);
+        let frozen = capture.clone();
+        capture.merge_snapshot(&live).unwrap();
+        capture.merge_snapshot(&frozen).unwrap();
+        assert_eq!(capture, frozen);
+        let wire = serde_json::to_vec(&capture).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<QualityRecord>(&wire).unwrap(),
+            capture
         );
     }
 

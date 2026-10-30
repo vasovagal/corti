@@ -74,6 +74,20 @@ pub enum BackendChoice {
     Local,
 }
 
+/// Local transcript evidence follows the recording's retention policy. This never controls the
+/// mandatory, content-free capture quality authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvidenceSettings {
+    pub enabled: bool,
+}
+
+impl Default for EvidenceSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Runtime configuration. Cloned into the pipeline worker; cheap and `Send`. Serialized to/from
 /// `config.toml`: a flat document of scalars, so TOML field-ordering rules never bite. `#[serde(default)]`
 /// on the container means a partial or older file deserializes cleanly, with every missing key filled from
@@ -174,9 +188,10 @@ pub struct AppConfig {
     /// (`CORTI_LIVE_BUFFER_MINUTES`, default 1, clamped to 1–10). This is the ordinary commit interval;
     /// hard byte caps can force an earlier write and decoder lag remains independently fixed/bounded.
     pub live_buffer_minutes: u32,
-    /// Deterministic post-ASR segment cleanup (#149). **Must stay the last field**: it serializes as a
-    /// `[cleanup]` TOML table, and TOML forbids a bare key after a table header.
+    /// Deterministic post-ASR segment cleanup (#149). Table fields follow all scalar fields.
     pub cleanup: CleanupSettings,
+    /// Optional local text evidence. Old settings files default to enabled.
+    pub evidence: EvidenceSettings,
 }
 
 impl Default for AppConfig {
@@ -205,6 +220,7 @@ impl Default for AppConfig {
             live_filing: true,
             live_buffer_minutes: DEFAULT_LIVE_BUFFER_MINUTES,
             cleanup: CleanupSettings::default(),
+            evidence: EvidenceSettings::default(),
         }
     }
 }
@@ -642,6 +658,7 @@ mod tests {
                 echo_audio_margin_db: 1.5,
                 strip_fillers: false,
             },
+            evidence: EvidenceSettings { enabled: false },
         };
         let back2: AppConfig = toml::from_str(&toml::to_string_pretty(&cfg2).unwrap()).unwrap();
         assert_eq!(cfg2, back2);
@@ -694,6 +711,19 @@ mod tests {
         assert_eq!(cfg.aec_enabled, d.aec_enabled);
         assert_eq!(cfg.transcribe_backend, d.transcribe_backend);
         assert_eq!(cfg.aws_bucket, None);
+    }
+
+    #[test]
+    fn legacy_settings_enable_evidence_and_explicit_optout_round_trips() {
+        let old: AppConfig =
+            toml::from_str("retention_days = 7\n[cleanup]\nstrip_fillers = false\n").unwrap();
+        assert!(old.evidence.enabled);
+        assert!(!old.cleanup.strip_fillers);
+        let disabled: AppConfig = toml::from_str("[evidence]\nenabled = false\n").unwrap();
+        assert!(!disabled.evidence.enabled);
+        let encoded = toml::to_string(&disabled).unwrap();
+        assert!(encoded.contains("[evidence]"));
+        assert_eq!(toml::from_str::<AppConfig>(&encoded).unwrap(), disabled);
     }
 
     /// A `config.toml` written before CoreML was retired still carries `local_provider`. The container's

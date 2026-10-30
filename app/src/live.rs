@@ -9,9 +9,12 @@
 //! (config `live_filing`, local backend, models on disk) and, if eligible, hands the detector a bounded
 //! lossy [`CaptureTee`]; once capture is running it spawns ONE `corti-live` std thread for the recording.
 //! That thread drains tee chunks → [`StreamingAec::push`] on the mic → two `LiveTranscriber`s. Every
-//! `live_buffer_minutes` (one minute by default), it checkpoints both VADs, optionally diarizes only that
-//! bounded far-end PCM window, merges the speakers, appends once, and calls `sync_all`. Independent audio/
-//! text caps force an earlier commit. The note is created lazily on the first non-empty window; its file +
+//! `live_buffer_minutes` (one minute by default), it seeks the first shared certified speech boundary,
+//! with at most 22 seconds of deferral at the current VAD settings. Natural filing preserves the native
+//! state; deadline/text fences settle their old input before replay can produce next-window polls. It
+//! optionally diarizes only the owned far-end PCM prefix, merges speakers, appends once, and calls
+//! `sync_all`. Separate bounded reserves hold real settlement input and retained text. The note is
+//! created lazily on the first non-empty window; its file +
 //! parent directory are synced before the path is published. The thread never blocks the capture writer
 //! (the fixed tee drops + counts when full) and is panic-contained — failure preserves prior chunks and
 //! degrades to the same-inode batch fallback.
@@ -48,6 +51,10 @@ use corti_core::{
     DiarizedTranscript, MicTapMismatches as LiveMismatches, RecordingMeta, Speaker,
     TranscriptSegment,
 };
+use corti_transcribe::boundary::{
+    BoundaryFence, BoundaryKind, BoundaryPolicy, BoundaryStep, Observation, SourceInterval,
+    TrackBoundary,
+};
 use corti_transcribe::decode::{DecodeQualityTracker, DecodeReport, InputSpan};
 use corti_transcribe::segment::{
     AudioEvidence, CleanupConfig, CleanupDecisions, CleanupStage, EchoAssessment, EchoCandidate,
@@ -74,6 +81,12 @@ const TEE_BACKLOG: usize = 2048;
 /// interval normally fires first (one minute at 48 kHz is ~11 MiB for this one `f32` channel); this guard
 /// makes unusual sample rates or hand-edited config unable to turn the rolling window into O(call length).
 const MAX_DIARIZATION_AUDIO_BYTES: usize = 128 * 1024 * 1024;
+/// Additional bound on the deferral/settlement component. This does not enlarge the existing total
+/// 128 MiB tap allocation cap; a nominal window that leaves insufficient headroom fails setup.
+const MAX_BOUNDARY_EXTRA_AUDIO_BYTES: usize = 32 * 1024 * 1024;
+/// Hard per-channel bound on native boundary retention; impossible configured windows fail closed
+/// before channel input, rather than shortening their nominal interval or allowing Vec growth.
+const MAX_BOUNDARY_NATIVE_PCM_BYTES: usize = 128 * 1024 * 1024;
 /// Independent cap for recognized words awaiting the next durable append. ASR output per minute is tiny in
 /// practice, but a hard cap makes the memory contract hold even for malformed/model-pathological output.
 const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
@@ -246,7 +259,7 @@ struct FinishQuality {
 
 /// The finish/discard decision the session thread waits for after the tee disconnects.
 enum Verdict {
-    Finish(FinishQuality),
+    Finish(Box<FinishQuality>),
     Discard,
 }
 
@@ -455,6 +468,7 @@ impl LiveManager {
         meta: RecordingMeta,
         sample_rate: u32,
         cfg: AppConfig,
+        shared_config: SharedConfig,
         pending: Pending,
         pipe_tx: Sender<PipelineMsg>,
     ) {
@@ -481,6 +495,7 @@ impl LiveManager {
                         meta,
                         sample_rate,
                         cfg,
+                        shared_config,
                         pipe_tx,
                         publisher,
                     )
@@ -528,7 +543,7 @@ impl LiveManager {
         }
         #[cfg(not(feature = "local"))]
         {
-            let _ = (meta, sample_rate, cfg, pending, pipe_tx);
+            let _ = (meta, sample_rate, cfg, shared_config, pending, pipe_tx);
         }
     }
 
@@ -571,10 +586,12 @@ impl LiveManager {
                 "live tee dropped chunks — finishing tails but requiring lossless batch fallback"
             );
         }
-        let _ = active.verdict_tx.send(Verdict::Finish(FinishQuality {
-            dropped_chunks,
-            capture: capture.cloned(),
-        }));
+        let _ = active
+            .verdict_tx
+            .send(Verdict::Finish(Box::new(FinishQuality {
+                dropped_chunks,
+                capture: capture.cloned(),
+            })));
         let replaced = inner
             .awaiting
             .insert(id.to_string(), AwaitingFinish::Running(active.handle));
@@ -684,6 +701,11 @@ fn reap_discard_work(work: DiscardWork) {
         reporter,
     } = work;
     let outcome = join_live_thread(handle);
+    if let Some(reporter) = reporter.as_ref()
+        && crate::evidence::remove(&reporter.meta.audio_path).is_err()
+    {
+        crate::evidence::unavailable();
+    }
     if let Some(path) = outcome.note_path().cloned() {
         match std::fs::remove_file(&path) {
             Ok(()) => info!(
@@ -847,6 +869,7 @@ impl corti_detect::LiveHook for AppLiveHook {
             meta.clone(),
             sample_rate,
             cfg,
+            self.config.clone(),
             pending,
             self.pipe_tx.clone(),
         );
@@ -925,6 +948,7 @@ fn session_thread(
     meta: RecordingMeta,
     sample_rate: u32,
     cfg: AppConfig,
+    shared_config: SharedConfig,
     pipe_tx: Sender<PipelineMsg>,
     publisher: StorePublisher,
 ) -> LiveOutcome {
@@ -943,6 +967,7 @@ fn session_thread(
         crate::provenance::from_config(&cfg, corti_vagus::provenance::GenerationMode::Live);
     let mut writer =
         NoteWriter::with_provenance(VagusFiler, meta.clone(), Some(pipe_tx), provenance);
+    writer.evidence_config = Some(shared_config);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_session(&rx, &verdict_rx, sample_rate, &cfg, &mut writer, &publisher)
     }));
@@ -994,27 +1019,74 @@ fn build_parts(sample_rate: u32, cfg: &AppConfig) -> Result<SessionParts> {
         ggml_model: cfg.local_ggml_model.clone(),
         ..LocalConfig::default()
     };
+    let min_silence = std::time::Duration::try_from_secs_f32(local_cfg.vad_min_silence)
+        .context("invalid native boundary silence interval")?;
+    let bounds = corti_transcribe_local::boundary_resampler_bounds(sample_rate)
+        .map_err(|error| anyhow::anyhow!("unsupported live boundary rate: {error:?}"))?;
+    let aec = cfg
+        .aec_enabled
+        .then(|| new_live_aec(sample_rate, cfg.aec_config()));
+    let aec_lag = aec.as_ref().map_or(0, |aec| aec.max_output_lag_samples()) as u64;
+    let received_admission = corti_capture::FILTER_FRAMES_PER_CHUNK as u64;
+    let delivered_push = aec_lag
+        .checked_add(received_admission)
+        .context("live AEC delivery bound overflow")?;
+    let settlement = bounds
+        .settlement_source_reserve(aec_lag, received_admission)
+        .map_err(|error| anyhow::anyhow!("live settlement reserve is unavailable: {error:?}"))?;
     let engine = LocalTranscriber::new(local_cfg)
         .live_engine()
         .context("loading the local live engine")?;
-    let mic = engine.channel().context("building the mic transcriber")?;
-    let them = engine.channel().context("building the tap transcriber")?;
-    let window = TranscriptWindow::new(
+    let mut mic = engine.channel().context("building the mic transcriber")?;
+    let mut them = engine.channel().context("building the tap transcriber")?;
+    let mut window = TranscriptWindow::new_with_reserve(
         sample_rate,
         cfg.live_buffer_minutes,
         engine.diarizes_far_end(),
         cfg.cleanup_config(),
+        Some((min_silence, settlement)),
     )
     .context("reserving the bounded live transcript window")?
     .with_lexicon(crate::lexicon::load_compiled().map(std::sync::Arc::new));
+    let rolling = window
+        .rolling
+        .as_mut()
+        .expect("rolling reserve constructed");
+    let capacity = bounds
+        .rolling_capacity(
+            aec_lag,
+            received_admission,
+            delivered_push,
+            rolling.policy.maximum_owned_frames(),
+        )
+        .map_err(|error| anyhow::anyhow!("live native capacity is unavailable: {error:?}"))?;
+    anyhow::ensure!(
+        capacity
+            .retained_samples
+            .checked_mul(std::mem::size_of::<f32>())
+            .is_some_and(|bytes| bytes <= MAX_BOUNDARY_NATIVE_PCM_BYTES),
+        "live native retention exceeds its byte cap"
+    );
+    let epoch_samples = i32::MAX as u64 - 512;
+    anyhow::ensure!(
+        capacity.minimum_epoch_samples <= epoch_samples,
+        "native epoch cannot hold boundary settlement"
+    );
+    rolling.maintenance_trigger = capacity.maintenance_trigger;
+    let limits = corti_transcribe_local::BoundaryLimits {
+        max_retained_samples: capacity.retained_samples,
+        max_epoch_samples: epoch_samples,
+        max_source_push: usize::try_from(delivered_push)?,
+    };
+    mic.enable_boundaries(limits)
+        .map_err(|error| anyhow::anyhow!("enabling mic ownership failed: {error:?}"))?;
+    them.enable_boundaries(limits)
+        .map_err(|error| anyhow::anyhow!("enabling tap ownership failed: {error:?}"))?;
     Ok(SessionParts {
         engine,
         mic,
         them,
-        // Streaming AEC on the mic, per config (skipped cleanly per-chunk when the mic side is empty).
-        aec: cfg
-            .aec_enabled
-            .then(|| new_live_aec(sample_rate, cfg.aec_config())),
+        aec,
         window,
     })
 }
@@ -1035,6 +1107,7 @@ fn run_session(
     let mut parts = build_parts(sample_rate, cfg);
     let consumed = match parts.as_mut() {
         Ok(p) => {
+            p.window.arm_evidence(writer, cfg);
             publisher.listening();
             consume_with_panic_boundary(|| {
                 consume_chunks(
@@ -1100,7 +1173,7 @@ fn await_capture_verdict<F: NoteFiler>(
         Ok(Verdict::Finish(quality)) => {
             writer.freeze_live_quality(&quality)?;
             consumed?;
-            Ok(Some(quality))
+            Ok(Some(*quality))
         }
         Ok(Verdict::Discard) => {
             writer.discard()?;
@@ -1113,6 +1186,7 @@ fn await_capture_verdict<F: NoteFiler>(
 
 struct RawEchoSource {
     segment: TranscriptSegment,
+    evidence_parent: Option<corti_transcribe::evidence::ParentRow>,
     /// Raw pause-separated children supply both text comparisons and actual speech intervals.
     /// The whole-result envelope also contains known pauses and cannot authorize acoustic overlap.
     speech_segments: Vec<TranscriptSegment>,
@@ -1141,13 +1215,24 @@ impl Default for RawEchoSources {
 }
 
 impl RawEchoSources {
+    #[cfg(test)]
     fn remember(&mut self, words: &[Word], lookback: f64) {
+        self.remember_with_parent(words, lookback, None);
+    }
+
+    fn remember_with_parent(
+        &mut self,
+        words: &[Word],
+        lookback: f64,
+        evidence_parent: Option<corti_transcribe::evidence::ParentRow>,
+    ) {
         let omitted_before = self.omitted;
         // A pause is a display boundary, not permission to split a raw critical-word comparison.
         // Keep the complete decoder result even when it spans several pause-separated display rows.
         for segment in words_to_segments(words, Speaker::Other("Them".to_string()), f64::INFINITY) {
             let source = RawEchoSource {
                 segment,
+                evidence_parent,
                 speech_segments: words_to_segments(
                     words,
                     Speaker::Other("Them".to_string()),
@@ -1287,6 +1372,44 @@ impl RawEchoSources {
             }
         }
     }
+
+    /// Snapshot exact comparison lineage within one returned release batch's aggregate budget.
+    /// Failure affects only optional evidence; the assessed words and verdict still reach emission.
+    fn comparison_parents(
+        &self,
+        poll: &MicPollContext,
+        context_bytes: &mut usize,
+    ) -> Option<Vec<corti_transcribe::evidence::ParentRow>> {
+        let MicPollContext::Known(raw) = poll else {
+            // assess_mic_poll returns before consulting any source when the raw poll was omitted.
+            return Some(Vec::new());
+        };
+        let count = self.segments.len().checked_add(1)?;
+        let remaining = MAX_BUFFERED_TRANSCRIPT_BYTES.saturating_sub(*context_bytes);
+        let parent_bytes = std::mem::size_of::<corti_transcribe::evidence::ParentRow>();
+        if count > MAX_LIVE_ECHO_SOURCES + 1
+            || count.checked_mul(parent_bytes)? > remaining
+            || raw.evidence_parent.is_none()
+            || self
+                .segments
+                .iter()
+                .any(|source| source.evidence_parent.is_none())
+        {
+            return None;
+        }
+        let mut parents = Vec::new();
+        parents.try_reserve_exact(count).ok()?;
+        let bytes = parents.capacity().checked_mul(parent_bytes)?;
+        if bytes > remaining {
+            return None;
+        }
+        for source in &self.segments {
+            parents.push(source.evidence_parent?);
+        }
+        parents.push(raw.evidence_parent?);
+        *context_bytes = context_bytes.checked_add(bytes)?;
+        Some(parents)
+    }
 }
 
 /// Original returned mic poll, shared by all of its pause-separated children. Omission is explicit:
@@ -1323,6 +1446,7 @@ impl MicPollContext {
         };
         let raw = RawEchoSource {
             segment,
+            evidence_parent: None,
             speech_segments: words_to_segments(words, Speaker::Me, SEGMENT_GAP),
         };
         let bytes = raw_source_bytes(&raw)
@@ -1341,7 +1465,85 @@ impl MicPollContext {
 
 /// Per-recording rolling state. Every collection is bounded by either the configured time window or an
 /// independent byte cap; after a successful durable append, lengths reset to zero and allocations are reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelBoundaryToken {
+    #[cfg(feature = "local")]
+    Native(corti_transcribe_local::BoundaryToken),
+    #[cfg(test)]
+    Scripted(u64),
+}
+
+#[derive(Clone, Copy)]
+struct ChannelBoundarySnapshot {
+    natural: Option<SourceInterval>,
+    delivered_through: u64,
+    epoch_remaining: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelBoundaryProgress {
+    Waiting,
+    Settled(ChannelBoundaryToken),
+    Ended,
+}
+
+#[derive(Clone, Copy)]
+struct OwnedCut {
+    fence: BoundaryFence,
+    reset_for_maintenance: bool,
+    track_ends: [u64; 2],
+    tokens: [Option<ChannelBoundaryToken>; 2],
+    settled: [bool; 2],
+}
+
+struct RollingBoundary {
+    policy: BoundaryPolicy,
+    min_silence: std::time::Duration,
+    /// Explicit additional input retained while the native owner settles an immutable fence.
+    settlement_frames: u64,
+    capacity_frames: u64,
+    maintenance_trigger: u64,
+    /// Reserve the complete retained cost at poll ingress, including held mic children released later.
+    text_charge: usize,
+    pending: Option<OwnedCut>,
+}
+
+impl RollingBoundary {
+    fn new(
+        start: u64,
+        nominal: u64,
+        rate: u32,
+        min_silence: std::time::Duration,
+        settlement_frames: u64,
+    ) -> Result<Self> {
+        let policy = BoundaryPolicy::new(start, nominal, rate, min_silence)?;
+        let capacity_frames = policy
+            .maximum_owned_frames()
+            .checked_add(settlement_frames)
+            .context("rolling audio capacity overflow")?;
+        let extra_bytes = capacity_frames
+            .checked_sub(nominal)
+            .and_then(|frames| frames.checked_mul(std::mem::size_of::<f32>() as u64))
+            .context("rolling audio headroom overflow")?;
+        anyhow::ensure!(
+            extra_bytes <= MAX_BOUNDARY_EXTRA_AUDIO_BYTES as u64,
+            "rolling audio headroom exceeds its separate byte cap"
+        );
+        Ok(Self {
+            policy,
+            min_silence,
+            settlement_frames,
+            capacity_frames,
+            maintenance_trigger: 0,
+            text_charge: 0,
+            pending: None,
+        })
+    }
+}
+
 struct TranscriptWindow {
+    evidence: Option<crate::evidence::live::LiveRun>,
+    them_evidence: Vec<Option<corti_transcribe::evidence::ParentRow>>,
     sample_rate: u32,
     frame_limit: u64,
     start_frame: u64,
@@ -1387,14 +1589,76 @@ struct TranscriptWindow {
     /// than replaying an arbitrarily long silent prefix. These offsets do not repair tee-drop gaps.
     mic_origin_frame: Option<u64>,
     tap_origin_frame: Option<u64>,
+    rolling: Option<RollingBoundary>,
 }
 
 impl TranscriptWindow {
+    fn arm_evidence<F: NoteFiler>(&mut self, writer: &NoteWriter<F>, cfg: &AppConfig) {
+        if !cfg.evidence.enabled {
+            return;
+        }
+        let lookahead = cfg.aec_enabled.then(|| {
+            corti_aec::lookahead_samples_for(
+                self.sample_rate,
+                cfg.aec_config().filter_len,
+                LIVE_AEC_LOOKAHEAD_SECONDS,
+            ) as u64
+        });
+        match crate::evidence::live::LiveRun::begin(
+            &corti_queue::job_id(&writer.meta),
+            &writer.meta,
+            &writer.provenance,
+            self.sample_rate,
+            lookahead,
+        ) {
+            Ok(evidence) => self.evidence = Some(evidence),
+            Err(_) => crate::evidence::unavailable(),
+        }
+    }
+
+    fn persist_evidence<F: NoteFiler>(
+        &mut self,
+        writer: &NoteWriter<F>,
+        quality: Option<&corti_core::QualityRecord>,
+    ) {
+        // Serialize an active toggle with publication. Once disabled, this recording releases its
+        // text owners and cannot recreate evidence after the next opt-out sweep.
+        let config = writer
+            .evidence_config
+            .as_ref()
+            .map(|config| config.lock().unwrap());
+        if config
+            .as_ref()
+            .is_some_and(|config| !config.evidence.enabled)
+        {
+            self.evidence = None;
+            return;
+        }
+        if let Some(evidence) = self.evidence.as_mut() {
+            if let Some(quality) = quality {
+                evidence.settle(quality, &writer.meta.audio_path);
+            } else {
+                evidence.persist_window(&writer.meta.audio_path);
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn new(
         sample_rate: u32,
         minutes: u32,
         diarize_far_end: bool,
         cleanup: CleanupConfig,
+    ) -> Result<Self> {
+        Self::new_with_reserve(sample_rate, minutes, diarize_far_end, cleanup, None)
+    }
+
+    fn new_with_reserve(
+        sample_rate: u32,
+        minutes: u32,
+        diarize_far_end: bool,
+        cleanup: CleanupConfig,
+        reserve: Option<(std::time::Duration, u64)>,
     ) -> Result<Self> {
         let sample_rate = sample_rate.max(1);
         let configured = u64::from(sample_rate)
@@ -1407,16 +1671,30 @@ impl TranscriptWindow {
         } else {
             configured
         };
+        let rolling = reserve
+            .map(|(silence, settlement)| {
+                RollingBoundary::new(0, frame_limit, sample_rate, silence, settlement)
+            })
+            .transpose()?;
         // Exact fallible preallocation makes the advertised audio cap an allocation cap, not merely a
         // length cap; ordinary geometric Vec growth could otherwise reserve almost twice the active window.
         // Allocation pressure degrades to batch fallback instead of panicking the live thread.
         let mut tap_audio = Vec::new();
         if diarize_far_end {
+            let capacity_frames = rolling
+                .as_ref()
+                .map_or(frame_limit, |owner| owner.capacity_frames);
+            anyhow::ensure!(
+                capacity_frames <= audio_cap_frames,
+                "live audio window and boundary reserve exceed the existing byte cap"
+            );
             tap_audio
-                .try_reserve_exact(frame_limit as usize)
+                .try_reserve_exact(usize::try_from(capacity_frames)?)
                 .context("reserving far-end diarization audio")?;
         }
         Ok(Self {
+            evidence: None,
+            them_evidence: Vec::new(),
             sample_rate,
             frame_limit,
             start_frame: 0,
@@ -1440,6 +1718,7 @@ impl TranscriptWindow {
             aec_availability: LiveAvailability::default(),
             mic_origin_frame: None,
             tap_origin_frame: None,
+            rolling,
         })
     }
 
@@ -1456,6 +1735,55 @@ impl TranscriptWindow {
     /// Seconds from call start at which the *next* window begins.
     fn next_start_sec(&self) -> f64 {
         self.start_frame.saturating_add(self.frames) as f64 / f64::from(self.sample_rate)
+    }
+
+    #[cfg(test)]
+    fn enable_rolling(
+        &mut self,
+        min_silence: std::time::Duration,
+        settlement_frames: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.frames == 0 && self.rolling.is_none(),
+            "rolling ownership must start before input"
+        );
+        let rolling = RollingBoundary::new(
+            self.start_frame,
+            self.frame_limit,
+            self.sample_rate,
+            min_silence,
+            settlement_frames,
+        )?;
+        if self.diarize_far_end {
+            self.tap_audio
+                .try_reserve_exact(
+                    usize::try_from(rolling.capacity_frames)?.saturating_sub(self.tap_audio.len()),
+                )
+                .context("reserving deferred diarization audio")?;
+        }
+        self.rolling = Some(rolling);
+        Ok(())
+    }
+
+    fn owned_frames(&self) -> u64 {
+        self.rolling
+            .as_ref()
+            .and_then(|rolling| rolling.pending)
+            .map_or(self.frames, |cut| cut.fence.frame - self.start_frame)
+    }
+
+    fn reset_rolling(&mut self) -> Result<()> {
+        if let Some(rolling) = &mut self.rolling {
+            rolling.policy = BoundaryPolicy::new(
+                self.start_frame,
+                self.frame_limit,
+                self.sample_rate,
+                rolling.min_silence,
+            )?;
+            rolling.text_charge = 0;
+            rolling.pending = None;
+        }
+        Ok(())
     }
 
     /// Take the blocks a `StreamingAec::block_stats()` drain produced. Ordered by `t_start_secs` because
@@ -1500,16 +1828,25 @@ impl TranscriptWindow {
         self.buffered_text_bytes = self
             .buffered_text_bytes
             .saturating_add(buffered_word_bytes(&region.words))
+            .saturating_add(
+                region.evidence_parents.as_ref().map_or(0, Vec::capacity)
+                    * std::mem::size_of::<corti_transcribe::evidence::ParentRow>(),
+            )
             .saturating_add(std::mem::size_of::<ReleasedMicRegion>());
         self.mic_regions.push(region);
     }
 
     fn remember_mic_poll(&mut self, words: &[Word]) -> MicPollContext {
-        let (context, bytes) = MicPollContext::new(
+        let (mut context, bytes) = MicPollContext::new(
             words,
             MAX_BUFFERED_TRANSCRIPT_BYTES.saturating_sub(self.mic_poll_bytes),
         );
-        if let MicPollContext::Known(raw) = &context {
+        if let MicPollContext::Known(raw) = &mut context {
+            if let Some(evidence) = self.evidence.as_mut()
+                && let Some(raw) = Arc::get_mut(raw)
+            {
+                raw.evidence_parent = evidence.context(&raw.segment);
+            }
             self.mic_poll_bytes += bytes;
             self.buffered_text_bytes = self.buffered_text_bytes.saturating_add(bytes);
             self.mic_polls.push(Arc::clone(raw));
@@ -1522,18 +1859,51 @@ impl TranscriptWindow {
         context
     }
 
+    #[cfg(test)]
     fn push_them_words(&mut self, words: Vec<Word>) {
+        self.push_them_words_with_parent(words);
+    }
+
+    fn push_them_words_with_parent(
+        &mut self,
+        words: Vec<Word>,
+    ) -> Option<corti_transcribe::evidence::ParentRow> {
         if words.is_empty() {
-            return;
+            return None;
+        }
+        let parent = self.evidence.as_mut().and_then(|evidence| {
+            let raw = TranscriptSegment {
+                speaker: Speaker::Other("Them".into()),
+                start: words[0].start,
+                end: words[words.len() - 1].end,
+                text: words
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            evidence
+                .capture(std::slice::from_ref(&raw), corti_core::QualityTrack::Tap)
+                .first()
+                .copied()
+        });
+        if self.evidence.is_some() {
+            self.them_evidence.push(parent);
         }
         self.carry
-            .remember(&words, self.cleanup.echo_window_seconds);
+            .remember_with_parent(&words, self.cleanup.echo_window_seconds, parent);
         self.buffered_text_bytes = self
             .buffered_text_bytes
             .saturating_add(buffered_word_bytes(&words))
+            .saturating_add(if self.evidence.is_some() {
+                std::mem::size_of::<Option<corti_transcribe::evidence::ParentRow>>()
+            } else {
+                0
+            })
             .saturating_add(std::mem::size_of::<usize>());
         self.them_words.extend(words);
         self.them_poll_ends.push(self.them_words.len());
+        parent
     }
 
     fn due(&self) -> bool {
@@ -1545,15 +1915,22 @@ impl TranscriptWindow {
     }
 
     fn clear_after_flush(&mut self) {
-        self.start_frame = self.start_frame.saturating_add(self.frames);
-        self.frames = 0;
+        if let Some(evidence) = self.evidence.as_mut() {
+            evidence.advance_window();
+        }
+        let owned = self.owned_frames();
+        self.start_frame = self.start_frame.saturating_add(owned);
+        self.frames -= owned;
         self.mic_regions.clear();
         self.mic_polls.clear();
         self.mic_poll_bytes = 0;
         self.mic_polls_omitted = 0;
         self.them_words.clear();
         self.them_poll_ends.clear();
-        self.tap_audio.clear();
+        self.them_evidence.clear();
+        if self.diarize_far_end {
+            self.tap_audio.drain(..owned as usize);
+        }
         self.buffered_text_bytes = 0;
         self.trim_aec_blocks();
         let horizon = self.start_sec() - self.cleanup.echo_window_seconds;
@@ -1605,6 +1982,10 @@ struct HeldMicRegion {
 /// Every released region reaches the caller, including an acoustic echo withheld from publication.
 /// Words and their original timing are retained separately from the content-free verdict.
 struct ReleasedMicRegion {
+    /// Before emission, the exact comparison parents captured with the assessment; `None` marks
+    /// missing lineage. The emitter consumes these and replaces them with the mic output parents.
+    /// Reusing this owner keeps region buffering/accounting unchanged; Option<Vec<_>> has Vec's size.
+    evidence_parents: Option<Vec<corti_transcribe::evidence::ParentRow>>,
     words: Vec<Word>,
     poll: MicPollContext,
     /// Missing comparison context is sticky even if another stage later has a smaller inventory.
@@ -1622,6 +2003,7 @@ impl ReleasedMicRegion {
 
     fn kept_with_poll(words: Vec<Word>, poll: MicPollContext) -> Self {
         Self {
+            evidence_parents: Some(Vec::new()),
             words,
             comparison_incomplete: poll.omitted(),
             poll,
@@ -1726,11 +2108,14 @@ impl EarlyDrop {
             return vec![ReleasedMicRegion::kept_with_poll(words, poll)];
         }
         let mut out = Vec::with_capacity(regions.len());
+        let mut context_bytes = 0;
         for region in regions {
             let candidate = EchoCandidate::from_words(true, &region);
             if !self.is_short(&candidate) {
                 // A sentence publishes now — but never ahead of a region that arrived before it.
-                out.append(&mut self.drain_held(evidence));
+                while !self.held.is_empty() {
+                    self.release_oldest(&mut out, evidence, &mut context_bytes);
+                }
                 out.push(ReleasedMicRegion::kept_with_poll(region, poll.clone()));
                 continue;
             }
@@ -1744,7 +2129,7 @@ impl EarlyDrop {
             self.stats.held += 1;
             // Everything popped here is older than what was just pushed, so order still holds.
             while self.held.len() > MAX_HELD_MIC_REGIONS {
-                self.release_oldest(&mut out, evidence);
+                self.release_oldest(&mut out, evidence, &mut context_bytes);
             }
         }
         self.prune_sources(now);
@@ -1753,16 +2138,28 @@ impl EarlyDrop {
 
     /// A far-end poll produced words: they become echo sources, and a closed far-end region is exactly the
     /// event a held region was waiting for. Returns the mic word groups this released.
+    #[cfg(test)]
     fn offer_them(
         &mut self,
         words: &[Word],
         now: f64,
         evidence: Option<AudioEvidence<'_>>,
     ) -> Vec<ReleasedMicRegion> {
+        self.offer_them_with_parent(words, now, evidence, None)
+    }
+
+    fn offer_them_with_parent(
+        &mut self,
+        words: &[Word],
+        now: f64,
+        evidence: Option<AudioEvidence<'_>>,
+        parent: Option<corti_transcribe::evidence::ParentRow>,
+    ) -> Vec<ReleasedMicRegion> {
         if !self.enabled() || words.is_empty() {
             return Vec::new();
         }
-        self.sources.remember(words, self.cfg.echo_window_seconds);
+        self.sources
+            .remember_with_parent(words, self.cfg.echo_window_seconds, parent);
         let released = self.drain_held(evidence);
         self.prune_sources(now);
         released
@@ -1775,8 +2172,9 @@ impl EarlyDrop {
             return Vec::new();
         }
         let mut out = Vec::new();
+        let mut context_bytes = 0;
         while self.held.front().is_some_and(|h| h.deadline <= now) {
-            self.release_oldest(&mut out, evidence);
+            self.release_oldest(&mut out, evidence, &mut context_bytes);
         }
         self.prune_sources(now);
         out
@@ -1793,8 +2191,9 @@ impl EarlyDrop {
 
     fn drain_held(&mut self, evidence: Option<AudioEvidence<'_>>) -> Vec<ReleasedMicRegion> {
         let mut out = Vec::with_capacity(self.held.len());
+        let mut context_bytes = 0;
         while !self.held.is_empty() {
-            self.release_oldest(&mut out, evidence);
+            self.release_oldest(&mut out, evidence, &mut context_bytes);
         }
         out
     }
@@ -1805,6 +2204,7 @@ impl EarlyDrop {
         &mut self,
         out: &mut Vec<ReleasedMicRegion>,
         evidence: Option<AudioEvidence<'_>>,
+        context_bytes: &mut usize,
     ) {
         let Some(held) = self.held.pop_front() else {
             return;
@@ -1816,12 +2216,17 @@ impl EarlyDrop {
         let (assessment, span) =
             self.sources
                 .assess_mic_poll(&held.candidate, &held.poll, &self.cfg, span);
+        // Capture the classifier's own inventory before offer_them/due can prune it. Each snapshot
+        // has at most 256 sources + one raw mic poll, and all snapshots returned together share the
+        // 1 MiB capacity budget. A large split poll can release more than the 64 held-region limit.
+        let evidence_parents = self.sources.comparison_parents(&held.poll, context_bytes);
         if assessment.verdict == EchoVerdict::DropAcoustic {
             self.stats.released_dropped += 1;
         } else {
             self.stats.released_published += 1;
         }
         out.push(ReleasedMicRegion {
+            evidence_parents,
             words: held.words,
             poll: held.poll,
             comparison_incomplete,
@@ -1881,11 +2286,13 @@ fn publish_them_words<P: TranscriptPublisher>(
     }
     let now = window.next_start_sec();
     let offset = window.them_words.len();
-    window.push_them_words(words);
+    let parent = window.push_them_words_with_parent(words);
     let words = &window.them_words[offset..];
     let sources = &window.carry;
     let evidence = |start, end| sources.span_evidence(&window.aec_blocks, start, end);
-    let released = window.early_drop.offer_them(words, now, Some(&evidence));
+    let released = window
+        .early_drop
+        .offer_them_with_parent(words, now, Some(&evidence), parent);
     publisher.words(Speaker::Other("Them".to_string()), words);
     emit_mic_words(window, publisher, released);
 }
@@ -1913,16 +2320,36 @@ fn emit_mic_words<P: TranscriptPublisher>(
     publisher: &P,
     released: Vec<ReleasedMicRegion>,
 ) {
-    for region in released {
-        for original in words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP) {
-            window.cleanup_decisions.record_echo_assessment(
+    for mut region in released {
+        let originals = words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP);
+        let mut decisions = CleanupDecisions::default();
+        let first_ordinal = window.early_decision_index;
+        for original in &originals {
+            let (target, index) = if window.evidence.is_some() {
+                (&mut decisions, window.early_decision_index)
+            } else {
+                (&mut window.cleanup_decisions, window.early_decision_index)
+            };
+            target.record_echo_assessment(
                 CleanupStage::EarlyEcho,
-                window.early_decision_index,
-                &original,
+                index,
+                original,
                 region.assessment,
                 region.evidence,
             );
             window.early_decision_index = window.early_decision_index.saturating_add(1);
+        }
+        if let Some(evidence) = window.evidence.as_mut() {
+            let context = region.evidence_parents.take();
+            if context.is_none() {
+                evidence.missing(1);
+            }
+            region.evidence_parents = Some(evidence.early(
+                &originals,
+                first_ordinal,
+                decisions,
+                context.as_deref().unwrap_or_default(),
+            ));
         }
         if region.assessment.verdict != EchoVerdict::DropAcoustic {
             publisher.words(Speaker::Me, &region.words);
@@ -1952,6 +2379,379 @@ fn degraded_detail(error: &anyhow::Error) -> String {
 /// Drain tee chunks until the sender (the capture writer) hangs up. Input chunks are split exactly at the
 /// rolling boundary, so even a surprising producer chunk cannot push retained audio beyond the configured/
 /// hard limit. AEC and ASR remain chunk-agnostic; only a full window forces their current tails final.
+fn rolling_observation<C: LiveChannel, F: NoteFiler>(
+    mic: &C,
+    them: &C,
+    window: &TranscriptWindow,
+    writer: &NoteWriter<F>,
+) -> Result<Observation> {
+    let received_through = window
+        .start_frame
+        .checked_add(window.frames)
+        .context("live received frame overflow")?;
+    let mut tracks = [TrackBoundary::NeverPresent; 2];
+    let mut maintenance_armed = false;
+    for (index, (origin, channel)) in [
+        (window.mic_origin_frame, mic),
+        (window.tap_origin_frame, them),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(origin) = origin {
+            let snapshot = channel
+                .boundary_snapshot()
+                .context("missing native boundary snapshot")?;
+            maintenance_armed |= snapshot.epoch_remaining
+                <= window
+                    .rolling
+                    .as_ref()
+                    .context("missing rolling owner")?
+                    .maintenance_trigger;
+            anyhow::ensure!(
+                snapshot.delivered_through == writer.delivered_input_frames[index],
+                "native delivery clock disagrees with app input"
+            );
+            let natural = snapshot
+                .natural
+                .map(|interval| -> Result<_> {
+                    Ok(SourceInterval {
+                        first: origin
+                            .checked_add(interval.first)
+                            .context("natural source start overflow")?,
+                        last: origin
+                            .checked_add(interval.last)
+                            .context("natural source end overflow")?,
+                    })
+                })
+                .transpose()?;
+            tracks[index] = TrackBoundary::Established {
+                start_frame: window.start_frame.max(origin),
+                delivered_through: origin
+                    .checked_add(snapshot.delivered_through)
+                    .context("native delivery position overflow")?,
+                natural,
+            };
+        }
+    }
+    Ok(Observation {
+        received_through,
+        tracks,
+        text_full: window.buffered_text_bytes >= MAX_BUFFERED_TRANSCRIPT_BYTES
+            || window
+                .rolling
+                .as_ref()
+                .is_some_and(|owner| owner.text_charge >= MAX_BUFFERED_TRANSCRIPT_BYTES),
+        maintenance_armed,
+    })
+}
+
+fn publish_owned_poll<F: NoteFiler, P: TranscriptPublisher>(
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    words: Vec<Word>,
+    track: corti_core::QualityTrack,
+) -> Result<()> {
+    if let Some(rolling) = window.rolling.as_mut()
+        && !words.is_empty()
+    {
+        // Bound the raw result BEFORE any cleanup inventory clones it. A whole returned poll is
+        // indivisible (#161); an unrepresentable/pathological poll is explicit processing loss.
+        // Three text copies and per-word region/context overhead conservatively cover the retained
+        // mic poll, its children and their eventual released words, including currently held input.
+        let charge = buffered_word_bytes(&words)
+            .checked_mul(3)
+            .and_then(|bytes| {
+                words
+                    .len()
+                    .checked_mul(
+                        std::mem::size_of::<ReleasedMicRegion>()
+                            + 2 * std::mem::size_of::<TranscriptSegment>()
+                            + if window.evidence.is_some() {
+                                2 * std::mem::size_of::<corti_transcribe::evidence::ParentRow>()
+                            } else {
+                                0
+                            },
+                    )
+                    .and_then(|regions| bytes.checked_add(regions))
+            })
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<RawEchoSource>()));
+        let Some(retained_charge) = charge
+            .and_then(|bytes| rolling.text_charge.checked_add(bytes))
+            .filter(|bytes| *bytes <= MAX_BUFFERED_TRANSCRIPT_BYTES)
+        else {
+            writer.mark_incomplete_to([
+                writer
+                    .decode_quality
+                    .input_frames(corti_core::QualityTrack::Mic),
+                writer
+                    .decode_quality
+                    .input_frames(corti_core::QualityTrack::Tap),
+            ]);
+            anyhow::bail!("live raw poll exceeds the bounded text payload");
+        };
+        rolling.text_charge = retained_charge;
+    }
+    match track {
+        corti_core::QualityTrack::Mic => publish_mic_words(window, publisher, words),
+        corti_core::QualityTrack::Tap => publish_them_words(window, publisher, words),
+        corti_core::QualityTrack::Both => anyhow::bail!("live poll must belong to one channel"),
+    }
+    Ok(())
+}
+
+/// Returns only after old polls have been filed or truthfully abandoned, before permitting suffix
+/// polls into the new raw inventory. A historical cut never changes the received input endpoint.
+fn settle_owned_cut<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
+    (mic, them): (&mut C, &mut C),
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    dropped_windows: &mut u32,
+    ended: bool,
+) -> Result<bool> {
+    let mut cut = window
+        .rolling
+        .as_ref()
+        .and_then(|rolling| rolling.pending)
+        .context("missing selected live ownership")?;
+    let mut failure = None;
+    for (index, (track, origin, channel)) in [
+        (
+            corti_core::QualityTrack::Mic,
+            window.mic_origin_frame,
+            &mut *mic,
+        ),
+        (
+            corti_core::QualityTrack::Tap,
+            window.tap_origin_frame,
+            &mut *them,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(origin) = origin {
+            // A track first appearing in the reserve still latches local zero BEFORE its first ASR.
+            if cut.tokens[index].is_none() {
+                let local = cut.fence.frame.saturating_sub(origin);
+                let forced =
+                    matches!(cut.fence.kind, BoundaryKind::Forced(_)) || cut.reset_for_maintenance;
+                if forced {
+                    writer.decode_quality.mark_forced_boundary(track, local);
+                }
+                let token = writer.call_channel(track, channel, |channel| {
+                    channel.latch_boundary(local, cut.fence.kind, cut.reset_for_maintenance)
+                })?;
+                cut.tokens[index] = Some(token);
+                cut.track_ends[index] = local;
+            }
+            let progress =
+                writer.call_channel(track, channel, |channel| channel.advance_boundary(ended));
+            cut.settled[index] = match progress {
+                Ok(ChannelBoundaryProgress::Settled(token)) => {
+                    anyhow::ensure!(
+                        cut.tokens[index] == Some(token),
+                        "native settled a different ownership fence"
+                    );
+                    true
+                }
+                Ok(ChannelBoundaryProgress::Waiting) => false,
+                Ok(ChannelBoundaryProgress::Ended) => {
+                    failure.get_or_insert_with(|| {
+                        anyhow::anyhow!("native ended without settling its ownership fence")
+                    });
+                    false
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    false
+                }
+            };
+        } else {
+            cut.settled[index] = true;
+        }
+    }
+    window.rolling.as_mut().unwrap().pending = Some(cut);
+    if let Some(words) = mic.poll_words() {
+        publish_owned_poll(
+            window,
+            writer,
+            publisher,
+            words,
+            corti_core::QualityTrack::Mic,
+        )?;
+    }
+    if let Some(words) = them.poll_words() {
+        publish_owned_poll(
+            window,
+            writer,
+            publisher,
+            words,
+            corti_core::QualityTrack::Tap,
+        )?;
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    if !cut.settled.into_iter().all(|settled| settled) {
+        return Ok(false);
+    }
+    release_held_mic_words(window, publisher);
+    match flush_window(diarizer, window, writer) {
+        Ok(()) => {
+            if *dropped_windows != 0 {
+                info!(target: "corti::live", dropped_windows = *dropped_windows, "live filing recovered");
+                *dropped_windows = 0;
+                publisher.listening();
+            }
+        }
+        Err(error) => {
+            *dropped_windows = dropped_windows.saturating_add(1);
+            writer.mark_incomplete_to(cut.track_ends);
+            window.clear_after_flush();
+            if *dropped_windows == 1 {
+                publisher.error(degraded_detail(&error));
+            }
+        }
+    }
+    window.reset_rolling()?;
+    for (index, (track, channel)) in [
+        (corti_core::QualityTrack::Mic, &mut *mic),
+        (corti_core::QualityTrack::Tap, &mut *them),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(token) = cut.tokens[index] {
+            writer.call_channel(track, channel, |channel| {
+                channel.acknowledge_boundary(token)
+            })?;
+        }
+    }
+    // Acknowledge may decode never-attempted suffix. Its entire returned polls belong to the new
+    // window, including the comparison context of any children that early cleanup withholds.
+    if let Some(words) = mic.poll_words() {
+        publish_owned_poll(
+            window,
+            writer,
+            publisher,
+            words,
+            corti_core::QualityTrack::Mic,
+        )?;
+    }
+    if let Some(words) = them.poll_words() {
+        publish_owned_poll(
+            window,
+            writer,
+            publisher,
+            words,
+            corti_core::QualityTrack::Tap,
+        )?;
+    }
+    Ok(true)
+}
+
+fn rolling_admission<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
+    mic: &mut C,
+    them: &mut C,
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    dropped_windows: &mut u32,
+) -> Result<usize> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rolling_admission_inner(
+            mic,
+            them,
+            diarizer,
+            window,
+            writer,
+            publisher,
+            dropped_windows,
+        )
+    }));
+    if !matches!(&result, Ok(Ok(_))) {
+        writer.mark_incomplete_to([
+            writer
+                .decode_quality
+                .input_frames(corti_core::QualityTrack::Mic),
+            writer
+                .decode_quality
+                .input_frames(corti_core::QualityTrack::Tap),
+        ]);
+    }
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn rolling_admission_inner<
+    C: LiveChannel,
+    D: LiveDiarizer,
+    F: NoteFiler,
+    P: TranscriptPublisher,
+>(
+    mic: &mut C,
+    them: &mut C,
+    diarizer: &D,
+    window: &mut TranscriptWindow,
+    writer: &mut NoteWriter<F>,
+    publisher: &P,
+    dropped_windows: &mut u32,
+) -> Result<usize> {
+    loop {
+        let observation = rolling_observation(mic, them, window, writer)?;
+        let rolling = window.rolling.as_mut().context("missing rolling policy")?;
+        match rolling.policy.observe(observation)? {
+            BoundaryStep::Admit { frames } => return Ok(usize::try_from(frames)?),
+            BoundaryStep::Selected {
+                fence,
+                reset_for_maintenance,
+                ..
+            } => {
+                if rolling.pending.is_none() {
+                    rolling.pending = Some(OwnedCut {
+                        fence,
+                        reset_for_maintenance,
+                        track_ends: writer.window_input_start,
+                        tokens: [None; 2],
+                        settled: [false; 2],
+                    });
+                }
+                if settle_owned_cut(
+                    (mic, them),
+                    diarizer,
+                    window,
+                    writer,
+                    publisher,
+                    dropped_windows,
+                    false,
+                )? {
+                    continue;
+                }
+                let rolling = window.rolling.as_ref().unwrap();
+                let reserve_end = fence
+                    .frame
+                    .checked_add(rolling.settlement_frames)
+                    .context("live settlement endpoint overflow")?;
+                let available = reserve_end
+                    .checked_sub(observation.received_through)
+                    .map(|frames| frames.min(rolling.capacity_frames.saturating_sub(window.frames)))
+                    .filter(|frames| *frames != 0)
+                    .context("live boundary settlement reserve exhausted")?;
+                return Ok(usize::try_from(
+                    available.min(corti_capture::FILTER_FRAMES_PER_CHUNK as u64),
+                )?);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // the split keeps every piece testable without models
 fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPublisher>(
     rx: &Receiver<CaptureChunk>,
@@ -1970,6 +2770,7 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     let mut mic_unavailable = [false; corti_capture::FILTER_FRAMES_PER_CHUNK];
     while let Ok(chunk) = rx.recv() {
         let chunk_frames = chunk.mic.len().max(chunk.tap.len());
+        writer.observe_activity(&chunk, sample_rate);
         observe_mismatch(&mut writer.mismatches, &chunk, sample_rate);
         anyhow::ensure!(
             chunk.unavailable.is_empty() || chunk.unavailable.len() == chunk_frames,
@@ -1988,8 +2789,20 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
         let has_tap = window.tap_origin_frame.is_some();
         let mut offset = 0usize;
         while offset < chunk_frames {
-            let take = window
-                .remaining_frames()
+            let allowance = if window.rolling.is_some() {
+                rolling_admission(
+                    mic,
+                    them,
+                    diarizer,
+                    window,
+                    writer,
+                    publisher,
+                    &mut dropped_windows,
+                )?
+            } else {
+                window.remaining_frames()
+            };
+            let take = allowance
                 .min(chunk_frames - offset)
                 .min(corti_capture::FILTER_FRAMES_PER_CHUNK);
             let end = offset + take;
@@ -2039,6 +2852,10 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                         window
                             .aec_availability
                             .push(aec, mic_slice, tap_slice, unavailable)?;
+                    if let Some(evidence) = window.evidence.as_mut() {
+                        evidence.observe_aec();
+                    }
+                    writer.live_aec_ran = true;
                     // --- #149 phase 3b: hand the window this push's per-block echo record. ---
                     window.push_aec_blocks(aec.block_stats());
                     // --- end phase 3b ---
@@ -2070,10 +2887,22 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
                 });
             }
             if let Some(words) = mic.poll_words() {
-                publish_mic_words(window, publisher, words);
+                publish_owned_poll(
+                    window,
+                    writer,
+                    publisher,
+                    words,
+                    corti_core::QualityTrack::Mic,
+                )?;
             }
             if let Some(words) = them.poll_words() {
-                publish_them_words(window, publisher, words);
+                publish_owned_poll(
+                    window,
+                    writer,
+                    publisher,
+                    words,
+                    corti_core::QualityTrack::Tap,
+                )?;
             }
             window.push_audio(tap_slice, take);
             // Call time advanced, so a hold no far-end region closed out can expire on its own (#149).
@@ -2083,7 +2912,17 @@ fn consume_chunks<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
             // A failed checkpoint degrades the session instead of ending it: filing is best-effort and the
             // post-call batch pass rebuilds from the WAV, so retrying on the next window lets access
             // restored mid-call recover on its own.
-            if window.due() {
+            if window.rolling.is_some() {
+                rolling_admission(
+                    mic,
+                    them,
+                    diarizer,
+                    window,
+                    writer,
+                    publisher,
+                    &mut dropped_windows,
+                )?;
+            } else if window.due() {
                 match checkpoint_and_flush(mic, them, diarizer, window, writer, publisher) {
                     Ok(()) if dropped_windows > 0 => {
                         info!(target: "corti::live", dropped_windows, "live filing recovered");
@@ -2153,6 +2992,18 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     // inventory. The remaining regions use the same shared verdict as batch and early cleanup.
     let mut segments = Vec::new();
     let mut protected_input_indices = Vec::new();
+    let mut evidence_parents = Vec::new();
+    let far_context: Vec<_> = window
+        .carry
+        .segments
+        .iter()
+        .filter_map(|source| source.evidence_parent)
+        .collect();
+    let mic_context: Vec<_> = window
+        .mic_polls
+        .iter()
+        .filter_map(|source| source.evidence_parent)
+        .collect();
     let mic_candidates: Vec<_> = window
         .mic_polls
         .iter()
@@ -2162,7 +3013,10 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
     let mut echo_dropped_audio = 0usize;
     let mut input_index = 0usize;
     for region in &window.mic_regions {
-        for original in words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP) {
+        for (ordinal, original) in words_to_segments(&region.words, Speaker::Me, SEGMENT_GAP)
+            .into_iter()
+            .enumerate()
+        {
             let candidate = EchoCandidate::from_segment(&original);
             let (assessment, evidence) = if region.assessment.verdict
                 == EchoVerdict::KeepCriticalDifference
@@ -2177,35 +3031,67 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
                     .carry
                     .assess_mic_poll(&candidate, &region.poll, &window.cleanup, evidence)
             };
+            let protected = assessment.verdict == EchoVerdict::KeepCriticalDifference
+                || region.comparison_incomplete
+                || window
+                    .carry
+                    .mic_comparison_incomplete(&candidate, &region.poll);
+            let mut decisions = CleanupDecisions::default();
             if assessment.verdict != EchoVerdict::Keep {
-                window.cleanup_decisions.record_echo_assessment(
+                let (target, index) = if window.evidence.is_some() {
+                    (&mut decisions, 0)
+                } else {
+                    (&mut window.cleanup_decisions, input_index)
+                };
+                target.record_echo_assessment(
                     CleanupStage::Echo,
-                    input_index,
+                    index,
                     &original,
                     assessment,
                     evidence,
                 );
             }
+            let links = window
+                .evidence
+                .as_mut()
+                .map(|evidence| {
+                    let input = region
+                        .evidence_parents
+                        .as_ref()
+                        .and_then(|parents| parents.get(ordinal))
+                        .copied();
+                    if input.is_none() {
+                        evidence.missing(1);
+                    }
+                    evidence.echo(
+                        input.as_slice(),
+                        if protected { &[0] } else { &[] },
+                        decisions,
+                        &far_context,
+                        corti_core::QualityTrack::Mic,
+                    )
+                })
+                .unwrap_or_default();
             input_index += 1;
             if assessment.verdict == EchoVerdict::DropAcoustic {
                 echo_dropped_audio += 1;
             } else {
-                if assessment.verdict == EchoVerdict::KeepCriticalDifference
-                    || region.comparison_incomplete
-                    || window
-                        .carry
-                        .mic_comparison_incomplete(&candidate, &region.poll)
-                {
+                if protected {
                     protected_input_indices.push(segments.len());
                 }
                 segments.push(original);
+                evidence_parents.extend(links);
             }
         }
     }
     if !window.them_words.is_empty() {
         let turns = if window.diarize_far_end {
             diarizer
-                .diarize_chunk(&window.tap_audio, window.sample_rate, window.start_sec())?
+                .diarize_chunk(
+                    &window.tap_audio[..window.owned_frames() as usize],
+                    window.sample_rate,
+                    window.start_sec(),
+                )?
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -2213,7 +3099,7 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
         // Bind protection to the ORIGINAL returned poll before any pause or diarization split. Every
         // displayed descendant keeps the flag; neither text lookup nor the bounded ledger is authority.
         let mut poll_start = 0;
-        for &poll_end in &window.them_poll_ends {
+        for (poll_index, &poll_end) in window.them_poll_ends.iter().enumerate() {
             let words = &window.them_words[poll_start..poll_end];
             poll_start = poll_end;
             let original = TranscriptSegment {
@@ -2232,32 +3118,77 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
                 &window.cleanup,
                 None,
             );
+            let mut decisions = CleanupDecisions::default();
             if assessment.verdict != EchoVerdict::Keep {
-                window.cleanup_decisions.record_echo_assessment(
+                let (target, index) = if window.evidence.is_some() {
+                    (&mut decisions, 0)
+                } else {
+                    (&mut window.cleanup_decisions, input_index)
+                };
+                target.record_echo_assessment(
                     CleanupStage::Echo,
-                    input_index,
+                    index,
                     &original,
                     assessment,
                     None,
                 );
             }
             input_index += 1;
+            let mut child_links = Vec::new();
+            let mut traced_children = Vec::new().into_iter();
+            if let Some(evidence) = window.evidence.as_mut() {
+                let input = window.them_evidence.get(poll_index).copied().flatten();
+                if input.is_none() {
+                    evidence.missing(1);
+                }
+                let poll = evidence.echo(
+                    input.as_slice(),
+                    &[],
+                    decisions,
+                    &mic_context,
+                    corti_core::QualityTrack::Tap,
+                );
+                let emitted = corti_transcribe::segment::words_to_segments_with_ranges(
+                    words,
+                    Speaker::Other("Them".into()),
+                    SEGMENT_GAP,
+                );
+                // The historical full-poll representation includes empty words. The emitter's ranges
+                // deliberately exclude them; mark that unavailable instead of inventing offsets.
+                if words.iter().any(|word| word.text.is_empty()) {
+                    evidence.missing(1);
+                }
+                let (children, links) = evidence.derive(
+                    poll.first().copied(),
+                    emitted,
+                    corti_transcribe::evidence::StageKind::Segmentation,
+                );
+                traced_children = children.into_iter();
+                child_links = links;
+            }
             // Whole-poll protection supplements child matches: unrelated speech in the same returned
             // poll must not conceal a critical match belonging to one pause-separated child.
-            for child in split_regions(words, SEGMENT_GAP) {
-                let original_child =
+            for (child_index, child) in split_regions(words, SEGMENT_GAP).into_iter().enumerate() {
+                let original_child = traced_children.next().unwrap_or_else(|| {
                     words_to_segments(&child, Speaker::Other("Them".to_string()), f64::INFINITY)
-                        .remove(0);
+                        .remove(0)
+                });
                 let child_assessment = echo_assessment(
                     &EchoCandidate::from_segment(&original_child),
                     &mic_candidates,
                     &window.cleanup,
                     None,
                 );
+                let mut decisions = CleanupDecisions::default();
                 if child_assessment.verdict != EchoVerdict::Keep {
-                    window.cleanup_decisions.record_echo_assessment(
+                    let (target, index) = if window.evidence.is_some() {
+                        (&mut decisions, 0)
+                    } else {
+                        (&mut window.cleanup_decisions, input_index)
+                    };
+                    target.record_echo_assessment(
                         CleanupStage::Echo,
-                        input_index,
+                        index,
                         &original_child,
                         child_assessment,
                         None,
@@ -2267,11 +3198,42 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
                 let protected = assessment.verdict == EchoVerdict::KeepCriticalDifference
                     || child_assessment.verdict == EchoVerdict::KeepCriticalDifference
                     || window.mic_polls_omitted > 0;
-                let rendered = if window.diarize_far_end {
-                    diarize_words(&child, &turns, SEGMENT_GAP, "Them")
+                let (rendered, links) = if let Some(evidence) = window.evidence.as_mut() {
+                    let input = child_links.get(child_index).copied();
+                    if input.is_none() {
+                        evidence.missing(1);
+                    }
+                    let echoed = evidence.echo(
+                        input.as_slice(),
+                        if protected { &[0] } else { &[] },
+                        decisions,
+                        &mic_context,
+                        corti_core::QualityTrack::Tap,
+                    );
+                    if window.diarize_far_end {
+                        let emitted = corti_transcribe::segment::diarize_words_with_ranges(
+                            &child,
+                            &turns,
+                            SEGMENT_GAP,
+                            "Them",
+                        );
+                        evidence.derive(
+                            echoed.first().copied(),
+                            emitted,
+                            corti_transcribe::evidence::StageKind::Diarization,
+                        )
+                    } else {
+                        (vec![original_child], echoed)
+                    }
+                } else if window.diarize_far_end {
+                    (
+                        diarize_words(&child, &turns, SEGMENT_GAP, "Them"),
+                        Vec::new(),
+                    )
                 } else {
-                    vec![original_child]
+                    (vec![original_child], Vec::new())
                 };
+                evidence_parents.extend(links);
                 for segment in rendered {
                     if protected {
                         protected_input_indices.push(segments.len());
@@ -2291,18 +3253,28 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
         echo_drop: false,
         ..window.cleanup.clone()
     };
-    let result = cleanup_with_protected_decisions(
-        segments,
-        &render_cleanup,
-        &[],
-        None,
-        rule,
-        &protected_input_indices,
-    );
-    let segments = result.segments;
-    let mut stats = result.stats;
+    let (segments, mut stats) = if let Some(evidence) = window.evidence.as_mut() {
+        evidence.cleanup(
+            segments,
+            &evidence_parents,
+            &protected_input_indices,
+            &render_cleanup,
+            rule,
+        )
+    } else {
+        let result = cleanup_with_protected_decisions(
+            segments,
+            &render_cleanup,
+            &[],
+            None,
+            rule,
+            &protected_input_indices,
+        );
+        window.cleanup_decisions.append(result.decisions);
+        (result.segments, result.stats)
+    };
     stats.echo_dropped_audio = echo_dropped_audio;
-    window.cleanup_decisions.append(result.decisions);
+    window.persist_evidence(writer, None);
     if !segments.is_empty() {
         writer.append_segments(&segments)?;
         info!(
@@ -2321,7 +3293,11 @@ fn flush_window<D: LiveDiarizer, F: NoteFiler>(
             "durable live transcript chunk synced"
         );
     }
-    writer.advance_window();
+    if let Some(cut) = window.rolling.as_ref().and_then(|rolling| rolling.pending) {
+        writer.advance_window_to(cut.track_ends);
+    } else {
+        writer.advance_window();
+    }
     window.clear_after_flush();
     Ok(())
 }
@@ -2340,135 +3316,281 @@ fn finish_session<C: LiveChannel, D: LiveDiarizer, F: NoteFiler, P: TranscriptPu
     writer: &mut NoteWriter<F>,
     publisher: &P,
 ) -> Result<LiveOutcome> {
-    writer.freeze_live_quality(&quality)?;
-    if let Some(aec) = aec.take() {
-        // `finish` consumes the filter, so the tail blocks — every block of a call shorter than the
-        // lookahead — are only reachable through `finish_with_stats`. The final window's cleanup is the
-        // one that needs them (#149 phase 3b).
-        let fin = std::mem::take(&mut window.aec_availability).finish(aec)?;
-        info!(
-            target: "corti::live",
-            delay_samples = fin.delay_samples as u64,
-            delay_ms = fin.delay_samples as f64 * 1000.0 / f64::from(sample_rate.max(1)),
-            stats_dropped = fin.stats_dropped,
-            tail_blocks = fin.stats.len(),
-            "live AEC finished"
-        );
-        window.push_aec_blocks(fin.stats);
-        if !fin.audio.is_empty() {
-            writer.delivered_input(corti_core::QualityTrack::Mic, fin.audio.len())?;
-            writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, |channel| {
-                channel.push(&fin.audio, sample_rate)
-            });
-        }
-    }
-    if let Some(words) = mic.poll_words() {
-        publish_mic_words(&mut window, publisher, words);
-    }
-    if let Some(words) = them.poll_words() {
-        publish_them_words(&mut window, publisher, words);
-    }
-    let mic_words =
-        writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, LiveChannel::finish);
-    publish_mic_words(&mut window, publisher, mic_words);
-    let them_words = writer.call_channel(
-        corti_core::QualityTrack::Tap,
-        &mut them,
-        LiveChannel::finish,
-    );
-    publish_them_words(&mut window, publisher, them_words);
-    // The session is over: every held region is judged now against everything the far end ever said in
-    // range, and published or dropped. Nothing waits past the last append.
-    release_held_mic_words(&mut window, publisher);
-    let early_drop = window.early_drop.stats;
-    // Freeze after both decoder tails, including failure-only outcomes. Keep it available even if
-    // the final append fails and the session's error boundary takes ownership of the partial note.
-    writer.freeze_live_quality(&quality)?;
-    if let Err(error) = flush_window(&diarizer, &mut window, writer) {
-        writer.mark_incomplete();
+    let rolling_owner = window.rolling.is_some();
+    let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         writer.freeze_live_quality(&quality)?;
-        return Err(error);
-    }
-    if early_drop != EarlyDropStats::default() {
-        info!(
-            target: "corti::live",
-            held = early_drop.held,
-            released_published = early_drop.released_published,
-            released_dropped = early_drop.released_dropped,
-            "live early drop of short mic echoes"
-        );
-    }
-
-    let mismatch_count = writer.mismatches.count();
-    let capture = writer.freeze_live_quality(&quality)?;
-    writer.settle_capture_quality(&capture, quality.capture.is_some())?;
-    // Capture authority already retains unchanged facts. Carry any additional settled facts through
-    // successful completion too; ordinary metadata capacity does not require a fallback or new ASR.
-    let settled_quality =
-        (capture != quality.capture.clone().unwrap_or_default()).then(|| capture.clone());
-    match writer.path().cloned() {
-        Some(note_path)
-            if quality.dropped_chunks == 0
-                && capture.completeness() == corti_core::SourceCompleteness::Complete =>
-        {
-            let mut applied_call_ids = Vec::new();
-            if let (Some(hosted), Some(recording_id), Some(raw_transcript)) = (
-                publisher.hosted(),
-                publisher.recording_id(),
-                writer.final_transcript(),
-            ) {
-                let settled = hosted.finalize(recording_id, raw_transcript, true);
-                // A disabled default has no calls and preserves the exact historical flip-only behavior.
-                // An attempted final (success or typed fallback) rewrites once while still transcribing so
-                // provenance and the selected safe body become durable before publication.
-                if settled.hosted_text_applied {
-                    if hosted.mark_final_applied(&settled.call_ids).is_ok() {
-                        if let Err(error) = writer.rewrite_settled_final(&settled) {
-                            let _ = hosted.abandon_final_result(&settled.call_ids);
-                            return Err(error);
-                        }
-                        applied_call_ids = settled.call_ids;
-                    } else {
-                        let _ = hosted.abandon_final_result(&settled.call_ids);
-                    }
-                } else if !settled.call_ids.is_empty() {
-                    writer.rewrite_settled_final(&settled)?;
-                }
-            }
-            corti_vagus::note::flip_state(&note_path).context("flipping the note's state line")?;
-            if let Some(hosted) = publisher.hosted() {
-                hosted
-                    .mark_final_checkpointed(&applied_call_ids)
-                    .map_err(|code| {
-                        anyhow::anyhow!("acknowledging hosted Final note failed: {code}")
-                    })?;
-            }
+        if let Some(aec) = aec.take() {
+            // `finish` consumes the filter, so the tail blocks — every block of a call shorter than the
+            // lookahead — are only reachable through `finish_with_stats`. The final window's cleanup is the
+            // one that needs them (#149 phase 3b).
+            let fin = std::mem::take(&mut window.aec_availability).finish(aec)?;
             info!(
                 target: "corti::live",
-                note_path = %note_path.display(),
-                "live note finalized — final chunk and state are synced"
+                delay_samples = fin.delay_samples as u64,
+                delay_ms = fin.delay_samples as f64 * 1000.0 / f64::from(sample_rate.max(1)),
+                stats_dropped = fin.stats_dropped,
+                tail_blocks = fin.stats.len(),
+                "live AEC finished"
             );
-            Ok(LiveOutcome::Filed {
-                note_path,
-                settled_quality,
-            })
+            window.push_aec_blocks(fin.stats);
+            if !fin.audio.is_empty() {
+                writer.delivered_input(corti_core::QualityTrack::Mic, fin.audio.len())?;
+                writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, |channel| {
+                    channel.push(&fin.audio, sample_rate)
+                });
+            }
         }
-        Some(note_path) => Ok(LiveOutcome::Fallback {
-            reason: format!(
-                "capture completeness {:?}; live tee dropped {} chunk(s); mic/tap mismatched {} chunk(s)",
-                capture.completeness(),
-                quality.dropped_chunks,
-                mismatch_count
-            ),
-            note_path: Some(note_path),
-            settled_quality: Some(capture),
-        }),
-        None if capture.requires_batch_recovery() => Ok(LiveOutcome::Fallback {
-            reason: "live processing coverage is incomplete".into(),
-            note_path: None,
-            settled_quality: Some(capture),
-        }),
-        None => Ok(LiveOutcome::NoNote { settled_quality }),
+        if let Some(words) = mic.poll_words() {
+            publish_owned_poll(
+                &mut window,
+                writer,
+                publisher,
+                words,
+                corti_core::QualityTrack::Mic,
+            )?;
+        }
+        if let Some(words) = them.poll_words() {
+            publish_owned_poll(
+                &mut window,
+                writer,
+                publisher,
+                words,
+                corti_core::QualityTrack::Tap,
+            )?;
+        }
+        if window.rolling.is_some() {
+            let ended = (|| -> Result<()> {
+                if window.rolling.as_ref().unwrap().pending.is_some() {
+                    anyhow::ensure!(
+                        settle_owned_cut(
+                            (&mut mic, &mut them),
+                            &diarizer,
+                            &mut window,
+                            writer,
+                            publisher,
+                            &mut 0,
+                            true
+                        )?,
+                        "live ownership remained unsettled after real tails"
+                    );
+                }
+                let mut failure = None;
+                for (track, origin, channel) in [
+                    (
+                        corti_core::QualityTrack::Mic,
+                        window.mic_origin_frame,
+                        &mut mic,
+                    ),
+                    (
+                        corti_core::QualityTrack::Tap,
+                        window.tap_origin_frame,
+                        &mut them,
+                    ),
+                ] {
+                    if origin.is_some() {
+                        let result = writer
+                            .call_channel(track, channel, |channel| channel.advance_boundary(true));
+                        match result {
+                            Ok(ChannelBoundaryProgress::Ended) => {}
+                            Ok(_) => {
+                                failure.get_or_insert_with(|| {
+                                    anyhow::anyhow!(
+                                        "native source end did not settle remaining input"
+                                    )
+                                });
+                            }
+                            Err(error) => {
+                                failure.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                if let Some(words) = mic.poll_words() {
+                    publish_owned_poll(
+                        &mut window,
+                        writer,
+                        publisher,
+                        words,
+                        corti_core::QualityTrack::Mic,
+                    )?;
+                }
+                if let Some(words) = them.poll_words() {
+                    publish_owned_poll(
+                        &mut window,
+                        writer,
+                        publisher,
+                        words,
+                        corti_core::QualityTrack::Tap,
+                    )?;
+                }
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                Ok(())
+            })();
+            if let Err(error) = ended {
+                // The real tails were attempted. Every mapped input still owned by this window (old or
+                // reserved suffix) remains unfiled; a previously durable prefix is never marked again.
+                if let Some(cut) = window.rolling.as_ref().and_then(|owner| owner.pending) {
+                    writer.mark_incomplete_to(cut.track_ends);
+                }
+                writer.mark_incomplete_to([
+                    writer
+                        .decode_quality
+                        .input_frames(corti_core::QualityTrack::Mic),
+                    writer
+                        .decode_quality
+                        .input_frames(corti_core::QualityTrack::Tap),
+                ]);
+                writer.freeze_live_quality(&quality)?;
+                return Err(error);
+            }
+        } else {
+            let mic_words =
+                writer.call_channel(corti_core::QualityTrack::Mic, &mut mic, LiveChannel::finish);
+            publish_mic_words(&mut window, publisher, mic_words);
+            let them_words = writer.call_channel(
+                corti_core::QualityTrack::Tap,
+                &mut them,
+                LiveChannel::finish,
+            );
+            publish_them_words(&mut window, publisher, them_words);
+        }
+        // The session is over: every held region is judged now against everything the far end ever said in
+        // range, and published or dropped. Nothing waits past the last append.
+        release_held_mic_words(&mut window, publisher);
+        let early_drop = window.early_drop.stats;
+        // Freeze after both decoder tails, including failure-only outcomes. Keep it available even if
+        // the final append fails and the session's error boundary takes ownership of the partial note.
+        writer.freeze_live_quality(&quality)?;
+        if let Err(error) = flush_window(&diarizer, &mut window, writer) {
+            writer.mark_incomplete();
+            writer.freeze_live_quality(&quality)?;
+            return Err(error);
+        }
+        if early_drop != EarlyDropStats::default() {
+            info!(
+                target: "corti::live",
+                held = early_drop.held,
+                released_published = early_drop.released_published,
+                released_dropped = early_drop.released_dropped,
+                "live early drop of short mic echoes"
+            );
+        }
+
+        let mismatch_count = writer.mismatches.count();
+        let capture = writer.freeze_live_quality(&quality)?;
+        window.persist_evidence(writer, Some(&capture));
+        writer.settle_capture_quality(&capture, quality.capture.is_some())?;
+        // Capture authority already retains unchanged facts. Carry any additional settled facts through
+        // successful completion too; ordinary metadata capacity does not require a fallback or new ASR.
+        let settled_quality =
+            (capture != quality.capture.clone().unwrap_or_default()).then(|| capture.clone());
+        match writer.path().cloned() {
+            Some(note_path)
+                if quality.dropped_chunks == 0
+                    && capture.completeness() == corti_core::SourceCompleteness::Complete =>
+            {
+                let mut applied_call_ids = Vec::new();
+                if let (Some(hosted), Some(recording_id), Some(raw_transcript)) = (
+                    publisher.hosted(),
+                    publisher.recording_id(),
+                    writer.final_transcript(),
+                ) {
+                    let hosted_snapshot = hosted.snapshot();
+                    if hosted_snapshot.control.master_enabled
+                        && hosted_snapshot.control.final_lane.enabled
+                        && let Some(evidence) = window.evidence.as_mut()
+                    {
+                        evidence.provider_input(&raw_transcript);
+                    }
+                    let settled = hosted.finalize(recording_id, raw_transcript, true);
+                    // A disabled default has no calls and preserves the exact historical flip-only behavior.
+                    // An attempted final (success or typed fallback) rewrites once while still transcribing so
+                    // provenance and the selected safe body become durable before publication.
+                    if settled.hosted_text_applied {
+                        if hosted.mark_final_applied(&settled.call_ids).is_ok() {
+                            // This is accepted selected app output, not a note-commit certificate.
+                            // Persist it before the note can expose the new prose, as batch does.
+                            if let Some(evidence) = window.evidence.as_mut() {
+                                evidence.final_prose(&settled.transcript, true);
+                            }
+                            window.persist_evidence(writer, Some(&capture));
+                            if let Err(error) = writer.rewrite_settled_final(&settled) {
+                                let _ = hosted.abandon_final_result(&settled.call_ids);
+                                return Err(error);
+                            }
+                            applied_call_ids = settled.call_ids;
+                        } else {
+                            let _ = hosted.abandon_final_result(&settled.call_ids);
+                            window.persist_evidence(writer, Some(&capture));
+                        }
+                    } else if !settled.call_ids.is_empty() {
+                        if let Some(evidence) = window.evidence.as_mut() {
+                            evidence.final_prose(&settled.transcript, false);
+                        }
+                        window.persist_evidence(writer, Some(&capture));
+                        writer.rewrite_settled_final(&settled)?;
+                    } else {
+                        window.persist_evidence(writer, Some(&capture));
+                    }
+                }
+                corti_vagus::note::flip_state(&note_path)
+                    .context("flipping the note's state line")?;
+                if let Some(hosted) = publisher.hosted() {
+                    hosted
+                        .mark_final_checkpointed(&applied_call_ids)
+                        .map_err(|code| {
+                            anyhow::anyhow!("acknowledging hosted Final note failed: {code}")
+                        })?;
+                }
+                info!(
+                    target: "corti::live",
+                    note_path = %note_path.display(),
+                    "live note finalized — final chunk and state are synced"
+                );
+                Ok(LiveOutcome::Filed {
+                    note_path,
+                    settled_quality,
+                })
+            }
+            Some(note_path) => Ok(LiveOutcome::Fallback {
+                reason: format!(
+                    "capture completeness {:?}; live tee dropped {} chunk(s); mic/tap mismatched {} chunk(s)",
+                    capture.completeness(),
+                    quality.dropped_chunks,
+                    mismatch_count
+                ),
+                note_path: Some(note_path),
+                settled_quality: Some(capture),
+            }),
+            None if capture.requires_batch_recovery() => Ok(LiveOutcome::Fallback {
+                reason: "live processing coverage is incomplete".into(),
+                note_path: None,
+                settled_quality: Some(capture),
+            }),
+            None => Ok(LiveOutcome::NoNote { settled_quality }),
+        }
+    }));
+    match completed {
+        Ok(result) => result,
+        Err(payload) => {
+            // Channel calls drain their reports before unwinding. Preserve every still-unfiled
+            // received interval too, even when a panic bypasses the ordinary Result handler.
+            // The writer advances this ownership only after a successful durable append.
+            if rolling_owner {
+                writer.mark_incomplete_to([
+                    writer
+                        .decode_quality
+                        .input_frames(corti_core::QualityTrack::Mic),
+                    writer
+                        .decode_quality
+                        .input_frames(corti_core::QualityTrack::Tap),
+                ]);
+            }
+            let _ = writer.freeze_live_quality(&quality);
+            std::panic::resume_unwind(payload)
+        }
     }
 }
 
@@ -2562,6 +3684,23 @@ trait LiveChannel {
     fn decode_complete(&self) -> bool {
         true
     }
+    fn boundary_snapshot(&self) -> Option<ChannelBoundarySnapshot> {
+        None
+    }
+    fn latch_boundary(
+        &mut self,
+        _frame: u64,
+        _kind: BoundaryKind,
+        _reset: bool,
+    ) -> Result<ChannelBoundaryToken> {
+        anyhow::bail!("live channel does not support rolling ownership")
+    }
+    fn advance_boundary(&mut self, _ended: bool) -> Result<ChannelBoundaryProgress> {
+        anyhow::bail!("live channel does not support rolling ownership")
+    }
+    fn acknowledge_boundary(&mut self, _token: ChannelBoundaryToken) -> Result<()> {
+        anyhow::bail!("live channel does not support rolling ownership")
+    }
 }
 
 #[cfg(feature = "local")]
@@ -2583,6 +3722,64 @@ impl LiveChannel for corti_transcribe_local::LiveTranscriber {
     }
     fn decode_complete(&self) -> bool {
         corti_transcribe_local::LiveTranscriber::decode_complete(self)
+    }
+    fn boundary_snapshot(&self) -> Option<ChannelBoundarySnapshot> {
+        corti_transcribe_local::LiveTranscriber::boundary_snapshot(self).map(|snapshot| {
+            ChannelBoundarySnapshot {
+                natural: snapshot.natural,
+                delivered_through: snapshot.delivered_through,
+                epoch_remaining: snapshot.epoch_remaining,
+            }
+        })
+    }
+    fn latch_boundary(
+        &mut self,
+        frame: u64,
+        kind: BoundaryKind,
+        reset: bool,
+    ) -> Result<ChannelBoundaryToken> {
+        let kind = match (kind, reset) {
+            (BoundaryKind::Natural, false) => corti_transcribe_local::BoundaryKind::Natural,
+            (BoundaryKind::Natural, true) => {
+                corti_transcribe_local::BoundaryKind::NaturalMaintenance
+            }
+            (BoundaryKind::Forced(_), _) => corti_transcribe_local::BoundaryKind::Forced,
+        };
+        corti_transcribe_local::LiveTranscriber::latch_boundary(self, frame, kind)
+            .map(ChannelBoundaryToken::Native)
+            .map_err(|error| anyhow::anyhow!("live boundary latch failed: {error:?}"))
+    }
+    fn advance_boundary(&mut self, ended: bool) -> Result<ChannelBoundaryProgress> {
+        let input = if ended {
+            corti_transcribe_local::BoundaryInput::SourceEnded
+        } else {
+            corti_transcribe_local::BoundaryInput::Continue
+        };
+        match corti_transcribe_local::LiveTranscriber::advance_boundary(self, input) {
+            corti_transcribe_local::BoundaryProgress::Waiting => {
+                Ok(ChannelBoundaryProgress::Waiting)
+            }
+            corti_transcribe_local::BoundaryProgress::OldSettled(token) => Ok(
+                ChannelBoundaryProgress::Settled(ChannelBoundaryToken::Native(token)),
+            ),
+            corti_transcribe_local::BoundaryProgress::Ended => Ok(ChannelBoundaryProgress::Ended),
+            corti_transcribe_local::BoundaryProgress::TerminalUnsettled(error) => {
+                anyhow::bail!("live boundary remained unsettled: {error:?}")
+            }
+        }
+    }
+    fn acknowledge_boundary(&mut self, token: ChannelBoundaryToken) -> Result<()> {
+        match token {
+            ChannelBoundaryToken::Native(token) => {
+                corti_transcribe_local::LiveTranscriber::acknowledge_boundary(self, token).map_err(
+                    |error| anyhow::anyhow!("live boundary acknowledgement failed: {error:?}"),
+                )
+            }
+            #[cfg(test)]
+            ChannelBoundaryToken::Scripted(_) => {
+                anyhow::bail!("scripted token supplied to native channel")
+            }
+        }
     }
 }
 
@@ -2641,6 +3838,7 @@ impl NoteFiler for VagusFiler {
 /// OS-synced write. Reports the created path to the pipeline (`PipelineMsg::LiveNoteCreated`) only after
 /// the initial note + directory entry are synced.
 struct NoteWriter<F: NoteFiler> {
+    evidence_config: Option<SharedConfig>,
     filer: F,
     meta: RecordingMeta,
     provenance: corti_vagus::provenance::TranscriptProvenance,
@@ -2658,6 +3856,11 @@ struct NoteWriter<F: NoteFiler> {
     /// Original Finish authority, never a previously settled snapshot. Tail errors can add facts
     /// after the first freeze; fallback recomputes from this baseline without recounting omissions.
     finish_capture: Option<corti_core::QualityRecord>,
+    activity: Option<corti_core::ChannelActivity>,
+    /// Supplementary observations only; Finish supplies capture/storage authority.
+    activity_quality: corti_core::QualityRecord,
+    saw_live_mic: bool,
+    live_aec_ran: bool,
 }
 
 impl<F: NoteFiler> NoteWriter<F> {
@@ -2680,6 +3883,7 @@ impl<F: NoteFiler> NoteWriter<F> {
         provenance: corti_vagus::provenance::TranscriptProvenance,
     ) -> Self {
         Self {
+            evidence_config: None,
             filer,
             meta,
             provenance,
@@ -2694,7 +3898,51 @@ impl<F: NoteFiler> NoteWriter<F> {
             delivered_input_frames: [0; 2],
             window_input_start: [0; 2],
             finish_capture: None,
+            activity: None,
+            activity_quality: corti_core::QualityRecord::default(),
+            saw_live_mic: false,
+            live_aec_ran: false,
         }
+    }
+
+    /// The tee carries normalized/downmixed samples before capture or live AEC. Observe the real
+    /// slices and availability before padding, decoder admission, or any fallible downstream work.
+    fn observe_activity(&mut self, chunk: &CaptureChunk, sample_rate: u32) {
+        use corti_core::{ActivityBlock, ActivityInput, ActivityScope, ChannelActivity};
+        self.saw_live_mic |= !chunk.mic.is_empty();
+        if self.activity.is_none()
+            && let Some(identity) = self
+                .meta
+                .audio_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+        {
+            let mut binding = ring::digest::Context::new(&ring::digest::SHA256);
+            binding.update(b"corti.pre-aec.downmix.v1\0");
+            binding.update(identity.as_bytes());
+            let digest: [u8; 32] = binding.finish().as_ref().try_into().expect("SHA256 length");
+            self.activity = ActivityInput::new(digest, sample_rate)
+                .and_then(|input| ChannelActivity::new(ActivityScope::Live, input))
+                .ok();
+        }
+        let Some(activity) = &mut self.activity else {
+            return;
+        };
+        // This bounded scratch mapping cannot claim omitted capture epochs. A missing/capped
+        // mapping is counted by the tracker as an omitted diagnostic run, never source loss.
+        if self.activity_quality.epochs.len() < corti_core::MAX_QUALITY_EPOCHS {
+            let _ = self.activity_quality.insert_epoch(chunk.epoch);
+        }
+        let _ = activity.push(
+            ActivityBlock {
+                epoch: chunk.epoch,
+                retained_start: chunk.retained_start_frame,
+                mic: &chunk.mic,
+                tap: &chunk.tap,
+                unavailable: Some(&chunk.unavailable),
+            },
+            &mut self.activity_quality,
+        );
     }
 
     fn freeze_live_quality(&mut self, finish: &FinishQuality) -> Result<corti_core::QualityRecord> {
@@ -2707,13 +3955,37 @@ impl<F: NoteFiler> NoteWriter<F> {
         } else {
             self.finish_capture = Some(capture.clone());
         }
-        Ok(self
+        if let Some(activity) = &mut self.activity {
+            let live = self
+                .activity_quality
+                .activity
+                .get(corti_core::ActivityScope::Live);
+            let source = capture.activity.get(corti_core::ActivityScope::Capture);
+            let authoritative_end = (live.unambiguous_input().is_some()
+                && live.unambiguous_input() == source.unambiguous_input()
+                && self
+                    .activity_quality
+                    .epochs
+                    .iter()
+                    .all(|epoch| capture.epochs.contains(epoch)))
+            .then(|| source.complete_end_frame())
+            .flatten();
+            activity.finish(authoritative_end, &mut self.activity_quality)?;
+        }
+        let mut quality = self
             .decode_quality
-            .settle(&self.mismatches.settle(&capture)?)?)
+            .settle(&self.mismatches.settle(&capture)?)?;
+        quality.merge_activity_snapshot(&self.activity_quality)?;
+        Ok(quality)
     }
 
     fn fallback_quality(&self) -> Option<corti_core::QualityRecord> {
-        self.finish_capture
+        let mut activity_quality = self.activity_quality.clone();
+        if let Some(mut activity) = self.activity.clone() {
+            activity.finish(None, &mut activity_quality).ok()?;
+        }
+        let mut quality = self
+            .finish_capture
             .as_ref()
             .and_then(|capture| {
                 self.mismatches
@@ -2730,9 +4002,23 @@ impl<F: NoteFiler> NoteWriter<F> {
                         .merge_snapshot(&self.mismatches.provisional_quality())
                         .ok()?;
                 }
-                (!quality.spans.is_empty() || quality.overflow != Default::default())
-                    .then_some(quality)
-            })
+                Some(quality)
+            })?;
+        if self.finish_capture.is_none() {
+            // Preserve supplementary mappings without changing the existing provisional coverage
+            // or claiming source omissions. The pipeline still reloads mandatory capture authority.
+            for epoch in &activity_quality.epochs {
+                if quality.epochs.len() < corti_core::MAX_QUALITY_EPOCHS {
+                    let _ = quality.insert_epoch(*epoch);
+                }
+            }
+        }
+        quality.merge_activity_snapshot(&activity_quality).ok()?;
+        (!quality.spans.is_empty()
+            || quality.overflow != Default::default()
+            || quality.activity != Default::default()
+            || self.finish_capture.is_some())
+        .then_some(quality)
     }
 
     /// Keep already-produced facts if a later region panics in this same decoder call. The original
@@ -2767,6 +4053,10 @@ impl<F: NoteFiler> NoteWriter<F> {
 
     fn advance_window(&mut self) {
         self.window_input_start = self.delivered_input_frames;
+    }
+
+    fn advance_window_to(&mut self, ends: [u64; 2]) {
+        self.window_input_start = ends;
     }
 
     fn delivered_input(&mut self, track: corti_core::QualityTrack, frames: usize) -> Result<()> {
@@ -2820,6 +4110,10 @@ impl<F: NoteFiler> NoteWriter<F> {
     /// Abandon the assembled final transcript: a dropped window leaves the note with a gap only the batch
     /// pass can fill, so it must not be published as canonical.
     fn mark_incomplete(&mut self) {
+        self.mark_incomplete_to(self.delivered_input_frames);
+    }
+
+    fn mark_incomplete_to(&mut self, ends: [u64; 2]) {
         for (index, track) in [corti_core::QualityTrack::Mic, corti_core::QualityTrack::Tap]
             .into_iter()
             .enumerate()
@@ -2828,11 +4122,11 @@ impl<F: NoteFiler> NoteWriter<F> {
                 track,
                 InputSpan {
                     start_frame: self.window_input_start[index],
-                    end_frame: self.delivered_input_frames[index],
+                    end_frame: ends[index],
                 },
             );
         }
-        self.advance_window();
+        self.advance_window_to(ends);
         self.final_segments.clear();
         self.final_transcript_bytes = 0;
         self.final_ledger_unavailable = true;
@@ -2882,12 +4176,25 @@ impl<F: NoteFiler> NoteWriter<F> {
         } else {
             crate::transcribe::RecordingStorageStatus::LegacyUnknown
         };
+        crate::provenance::observe_live_aec_execution(
+            &mut self.provenance,
+            self.live_aec_ran,
+            self.saw_live_mic,
+        );
         crate::provenance::attach_quality(&mut self.provenance, quality, Some(storage))?;
         let partial = quality.completeness() != corti_core::SourceCompleteness::Complete;
-        if self.note.is_none()
-            && partial
-            && (!quality.spans.is_empty() || quality.overflow != Default::default())
-        {
+        // Unknown authority is preserved, but diagnostic-only facts cannot create a partial note
+        // and thereby select fallback for an otherwise empty transcript.
+        let has_loss_history = quality
+            .spans
+            .iter()
+            .any(|span| span.class != corti_core::QualityClass::DegradedOnly)
+            || quality.overflow.omitted_spans[..2]
+                .iter()
+                .any(|&count| count != 0)
+            || quality.overflow.omitted_epochs != 0
+            || quality.overflow.counter_saturated;
+        if self.note.is_none() && partial && has_loss_history {
             self.create()?;
         }
         if let Some(path) = &self.note {
@@ -2946,6 +4253,11 @@ impl<F: NoteFiler> NoteWriter<F> {
     /// owned by the writer so `session_thread` returns it in `LiveOutcome::Fallback` for reaper/pipeline
     /// cleanup instead of forgetting the only reference.
     fn discard(&mut self) -> Result<()> {
+        // Capture owns audio/mandatory-quality deletion. Optional text follows that recording's
+        // discard even when no vault note exists or a later note unlink fails.
+        if crate::evidence::remove(&self.meta.audio_path).is_err() {
+            crate::evidence::unavailable();
+        }
         let Some(path) = self.note.as_ref() else {
             return Ok(());
         };
@@ -2996,6 +4308,702 @@ mod tests {
             ended_at: None,
             owning_app: OwningApp::from_bundle_id("us.zoom.xos"),
             audio_path: PathBuf::from("/tmp/rec.wav"),
+        }
+    }
+
+    #[test]
+    fn activity_live_observes_raw_input_across_windows_and_refreshes_owned_note() {
+        use corti_core::{
+            ActivityBlock, ActivityScope, ChannelActivity, FarReference, QualityRecord,
+        };
+        use corti_vagus::provenance::GenerationMode;
+        use std::os::unix::fs::MetadataExt;
+        let rate = 8_000;
+        let raw_mic = vec![0.01; rate as usize * 5];
+        let raw_tap = vec![0.0; raw_mic.len()];
+        for enabled in [false, true] {
+            for with_words in [false, true] {
+                for ledger_capped in [false, true] {
+                    let cfg = crate::config::AppConfig {
+                        aec_enabled: enabled,
+                        ..Default::default()
+                    };
+                    let provenance = crate::provenance::from_config_with_aec(
+                        &cfg,
+                        GenerationMode::Live,
+                        crate::provenance::AecExecution::Live,
+                        false,
+                    );
+                    let filer = TempFiler::new(&format!(
+                        "activity-live-{enabled}-{with_words}-{ledger_capped}"
+                    ));
+                    let note = filer.note();
+                    let mut writer = NoteWriter::with_provenance(filer, meta(), None, provenance);
+                    let words = if with_words {
+                        vec![vec![word(0.0, 0.2, "Synthetic durable body.")]]
+                    } else {
+                        vec![]
+                    };
+                    let mut mic = Scripted::new(words, vec![]);
+                    let mut tap = Scripted::new(vec![], vec![]);
+                    let mic_audio = mic.audio.clone();
+                    let tap_audio = tap.audio.clone();
+                    let mut window =
+                        TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+                    window.frame_limit = u64::from(rate);
+                    let mut aec =
+                        enabled.then(|| new_live_aec(rate, corti_aec::AecConfig::default()));
+                    let epoch = fixture_epoch(rate, true, true);
+                    for (index, samples) in raw_mic.chunks(4_096).enumerate() {
+                        let (tx, rx) = sync_channel(1);
+                        tx.send(CaptureChunk {
+                            epoch,
+                            retained_start_frame: (index * 4_096) as u64,
+                            mic: samples.to_vec(),
+                            tap: vec![0.0; samples.len()],
+                            unavailable: vec![],
+                        })
+                        .unwrap();
+                        drop(tx);
+                        consume_chunks(
+                            &rx,
+                            rate,
+                            &mut aec,
+                            &mut mic,
+                            &mut tap,
+                            &NoDiarizer,
+                            &mut window,
+                            &mut writer,
+                            &NoopPublisher,
+                        )
+                        .unwrap();
+                    }
+                    // The open run is available before Finish, independent of text/window rotation.
+                    assert!(
+                        writer
+                            .activity_quality
+                            .activity
+                            .get(ActivityScope::Live)
+                            .suspected()
+                    );
+                    assert_eq!(
+                        writer
+                            .activity_quality
+                            .activity
+                            .get(ActivityScope::Live)
+                            .far_reference(),
+                        FarReference::Unknown
+                    );
+                    assert!(
+                        writer
+                            .activity_quality
+                            .spans
+                            .iter()
+                            .any(|span| span.stage == corti_core::QualityStage::Live
+                                && span.start_frame == 0
+                                && span.end_frame == 40_000)
+                    );
+                    let inode = with_words.then(|| std::fs::metadata(&note).unwrap().ino());
+                    let original_body =
+                        with_words.then(|| read(&note).split("\n---\n").last().unwrap().to_owned());
+                    if ledger_capped {
+                        writer.final_segments.clear();
+                        writer.final_ledger_unavailable = true;
+                    }
+                    let input = writer
+                        .activity_quality
+                        .activity
+                        .get(ActivityScope::Live)
+                        .unambiguous_input()
+                        .unwrap();
+                    let mut capture = QualityRecord::observed();
+                    capture.insert_epoch(epoch).unwrap();
+                    let mut source = ChannelActivity::new(ActivityScope::Capture, input).unwrap();
+                    source
+                        .push(
+                            ActivityBlock {
+                                epoch,
+                                retained_start: 0,
+                                mic: &raw_mic,
+                                tap: &raw_tap,
+                                unavailable: Some(&[]),
+                            },
+                            &mut capture,
+                        )
+                        .unwrap();
+                    source
+                        .finish(Some(raw_mic.len() as u64), &mut capture)
+                        .unwrap();
+                    let outcome = finish_session(
+                        rate,
+                        aec,
+                        mic,
+                        tap,
+                        NoDiarizer,
+                        window,
+                        FinishQuality {
+                            dropped_chunks: 0,
+                            capture: Some(capture.clone()),
+                        },
+                        &mut writer,
+                        &NoopPublisher,
+                    )
+                    .unwrap();
+                    let quality = match outcome {
+                        LiveOutcome::Filed {
+                            settled_quality: Some(quality),
+                            ..
+                        } if with_words => quality,
+                        LiveOutcome::NoNote {
+                            settled_quality: Some(quality),
+                        } if !with_words => quality,
+                        _ => panic!("activity alone must not select fallback or create a note"),
+                    };
+                    assert_eq!(
+                        quality.completeness(),
+                        corti_core::SourceCompleteness::Complete
+                    );
+                    assert!(!quality.requires_batch_recovery());
+                    assert_eq!(
+                        quality.activity.get(ActivityScope::Live).far_reference(),
+                        FarReference::Absent
+                    );
+                    assert_eq!(
+                        quality
+                            .activity
+                            .get(ActivityScope::Live)
+                            .complete_end_frame(),
+                        Some(40_000)
+                    );
+                    assert_eq!(
+                        writer
+                            .freeze_live_quality(&FinishQuality {
+                                dropped_chunks: 0,
+                                capture: Some(capture)
+                            })
+                            .unwrap(),
+                        quality
+                    );
+                    assert_eq!(writer.fallback_quality(), Some(quality));
+                    assert_eq!(
+                        writer.provenance.configuration["aec"]["outcome"],
+                        if enabled {
+                            "no_far_reference"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    assert_eq!(
+                        writer.provenance.configuration["aec"]["far_reference"],
+                        "absent"
+                    );
+                    if enabled {
+                        assert_eq!(
+                            writer.provenance.configuration["aec"]["lookahead_seconds"]
+                                .as_f64()
+                                .unwrap() as f32,
+                            0.1
+                        );
+                    }
+                    assert_eq!(*tap_audio.borrow(), raw_tap);
+                    let expected = if enabled {
+                        let mut reference = new_live_aec(rate, corti_aec::AecConfig::default());
+                        let mut output = Vec::new();
+                        for samples in raw_mic.chunks(4_096) {
+                            output.extend(reference.push(samples, &vec![0.0; samples.len()]));
+                        }
+                        output.extend(reference.finish());
+                        output
+                    } else {
+                        raw_mic.clone()
+                    };
+                    assert_eq!(
+                        *mic_audio.borrow(),
+                        expected,
+                        "diagnostics cannot change decoder input"
+                    );
+                    if let Some(inode) = inode {
+                        assert_eq!(std::fs::metadata(&note).unwrap().ino(), inode);
+                        let after = read(&note);
+                        assert_eq!(after.matches("Synthetic durable body.").count(), 1);
+                        assert!(after.contains("State: transcribed "));
+                        assert_eq!(
+                            after.split("\n---\n").last().unwrap(),
+                            original_body
+                                .unwrap()
+                                .replace("State: transcribing", "State: transcribed ")
+                        );
+                        assert!(after.contains(if enabled {
+                            "no_far_reference"
+                        } else {
+                            "disabled"
+                        }));
+                    } else {
+                        assert!(!note.exists());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn activity_live_requires_matching_terminal_authority_and_never_observes_fill() {
+        use corti_core::{
+            ActivityBlock, ActivityInput, ActivityScope, ChannelActivity, FarReference,
+            QualityRecord,
+        };
+        for mode in [
+            "complete",
+            "no_finish",
+            "wrong_input",
+            "wrong_extent",
+            "missing_prefix",
+            "unavailable",
+            "bad_bitmap",
+            "missing_tap",
+            "epoch_conflict",
+            "panic",
+        ] {
+            let rate = 8;
+            let epoch = fixture_epoch(rate, true, true);
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("activity-proof-{mode}")),
+                meta(),
+                None,
+            );
+            let mut mic = Scripted::new(vec![], vec![]);
+            mic.panic_on_push = (mode == "panic").then_some(1);
+            let mut tap = Scripted::new(vec![], vec![]);
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch,
+                retained_start_frame: u64::from(mode == "missing_prefix"),
+                mic: vec![0.01; 40],
+                tap: if mode == "missing_tap" {
+                    vec![]
+                } else {
+                    vec![0.0; 40]
+                },
+                unavailable: match mode {
+                    "unavailable" => vec![true; 40],
+                    "bad_bitmap" => vec![true],
+                    _ => vec![],
+                },
+            })
+            .unwrap();
+            drop(tx);
+            let result = consume_with_panic_boundary(|| {
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut None,
+                    &mut mic,
+                    &mut tap,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+            });
+            assert_eq!(result.is_err(), mode == "bad_bitmap" || mode == "panic");
+            let input = writer
+                .activity_quality
+                .activity
+                .get(ActivityScope::Live)
+                .unambiguous_input()
+                .unwrap();
+            let mut capture = QualityRecord::observed();
+            capture
+                .insert_epoch(if mode == "epoch_conflict" {
+                    corti_core::CaptureEpoch {
+                        source_rate_hz: 16,
+                        ..epoch
+                    }
+                } else {
+                    epoch
+                })
+                .unwrap();
+            let mut source = ChannelActivity::new(
+                ActivityScope::Capture,
+                if mode == "wrong_input" {
+                    ActivityInput::new([19; 32], rate).unwrap()
+                } else {
+                    input
+                },
+            )
+            .unwrap();
+            let length = if mode == "wrong_extent" { 41 } else { 40 };
+            source
+                .push(
+                    ActivityBlock {
+                        epoch,
+                        retained_start: 0,
+                        mic: &vec![0.01; length],
+                        tap: &vec![0.0; length],
+                        unavailable: Some(&[]),
+                    },
+                    &mut capture,
+                )
+                .unwrap();
+            source.finish(Some(length as u64), &mut capture).unwrap();
+            let quality = if mode == "no_finish" {
+                writer.fallback_quality().unwrap()
+            } else {
+                writer
+                    .freeze_live_quality(&FinishQuality {
+                        dropped_chunks: 0,
+                        capture: Some(capture),
+                    })
+                    .unwrap()
+            };
+            let evidence = quality.activity.get(ActivityScope::Live);
+            assert_eq!(
+                evidence.far_reference(),
+                if mode == "complete" || mode == "panic" {
+                    FarReference::Absent
+                } else {
+                    FarReference::Unknown
+                },
+                "{mode}"
+            );
+            assert_eq!(
+                evidence.suspected(),
+                !matches!(mode, "unavailable" | "bad_bitmap" | "missing_tap"),
+                "{mode}"
+            );
+            if mode == "epoch_conflict" {
+                assert_eq!(evidence.omitted_runs(), 1);
+                assert_eq!(
+                    quality.completeness(),
+                    corti_core::SourceCompleteness::Complete
+                );
+            }
+            assert!(!quality.overflow.counter_saturated);
+            if mode != "missing_tap" {
+                assert!(!quality.requires_batch_recovery(), "{mode}");
+            }
+            assert_eq!(writer.fallback_quality().unwrap(), quality);
+        }
+    }
+
+    #[test]
+    fn activity_live_epoch_cap_is_diagnostic_and_source_projection_stays_exact() {
+        use corti_core::{ActivityScope, FarReference, QualityRecord};
+        let mut writer = NoteWriter::new(TempFiler::new("activity-live-epochs"), meta(), None);
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut tap = Scripted::new(vec![], vec![]);
+        let mut window = TranscriptWindow::new(8, 1, false, CleanupConfig::default()).unwrap();
+        let mut capture = QualityRecord::observed();
+        for id in 0..80 {
+            let epoch = corti_core::CaptureEpoch {
+                id,
+                source_rate_hz: 16,
+                source_frame_base: u64::from(id) * 80,
+                retained_start_frame: u64::from(id) * 40,
+                source_start_ns: Some(u64::from(id) * 5_000_000_000),
+                reason: if id == 0 {
+                    corti_core::CaptureEpochReason::Start
+                } else {
+                    corti_core::CaptureEpochReason::HostDiscontinuity
+                },
+                ..fixture_epoch(8, true, true)
+            };
+            if id < 64 {
+                capture.insert_epoch(epoch).unwrap();
+            }
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch,
+                retained_start_frame: u64::from(id) * 40,
+                mic: vec![0.01; 40],
+                tap: vec![0.0; 40],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                8,
+                &mut None,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+        }
+        let before = writer.activity_quality.clone();
+        assert_eq!(before.epochs.len(), 64);
+        assert_eq!(before.overflow.omitted_epochs, 0);
+        assert_eq!(before.activity.get(ActivityScope::Live).omitted_runs(), 16);
+        let finish = FinishQuality {
+            dropped_chunks: 0,
+            capture: Some(capture.clone()),
+        };
+        let quality = writer.freeze_live_quality(&finish).unwrap();
+        assert_eq!(quality.epochs, capture.epochs);
+        assert_eq!(
+            quality.completeness(),
+            corti_core::SourceCompleteness::Complete
+        );
+        assert!(!quality.requires_batch_recovery());
+        assert_eq!(quality.overflow.omitted_epochs, 0);
+        assert_eq!(quality.overflow.omitted_spans, [0, 0, 16]);
+        assert!(!quality.overflow.counter_saturated);
+        assert_eq!(
+            quality.activity.get(ActivityScope::Live).far_reference(),
+            FarReference::Unknown
+        );
+        assert!(quality.activity.get(ActivityScope::Live).suspected());
+        assert_eq!(quality.spans.len(), 64);
+        for (id, span) in quality.spans.iter().enumerate() {
+            assert_eq!(
+                (span.epoch, span.start_frame, span.end_frame),
+                (id as u32, id as u64 * 80, id as u64 * 80 + 80)
+            );
+        }
+        assert_eq!(writer.freeze_live_quality(&finish).unwrap(), quality);
+        assert_eq!(writer.fallback_quality(), Some(quality));
+        assert!(writer.path().is_none());
+    }
+
+    #[test]
+    fn activity_live_execution_refresh_requires_actual_mic_input() {
+        use corti_vagus::provenance::GenerationMode;
+        for mode in ["empty", "tap_only", "short_mic"] {
+            let rate = 8_000;
+            let cfg = crate::config::AppConfig::default();
+            let provenance = crate::provenance::from_config_with_aec(
+                &cfg,
+                GenerationMode::Live,
+                crate::provenance::AecExecution::Live,
+                false,
+            );
+            let mut writer = NoteWriter::with_provenance(
+                TempFiler::new(&format!("activity-execution-{mode}")),
+                meta(),
+                None,
+                provenance,
+            );
+            let mut mic = Scripted::new(vec![], vec![]);
+            let mut tap = Scripted::new(vec![], vec![]);
+            let mut aec = Some(new_live_aec(rate, corti_aec::AecConfig::default()));
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            let epoch = fixture_epoch(rate, mode == "short_mic", true);
+            let (tx, rx) = sync_channel(1);
+            if mode != "empty" {
+                tx.send(CaptureChunk {
+                    epoch,
+                    retained_start_frame: 0,
+                    mic: if mode == "short_mic" {
+                        vec![0.01; 16]
+                    } else {
+                        vec![]
+                    },
+                    tap: vec![0.01; 16],
+                    unavailable: vec![],
+                })
+                .unwrap();
+            }
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut aec,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert!(
+                mic.audio.borrow().is_empty(),
+                "short mic remains in real AEC lookahead"
+            );
+            let received = mic.audio.clone();
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            let outcome = finish_session(
+                rate,
+                aec,
+                mic,
+                tap,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert!(matches!(outcome, LiveOutcome::NoNote { .. }));
+            assert_eq!(
+                received.borrow().len(),
+                if mode == "short_mic" { 16 } else { 0 }
+            );
+            assert_eq!(
+                writer.provenance.configuration["aec"]["execution_outcome"],
+                if mode == "short_mic" {
+                    "applied"
+                } else {
+                    "not_applicable"
+                }
+            );
+            assert_eq!(
+                writer.provenance.configuration["aec"]["far_reference"],
+                if mode == "empty" {
+                    "unknown"
+                } else {
+                    "present"
+                }
+            );
+            assert!(writer.path().is_none());
+        }
+    }
+
+    #[test]
+    fn activity_live_unknown_authority_keeps_empty_asr_note_free() {
+        for mode in [
+            "missing",
+            "legacy_unmapped",
+            "legacy_mapped",
+            "generic_degraded",
+            "source_loss",
+            "processing_loss",
+            "epoch_omission",
+            "global_saturation",
+        ] {
+            let epoch = fixture_epoch(8, true, true);
+            let filer = TempFiler::new(&format!("activity-unknown-authority-{mode}"));
+            let note = filer.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let mut mic = Scripted::new(vec![], vec![]);
+            let mut tap = Scripted::new(vec![], vec![]);
+            let mut window = TranscriptWindow::new(8, 1, false, CleanupConfig::default()).unwrap();
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                epoch,
+                retained_start_frame: 0,
+                mic: vec![0.01; 40],
+                tap: vec![0.0; 40],
+                unavailable: vec![],
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                8,
+                &mut None,
+                &mut mic,
+                &mut tap,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            let mut capture = corti_core::QualityRecord::default();
+            if mode != "legacy_unmapped" {
+                capture.insert_epoch(epoch).unwrap();
+            }
+            let loss = matches!(
+                mode,
+                "source_loss" | "processing_loss" | "epoch_omission" | "global_saturation"
+            );
+            match mode {
+                "source_loss" | "processing_loss" => {
+                    let processing = mode == "processing_loss";
+                    capture
+                        .insert_span(corti_core::QualitySpan {
+                            epoch: 0,
+                            start_frame: 0,
+                            end_frame: 1,
+                            track: corti_core::QualityTrack::Mic,
+                            cause: if processing {
+                                corti_core::QualityCause::DecodeFailure
+                            } else {
+                                corti_core::QualityCause::RingOverflow
+                            },
+                            class: if processing {
+                                corti_core::QualityClass::ProcessingLoss
+                            } else {
+                                corti_core::QualityClass::SourceLoss
+                            },
+                            stage: if processing {
+                                corti_core::QualityStage::Live
+                            } else {
+                                corti_core::QualityStage::Capture
+                            },
+                            resolution: corti_core::QualityResolution::Outstanding,
+                        })
+                        .unwrap();
+                }
+                "epoch_omission" => capture.record_omitted_epochs(1),
+                "global_saturation" => capture.overflow.counter_saturated = true,
+                "generic_degraded" => capture
+                    .record_omitted_spans(
+                        corti_core::QualityClass::DegradedOnly,
+                        corti_core::QualityResolution::Outstanding,
+                        1,
+                    )
+                    .unwrap(),
+                _ => {}
+            }
+            let outcome = finish_session(
+                8,
+                None,
+                mic,
+                tap,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: (mode != "missing").then_some(capture),
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            assert_eq!(
+                note.exists(),
+                loss,
+                "diagnostic alone cannot create a partial note: {mode}"
+            );
+            let quality = match outcome {
+                LiveOutcome::NoNote {
+                    settled_quality: Some(quality),
+                } if !loss => quality,
+                LiveOutcome::Fallback {
+                    settled_quality: Some(quality),
+                    note_path: Some(_),
+                    ..
+                } if loss => quality,
+                _ => panic!("unexpected loss authority for {mode}"),
+            };
+            assert_eq!(
+                quality.completeness(),
+                if matches!(mode, "source_loss" | "processing_loss") {
+                    corti_core::SourceCompleteness::Incomplete
+                } else {
+                    corti_core::SourceCompleteness::Unknown
+                }
+            );
+            assert_eq!(quality.requires_batch_recovery(), mode == "processing_loss");
+            assert!(
+                quality
+                    .activity
+                    .get(corti_core::ActivityScope::Live)
+                    .suspected()
+            );
         }
     }
 
@@ -3273,6 +5281,22 @@ mod tests {
         finish_report: DecodeReport,
         pending_report: DecodeReport,
         decode_complete: bool,
+        checkpoints: usize,
+        natural_after: Option<(u64, SourceInterval)>,
+        boundary_token: Option<ChannelBoundaryToken>,
+        boundary_acks: usize,
+        boundary_ready_after: u64,
+        after_ack: Vec<Word>,
+        ack_note: Option<PathBuf>,
+        ack_filing_attempts: Option<std::rc::Rc<std::cell::Cell<usize>>>,
+        boundary_ended: bool,
+        boundary_report: DecodeReport,
+        boundary_report_stage: Option<&'static str>,
+        epoch_capacity: u64,
+        epoch_remaining: u64,
+        boundary_forced: bool,
+        natural_every_push: bool,
+        natural_lag: u64,
     }
 
     impl Scripted {
@@ -3293,13 +5317,46 @@ mod tests {
                 finish_report: DecodeReport::default(),
                 pending_report: DecodeReport::default(),
                 decode_complete: true,
+                checkpoints: 0,
+                natural_after: None,
+                boundary_token: None,
+                boundary_acks: 0,
+                boundary_ready_after: 0,
+                after_ack: Vec::new(),
+                ack_note: None,
+                ack_filing_attempts: None,
+                boundary_ended: false,
+                boundary_report: DecodeReport::default(),
+                boundary_report_stage: None,
+                epoch_capacity: u64::MAX,
+                epoch_remaining: u64::MAX,
+                boundary_forced: false,
+                natural_every_push: false,
+                natural_lag: 0,
             }
+        }
+
+        fn boundary_facts(&mut self, stage: &'static str) {
+            if self.boundary_report_stage == Some(stage) {
+                let report = std::mem::take(&mut self.boundary_report);
+                self.decode_complete &= report.is_complete();
+                self.pending_report.merge(report);
+                self.boundary_report_stage = None;
+            }
+            assert_ne!(
+                self.panic_after_report,
+                Some(stage),
+                "scripted boundary panic after report"
+            );
         }
     }
 
     impl LiveChannel for Scripted {
         fn push(&mut self, samples: &[f32], sample_rate: u32) {
             self.pushes.push(samples.len());
+            self.epoch_remaining = self
+                .epoch_remaining
+                .saturating_sub((samples.len() as u64 * 16_000).div_ceil(u64::from(sample_rate)));
             self.audio.borrow_mut().extend_from_slice(samples);
             self.sample_rate = sample_rate;
             assert_ne!(
@@ -3328,6 +5385,7 @@ mod tests {
             }
         }
         fn checkpoint(&mut self) -> Vec<Word> {
+            self.checkpoints += 1;
             let report = std::mem::take(&mut self.checkpoint_report);
             self.decode_complete &= report.is_complete();
             self.pending_report.merge(report);
@@ -3366,6 +5424,1789 @@ mod tests {
         fn decode_complete(&self) -> bool {
             self.decode_complete
         }
+        fn boundary_snapshot(&self) -> Option<ChannelBoundarySnapshot> {
+            let delivered_through = self.audio.borrow().len() as u64;
+            Some(ChannelBoundarySnapshot {
+                natural: if self.natural_every_push {
+                    Some(SourceInterval {
+                        first: 0,
+                        last: delivered_through.saturating_sub(self.natural_lag),
+                    })
+                } else {
+                    self.natural_after
+                        .filter(|(after, _)| delivered_through >= *after)
+                        .map(|(_, interval)| interval)
+                },
+                delivered_through,
+                epoch_remaining: self.epoch_remaining,
+            })
+        }
+        fn latch_boundary(
+            &mut self,
+            frame: u64,
+            kind: BoundaryKind,
+            reset: bool,
+        ) -> Result<ChannelBoundaryToken> {
+            self.boundary_facts("latch");
+            anyhow::ensure!(
+                self.boundary_token.is_none(),
+                "scripted fence already latched"
+            );
+            let token = ChannelBoundaryToken::Scripted(frame);
+            self.boundary_forced = matches!(kind, BoundaryKind::Forced(_)) || reset;
+            self.boundary_token = Some(token);
+            Ok(token)
+        }
+        fn advance_boundary(&mut self, ended: bool) -> Result<ChannelBoundaryProgress> {
+            self.boundary_facts(if ended { "end" } else { "advance" });
+            if ended && !self.boundary_ended {
+                self.boundary_ended = true;
+                self.pending.append(&mut self.tail);
+                self.pending_report
+                    .merge(std::mem::take(&mut self.finish_report));
+            }
+            if self.boundary_token.is_some()
+                && (self.audio.borrow().len() as u64) < self.boundary_ready_after
+            {
+                anyhow::ensure!(!ended, "scripted terminal unsettled boundary");
+                return Ok(ChannelBoundaryProgress::Waiting);
+            }
+            Ok(self.boundary_token.map_or(
+                ChannelBoundaryProgress::Ended,
+                ChannelBoundaryProgress::Settled,
+            ))
+        }
+        fn acknowledge_boundary(&mut self, token: ChannelBoundaryToken) -> Result<()> {
+            self.boundary_facts("ack");
+            anyhow::ensure!(
+                self.pending.is_empty() && self.boundary_token == Some(token),
+                "scripted ack before old drain"
+            );
+            if let Some(note) = &self.ack_note {
+                let text = std::fs::read_to_string(note)?;
+                anyhow::ensure!(
+                    text.contains("Synthetic old."),
+                    "suffix acknowledged before old filing"
+                );
+                anyhow::ensure!(
+                    !text.contains("Synthetic next."),
+                    "suffix leaked into old filing"
+                );
+            }
+            if let Some(attempts) = &self.ack_filing_attempts {
+                anyhow::ensure!(
+                    attempts.get() != 0,
+                    "suffix resumed before old append or drop"
+                );
+            }
+            self.boundary_token = None;
+            if self.boundary_forced {
+                self.epoch_remaining = self.epoch_capacity;
+            }
+            self.boundary_acks += 1;
+            self.pending.append(&mut self.after_ack);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn natural_historical_fence_retires_exact_prefix_without_checkpoint() {
+        struct ExactDiarizer(RefCell<Vec<(Vec<f32>, f64)>>);
+        impl LiveDiarizer for ExactDiarizer {
+            fn diarize_chunk(
+                &self,
+                pcm: &[f32],
+                _: u32,
+                start: f64,
+            ) -> Result<Option<Vec<SpeakerTurn>>> {
+                self.0.borrow_mut().push((pcm.to_vec(), start));
+                Ok(None)
+            }
+        }
+        let rate = 8_000;
+        let pcm: Vec<f32> = (0..48).map(|frame| frame as f32 / 64.0).collect();
+        let words = vec![
+            word(0.001, 0.002, "Synthetic"),
+            word(0.002, 0.0025, "sentence."),
+        ];
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![vec![], words.clone()], vec![]);
+        them.natural_after = Some((
+            32,
+            SourceInterval {
+                first: 20,
+                last: 24,
+            },
+        ));
+        let diarizer = ExactDiarizer(RefCell::new(Vec::new()));
+        let mut window = TranscriptWindow::new(
+            rate,
+            1,
+            true,
+            CleanupConfig {
+                echo_drop: false,
+                strip_fillers: false,
+                drop_backchannels: false,
+                merge_gap_seconds: 0.0,
+                ..CleanupConfig::default()
+            },
+        )
+        .unwrap();
+        window.frame_limit = 16;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 32)
+            .unwrap();
+        let filer = TempFiler::new("natural-historical-prefix");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let publisher = RecordingPublisher::default();
+        let (tx, rx) = sync_channel(2);
+        for start in [0, 16] {
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: pcm[start..start + 16].to_vec(),
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start as u64,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        consume_chunks(
+            &rx,
+            rate,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &diarizer,
+            &mut window,
+            &mut writer,
+            &publisher,
+        )
+        .unwrap();
+        // The closed region ends at20 after observation32. The admissible natural interval is
+        //20..=24; filing owns the earliest common cut20, not the nominal16 or observation32.
+        assert_eq!(
+            (
+                (mic.checkpoints, them.checkpoints),
+                diarizer.0.borrow().clone(),
+                window.tap_audio.clone(),
+                (window.start_frame, window.frames)
+            ),
+            (
+                (0, 0),
+                vec![(pcm[..20].to_vec(), 0.0)],
+                pcm[20..32].to_vec(),
+                (20, 12)
+            ),
+            "natural retirement preserves its exact PCM suffix and never checkpoints"
+        );
+        let published: Vec<_> = publisher
+            .0
+            .borrow()
+            .iter()
+            .flat_map(|(_, words)| words.clone())
+            .collect();
+        assert_eq!(published, words);
+        assert!(read(&note).contains("Synthetic sentence."));
+        them.natural_after = Some((
+            48,
+            SourceInterval {
+                first: 40,
+                last: 44,
+            },
+        ));
+        them.on_push
+            .extend([vec![word(0.003, 0.004, "Synthetic next.")], vec![]]);
+        for (start, end) in [(32, 37), (37, 48)] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: pcm[start..end].to_vec(),
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start as u64,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &diarizer,
+                &mut window,
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            *diarizer.0.borrow(),
+            vec![(pcm[..20].to_vec(), 0.0), (pcm[20..40].to_vec(), 0.0025)],
+        );
+        assert_eq!(window.tap_audio, pcm[40..]);
+        assert_eq!((window.start_frame, window.frames), (40, 8));
+        assert_eq!((mic.checkpoints, them.checkpoints), (0, 0));
+        assert_eq!(
+            window
+                .carry
+                .segments
+                .iter()
+                .map(|source| source.segment.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Synthetic sentence.", "Synthetic next."],
+            "retiring a historical prefix preserves the raw comparison carry",
+        );
+    }
+
+    #[test]
+    fn forced_settlement_files_old_poll_before_acknowledging_suffix() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![vec![word(0.0, 0.002, "Synthetic old.")]], vec![]);
+        them.boundary_ready_after = 48;
+        them.after_ack = vec![word(0.002, 0.006, "Synthetic next.")];
+        let filer = TempFiler::new("forced-settlement-order");
+        let note = filer.note();
+        them.ack_note = Some(note.clone());
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        for (start, length) in [(0, 16), (16, 32)] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; length],
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            if start == 0 {
+                window.buffered_text_bytes = MAX_BUFFERED_TRANSCRIPT_BYTES;
+            }
+        }
+        assert_eq!(them.checkpoints, 0);
+        assert_eq!(them.boundary_acks, 1);
+        assert_eq!((window.start_frame, window.frames), (16, 32));
+        assert_eq!(writer.window_input_start, [0, 16]);
+        assert!(read(&note).contains("Synthetic old."));
+        assert!(!read(&note).contains("Synthetic next."));
+        assert_eq!(
+            window.them_words,
+            vec![word(0.002, 0.006, "Synthetic next.")]
+        );
+        assert_eq!(window.them_poll_ends, vec![1]);
+    }
+
+    #[test]
+    fn forced_filing_or_drop_preserves_critical_poll_children_before_resuming_repeats() {
+        struct OrderedFiler {
+            inner: FlakyFiler,
+            attempts: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl NoteFiler for OrderedFiler {
+            fn create_note(
+                &self,
+                title: &str,
+                source: &str,
+                body: &str,
+                provenance: &corti_vagus::provenance::TranscriptProvenance,
+            ) -> Result<PathBuf> {
+                self.attempts.set(self.attempts.get() + 1);
+                self.inner.create_note(title, source, body, provenance)
+            }
+        }
+        for fail_old in [false, true] {
+            let rate = 8_000;
+            let old_mic = vec![
+                word(1.0, 2.0, "The gateway dimensions are in"),
+                word(5.0, 6.0, "um"),
+                word(7.5, 7.8, "today."),
+            ];
+            let old_tap = vec![word(0.0, 7.9, "The gateway dimensions are in mm today.")];
+            let mut pushes = vec![vec![]; 15];
+            pushes.push(old_mic);
+            let mut mic = Scripted::new(pushes, vec![]);
+            let mut them = Scripted::new(vec![old_tap], vec![]);
+            let next_mic = vec![
+                word(8.001, 8.002, "Very"),
+                word(8.002, 8.003, "very important."),
+            ];
+            mic.after_ack = next_mic.clone();
+            them.after_ack = vec![word(8.001, 8.004, "Synthetic next.")];
+            mic.boundary_ready_after = 64_032;
+            them.boundary_ready_after = 64_032;
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            mic.ack_filing_attempts = Some(attempts.clone());
+            them.ack_filing_attempts = Some(attempts.clone());
+            let filer = OrderedFiler {
+                inner: FlakyFiler::new(
+                    &format!("forced-critical-drop-{fail_old}"),
+                    usize::from(fail_old),
+                ),
+                attempts,
+            };
+            let note = filer.inner.note();
+            let mut writer = NoteWriter::new(filer, meta(), None);
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            window
+                .enable_rolling(std::time::Duration::from_secs(1), 64)
+                .unwrap();
+            let publisher = RecordingPublisher::default();
+            for (start, length) in [(0, 64_000), (64_000, 32)] {
+                let (tx, rx) = sync_channel(1);
+                tx.send(CaptureChunk {
+                    mic: vec![0.125; length],
+                    tap: vec![0.0625; length],
+                    unavailable: vec![],
+                    epoch: fixture_epoch(rate, true, true),
+                    retained_start_frame: start,
+                })
+                .unwrap();
+                drop(tx);
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut None,
+                    &mut mic,
+                    &mut them,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                if start == 0 {
+                    assert!(!window.early_drop.held.is_empty());
+                    window.buffered_text_bytes = MAX_BUFFERED_TRANSCRIPT_BYTES;
+                }
+            }
+            assert_eq!((mic.boundary_acks, them.boundary_acks), (1, 1));
+            assert_eq!((mic.checkpoints, them.checkpoints), (0, 0));
+            assert_eq!(writer.window_input_start, [64_000; 2]);
+            assert_eq!(window.mic_polls.len(), 1);
+            assert_eq!(window.mic_polls[0].segment.text, "Very very important.");
+            assert_eq!(window.them_poll_ends, [1]);
+            assert_eq!(
+                window.carry.segments[0].segment.text,
+                "The gateway dimensions are in mm today."
+            );
+            if fail_old {
+                assert!(!note.exists());
+            } else {
+                let filed = read(&note);
+                assert!(filed.contains("**[00:05] Me:** um"), "{filed}");
+                assert!(!filed.contains("Synthetic next."));
+                assert!(!filed.contains("Very very important."));
+            }
+            let mut capture = corti_core::QualityRecord::observed();
+            capture
+                .insert_epoch(fixture_epoch(rate, true, true))
+                .unwrap();
+            let outcome = finish_session(
+                rate,
+                None,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+            assert_eq!(matches!(outcome, LiveOutcome::Fallback { .. }), fail_old);
+            let quality = writer.fallback_quality().unwrap();
+            let losses: Vec<_> = quality
+                .spans
+                .iter()
+                .filter(|span| span.cause == corti_core::QualityCause::WindowNotFiled)
+                .map(|span| (span.track, span.start_frame, span.end_frame))
+                .collect();
+            assert_eq!(
+                losses,
+                if fail_old {
+                    vec![
+                        (corti_core::QualityTrack::Mic, 0, 64_000),
+                        (corti_core::QualityTrack::Tap, 0, 64_000),
+                    ]
+                } else {
+                    vec![]
+                }
+            );
+            let next: Vec<_> = publisher
+                .0
+                .borrow()
+                .iter()
+                .flat_map(|(_, words)| words.clone())
+                .filter(|word| word.start >= 8.0 && word.text != "Synthetic next.")
+                .collect();
+            assert_eq!(next, next_mic);
+            assert!(read(&note).contains("Synthetic next."));
+        }
+    }
+
+    #[test]
+    fn forced_eof_does_not_bypass_unsettled_owned_input() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![vec![word(0.0, 0.002, "Synthetic old.")]], vec![]);
+        them.boundary_ready_after = 64;
+        let mut writer = NoteWriter::new(TempFiler::new("forced-eof-unsettled"), meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        for (start, length) in [(0, 16), (16, 16)] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; length],
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            if start == 0 {
+                window.buffered_text_bytes = MAX_BUFFERED_TRANSCRIPT_BYTES;
+            }
+        }
+        let mut capture = corti_core::QualityRecord::observed();
+        capture
+            .insert_epoch(fixture_epoch(rate, false, true))
+            .unwrap();
+        let finish = FinishQuality {
+            dropped_chunks: 0,
+            capture: Some(capture),
+        };
+        let result = finish_session(
+            rate,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            finish,
+            &mut writer,
+            &NoopPublisher,
+        );
+        assert!(
+            result.is_err(),
+            "EOF must not bypass a still-owned native fence: {result:?}"
+        );
+        let quality = writer.fallback_quality().unwrap();
+        assert!(quality.spans.iter().any(|span| span.cause
+            == corti_core::QualityCause::WindowNotFiled
+            && span.track == corti_core::QualityTrack::Tap
+            && span.start_frame == 0
+            && span.end_frame == 32));
+    }
+
+    #[test]
+    fn forced_eof_keeps_prior_filing_and_separate_old_and_next_epoch_losses() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(
+            vec![
+                vec![word(0.0, 0.002, "Synthetic durable.")],
+                vec![word(0.002, 0.004, "Synthetic waiting.")],
+            ],
+            vec![],
+        );
+        them.natural_after = Some((
+            16,
+            SourceInterval {
+                first: 16,
+                last: 16,
+            },
+        ));
+        let filer = TempFiler::new("forced-eof-prior-and-epochs");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 16;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        let initial = fixture_epoch(rate, false, true);
+        let mut later = initial;
+        later.id = 1;
+        later.reason = corti_core::CaptureEpochReason::LayoutChange;
+        later.source_start_ns = Some(8_000_000);
+        later.source_frame_base = 64;
+        later.retained_start_frame = 32;
+        for start in [0, 16, 32] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; 16],
+                unavailable: vec![],
+                epoch: if start == 32 { later } else { initial },
+                retained_start_frame: start,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            if start == 0 {
+                assert_eq!(writer.window_input_start, [0, 16]);
+                them.natural_after = None;
+                them.boundary_ready_after = 128;
+            } else if start == 16 {
+                window.buffered_text_bytes = MAX_BUFFERED_TRANSCRIPT_BYTES;
+            }
+        }
+        assert_eq!(
+            window
+                .rolling
+                .as_ref()
+                .unwrap()
+                .pending
+                .unwrap()
+                .fence
+                .frame,
+            32
+        );
+        let mut capture = corti_core::QualityRecord::observed();
+        capture.insert_epoch(initial).unwrap();
+        capture.insert_epoch(later).unwrap();
+        assert!(
+            finish_session(
+                rate,
+                None,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture)
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+            .is_err()
+        );
+        let quality = writer.fallback_quality().unwrap();
+        let facts: Vec<_> = quality
+            .spans
+            .iter()
+            .map(|span| {
+                (
+                    span.epoch,
+                    span.start_frame,
+                    span.end_frame,
+                    span.track,
+                    span.cause,
+                    span.class,
+                    span.stage,
+                    span.resolution,
+                )
+            })
+            .collect();
+        use corti_core::{
+            QualityCause, QualityClass, QualityResolution, QualityStage, QualityTrack,
+        };
+        assert_eq!(
+            facts,
+            vec![
+                (
+                    0,
+                    16,
+                    32,
+                    QualityTrack::Tap,
+                    QualityCause::WindowNotFiled,
+                    QualityClass::ProcessingLoss,
+                    QualityStage::Live,
+                    QualityResolution::Outstanding
+                ),
+                (
+                    0,
+                    31,
+                    32,
+                    QualityTrack::Tap,
+                    QualityCause::ForcedBoundary,
+                    QualityClass::DegradedOnly,
+                    QualityStage::Live,
+                    QualityResolution::Outstanding
+                ),
+                (
+                    1,
+                    64,
+                    80,
+                    QualityTrack::Tap,
+                    QualityCause::WindowNotFiled,
+                    QualityClass::ProcessingLoss,
+                    QualityStage::Live,
+                    QualityResolution::Outstanding
+                ),
+            ]
+        );
+        assert!(read(&note).contains("Synthetic durable."));
+        assert!(!read(&note).contains("Synthetic waiting."));
+        assert_eq!(writer.fallback_quality(), Some(quality));
+    }
+
+    #[test]
+    fn historical_filing_failure_marks_owned_prefix_and_keeps_suffix() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(
+            vec![vec![], vec![word(0.0, 0.0025, "Synthetic old.")]],
+            vec![],
+        );
+        them.natural_after = Some((
+            32,
+            SourceInterval {
+                first: 20,
+                last: 24,
+            },
+        ));
+        them.after_ack = vec![word(0.0025, 0.004, "Synthetic next.")];
+        let filer = FlakyFiler::new("historical-owned-failure", 1);
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 16;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        let (tx, rx) = sync_channel(2);
+        for start in [0, 16] {
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; 16],
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        consume_chunks(
+            &rx,
+            rate,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+        assert_eq!(writer.window_input_start, [0, 20]);
+        let mut capture = corti_core::QualityRecord::observed();
+        capture
+            .insert_epoch(fixture_epoch(rate, false, true))
+            .unwrap();
+        let outcome = finish_session(
+            rate,
+            None,
+            mic,
+            them,
+            NoDiarizer,
+            window,
+            FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            },
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+        assert!(matches!(outcome, LiveOutcome::Fallback { .. }));
+        let quality = writer.fallback_quality().unwrap();
+        assert_eq!(quality.spans.len(), 1);
+        let span = &quality.spans[0];
+        assert_eq!(
+            (
+                span.epoch,
+                span.start_frame,
+                span.end_frame,
+                span.track,
+                span.cause,
+                span.class,
+                span.stage,
+                span.resolution
+            ),
+            (
+                0,
+                0,
+                20,
+                corti_core::QualityTrack::Tap,
+                corti_core::QualityCause::WindowNotFiled,
+                corti_core::QualityClass::ProcessingLoss,
+                corti_core::QualityStage::Live,
+                corti_core::QualityResolution::Outstanding
+            )
+        );
+        assert!(!read(&note).contains("Synthetic old."));
+        assert!(read(&note).contains("Synthetic next."));
+    }
+
+    #[test]
+    fn forced_eof_delivers_real_aec_tail_before_deciding_settlement() {
+        for sufficient in [false, true] {
+            let rate = 8_000;
+            let mut mic = Scripted::new(vec![], vec![]);
+            let mut them = Scripted::new(vec![vec![word(0.0, 0.002, "Synthetic old.")]], vec![]);
+            mic.boundary_ready_after = if sufficient { 32 } else { 33 };
+            them.boundary_ready_after = 32;
+            let mic_audio = mic.audio.clone();
+            let mut writer = NoteWriter::new(
+                TempFiler::new(if sufficient {
+                    "forced-tail-sufficient"
+                } else {
+                    "forced-tail-insufficient"
+                }),
+                meta(),
+                None,
+            );
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            window
+                .enable_rolling(std::time::Duration::from_secs(1), 64)
+                .unwrap();
+            let mut aec = Some(new_live_aec(rate, corti_aec::AecConfig::default()));
+            for start in [0, 16] {
+                let (tx, rx) = sync_channel(1);
+                tx.send(CaptureChunk {
+                    mic: vec![0.125; 16],
+                    tap: vec![0.0625; 16],
+                    unavailable: vec![],
+                    epoch: fixture_epoch(rate, true, true),
+                    retained_start_frame: start,
+                })
+                .unwrap();
+                drop(tx);
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut aec,
+                    &mut mic,
+                    &mut them,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+                .unwrap();
+                if start == 0 {
+                    window.buffered_text_bytes = MAX_BUFFERED_TRANSCRIPT_BYTES;
+                }
+            }
+            assert!(
+                mic.pushes.is_empty(),
+                "actual lookahead must still own these samples"
+            );
+            let mut capture = corti_core::QualityRecord::observed();
+            capture
+                .insert_epoch(fixture_epoch(rate, true, true))
+                .unwrap();
+            let outcome = finish_session(
+                rate,
+                aec,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture.clone()),
+                },
+                &mut writer,
+                &NoopPublisher,
+            );
+            assert_eq!(
+                mic_audio.borrow().len(),
+                32,
+                "real AEC tail is delivered exactly once"
+            );
+            let quality = writer.fallback_quality().unwrap();
+            assert_eq!(quality.epochs, capture.epochs);
+            let losses: Vec<_> = quality
+                .spans
+                .iter()
+                .filter(|span| span.cause == corti_core::QualityCause::WindowNotFiled)
+                .map(|span| (span.track, span.start_frame, span.end_frame))
+                .collect();
+            if sufficient {
+                assert!(matches!(outcome.unwrap(), LiveOutcome::Filed { .. }));
+                assert!(losses.is_empty());
+            } else {
+                assert!(outcome.is_err());
+                assert_eq!(
+                    losses,
+                    vec![
+                        (corti_core::QualityTrack::Mic, 0, 32),
+                        (corti_core::QualityTrack::Tap, 0, 32)
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_operations_drain_known_reports_before_resuming_panic() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for (stage, metadata_only) in ["latch", "advance", "ack", "end"]
+            .into_iter()
+            .flat_map(|stage| [false, true].map(|metadata| (stage, metadata)))
+        {
+            let rate = 8_000;
+            let epoch = fixture_epoch(rate, false, true);
+            let mut mic = Scripted::new(vec![], vec![]);
+            let mut them = Scripted::new(
+                if metadata_only {
+                    vec![]
+                } else {
+                    vec![vec![word(0.0, 0.002, "Synthetic old.")]]
+                },
+                vec![],
+            );
+            if stage != "end" {
+                them.natural_after = Some((
+                    16,
+                    SourceInterval {
+                        first: 16,
+                        last: 16,
+                    },
+                ));
+            }
+            if metadata_only {
+                for frame in 0..=corti_core::MAX_QUALITY_SPANS as u64 {
+                    them.boundary_report.record(RegionOutcome {
+                        span: InputSpan {
+                            start_frame: frame,
+                            end_frame: frame + 1,
+                        },
+                        status: RegionStatus::RecognizedEmpty,
+                    });
+                }
+            } else {
+                them.boundary_report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 4,
+                        end_frame: 8,
+                    },
+                    status: RegionStatus::Failed(DecodeErrorCategory::NoResult),
+                });
+            }
+            them.boundary_report_stage = Some(stage);
+            them.panic_after_report = Some(stage);
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("boundary-panic-{stage}-{metadata_only}")),
+                meta(),
+                None,
+            );
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = 16;
+            window
+                .enable_rolling(std::time::Duration::from_secs(1), 64)
+                .unwrap();
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            capture
+                .record_omitted_spans(
+                    corti_core::QualityClass::DegradedOnly,
+                    corti_core::QualityResolution::Outstanding,
+                    2,
+                )
+                .unwrap();
+            let finish = FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            };
+            writer.freeze_live_quality(&finish).unwrap();
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; 16],
+                unavailable: vec![],
+                epoch,
+                retained_start_frame: 0,
+            })
+            .unwrap();
+            drop(tx);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut None,
+                    &mut mic,
+                    &mut them,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &NoopPublisher,
+                )
+                .unwrap();
+                if stage == "end" {
+                    finish_session(
+                        rate,
+                        None,
+                        mic,
+                        them,
+                        NoDiarizer,
+                        window,
+                        finish,
+                        &mut writer,
+                        &NoopPublisher,
+                    )
+                    .unwrap();
+                }
+            }));
+            assert!(outcome.is_err());
+            let quality = writer.fallback_quality().unwrap();
+            assert_eq!(
+                quality
+                    .spans
+                    .iter()
+                    .filter(|span| span.cause == corti_core::QualityCause::NoResult)
+                    .map(|span| (span.start_frame, span.end_frame))
+                    .collect::<Vec<_>>(),
+                if metadata_only { vec![] } else { vec![(4, 8)] }
+            );
+            assert_eq!(
+                quality.overflow.outstanding_omitted_spans,
+                [0, 0, 2 + u64::from(metadata_only)]
+            );
+            if metadata_only {
+                assert_eq!(writer.decode_incomplete, [false, false]);
+                assert!(
+                    quality
+                        .spans
+                        .iter()
+                        .all(|span| span.cause == corti_core::QualityCause::WindowNotFiled)
+                );
+            }
+            if stage == "end" {
+                assert_eq!(
+                    quality
+                        .spans
+                        .iter()
+                        .filter(|span| span.cause == corti_core::QualityCause::WindowNotFiled)
+                        .map(|span| (span.track, span.start_frame, span.end_frame))
+                        .collect::<Vec<_>>(),
+                    vec![(corti_core::QualityTrack::Tap, 0, 16)]
+                );
+            }
+            assert_eq!(writer.fallback_quality(), Some(quality));
+        }
+    }
+
+    #[test]
+    fn terminal_panic_preserves_durable_prefix_and_marks_received_epoch_suffix() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(
+            vec![
+                vec![word(0.0, 0.002, "Synthetic durable.")],
+                vec![word(0.002, 0.004, "Synthetic waiting.")],
+            ],
+            vec![],
+        );
+        them.natural_after = Some((
+            16,
+            SourceInterval {
+                first: 16,
+                last: 16,
+            },
+        ));
+        let filer = TempFiler::new("terminal-panic-durable-prefix");
+        let note = filer.note();
+        let mut writer = NoteWriter::new(filer, meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 16;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        let initial = fixture_epoch(rate, false, true);
+        let mut later = initial;
+        later.id = 1;
+        later.reason = corti_core::CaptureEpochReason::LayoutChange;
+        later.source_start_ns = Some(8_000_000);
+        later.source_frame_base = 64;
+        later.retained_start_frame = 16;
+        for start in [0, 16] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; 16],
+                unavailable: vec![],
+                epoch: if start == 0 { initial } else { later },
+                retained_start_frame: start,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            them.natural_after = None;
+        }
+        assert_eq!(writer.window_input_start, [0, 16]);
+        assert_eq!(read(&note).matches("Synthetic durable.").count(), 1);
+        them.panic_after_report = Some("end");
+        let mut capture = corti_core::QualityRecord::observed();
+        capture.insert_epoch(initial).unwrap();
+        capture.insert_epoch(later).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_session(
+                rate,
+                None,
+                mic,
+                them,
+                NoDiarizer,
+                window,
+                FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                },
+                &mut writer,
+                &NoopPublisher,
+            )
+        }));
+        assert!(result.is_err());
+        let quality = writer.fallback_quality().unwrap();
+        assert_eq!(quality.spans.len(), 1);
+        let span = quality.spans[0];
+        assert_eq!(
+            (
+                span.epoch,
+                span.start_frame,
+                span.end_frame,
+                span.track,
+                span.cause
+            ),
+            (
+                1,
+                64,
+                80,
+                corti_core::QualityTrack::Tap,
+                corti_core::QualityCause::WindowNotFiled
+            )
+        );
+        assert_eq!(writer.window_input_start, [0, 32]);
+        assert_eq!(writer.fallback_quality(), Some(quality));
+        assert_eq!(read(&note).matches("Synthetic durable.").count(), 1);
+        assert!(!read(&note).contains("Synthetic waiting."));
+    }
+
+    #[test]
+    fn rolling_maintenance_waits_for_ordinary_boundary_without_shortening_window() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![], vec![]);
+        them.epoch_capacity = 1024;
+        them.epoch_remaining = 1024;
+        them.natural_every_push = true;
+        let mut writer = NoteWriter::new(TempFiler::new("rolling-maintenance"), meta(), None);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 64;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        // Inject only the scalar arm signal here; native tests separately prove its capacity bound.
+        // The arm becomes true at frame32, while the unchanged nominal boundary is frame64.
+        window.rolling.as_mut().unwrap().maintenance_trigger = 960;
+        let (tx, rx) = sync_channel(8);
+        for start in (0..128).step_by(16) {
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.0; 16],
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: start,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        consume_chunks(
+            &rx,
+            rate,
+            &mut None,
+            &mut mic,
+            &mut them,
+            &NoDiarizer,
+            &mut window,
+            &mut writer,
+            &NoopPublisher,
+        )
+        .unwrap();
+        assert_eq!((them.boundary_acks, them.checkpoints), (2, 0));
+        assert_eq!(them.audio.borrow().len(), 128);
+        assert_eq!(them.epoch_remaining, 1024);
+        assert_eq!((window.start_frame, window.frames), (128, 0));
+        let mut capture = corti_core::QualityRecord::observed();
+        capture
+            .insert_epoch(fixture_epoch(rate, false, true))
+            .unwrap();
+        let quality = writer
+            .freeze_live_quality(&FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            })
+            .unwrap();
+        assert!(!quality.requires_batch_recovery());
+        assert_eq!(
+            quality
+                .spans
+                .iter()
+                .map(|span| (span.cause, span.start_frame, span.end_frame))
+                .collect::<Vec<_>>(),
+            [64, 128].map(|end| (corti_core::QualityCause::ForcedBoundary, end - 1, end))
+        );
+    }
+
+    #[test]
+    fn rolling_common_fence_translates_both_late_track_origins_once() {
+        for late_mic in [false, true] {
+            let rate = 8_000;
+            let early = || {
+                let mut channel = Scripted::new(
+                    vec![vec![], vec![], vec![word(0.0, 0.0025, "Synthetic early.")]],
+                    vec![],
+                );
+                channel.natural_after = Some((
+                    48,
+                    SourceInterval {
+                        first: 20,
+                        last: 24,
+                    },
+                ));
+                channel
+            };
+            let late = || {
+                let mut channel = Scripted::new(
+                    vec![vec![], vec![word(0.0, 0.0005, "Synthetic late.")]],
+                    vec![],
+                );
+                channel.natural_after = Some((32, SourceInterval { first: 4, last: 8 }));
+                channel
+            };
+            let (mut mic, mut them) = if late_mic {
+                (late(), early())
+            } else {
+                (early(), late())
+            };
+            let mut writer = NoteWriter::new(
+                TempFiler::new(if late_mic {
+                    "natural-late-mic"
+                } else {
+                    "natural-late-tap"
+                }),
+                meta(),
+                None,
+            );
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = 16;
+            window
+                .enable_rolling(std::time::Duration::from_secs(1), 64)
+                .unwrap();
+            let publisher = RecordingPublisher::default();
+            for start in [0, 16, 32] {
+                let mut epoch = fixture_epoch(rate, true, true);
+                if start == 0 {
+                    epoch.mic_channels = u32::from(!late_mic);
+                    epoch.tap_channels = u32::from(late_mic);
+                } else {
+                    epoch.id = 1;
+                    epoch.reason = corti_core::CaptureEpochReason::LayoutChange;
+                    epoch.source_start_ns = Some(2_000_000);
+                    epoch.source_frame_base = 16;
+                    epoch.retained_start_frame = 16;
+                }
+                let (tx, rx) = sync_channel(1);
+                tx.send(CaptureChunk {
+                    mic: if start == 0 && late_mic {
+                        vec![]
+                    } else {
+                        vec![0.125; 16]
+                    },
+                    tap: if start == 0 && !late_mic {
+                        vec![]
+                    } else {
+                        vec![0.0625; 16]
+                    },
+                    unavailable: vec![],
+                    epoch,
+                    retained_start_frame: start,
+                })
+                .unwrap();
+                drop(tx);
+                consume_chunks(
+                    &rx,
+                    rate,
+                    &mut None,
+                    &mut mic,
+                    &mut them,
+                    &NoDiarizer,
+                    &mut window,
+                    &mut writer,
+                    &publisher,
+                )
+                .unwrap();
+                if start < 32 {
+                    assert_eq!(
+                        window.start_frame, 0,
+                        "one ready track cannot retire ownership"
+                    );
+                }
+            }
+            assert_eq!((window.start_frame, window.frames), (20, 28));
+            assert_eq!(
+                writer.window_input_start,
+                if late_mic { [4, 20] } else { [20, 4] }
+            );
+            assert_eq!((mic.checkpoints, them.checkpoints), (0, 0));
+            let late_words: Vec<_> = publisher
+                .0
+                .borrow()
+                .iter()
+                .flat_map(|(_, words)| words)
+                .filter(|word| word.text == "Synthetic late.")
+                .cloned()
+                .collect();
+            assert_eq!(late_words, vec![word(0.002, 0.0025, "Synthetic late.")]);
+        }
+    }
+
+    #[test]
+    fn natural_common_fence_waits_for_real_aec_delivery_and_keeps_tap_suffix() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![], vec![]);
+        mic.natural_every_push = true;
+        them.natural_every_push = true;
+        let mut aec = Some(new_live_aec(rate, corti_aec::AecConfig::default()));
+        let lag = aec.as_ref().unwrap().max_output_lag_samples();
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 256;
+        window.diarize_far_end = true;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), lag as u64 + 4096)
+            .unwrap();
+        let mut writer = NoteWriter::new(TempFiler::new("natural-real-aec-lag"), meta(), None);
+        let total = 2 * lag + 4096;
+        let pcm: Vec<_> = (0..total).map(|index| (index % 31) as f32 / 64.0).collect();
+        for (start, end) in [(0, 256), (256, total)] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![0.125; end - start],
+                tap: pcm[start..end].to_vec(),
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, true, true),
+                retained_start_frame: start as u64,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut aec,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            if start == 0 {
+                assert!(
+                    mic.pushes.is_empty(),
+                    "the actual filter still owns the initial source prefix"
+                );
+                assert_eq!(
+                    window.start_frame, 0,
+                    "tap readiness cannot stand in for delayed mic delivery"
+                );
+                assert_eq!(writer.delivered_input_frames, [0, end as u64]);
+            }
+        }
+        let delivered = writer.delivered_input_frames[0];
+        assert!(delivered >= window.frame_limit);
+        assert!(delivered < total as u64);
+        assert_eq!(
+            window.start_frame,
+            delivered / window.frame_limit * window.frame_limit
+        );
+        assert_eq!(writer.window_input_start, [window.start_frame; 2]);
+        assert_eq!(window.tap_audio, pcm[window.start_frame as usize..]);
+        assert_eq!((mic.checkpoints, them.checkpoints), (0, 0));
+    }
+
+    #[test]
+    fn natural_readiness_uses_attempted_extent_after_empty_failed_and_capped_reports() {
+        use corti_transcribe::decode::{DecodeErrorCategory, RegionOutcome, RegionStatus};
+        for failed in [false, true] {
+            let rate = 8_000;
+            let mut report = DecodeReport::default();
+            for frame in 0..=corti_core::MAX_QUALITY_SPANS as u64 {
+                report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: frame,
+                        end_frame: frame + 1,
+                    },
+                    status: RegionStatus::RecognizedEmpty,
+                });
+            }
+            if failed {
+                report.record(RegionOutcome {
+                    span: InputSpan {
+                        start_frame: 299,
+                        end_frame: 300,
+                    },
+                    status: RegionStatus::Failed(DecodeErrorCategory::NoResult),
+                });
+            }
+            let mut mic = Scripted::new(vec![], vec![]);
+            let words = vec![word(0.0, 0.001, "Synthetic survivor.")];
+            let mut them = Scripted::new(vec![words.clone()], vec![]);
+            them.on_push_reports
+                .extend([DecodeReport::default(), report]);
+            them.natural_after = Some((
+                512,
+                SourceInterval {
+                    first: 300,
+                    last: 320,
+                },
+            ));
+            let mut window =
+                TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+            window.frame_limit = 256;
+            window
+                .enable_rolling(std::time::Duration::from_secs(1), 64)
+                .unwrap();
+            let mut writer = NoteWriter::new(
+                TempFiler::new(&format!("natural-attempted-report-{failed}")),
+                meta(),
+                None,
+            );
+            let publisher = RecordingPublisher::default();
+            let epoch = fixture_epoch(rate, false, true);
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: vec![0.125; 512],
+                unavailable: vec![],
+                epoch,
+                retained_start_frame: 0,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &publisher,
+            )
+            .unwrap();
+            assert_eq!((window.start_frame, window.frames), (300, 212));
+            assert_eq!(writer.window_input_start, [0, 300]);
+            assert_eq!(them.checkpoints, 0);
+            assert_eq!(
+                publisher
+                    .0
+                    .borrow()
+                    .iter()
+                    .flat_map(|(_, words)| words.clone())
+                    .collect::<Vec<_>>(),
+                words
+            );
+            let mut capture = corti_core::QualityRecord::observed();
+            capture.insert_epoch(epoch).unwrap();
+            let quality = writer
+                .freeze_live_quality(&FinishQuality {
+                    dropped_chunks: 0,
+                    capture: Some(capture),
+                })
+                .unwrap();
+            assert_eq!(quality.requires_batch_recovery(), failed);
+            assert_eq!(
+                quality.overflow.outstanding_omitted_spans,
+                [0, 0, 1 + u64::from(failed)]
+            );
+            assert_eq!(
+                quality
+                    .spans
+                    .iter()
+                    .map(|span| (span.cause, span.start_frame, span.end_frame))
+                    .collect::<Vec<_>>(),
+                if failed {
+                    vec![(corti_core::QualityCause::NoResult, 299, 300)]
+                } else {
+                    vec![]
+                },
+                "a retained failure evicts successful metadata without losing its exact source span",
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_rolling_windows_bound_irregular_admission_and_retain_exact_suffix() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(vec![], vec![]);
+        them.natural_every_push = true;
+        them.natural_lag = 512;
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window.frame_limit = 6000;
+        window.diarize_far_end = true;
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 4096)
+            .unwrap();
+        let capacity = window.tap_audio.capacity();
+        assert_eq!(window.frame_limit, 6000);
+        assert_eq!(capacity as u64, 6000 + 22 * u64::from(rate) + 4096);
+        let total = 20 * 6000 + 523;
+        let pcm = |frame: usize| ((frame % 251) as f32 - 125.0) / 128.0;
+        let mut writer = NoteWriter::new(TempFiler::new("delayed-bounded-windows"), meta(), None);
+        let mut received = 0;
+        for requested in [13, 8193, 509, 16385].into_iter().cycle() {
+            let length = requested.min(total - received);
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![],
+                tap: (received..received + length).map(pcm).collect(),
+                unavailable: vec![],
+                epoch: fixture_epoch(rate, false, true),
+                retained_start_frame: received as u64,
+            })
+            .unwrap();
+            drop(tx);
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            )
+            .unwrap();
+            received += length;
+            assert_eq!(window.tap_audio.capacity(), capacity);
+            assert!(window.tap_audio.len() <= capacity);
+            assert_eq!(window.tap_audio.len() as u64, window.frames);
+            assert!(window.rolling.as_ref().unwrap().pending.is_none());
+            if received == total {
+                break;
+            }
+        }
+        assert_eq!((window.start_frame, window.frames), (120_000, 523));
+        assert_eq!(
+            window.tap_audio,
+            (120_000..total).map(pcm).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            them.audio.borrow().as_slice(),
+            (0..total).map(pcm).collect::<Vec<_>>()
+        );
+        assert_eq!((them.boundary_acks, them.checkpoints), (20, 0));
+        assert!(
+            them.pushes
+                .iter()
+                .all(|&frames| frames != 0 && frames <= corti_capture::FILTER_FRAMES_PER_CHUNK)
+        );
+        assert!(mic.pushes.is_empty());
+        assert!(writer.path().is_none());
+    }
+
+    #[test]
+    fn held_mic_polls_reserve_their_future_release_before_accepting_more_text() {
+        let rate = 8_000;
+        let mut mic = Scripted::new(
+            (0..4)
+                .map(|index| {
+                    vec![word(
+                        f64::from(index) * 0.002,
+                        f64::from(index + 1) * 0.002,
+                        &"s".repeat(100_000),
+                    )]
+                })
+                .collect(),
+            vec![],
+        );
+        let mut them = Scripted::new(vec![], vec![]);
+        let mut window = TranscriptWindow::new(rate, 1, false, CleanupConfig::default()).unwrap();
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        let mut writer = NoteWriter::new(TempFiler::new("held-text-reservation"), meta(), None);
+        let epoch = fixture_epoch(rate, true, false);
+        for start in [0, 16, 32, 48] {
+            let (tx, rx) = sync_channel(1);
+            tx.send(CaptureChunk {
+                mic: vec![0.125; 16],
+                tap: vec![],
+                unavailable: vec![],
+                epoch,
+                retained_start_frame: start,
+            })
+            .unwrap();
+            drop(tx);
+            let result = consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+            );
+            assert_eq!(result.is_err(), start == 48, "{result:?}");
+        }
+        assert_eq!(window.early_drop.held.len(), 3);
+        assert_eq!(window.mic_polls.len(), 3);
+        assert!(window.rolling.as_ref().unwrap().text_charge <= MAX_BUFFERED_TRANSCRIPT_BYTES);
+        assert!(window.rolling.as_ref().unwrap().text_charge >= 900_000);
+        assert!(
+            window.buffered_text_bytes < 700_000,
+            "released words alone undercount held payload"
+        );
+        let mut capture = corti_core::QualityRecord::observed();
+        capture.insert_epoch(epoch).unwrap();
+        let quality = writer
+            .freeze_live_quality(&FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            })
+            .unwrap();
+        assert_eq!(quality.spans.len(), 1);
+        assert_eq!(
+            (
+                quality.spans[0].track,
+                quality.spans[0].cause,
+                quality.spans[0].start_frame,
+                quality.spans[0].end_frame
+            ),
+            (
+                corti_core::QualityTrack::Mic,
+                corti_core::QualityCause::WindowNotFiled,
+                0,
+                64
+            ),
+        );
+    }
+
+    #[test]
+    fn rolling_audio_and_poll_budgets_fail_closed_without_growing_nominal_window() {
+        let nominal = (MAX_DIARIZATION_AUDIO_BYTES / std::mem::size_of::<f32>()) as u64;
+        let owner = RollingBoundary::new(
+            0,
+            nominal,
+            192_000,
+            std::time::Duration::from_secs(1),
+            40_000,
+        )
+        .unwrap();
+        assert_eq!(owner.policy.maximum_owned_frames(), nominal + 22 * 192_000);
+        assert_eq!(owner.capacity_frames, nominal + 22 * 192_000 + 40_000);
+        assert!(
+            owner.capacity_frames * 4
+                < (MAX_DIARIZATION_AUDIO_BYTES + MAX_BOUNDARY_EXTRA_AUDIO_BYTES) as u64
+        );
+        // Scalar policy ownership does not authorize an allocation over the original total cap.
+        assert!(
+            TranscriptWindow::new_with_reserve(
+                192_000,
+                10,
+                true,
+                CleanupConfig::default(),
+                Some((std::time::Duration::from_secs(1), 40_000)),
+            )
+            .is_err()
+        );
+        let rate = 48_000_u32;
+        for minutes in [1, 10] {
+            let ordinary = TranscriptWindow::new_with_reserve(
+                rate,
+                minutes,
+                true,
+                CleanupConfig::default(),
+                Some((std::time::Duration::from_secs(1), 40_000)),
+            )
+            .unwrap();
+            assert_eq!(
+                ordinary.frame_limit,
+                u64::from(rate) * 60 * u64::from(minutes)
+            );
+            assert!(
+                ordinary.tap_audio.capacity() * std::mem::size_of::<f32>()
+                    <= MAX_DIARIZATION_AUDIO_BYTES
+            );
+        }
+        let exact_reserve = nominal - 600 * u64::from(rate) - 22 * u64::from(rate);
+        let exact = TranscriptWindow::new_with_reserve(
+            rate,
+            10,
+            true,
+            CleanupConfig::default(),
+            Some((std::time::Duration::from_secs(1), exact_reserve)),
+        )
+        .unwrap();
+        assert_eq!(exact.frame_limit, 600 * u64::from(rate));
+        assert_eq!(
+            exact.tap_audio.capacity() * std::mem::size_of::<f32>(),
+            MAX_DIARIZATION_AUDIO_BYTES
+        );
+        assert!(
+            TranscriptWindow::new_with_reserve(
+                rate,
+                10,
+                true,
+                CleanupConfig::default(),
+                Some((std::time::Duration::from_secs(1), exact_reserve + 1)),
+            )
+            .is_err()
+        );
+        assert!(
+            RollingBoundary::new(
+                0,
+                nominal,
+                192_000,
+                std::time::Duration::from_secs(3_600),
+                40_000
+            )
+            .is_err()
+        );
+        let rate = 8_000;
+        let mut mic = Scripted::new(vec![], vec![]);
+        let mut them = Scripted::new(
+            vec![vec![word(
+                0.0,
+                0.002,
+                &"s".repeat(MAX_BUFFERED_TRANSCRIPT_BYTES + 1),
+            )]],
+            vec![],
+        );
+        let mut writer = NoteWriter::new(TempFiler::new("oversized-owned-poll"), meta(), None);
+        let mut window = TranscriptWindow::new_with_reserve(
+            rate,
+            1,
+            true,
+            CleanupConfig::default(),
+            Some((std::time::Duration::from_secs(1), 64)),
+        )
+        .unwrap();
+        let capacity = window.tap_audio.capacity();
+        assert_eq!(
+            capacity,
+            window.rolling.as_ref().unwrap().capacity_frames as usize
+        );
+        let (tx, rx) = sync_channel(1);
+        let epoch = fixture_epoch(rate, false, true);
+        tx.send(CaptureChunk {
+            mic: vec![],
+            tap: vec![0.125; 16],
+            unavailable: vec![],
+            epoch,
+            retained_start_frame: 0,
+        })
+        .unwrap();
+        drop(tx);
+        assert!(
+            consume_chunks(
+                &rx,
+                rate,
+                &mut None,
+                &mut mic,
+                &mut them,
+                &NoDiarizer,
+                &mut window,
+                &mut writer,
+                &NoopPublisher
+            )
+            .is_err()
+        );
+        assert!(window.them_words.is_empty());
+        assert!(window.them_poll_ends.is_empty());
+        assert!(writer.path().is_none());
+        assert_eq!(window.tap_audio.capacity(), capacity);
+        let mut capture = corti_core::QualityRecord::observed();
+        capture.insert_epoch(epoch).unwrap();
+        let quality = writer
+            .freeze_live_quality(&FinishQuality {
+                dropped_chunks: 0,
+                capture: Some(capture),
+            })
+            .unwrap();
+        assert_eq!(quality.spans.len(), 1);
+        assert_eq!(
+            (
+                quality.spans[0].cause,
+                quality.spans[0].start_frame,
+                quality.spans[0].end_frame
+            ),
+            (corti_core::QualityCause::WindowNotFiled, 0, 16)
+        );
     }
 
     #[test]
@@ -3945,7 +7786,14 @@ mod tests {
                             "ordinary metadata capacity must preserve the successful live outcome"
                         ),
                     };
-                    assert_eq!(quality, metadata.then(|| expected.clone()));
+                    let quality = quality.expect("raw activity survives successful empty ASR too");
+                    let activity = quality.activity.get(corti_core::ActivityScope::Live);
+                    assert_eq!(activity.far_reference(), corti_core::FarReference::Unknown);
+                    assert!(activity.uncertain());
+                    assert!(!activity.suspected());
+                    assert_eq!(activity.complete_end_frame(), None);
+                    expected.activity = quality.activity;
+                    assert_eq!(quality, expected);
                     assert_eq!(
                         writer
                             .freeze_live_quality(&FinishQuality {
@@ -4069,7 +7917,7 @@ mod tests {
             } else {
                 assert!(consumed.is_err());
                 let (tx, rx) = sync_channel(1);
-                tx.send(Verdict::Finish(finish)).unwrap();
+                tx.send(Verdict::Finish(Box::new(finish))).unwrap();
                 assert!(await_capture_verdict(&rx, consumed, &mut writer).is_err());
             }
             let mut expected = capture.clone();
@@ -4080,6 +7928,12 @@ mod tests {
                     1,
                 )
                 .unwrap();
+            let observed = writer.fallback_quality().unwrap();
+            let activity = observed.activity.get(corti_core::ActivityScope::Live);
+            assert_eq!(activity.far_reference(), corti_core::FarReference::Unknown);
+            assert!(activity.uncertain());
+            assert!(!activity.suspected());
+            expected.activity = observed.activity;
             assert_eq!(writer.fallback_quality(), Some(expected.clone()));
             assert_eq!(writer.fallback_quality(), Some(expected));
             assert_eq!(writer.finish_capture.as_ref(), Some(&capture));
@@ -4198,7 +8052,7 @@ mod tests {
             } else {
                 assert!(consumed.is_err());
                 let (tx, rx) = sync_channel(1);
-                tx.send(Verdict::Finish(finish)).unwrap();
+                tx.send(Verdict::Finish(Box::new(finish))).unwrap();
                 assert!(await_capture_verdict(&rx, consumed, &mut writer).is_err());
             }
             let quality = writer
@@ -4435,8 +8289,9 @@ mod tests {
                 assert!(matches!(
                     outcome,
                     LiveOutcome::NoNote {
-                        settled_quality: None
-                    }
+                        settled_quality: Some(ref quality)
+                    } if quality.activity.get(corti_core::ActivityScope::Live).far_reference()
+                        == if mic_only { corti_core::FarReference::Unknown } else { corti_core::FarReference::Present }
                 ));
                 assert_eq!(
                     actual_mic.borrow().len(),
@@ -4950,10 +8805,15 @@ mod tests {
                 }
             }
             expected_spans.sort_unstable();
+            let activity = quality.activity.get(corti_core::ActivityScope::Live);
+            assert_eq!(activity.far_reference(), corti_core::FarReference::Present);
+            assert!(activity.uncertain());
+            assert!(!activity.suspected());
             assert_eq!(
                 quality,
                 corti_core::QualityRecord {
                     spans: expected_spans,
+                    activity: quality.activity,
                     ..immutable_capture.clone()
                 },
                 "exact settled facts for {failure}"
@@ -5048,10 +8908,10 @@ mod tests {
             );
             match verdict {
                 "finish" => verdict_tx
-                    .send(Verdict::Finish(FinishQuality {
+                    .send(Verdict::Finish(Box::new(FinishQuality {
                         dropped_chunks: 1,
                         capture: Some(capture.clone()),
-                    }))
+                    })))
                     .unwrap(),
                 "discard" => verdict_tx.send(Verdict::Discard).unwrap(),
                 "disconnect" => {}
@@ -7006,6 +10866,7 @@ mod tests {
             word(24.0, 25.0, "today."),
         ]);
         window.push_mic_region(ReleasedMicRegion {
+            evidence_parents: Some(Vec::new()),
             words: vec![word(20.0, 21.0, "um")],
             poll,
             comparison_incomplete: true,
@@ -7447,12 +11308,16 @@ mod tests {
             &NoopPublisher,
         )
         .unwrap();
-        assert!(matches!(
-            outcome,
-            LiveOutcome::NoNote {
-                settled_quality: None
-            }
-        ));
+        let LiveOutcome::NoNote {
+            settled_quality: Some(quality),
+        } = outcome
+        else {
+            panic!("empty ASR keeps its observations without creating a note");
+        };
+        let activity = quality.activity.get(corti_core::ActivityScope::Live);
+        assert_eq!(activity.far_reference(), corti_core::FarReference::Unknown);
+        assert!(activity.uncertain());
+        assert!(!activity.suspected());
         assert!(!note.exists());
     }
 
@@ -7704,10 +11569,7 @@ mod tests {
         install_active(&manager, "a", 0, move |verdicts| {
             assert!(matches!(
                 verdicts.recv().unwrap(),
-                Verdict::Finish(FinishQuality {
-                    dropped_chunks: 0,
-                    capture: None
-                })
+                Verdict::Finish(quality) if quality.dropped_chunks == 0 && quality.capture.is_none()
             ));
             a_finishing_tx.send(()).unwrap();
             release_a_rx.recv().unwrap();

@@ -123,6 +123,13 @@ mod retention_tests {
 
     fn with_metadata(capture: &QualityRecord) -> QualityRecord {
         let mut quality = capture.clone();
+        corti_core::quality_mapping::insert_retained_forced_boundary(
+            &mut quality,
+            7,
+            8,
+            corti_core::QualityTrack::Both,
+        )
+        .unwrap();
         quality
             .record_omitted_spans(
                 QualityClass::DegradedOnly,
@@ -140,6 +147,10 @@ mod retention_tests {
         assert_eq!(&loaded.quality, expected);
         assert!(loaded.storage_complete());
         assert!(!loaded.quality.requires_batch_recovery());
+        assert_eq!(
+            loaded.quality.source_completeness(),
+            corti_core::SourceCompleteness::Complete
+        );
         let stored = corti_core::quality_store::load_quality(
             &fixture.meta.audio_path,
             &fixture.id,
@@ -409,5 +420,147 @@ mod retention_tests {
             drop(fixture.ctx);
             std::fs::remove_dir_all(fixture.directory).unwrap();
         }
+    }
+
+    /// The app's real EOF tests establish when this outcome is produced. Here the exact production
+    /// dispatch, ASR, checkpoint, rewrite and completion paths consume it; the native decoder is the
+    /// only substituted operation. A complete retry must settle loss without erasing the forced cut.
+    #[test]
+    fn unfiled_boundary_recovers_once_and_retains_source_intervals_after_restart() {
+        use crate::transcribe::{FirstAsrBackend, RetryOrigin};
+        use corti_core::{QualityCause, QualityStage, QualityTrack};
+        use std::os::unix::fs::MetadataExt;
+
+        let mut fixture = fixture("boundary-eof-recovery", 0);
+        let audio = fixture.meta.audio_path.clone();
+        let mut live = with_metadata(&fixture.capture);
+        corti_core::insert_retained_processing_loss(
+            &mut live,
+            8,
+            16,
+            QualityTrack::Both,
+            QualityCause::WindowNotFiled,
+            QualityStage::Live,
+        )
+        .unwrap();
+        assert!(live.requires_batch_recovery());
+        let original_spans = live.spans.clone();
+        corti_vagus::note::append(&fixture.note, "\nSynthetic incomplete live prefix.\n").unwrap();
+        let inode = std::fs::metadata(&fixture.note).unwrap().ino();
+        let counted = fixture.calls.clone();
+        let cfg = fixture.ctx.config.lock().unwrap().clone();
+        fixture.ctx.backend = Backend::scripted(
+            cfg,
+            Box::new(move |_, _, quality| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(corti_transcribe::TranscriptionOutcome {
+                    transcript: corti_core::DiarizedTranscript::new(vec![
+                        corti_core::TranscriptSegment {
+                            speaker: corti_core::Speaker::Me,
+                            start: 0.0,
+                            end: 0.001,
+                            text: "Synthetic recovered boundary.".into(),
+                        },
+                    ]),
+                    quality: quality.clone(),
+                    decode_complete: true,
+                })
+            }),
+        );
+        process_live_result(
+            &mut fixture.ctx,
+            &fixture.id,
+            &fixture.meta,
+            &audio,
+            Some(LiveOutcome::Fallback {
+                reason: "synthetic unfiled EOF interval".into(),
+                note_path: Some(fixture.note.clone()),
+                settled_quality: Some(live),
+            }),
+        );
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+        let claimed = fixture
+            .ctx
+            .queue
+            .jobs()
+            .claim_due(Utc::now())
+            .unwrap()
+            .unwrap();
+        let origin = crate::jobs::original_backend(&claimed.payload);
+        assert_eq!(origin, Some(FirstAsrBackend::Local));
+        assert_eq!(claimed.max_attempts, 6);
+        assert_eq!(claimed.payload["note_canonical"], false);
+        let control = rusqlite::Connection::open(fixture.directory.join("queue.db")).unwrap();
+        control.execute_batch("CREATE TRIGGER reject_boundary_done BEFORE UPDATE ON recordings WHEN NEW.status='done' BEGIN SELECT RAISE(ABORT,'synthetic boundary completion failure'); END;").unwrap();
+        let error = transcribe_and_file(
+            &mut fixture.ctx,
+            &fixture.id,
+            &fixture.meta,
+            &audio,
+            Some(&OwnedNote::partial(fixture.note.clone())),
+            RetryOrigin::Retry(origin),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("synthetic boundary completion failure"));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let checkpoint = FilingCheckpoint::load(&audio).unwrap();
+        assert_eq!(checkpoint.original_backend, Some(FirstAsrBackend::Local));
+        let settled = checkpoint.quality.as_ref().unwrap();
+        assert_eq!(
+            settled.source_completeness(),
+            corti_core::SourceCompleteness::Complete
+        );
+        assert!(!settled.requires_batch_recovery());
+        let mut expected_spans = original_spans;
+        for span in &mut expected_spans {
+            if span.class == QualityClass::ProcessingLoss {
+                span.resolution = QualityResolution::RecoveredByBatch;
+            }
+        }
+        assert_eq!(settled.spans, expected_spans);
+        assert_eq!(settled.epochs, fixture.capture.epochs);
+        let body = std::fs::read_to_string(&fixture.note).unwrap();
+        assert_eq!(body.matches("Synthetic recovered boundary.").count(), 1);
+        assert!(!body.contains("Synthetic incomplete live prefix."));
+        assert!(!body.contains("Transcript coverage is partial"));
+        assert_eq!(std::fs::metadata(&fixture.note).unwrap().ino(), inode);
+
+        // Reopen while the claimed job is still Running, as after an abrupt process exit. The
+        // checkpoint authorizes filing only, even when retry-origin input is now absent.
+        fixture.ctx.queue = Queue::open_at(fixture.directory.join("queue.db")).unwrap();
+        assert_eq!(fixture.ctx.queue.jobs().recover_running().unwrap(), 1);
+        let replay = fixture
+            .ctx
+            .queue
+            .jobs()
+            .claim_due(Utc::now())
+            .unwrap()
+            .unwrap();
+        control
+            .execute_batch("DROP TRIGGER reject_boundary_done;")
+            .unwrap();
+        transcribe_and_file(
+            &mut fixture.ctx,
+            &fixture.id,
+            &fixture.meta,
+            &audio,
+            None,
+            RetryOrigin::Retry(None),
+        )
+        .unwrap();
+        fixture.ctx.queue.jobs().complete(&replay).unwrap();
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.ctx.queue.get(&fixture.id).unwrap().unwrap().status,
+            JobStatus::Done
+        );
+        assert!(!checkpoint_path(&audio).exists());
+        fixture.ctx.queue = Queue::open_at(fixture.directory.join("queue.db")).unwrap();
+        assert_retained(&fixture, settled);
+        assert_eq!(std::fs::metadata(&fixture.note).unwrap().ino(), inode);
+        assert_eq!(std::fs::read_to_string(&fixture.note).unwrap(), body);
+        drop(control);
+        drop(fixture.ctx);
+        std::fs::remove_dir_all(fixture.directory).unwrap();
     }
 }

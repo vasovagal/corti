@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "status": "pre-model proposal; independent manifest/wrapper review required",
+  "generation": {
+    "tool": "macOS say then afconvert",
+    "voice_selection": "installed English voices: lexicographic minimum of (locale != en_US, name, locale), identical to existing quality fixture selection",
+    "words_per_minute": 165,
+    "format": "mono signed 16-bit little-endian WAV",
+    "sample_rates": [16000, 44100, 48000],
+    "leading_silence_ms": 1000,
+    "between_utterance_silence_ms": 1600,
+    "trailing_silence_ms": 2000,
+    "continuous_leading_silence_ms": 1000,
+    "continuous_trailing_silence_ms": 2000,
+    "hash_before_inference": true,
+    "model_pins": "existing models.rs catalog; verify existing SHA-256 pins before every inference campaign"
+  },
+  "sentences": [
+    {
+      "id": "release",
+      "text": "Please tell Nora not to deploy version one point five before the review.",
+      "critical": [
+        {"id": "name", "authored": ["Nora"], "alternatives": [["Nora"], ["nora"]]},
+        {"id": "negation", "authored": ["not"], "alternatives": [["not"]]},
+        {"id": "version", "authored": ["version", "one", "point", "five"], "alternatives": [["version", "one", "point", "five"], ["version", "1.5"]]}
+      ]
+    },
+    {
+      "id": "budget",
+      "text": "The budget for Ada is one thousand five hundred euros and not fifteen thousand euros.",
+      "critical": [
+        {"id": "name", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"]]},
+        {"id": "negation", "authored": ["not"], "alternatives": [["not"]]},
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros."], "alternatives": [["fifteen", "thousand", "euros."], ["15,000", "euros."], ["15000", "euros."]]}
+      ]
+    },
+    {
+      "id": "measure",
+      "text": "Please ask Grace to measure fifteen millimeters and never replace that value with fifty millimeters.",
+      "critical": [
+        {"id": "name", "authored": ["Grace"], "alternatives": [["Grace"], ["grace"]]},
+        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"]]},
+        {"id": "negation", "authored": ["never"], "alternatives": [["never"]]},
+        {"id": "contrast-unit", "authored": ["fifty", "millimeters."], "alternatives": [["fifty", "millimeters."], ["50", "millimeters."], ["50", "mm."]]}
+      ]
+    },
+    {
+      "id": "repeat",
+      "text": "Please restart the gateway. Please restart the gateway.",
+      "critical": [
+        {"id": "request-first", "authored": ["Please", "restart", "the", "gateway."], "alternatives": [["Please", "restart", "the", "gateway."]]},
+        {"id": "request-second", "authored": ["Please", "restart", "the", "gateway."], "alternatives": [["Please", "restart", "the", "gateway."]]}
+      ]
+    }
+  ],
+  "waveforms": [
+    {
+      "id": "paused",
+      "construction": "render each sentence once; concatenate release,budget,measure,repeat three times with the frozen digital pauses; no resynthesis or output-dependent selection",
+      "sentence_order": ["release", "budget", "measure", "repeat", "release", "budget", "measure", "repeat", "release", "budget", "measure", "repeat"],
+      "minimum_duration_seconds": 65,
+      "annotation_windows": "exact source interval of each generated utterance, expanded 250 ms on either side inside the neighboring digital pause; repeat IDs include sequence index"
+    },
+    {
+      "id": "continuous",
+      "construction": "one say invocation over the exact text below; no punctuation, inserted pauses, stretching, resynthesis or segmentation selected using model output",
+      "text": "please tell Nora not to deploy version one point five before the review and explain that the budget for Ada is one thousand five hundred euros and not fifteen thousand euros while Grace measures fifteen millimeters and never replaces that value with fifty millimeters because the same account and the same measurement must remain unchanged throughout the entire review so please restart the gateway please restart the gateway and keep the written instructions available while the next operator reads the details aloud to the group and confirms that the work is ready for a careful independent review before anyone makes another change to the system",
+      "critical": [
+        {"id": "name-nora", "authored": ["Nora"], "alternatives": [["Nora"], ["nora"]]},
+        {"id": "negation-release", "authored": ["not"], "alternatives": [["not"]]},
+        {"id": "version", "authored": ["version", "one", "point", "five"], "alternatives": [["version", "one", "point", "five"], ["version", "1.5"]]},
+        {"id": "name-ada", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"]]},
+        {"id": "negation-amount", "authored": ["not"], "alternatives": [["not"]]},
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros"], "alternatives": [["fifteen", "thousand", "euros"], ["15,000", "euros"], ["15000", "euros"]]},
+        {"id": "name-grace", "authored": ["Grace"], "alternatives": [["Grace"], ["grace"]]},
+        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"]]},
+        {"id": "negation-measure", "authored": ["never"], "alternatives": [["never"]]},
+        {"id": "contrast-unit", "authored": ["fifty", "millimeters"], "alternatives": [["fifty", "millimeters"], ["50", "millimeters"], ["50", "mm"]]},
+        {"id": "repeat-first", "authored": ["please", "restart", "the", "gateway"], "alternatives": [["please", "restart", "the", "gateway"], ["Please", "restart", "the", "gateway."]]},
+        {"id": "repeat-second", "authored": ["please", "restart", "the", "gateway"], "alternatives": [["please", "restart", "the", "gateway"], ["Please", "restart", "the", "gateway."]]}
+      ],
+      "minimum_spoken_duration_seconds": 20,
+      "annotation_windows": "whole authored utterance; ordered unique nonoverlapping assignment of all declared occurrences, never ASR-selected subwindows"
+    }
+  ],
+  "tracks": [
+    {"id": "mic", "prefix_silence_ms": 0},
+    {"id": "tap", "prefix_silence_ms": 400}
+  ],
+  "input_chunks": [511, 1, 577, 4096, 73, 512, 2003],
+  "matrix": [
+    {"id": "paused-16-phase0", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
+    {"id": "paused-16-phase100", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 100, "mode": "ordinary"},
+    {"id": "paused-16-phase300", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 300, "mode": "ordinary"},
+    {"id": "paused-16-phase700", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
+    {"id": "paused-441-phase0", "waveform": "paused", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
+    {"id": "paused-441-phase700", "waveform": "paused", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
+    {"id": "paused-48-phase0", "waveform": "paused", "sample_rate": 48000, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
+    {"id": "paused-48-phase700", "waveform": "paused", "sample_rate": 48000, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
+    {"id": "paused-real60", "waveform": "paused", "sample_rate": 16000, "window_ms": 60000, "phase_ms": 0, "mode": "ordinary"},
+    {"id": "continuous-phase0", "waveform": "continuous", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
+    {"id": "continuous-phase300", "waveform": "continuous", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 300, "mode": "ordinary"},
+    {"id": "continuous-forced-fence", "waveform": "continuous", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 0, "mode": "explicit-forced-probe", "forced_source_ms": [6250, 14750]},
+    {"id": "paused-maintenance", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 0, "mode": "maintenance", "native_epoch_limit_samples": 960000}
+  ],
+  "comparison": {
+    "engine": "real Silero and pinned Sherpa; existing GGML/chunk/fault exact assertions remain separate and unchanged",
+    "reference": "one uncut batch per exact waveform/rate/track; cache only by identical PCM hash and exact decoder identity",
+    "controls": "uncut live A for every waveform/rate/track; do not substitute A for the corresponding batch reference",
+    "channel_scope": "two real native decoder channels coordinated by the portable boundary policy and native handshake; no AEC in this recognition matrix; actual app AEC lag/EOF/carry ownership has separate shared-path regressions",
+    "phase": "shorten only first nominal ownership interval by phase_ms; subsequent nominal intervals unchanged; PCM and source clock never shifted by filing phase",
+    "word_gate": "NFC, whitespace, lowercase, punctuation retained; integer 100*edit_distance <= 5*batch_tokens per cell and track",
+    "critical_gate": "every declared occurrence uniquely covered by a frozen literal baseline alternative; candidate must preserve exact raw baseline tokens, order and multiplicity; missing/ambiguous coverage fails",
+    "extra_critical_lexemes": ["US", "mM", "mm", "V2.0", "15000", "1500", "1,500", "15,000", "fifteen", "fifty", "Nora", "Ada", "Grace", "millimeters", "millimeters.", "euros", "euros."],
+    "lexeme_expansion": "union of every declared raw alternative token plus extra_critical_lexemes; no output-derived additions",
+    "empty_baseline": "reject for every speech cell",
+    "boundary_local_reports": "report the same alignment restricted to annotated occurrences whose batch word times overlap +/-1 second around each observed cut; whole-run gate remains mandatory",
+    "crossing_coverage": "across the paused short-phase matrix, each track must have a baseline name, negator and multi-token-number occurrence strictly straddling an observed nominal due frame; each track of the explicit forced probe must have a critical occurrence strictly straddling at least one fixed forced frame; actual deferred natural cuts need not divide a critical word",
+    "maintenance": "arm in advance and reset only at an ordinary selected boundary; never move nominal due or shorten the window; impossible native epoch capacity fails before inference",
+    "required_structure": ["every matrix cell and both tracks present", "no duplicate or missing required result", "source time monotonic", "attempted canonical PCM owned once", "source fence within unchanged nominal plus22seconds unless explicitly forced earlier", "at least one natural cut in paused ordinary cells", "at least one cut in real60 cell", "both explicit forced fences observed", "at least one proactive maintenance reset", "no AEC/VAD/model default changes", "raw words and timestamps retained", "every loss/metadata/cut/settlement record retained within declared bounded evidence"]
+  }
+}

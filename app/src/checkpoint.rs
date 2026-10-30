@@ -108,6 +108,9 @@ impl AwsStaging {
 pub(crate) struct FilingCheckpoint {
     version: u32,
     pub(crate) transcript: DiarizedTranscript,
+    /// Optional local-file generation receipt. Never embeds evidence text or authorizes ASR replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) evidence: Option<crate::evidence::Status>,
     /// Existing partial live note, or the path returned by `vagus add-note` before queue completion.
     pub(crate) note_path: Option<PathBuf>,
     /// `true` once the note body is canonical. Completion retries must trust this path even if vagus has
@@ -148,6 +151,7 @@ impl FilingCheckpoint {
         Self {
             version: VERSION,
             transcript,
+            evidence: None,
             note_path,
             note_canonical: false,
             provenance: legacy_batch_provenance(),
@@ -404,13 +408,17 @@ pub(crate) fn temporary_paths(audio: &Path) -> std::io::Result<Vec<PathBuf>> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    let prefixes: Vec<String> = [checkpoint, aws_staging_path_for(audio)]
-        .into_iter()
-        .filter_map(|path| {
-            path.file_name()
-                .map(|name| format!("{}.tmp-", name.to_string_lossy()))
-        })
-        .collect();
+    let prefixes: Vec<String> = [
+        checkpoint,
+        aws_staging_path_for(audio),
+        crate::evidence::path_for(audio),
+    ]
+    .into_iter()
+    .filter_map(|path| {
+        path.file_name()
+            .map(|name| format!("{}.tmp-", name.to_string_lossy()))
+    })
+    .collect();
 
     let entries = match std::fs::read_dir(&parent) {
         Ok(entries) => entries,

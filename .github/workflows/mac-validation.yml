@@ -92,6 +92,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
           python3 -m unittest discover -s scripts/quality -p 'test_*.py'
+          python3 -m unittest discover -s scripts/quality/boundary -p 'test_*.py'
           python3 -m unittest discover -s bench/scoring -p 'test_cleanup.py'
       - name: Hardware
         run: |

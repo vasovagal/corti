@@ -41,6 +41,11 @@ mod resample;
 
 pub use asr::Asr;
 pub use corti_transcribe::segment::Word;
+#[doc(hidden)]
+pub use live::{
+    BoundaryCapacity, BoundaryError, BoundaryInput, BoundaryKind, BoundaryLimits, BoundaryProgress,
+    BoundaryResamplerBounds, BoundarySnapshot, BoundaryToken, boundary_resampler_bounds,
+};
 pub use live::{LiveEngine, LiveTranscriber};
 #[cfg(feature = "stream")]
 pub use live::{LiveSink, LiveStreamCompletion, LiveWordStream, live_word_stream};

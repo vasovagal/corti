@@ -507,7 +507,14 @@ pub fn write_clean_wav_with_options(
     lookahead_seconds: f32,
     sidecar: AecStatsSidecar,
 ) -> Result<Option<PathBuf>> {
-    write_clean_wav_with_quality(raw_2track_wav, aec_cfg, lookahead_seconds, sidecar, None)
+    write_clean_wav_with_quality(
+        raw_2track_wav,
+        aec_cfg,
+        lookahead_seconds,
+        sidecar,
+        None,
+        None,
+    )
 }
 
 /// Quality-aware offline fallback. A primed AEC may emit a filter response during unavailable input;
@@ -515,21 +522,24 @@ pub fn write_clean_wav_with_options(
 /// Source/retained epoch mapping comes from the existing mandatory capture record, never current settings.
 /// Refuse before AEC or output creation when accounting overflow prevents exact availability masking;
 /// callers can retain the raw recording through their existing fallback.
+/// Additional pre-AEC observation requires affirmative raw-input authority from the existing capture
+/// processing record. A capture identity or ordinary WAV name alone may describe filtered PCM.
 pub fn write_clean_wav_with_quality(
     raw_2track_wav: &Path,
     aec_cfg: &corti_aec::AecConfig,
     lookahead_seconds: f32,
     sidecar: AecStatsSidecar,
-    quality: Option<&corti_core::QualityRecord>,
+    quality: Option<&mut corti_core::QualityRecord>,
+    capture_processing: Option<&CaptureProcessing>,
 ) -> Result<Option<PathBuf>> {
     let mut reader = hound::WavReader::open(raw_2track_wav)
         .with_context(|| format!("opening {} for AEC", raw_2track_wav.display()))?;
     let spec = reader.spec();
     match spec.channels {
-        // Tap-only / listen-only ("webinar") recording: no mic track, nothing to cancel. Only the header
-        // has been read at this point (never the samples), so the raw file is left untouched.
-        1 => return Ok(None),
-        2 => {}
+        // Preserve the legacy header-only path when no quality handoff was requested. A quality-aware
+        // raw traversal can observe the real tap without claiming that a microphone/AEC existed.
+        1 if quality.is_none() => return Ok(None),
+        1 | 2 => {}
         n => anyhow::bail!("expected a 1- or 2-channel recording for AEC, got {n} channel(s)"),
     }
 
@@ -548,10 +558,20 @@ pub fn write_clean_wav_with_quality(
                 .context("reading int samples")?
         }
     };
-    let mic: Vec<f32> = samples.iter().step_by(2).copied().collect();
-    let mut tap: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
-    anyhow::ensure!(mic.len() == tap.len(), "unaligned stereo recording for AEC");
-    let unavailable = match quality {
+    let (mic, mut tap): (Vec<f32>, Vec<f32>) = if spec.channels == 1 {
+        (Vec::new(), samples)
+    } else {
+        let mic = samples.iter().step_by(2).copied().collect::<Vec<_>>();
+        let tap = samples
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>();
+        anyhow::ensure!(mic.len() == tap.len(), "unaligned stereo recording for AEC");
+        (mic, tap)
+    };
+    let unavailable = match quality.as_deref() {
         Some(quality) => {
             anyhow::ensure!(
                 quality
@@ -560,10 +580,23 @@ pub fn write_clean_wav_with_quality(
                     .all(|epoch| epoch.retained_rate_hz == spec.sample_rate),
                 "capture quality rate does not match the retained WAV"
             );
-            quality.retained_source_loss_intervals(mic.len() as u64)?
+            quality.retained_source_loss_intervals(tap.len() as u64)?
         }
         None => Vec::new(),
     };
+    if let Some(quality) = quality {
+        observe_offline_activity(
+            quality,
+            capture_processing,
+            &mic,
+            &tap,
+            spec.sample_rate,
+            &unavailable,
+        );
+    }
+    if spec.channels == 1 {
+        return Ok(None);
+    }
 
     // Drive the streaming canceller with the env-tunable lookahead (ADR 0007 §1): the lookahead window
     // warms the filter and locks the mic↔far delay before the opening is emitted. This is the live path —
@@ -658,6 +691,130 @@ pub fn write_clean_wav_with_quality(
     }
 
     Ok(Some(out))
+}
+
+/// Observe only an affirmatively raw, unambiguously bound capture input. A foreign/legacy file
+/// or a capture whose processing marker was lost has no authority for historical raw samples.
+/// File naming, a capture identity and numerical zeros cannot manufacture that authority.
+fn observe_offline_activity(
+    quality: &mut corti_core::QualityRecord,
+    capture_processing: Option<&CaptureProcessing>,
+    mic: &[f32],
+    tap: &[f32],
+    sample_rate: u32,
+    losses: &[(u64, u64, corti_core::QualityTrack)],
+) {
+    use corti_core::{
+        ActivityBlock, ActivityScope, ChannelActivity, QualityCoverage, QualityTrack,
+    };
+
+    let capture = *quality.activity.get(ActivityScope::Capture);
+    let Some(input) = capture
+        .unambiguous_input()
+        .filter(|input| input.retained_rate_hz() == sample_rate)
+    else {
+        return;
+    };
+    let Some(processing) = capture_processing.filter(|processing| {
+        processing.validate().is_ok()
+            && matches!(
+                processing.aec,
+                CaptureAecState::RawFallback { .. }
+                    | CaptureAecState::Disabled
+                    | CaptureAecState::NotApplicable
+            )
+            && processing.quality.as_ref().and_then(|quality| {
+                quality
+                    .activity
+                    .get(ActivityScope::Capture)
+                    .unambiguous_input()
+            }) == Some(input)
+    }) else {
+        return;
+    };
+    // NotApplicable is a raw tap-only disposition, never authority for a newly encountered mic.
+    if matches!(processing.aec, CaptureAecState::NotApplicable) && !mic.is_empty() {
+        return;
+    }
+    let Ok(mut activity) = ChannelActivity::new(ActivityScope::Offline, input) else {
+        return;
+    };
+    let epochs = quality.epochs.clone(); // Existing fixed 64-epoch bound, not audio-length history.
+    let frames = mic.len().max(tap.len()) as u64;
+    let unavailable = [true; AEC_PUSH_FRAMES];
+    let mut cursor = 0_u64;
+    while cursor < frames {
+        let Some(index) = epochs
+            .iter()
+            .rposition(|epoch| epoch.retained_start_frame <= cursor)
+        else {
+            cursor = epochs
+                .first()
+                .map_or(frames, |epoch| epoch.retained_start_frame.min(frames));
+            continue;
+        };
+        let epoch = epochs[index];
+        let next = epochs.get(index + 1);
+        let known = quality.coverage == QualityCoverage::Observed
+            && next.map_or(quality.overflow.omitted_epochs == 0, |next| {
+                epoch.id.checked_add(1) == Some(next.id)
+            });
+        let mut end = frames.min(cursor.saturating_add(AEC_PUSH_FRAMES as u64));
+        if let Some(next) = next {
+            end = end.min(next.retained_start_frame);
+        }
+        let mut mic_missing = false;
+        let mut tap_missing = false;
+        for &(start, stop, track) in losses {
+            if start > cursor {
+                end = end.min(start);
+            }
+            if stop > cursor {
+                end = end.min(stop);
+            }
+            if start <= cursor && cursor < stop {
+                mic_missing |= matches!(track, QualityTrack::Mic | QualityTrack::Both);
+                tap_missing |= matches!(track, QualityTrack::Tap | QualityTrack::Both);
+            }
+        }
+        if end <= cursor {
+            break;
+        }
+        let start = cursor as usize;
+        let stop = end as usize;
+        let both_missing = mic_missing && tap_missing;
+        let _ = activity.push(
+            ActivityBlock {
+                epoch,
+                retained_start: cursor,
+                mic: if epoch.mic_channels == 0 || (mic_missing && !both_missing) {
+                    &[]
+                } else {
+                    mic.get(start..stop).unwrap_or(&[])
+                },
+                tap: if epoch.tap_channels == 0 || (tap_missing && !both_missing) {
+                    &[]
+                } else {
+                    tap.get(start..stop).unwrap_or(&[])
+                },
+                unavailable: if !known {
+                    None
+                } else if both_missing {
+                    Some(&unavailable[..stop - start])
+                } else {
+                    Some(&[])
+                },
+            },
+            quality,
+        );
+        cursor = end;
+    }
+    // A successfully parsed prefix alone is insufficient. Bind this traversal to the independently
+    // completed capture extent; damaged/legacy/interrupted captures retain positive facts only.
+    let complete = capture
+        .complete_end_frame()
+        .filter(|&end| end == frames && cursor == frames);
+    let _ = activity.finish(complete, quality);
 }
 
 #[cfg(target_os = "macos")]
@@ -1339,6 +1496,501 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn activity_raw_fixture(name: &str, mic: &[f32], tap: &[f32], rate: u32) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "corti-offline-activity-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("recording.wav");
+        let mut writer = hound::WavWriter::create(
+            &raw,
+            hound::WavSpec {
+                channels: if mic.is_empty() { 1 } else { 2 },
+                sample_rate: rate,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for (index, &tap) in tap.iter().enumerate() {
+            if let Some(&mic) = mic.get(index) {
+                writer.write_sample(mic).unwrap();
+            }
+            writer.write_sample(tap).unwrap();
+        }
+        writer.finalize().unwrap();
+        (dir, raw)
+    }
+
+    fn activity_capture(
+        mic: &[f32],
+        tap: &[f32],
+        rate: u32,
+        known: bool,
+    ) -> corti_core::QualityRecord {
+        use corti_core::{
+            ActivityBlock, ActivityInput, ActivityScope, CaptureEpoch, CaptureEpochReason,
+            ChannelActivity, QualityRecord,
+        };
+        let mut quality = QualityRecord::observed();
+        let epoch = CaptureEpoch {
+            id: 0,
+            source_start_ns: Some(0),
+            source_rate_hz: rate,
+            source_frame_base: 0,
+            retained_start_frame: 0,
+            retained_rate_hz: rate,
+            mic_channels: u32::from(!mic.is_empty()),
+            tap_channels: 1,
+            reason: CaptureEpochReason::Start,
+        };
+        quality.insert_epoch(epoch).unwrap();
+        let mut tracker = ChannelActivity::new(
+            ActivityScope::Capture,
+            ActivityInput::new([3; 32], rate).unwrap(),
+        )
+        .unwrap();
+        tracker
+            .push(
+                ActivityBlock {
+                    epoch,
+                    retained_start: 0,
+                    mic,
+                    tap,
+                    unavailable: known.then_some(&[]),
+                },
+                &mut quality,
+            )
+            .unwrap();
+        tracker
+            .finish(known.then_some(tap.len() as u64), &mut quality)
+            .unwrap();
+        quality
+    }
+
+    fn raw_activity_processing(quality: &corti_core::QualityRecord) -> CaptureProcessing {
+        CaptureProcessing {
+            schema_version: CAPTURE_PROCESSING_SCHEMA_VERSION,
+            aec: CaptureAecState::Disabled,
+            quality: Some(quality.clone()),
+        }
+    }
+
+    #[test]
+    fn offline_observation_requires_affirmative_matching_raw_processing_authority() {
+        use corti_core::{ActivityScope, FarReference};
+        let rate = 8_000;
+        let mic = vec![0.01; rate as usize * 5];
+        let tap = vec![0.0; mic.len()];
+        let (dir, raw) = activity_raw_fixture("raw-authority", &mic, &tap, rate);
+        let captured = activity_capture(&mic, &tap, rate, true);
+        let config = AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let baseline = write_clean_wav_with_options(&raw, &config, 0.1, AecStatsSidecar::Off)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&baseline).unwrap();
+        let mut applied = raw_activity_processing(&captured);
+        applied.aec = CaptureAecState::Applied {
+            config: config.clone(),
+            lookahead_seconds: 0.1,
+        };
+        let mut degraded = applied.clone();
+        degraded.aec = CaptureAecState::Degraded {
+            config: config.clone(),
+            lookahead_seconds: 0.1,
+        };
+        let mut invalid = raw_activity_processing(&captured);
+        invalid.schema_version += 1;
+        let mut wrong_layout = raw_activity_processing(&captured);
+        wrong_layout.aec = CaptureAecState::NotApplicable;
+        let wrong_input = raw_activity_processing(&activity_capture(&mic, &tap, rate + 1, true));
+        for authority in [
+            None,
+            Some(applied),
+            Some(degraded),
+            Some(CaptureProcessing::disabled()),
+            Some(invalid),
+            Some(wrong_layout),
+            Some(wrong_input),
+        ] {
+            let mut quality = captured.clone();
+            let clean = write_clean_wav_with_quality(
+                &raw,
+                &config,
+                0.1,
+                AecStatsSidecar::Off,
+                Some(&mut quality),
+                authority.as_ref(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                quality.activity.get(ActivityScope::Offline).far_reference(),
+                FarReference::Unknown
+            );
+            assert_eq!(quality.activity.get(ActivityScope::Offline).input(), None);
+            assert_eq!(
+                quality, captured,
+                "missing raw authority must not rewrite existing history"
+            );
+            assert_eq!(
+                std::fs::read(clean).unwrap(),
+                bytes,
+                "observation authority does not select the AEC path"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_conflicts_cannot_authorize_input_but_historical_uncertainty_can() {
+        use corti_core::{
+            ActivityBlock, ActivityInput, ActivityScope, ChannelActivity, FarReference,
+            QualityRecord,
+        };
+        let rate = 8_000;
+        let mic = vec![0.01; rate as usize * 5];
+        let zero = vec![0.0; mic.len()];
+        let positive = vec![0.1; mic.len()];
+        let (dir, raw) = activity_raw_fixture("conflicted-authority", &mic, &positive, rate);
+        let base = activity_capture(&mic, &positive, rate, true);
+        let mut other = QualityRecord::observed();
+        let epoch = base.epochs[0];
+        other.insert_epoch(epoch).unwrap();
+        let mut tracker = ChannelActivity::new(
+            ActivityScope::Capture,
+            ActivityInput::new([4; 32], rate).unwrap(),
+        )
+        .unwrap();
+        tracker
+            .push(
+                ActivityBlock {
+                    epoch,
+                    retained_start: 0,
+                    mic: &mic,
+                    tap: &positive,
+                    unavailable: Some(&[]),
+                },
+                &mut other,
+            )
+            .unwrap();
+        tracker.finish(Some(mic.len() as u64), &mut other).unwrap();
+        let mut identity_conflict = base.clone();
+        identity_conflict.merge_snapshot(&other).unwrap();
+        let mut proof_conflict = base.clone();
+        proof_conflict
+            .merge_snapshot(&activity_capture(&mic, &zero, rate, true))
+            .unwrap();
+        let mut extent_conflict = base.clone();
+        extent_conflict
+            .merge_snapshot(&activity_capture(
+                &mic[..mic.len() - 1],
+                &positive[..positive.len() - 1],
+                rate,
+                true,
+            ))
+            .unwrap();
+        let config = AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        for mut quality in [identity_conflict, proof_conflict, extent_conflict] {
+            let before = quality.clone();
+            assert!(
+                quality
+                    .activity
+                    .get(ActivityScope::Capture)
+                    .input()
+                    .is_some(),
+                "retained history still has its deterministic identity"
+            );
+            assert_eq!(
+                quality
+                    .activity
+                    .get(ActivityScope::Capture)
+                    .unambiguous_input(),
+                None
+            );
+            // Both a conflicted carrier and the original nonconflicting raw authority must fail closed.
+            for processing in [
+                raw_activity_processing(&quality),
+                raw_activity_processing(&base),
+            ] {
+                write_clean_wav_with_quality(
+                    &raw,
+                    &config,
+                    0.1,
+                    AecStatsSidecar::Off,
+                    Some(&mut quality),
+                    Some(&processing),
+                )
+                .unwrap();
+                assert_eq!(
+                    quality.activity.get(ActivityScope::Offline).far_reference(),
+                    FarReference::Unknown
+                );
+                assert_eq!(quality.activity.get(ActivityScope::Offline).input(), None);
+                assert_eq!(quality, before);
+            }
+        }
+        let (retry_dir, retry_raw) =
+            activity_raw_fixture("uncertain-complete-authority", &mic, &zero, rate);
+        let mut quality = activity_capture(&mic, &zero, rate, false);
+        quality
+            .merge_snapshot(&activity_capture(&mic, &zero, rate, true))
+            .unwrap();
+        let capture = *quality.activity.get(ActivityScope::Capture);
+        assert!(capture.uncertain());
+        assert!(capture.unambiguous_input().is_some());
+        assert_eq!(capture.complete_end_frame(), Some(mic.len() as u64));
+        let processing = raw_activity_processing(&quality);
+        write_clean_wav_with_quality(
+            &retry_raw,
+            &config,
+            0.1,
+            AecStatsSidecar::Off,
+            Some(&mut quality),
+            Some(&processing),
+        )
+        .unwrap();
+        assert_eq!(*quality.activity.get(ActivityScope::Capture), capture);
+        assert_eq!(
+            quality.activity.get(ActivityScope::Offline).far_reference(),
+            FarReference::Absent
+        );
+        assert_eq!(
+            quality
+                .activity
+                .get(ActivityScope::Offline)
+                .complete_end_frame(),
+            Some(mic.len() as u64)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(retry_dir).unwrap();
+    }
+
+    #[test]
+    fn offline_tap_only_observation_preserves_not_applicable_and_creates_no_derivative() {
+        use corti_core::{ActivityScope, FarReference};
+        let rate = 8_000;
+        for (name, value, expected) in [
+            ("tap-zero", 0.0, FarReference::Absent),
+            ("tap-present", 0.01, FarReference::Present),
+        ] {
+            let tap = vec![value; rate as usize * 5];
+            let (dir, raw) = activity_raw_fixture(name, &[], &tap, rate);
+            let before = std::fs::read(&raw).unwrap();
+            let mut quality = activity_capture(&[], &tap, rate, true);
+            let mut processing = raw_activity_processing(&quality);
+            processing.aec = CaptureAecState::NotApplicable;
+            assert_eq!(
+                write_clean_wav_with_quality(
+                    &raw,
+                    &Default::default(),
+                    0.1,
+                    AecStatsSidecar::Write,
+                    Some(&mut quality),
+                    Some(&processing)
+                )
+                .unwrap(),
+                None
+            );
+            let observed = quality.activity.get(ActivityScope::Offline);
+            assert_eq!(observed.far_reference(), expected);
+            assert!(!observed.suspected());
+            assert_eq!(observed.complete_end_frame(), Some(tap.len() as u64));
+            assert_eq!(std::fs::read(&raw).unwrap(), before);
+            assert!(!clean_wav_path(&raw).exists());
+            assert!(!aec_stats_path(&raw).exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn offline_activity_uses_pre_aec_samples_without_changing_wav_bytes_or_retry_counts() {
+        use corti_core::{
+            ActivityScope, FarReference, QualityCause, QualityClass, QualityStage,
+            SourceCompleteness,
+        };
+        let rate = 8_000;
+        let mic = vec![0.01; rate as usize * 6 + 17];
+        let tap = vec![0.0; mic.len()];
+        let (dir, raw) = activity_raw_fixture("parity", &mic, &tap, rate);
+        let raw_bytes = std::fs::read(&raw).unwrap();
+        let config = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let clean = write_clean_wav_with_options(&raw, &config, 0.1, AecStatsSidecar::Off)
+            .unwrap()
+            .unwrap();
+        let baseline = std::fs::read(&clean).unwrap();
+        let mut quality = activity_capture(&mic, &tap, rate, true);
+        let processing = raw_activity_processing(&quality);
+        write_clean_wav_with_quality(
+            &raw,
+            &config,
+            0.1,
+            AecStatsSidecar::Off,
+            Some(&mut quality),
+            Some(&processing),
+        )
+        .unwrap();
+        let observed = quality.activity.get(ActivityScope::Offline);
+        assert!(observed.suspected());
+        assert_eq!(observed.far_reference(), FarReference::Absent);
+        assert_eq!(observed.complete_end_frame(), Some(mic.len() as u64));
+        assert!(
+            quality
+                .spans
+                .iter()
+                .any(|span| span.cause == QualityCause::FarReferenceSilent
+                    && span.stage == QualityStage::Batch
+                    && span.class == QualityClass::DegradedOnly
+                    && span.start_frame == 0
+                    && span.end_frame == u64::from(rate) * 6)
+        );
+        assert_eq!(std::fs::read(&clean).unwrap(), baseline);
+        assert_eq!(std::fs::read(&raw).unwrap(), raw_bytes);
+        assert_eq!(quality.completeness(), SourceCompleteness::Complete);
+        assert!(!quality.requires_batch_recovery());
+        let frozen = quality.clone();
+        write_clean_wav_with_quality(
+            &raw,
+            &config,
+            0.1,
+            AecStatsSidecar::Off,
+            Some(&mut quality),
+            Some(&processing),
+        )
+        .unwrap();
+        assert_eq!(quality, frozen);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_activity_keeps_valid_tap_history_across_mic_only_source_loss() {
+        use corti_core::{
+            ActivityScope, FarReference, QualityCause, QualityClass, QualityResolution,
+            QualitySpan, QualityStage, QualityTrack,
+        };
+        let rate = 8_000;
+        let mut mic = vec![0.01; rate as usize * 6];
+        mic[rate as usize..rate as usize * 2].fill(0.0);
+        let mut tap = vec![0.0; mic.len()];
+        tap[0] = 0.2;
+        let (dir, raw) = activity_raw_fixture("mic-loss", &mic, &tap, rate);
+        let mut quality = activity_capture(&mic, &tap, rate, false);
+        quality
+            .insert_span(QualitySpan {
+                epoch: 0,
+                start_frame: u64::from(rate),
+                end_frame: u64::from(rate) * 2,
+                track: QualityTrack::Mic,
+                cause: QualityCause::RingOverflow,
+                class: QualityClass::SourceLoss,
+                stage: QualityStage::Capture,
+                resolution: QualityResolution::Outstanding,
+            })
+            .unwrap();
+        let config = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let processing = raw_activity_processing(&quality);
+        let clean = write_clean_wav_with_quality(
+            &raw,
+            &config,
+            0.1,
+            AecStatsSidecar::Off,
+            Some(&mut quality),
+            Some(&processing),
+        )
+        .unwrap()
+        .unwrap();
+        let observed = quality.activity.get(ActivityScope::Offline);
+        assert_eq!(observed.far_reference(), FarReference::Intermittent);
+        assert!(observed.uncertain());
+        assert!(!observed.suspected());
+        assert_eq!(observed.complete_end_frame(), None);
+        let samples = hound::WavReader::open(clean)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            samples
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .copied()
+                .collect::<Vec<_>>(),
+            tap
+        );
+        assert!(
+            samples[rate as usize * 2..rate as usize * 4]
+                .iter()
+                .step_by(2)
+                .all(|sample| *sample == 0.0)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn offline_activity_legacy_input_remains_unknown_and_failed_output_keeps_observations() {
+        use corti_core::{ActivityScope, FarReference, QualityRecord};
+        let rate = 8_000;
+        let mic = vec![0.01; rate as usize * 5];
+        let tap = vec![0.0; mic.len()];
+        let (dir, raw) = activity_raw_fixture("legacy-failure", &mic, &tap, rate);
+        let config = corti_aec::AecConfig {
+            filter_len: 256,
+            ..Default::default()
+        };
+        let mut legacy = QualityRecord::default();
+        let clean = write_clean_wav_with_quality(
+            &raw,
+            &config,
+            0.1,
+            AecStatsSidecar::Off,
+            Some(&mut legacy),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            legacy.activity.get(ActivityScope::Offline).far_reference(),
+            FarReference::Unknown
+        );
+        assert_eq!(legacy, QualityRecord::default());
+        std::fs::remove_file(&clean).unwrap();
+        std::fs::create_dir(&clean).unwrap();
+        let mut bound = activity_capture(&mic, &tap, rate, true);
+        let processing = raw_activity_processing(&bound);
+        assert!(
+            write_clean_wav_with_quality(
+                &raw,
+                &config,
+                0.1,
+                AecStatsSidecar::Off,
+                Some(&mut bound),
+                Some(&processing)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            bound.activity.get(ActivityScope::Offline).far_reference(),
+            FarReference::Absent
+        );
+        assert!(bound.activity.get(ActivityScope::Offline).suspected());
+        assert!(!bound.requires_batch_recovery());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn synthetic_echo(frames: usize) -> (Vec<f32>, Vec<f32>) {
         let tap: Vec<f32> = (0..frames).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
         let mic: Vec<f32> = (0..frames)
@@ -1463,9 +2115,16 @@ mod tests {
                 QualityCause::RingOverflow,
             ))
             .unwrap();
-        write_clean_wav_with_quality(&raw, &config, 0.5, AecStatsSidecar::Off, Some(&quality))
-            .unwrap()
-            .unwrap();
+        write_clean_wav_with_quality(
+            &raw,
+            &config,
+            0.5,
+            AecStatsSidecar::Off,
+            Some(&mut quality),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         let masked = hound::WavReader::open(&clean)
             .unwrap()
             .samples::<f32>()
@@ -1609,13 +2268,14 @@ mod tests {
                 .unwrap();
         }
         assert!(saturated.overflow.counter_saturated);
-        for uncertain in [&quality, &saturated] {
+        for uncertain in [&mut quality, &mut saturated] {
             let error = write_clean_wav_with_quality(
                 &raw,
                 &config,
                 0.5,
                 AecStatsSidecar::Write,
                 Some(uncertain),
+                None,
             )
             .unwrap_err();
             assert_eq!(

@@ -213,6 +213,54 @@ rejects the new field because its private envelope uses `deny_unknown_fields`; n
 that unreleased intermediate format is claimed. The released base had no quality sidecar. Existing
 released queue/notes/settings formats and SQLite schema version are unchanged.
 
+### Pre-AEC channel activity and finish-time AEC identity (#156)
+
+The same schema-1 `QualityRecord` carries bounded Capture, Offline and Live activity observations,
+each bound to its raw input and retained rate. Writers observe normalized/downmixed channels before
+filtering, live consumers before mismatch padding/AEC, and an authorized offline raw pass before its
+filter. An unavailable numerical zero is not observed silence. Legacy, foreign and already-clean
+artifacts cannot supply missing historical pre-AEC availability. Positive observations and uncertainty
+survive retries; only an independently complete traversal with an exact bound terminal extent can
+prove absence. Partial traversals cannot combine into that proof. A valid complete same-input retry
+can establish current coverage while retaining uncertainty history; contradictory input/proof facts
+remain unknown.
+
+Offline observation additionally requires the selected recording's existing, validated capture-processing
+marker to affirm wholly raw input and agree with the carried record's unambiguous input binding. An
+ordinary capture WAV may already contain filtered mic PCM; its name, Capture identity and sample rate
+cannot replace that marker. `--input` and disk-only redo keep existing audio/AEC routing but retain
+unknown Offline activity when the marker is missing. Input/proof conflict cannot seed a fresh definite
+scope. This gate does not reject historical uncertainty by itself and changes no quality wire field.
+
+Five complete one-second bins of active microphone RMS above the accepted, explicitly uncalibrated
+−60 dBFS threshold and exactly zero tap produce a suspected silent-reference diagnostic. This is
+`DegradedOnly`, including bounded omissions and diagnostic counter saturation. It does not request
+fallback, make source/text incomplete, change storage authority or alter AEC/audio routing.
+
+AEC provenance records actual execution disposition separately from the matching observation scope
+and `far_reference` (`unknown`, `present`, `intermittent`, `absent`). Only an applied disposition is
+refined by reference evidence; disabled, not-applicable, raw fallback, mixed/degraded and failed
+dispositions retain precedence. An enabled live session starts pending and records the actual short
+0.1-second lookahead. Settings alone cannot establish that a canceller ran, nor can a clean-WAV redo
+invent observations of its earlier raw input. Offline observations remain in the existing quality
+handoff after an AEC/backend failure and are retained by the existing recording owner; print-only
+callers do not publish quality history. A retention failure preserves the original backend error.
+
+The existing owned-note metadata-only finish refresh also publishes these AEC/activity fields, even
+without hosted work or an assembled final transcript ledger. It continues to operate only on the
+current returned note path and preserve the body and inode before the state flip. Its existing
+non-atomic failure behavior, ownership rules and checkpoint/retry authority remain unchanged. There
+is no additional note-read API, quality carrier, queue schema, capture graph or AEC default change.
+
+The live consumer observes the actual pre-filter tee slices, retained positions, epoch bindings and
+availability before mismatch padding, AEC or decoder admission. Its one recording-scoped tracker
+survives text-window rotation and publishes open runs before a later decoder failure can discard
+them. Only a matching, unambiguous Capture completion proof supplies its terminal extent; channel
+closure or the last received chunk cannot do so. Supplementary activity merges against Finish's
+epoch authority without adding capture coverage or omitted epochs. Unmappable runs use the same
+bounded diagnostic omission lower bounds, so repeated finish/fallback snapshots cannot recount them
+or turn activity-only capacity loss into source/processing incompleteness.
+
 ## Consequences
 
 - A bad note is self-describing enough to group quality reports by Corti release, final path, model set, and

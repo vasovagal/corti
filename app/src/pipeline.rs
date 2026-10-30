@@ -1474,6 +1474,9 @@ fn resume_filing_checkpoint(
     audio: &Path,
     checkpoint: FilingCheckpoint,
 ) -> Result<()> {
+    let enabled = ctx.config.lock().unwrap().evidence.enabled;
+    let _evidence_status =
+        crate::evidence::integration::replay_status(id, meta, audio, checkpoint.evidence, enabled);
     // A checkpoint can be newer than the row when its atomic rename succeeded but the adjacent SQLite
     // transition failed (or the process died between them). Treat it as authoritative from every dispatch
     // path, including a duplicate first-attempt Process message.
@@ -1574,19 +1577,40 @@ fn transcribe_without_checkpoint(
         // wholly-raw writer setup failure take the safe file pass selected above. Pipeline AWS attempts use the
         // row's stable name; one-shot CLI calls pass none.
         let t0 = std::time::Instant::now();
-        let transcribed = crate::transcribe::transcribe_recording(
+        let mut evidence = None;
+        let evidence_request =
+            current_cfg
+                .evidence
+                .enabled
+                .then_some(crate::evidence::integration::BatchRequest {
+                    output: &mut evidence,
+                    capture: capture_processing.as_ref(),
+                    already_clean: false,
+                    kind: match origin {
+                        crate::transcribe::RetryOrigin::Fresh
+                        | crate::transcribe::RetryOrigin::RecordedFirst(_) => {
+                            corti_transcribe::evidence::StageKind::TrueAsr
+                        }
+                        crate::transcribe::RetryOrigin::Retry(_) => {
+                            corti_transcribe::evidence::StageKind::FallbackAsr
+                        }
+                    },
+                });
+        let transcribed = crate::transcribe::transcribe_recording_with_evidence(
             &ctx.backend,
             offline_aec.as_ref(),
             crate::transcribe::TranscriptionAttempt::durable_named(id, &transcribe_job)
-                .with_quality(&quality.quality),
+                .with_capture_processing(capture_processing.as_ref())
+                .with_quality(&mut quality.quality),
             meta,
             audio,
+            evidence_request,
         );
         ctx.stats
             .record_stage("transcribe", t0.elapsed(), ctx.backend_label);
         let transcribe_secs = t0.elapsed().as_secs_f64();
         let (decoded, _transcribed_input, aec_outcome, cleanup_audio_evidence) =
-            transcribed.context("transcription failed")?;
+            transcribed.map_err(|error| quality.retain_failed_attempt(error, id, audio, false))?;
         let raw_transcript = settle_batch_decode_quality(
             &mut quality,
             decoded,
@@ -1602,6 +1626,13 @@ fn transcribe_without_checkpoint(
         // complete generation fence immediately before selecting hosted text for durability.
         let hosted_snapshot = ctx.hosted.snapshot();
         let hosted_allowed = origin.permits_hosted_final(ctx.backend.identity());
+        if hosted_allowed
+            && hosted_snapshot.control.master_enabled
+            && hosted_snapshot.control.final_lane.enabled
+            && let Some(evidence) = evidence.as_mut()
+        {
+            evidence.provider_input(&raw_transcript);
+        }
         if hosted_allowed
             && hosted_snapshot.control.master_enabled
             && hosted_snapshot.control.final_lane.enabled
@@ -1636,6 +1667,9 @@ fn transcribe_without_checkpoint(
             final_applied = false;
         }
         let transcript = settled.transcript.clone();
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.final_prose(&transcript, final_applied);
+        }
 
         // A recording-scoped live outcome is authoritative when supplied: checkpoint it directly so a second
         // queue read failure cannot lose ownership after expensive ASR. Row-only paths are legacy partials.
@@ -1692,6 +1726,24 @@ fn transcribe_without_checkpoint(
         {
             checkpoint.set_canonical_note(note.path);
         }
+        // The optional local ledger publishes before the existing #93 durability boundary. A
+        // pre-checkpoint crash re-runs ASR and replaces this generation; a checkpoint replay never
+        // invokes the backend or rewrites the evidence bytes. I/O/truncation cannot fail filing.
+        checkpoint.evidence = Some({
+            // Serialize the current enabled check with publication, as live windows do. A settings
+            // toggle cannot finish and sweep the file between this check and its atomic replacement.
+            let config = ctx.config.lock().unwrap();
+            if !config.evidence.enabled {
+                crate::evidence::Status::Disabled
+            } else if let Some(evidence) = evidence.as_mut() {
+                if let Some(quality) = checkpoint.quality.as_ref() {
+                    evidence.settle_quality(quality);
+                }
+                evidence.persist(audio)
+            } else {
+                crate::evidence::Status::Unavailable
+            }
+        });
         if let Err(error) = checkpoint
             .store(audio)
             .context("persisting transcript checkpoint")

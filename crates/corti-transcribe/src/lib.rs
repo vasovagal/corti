@@ -12,8 +12,14 @@ use std::path::Path;
 use anyhow::Result;
 use corti_core::{DiarizedTranscript, QualityRecord, RecordingMeta};
 
+/// Checked source-frame policy for deferred live filing boundaries.
+pub mod boundary;
+
 /// Content-free decode outcomes and checked mapping back to capture quality.
 pub mod decode;
+
+/// Local-only canonical timing, original ASR rows, and reversible cleanup evidence.
+pub mod evidence;
 
 /// Shared reconciliation helpers (word grouping, speaker merge, diarization attribution) used by the
 /// concrete backends to shape timestamped words into a [`DiarizedTranscript`], plus the deterministic

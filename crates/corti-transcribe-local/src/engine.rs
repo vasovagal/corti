@@ -202,7 +202,7 @@ pub fn transcribe_channel(
     vad: VoiceActivityDetector,
     samples_16k: &[f32],
 ) -> Vec<Word> {
-    let mut live = LiveTranscriber::new(rec, vad);
+    let mut live = LiveTranscriber::from_pinned_vad(rec, vad);
     // The channel is already at 16 kHz (the caller resampled), so `push` does no resampling.
     live.push(samples_16k, TARGET_RATE as u32);
     live.finish()
@@ -215,7 +215,7 @@ pub(crate) fn transcribe_resampled_channel(
     source_frames: usize,
     source_rate: u32,
 ) -> (Vec<Word>, corti_transcribe::decode::DecodeReport, bool) {
-    let mut live = LiveTranscriber::new(rec, vad);
+    let mut live = LiveTranscriber::from_pinned_vad(rec, vad);
     live.push_resampled(samples_16k, source_frames, source_rate);
     let words = live.finish();
     let complete = live.decode_complete();

@@ -41,6 +41,9 @@ pub(crate) fn attach_quality(
     storage: Option<crate::transcribe::RecordingStorageStatus>,
 ) -> anyhow::Result<()> {
     quality.validate()?;
+    if let Some(Value::Object(aec)) = provenance.configuration.get_mut("aec") {
+        project_aec_activity(aec, Some(quality));
+    }
     let projection = quality_frontmatter_projection(quality)?;
     provenance
         .configuration
@@ -414,13 +417,12 @@ fn base_configuration(
                 "disabled"
             },
             if cfg.aec_enabled {
-                "applied"
+                "pending"
             } else {
                 "disabled"
             },
             &current,
-            cfg.aec_enabled
-                .then(corti_aec::configured_lookahead_seconds),
+            cfg.aec_enabled.then_some(0.1), // The actual live short-lookahead canceller.
         ),
         AecExecution::Capture(processing) => match &processing.aec {
             corti_capture::CaptureAecState::Disabled => {
@@ -504,6 +506,26 @@ fn base_configuration(
     aec.insert("enabled".into(), Value::Bool(enabled));
     aec.insert("mode".into(), Value::String(aec_mode.into()));
     aec.insert("outcome".into(), Value::String(outcome.into()));
+    aec.insert("execution_outcome".into(), Value::String(outcome.into()));
+    aec.insert(
+        "observation_scope".into(),
+        Value::String(
+            match execution {
+                AecExecution::Live => "live",
+                AecExecution::Capture(_) => "capture",
+                AecExecution::Offline { .. } => "offline",
+                AecExecution::PreprocessedUnknown | AecExecution::Disabled => "unknown",
+            }
+            .into(),
+        ),
+    );
+    project_aec_activity(
+        &mut aec,
+        match execution {
+            AecExecution::Capture(processing) => processing.quality.as_ref(),
+            _ => None,
+        },
+    );
     aec.insert(
         "filter_len".into(),
         Value::from(effective.filter_len as u64),
@@ -557,10 +579,83 @@ fn base_configuration(
     configuration
 }
 
-/// The deterministic segment-cleanup rules a transcript was produced under (#149), or the string `"off"`
-/// when no pass would run. Recorded so a note is self-describing: a row that looks like it is missing an
-/// echo, a fragment or a "Yeah." can be explained from the note itself. `live` additionally records whether
-/// the live path's early drop was running (#149 phase 2).
+/// Observation projection never changes execution disposition or selects another audio path.
+fn project_aec_activity(aec: &mut Map<String, Value>, quality: Option<&corti_core::QualityRecord>) {
+    use corti_core::{ActivityScope, FarReference};
+    let scope = match aec.get("observation_scope").and_then(Value::as_str) {
+        Some("capture") => Some(ActivityScope::Capture),
+        Some("offline") => Some(ActivityScope::Offline),
+        Some("live") => Some(ActivityScope::Live),
+        _ => None,
+    };
+    let evidence = scope
+        .and_then(|scope| quality.map(|quality| *quality.activity.get(scope)))
+        .unwrap_or_default();
+    let reference = evidence.far_reference();
+    let label = match reference {
+        FarReference::Unknown => "unknown",
+        FarReference::Present => "present",
+        FarReference::Intermittent => "intermittent",
+        FarReference::Absent => "absent",
+    };
+    let execution = aec
+        .get("execution_outcome")
+        .or_else(|| aec.get("outcome"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let outcome = if execution == "applied" {
+        match reference {
+            FarReference::Unknown => "applied_far_reference_unknown",
+            FarReference::Present => "applied",
+            FarReference::Intermittent => "applied_with_intermittent_far_reference",
+            FarReference::Absent => "no_far_reference",
+        }
+    } else {
+        &execution
+    }
+    .to_owned();
+    aec.insert("outcome".into(), Value::String(outcome));
+    aec.entry("execution_outcome")
+        .or_insert(Value::String(execution));
+    aec.insert("far_reference".into(), Value::String(label.into()));
+    aec.insert(
+        "suspected_silent_far_reference".into(),
+        Value::Bool(evidence.suspected()),
+    );
+    aec.insert(
+        "activity_uncertain".into(),
+        Value::Bool(evidence.uncertain()),
+    );
+}
+
+/// Called from the live consumer when it actually feeds the canceller, and at its finish refresh.
+/// Pending construction is not evidence that any mic/reference samples reached AEC.
+#[cfg_attr(not(feature = "local"), allow(dead_code))]
+pub(crate) fn observe_live_aec_execution(
+    provenance: &mut TranscriptProvenance,
+    ran: bool,
+    saw_mic: bool,
+) {
+    if let Some(Value::Object(aec)) = provenance.configuration.get_mut("aec")
+        && aec.get("observation_scope").and_then(Value::as_str) == Some("live")
+        && aec.get("enabled").and_then(Value::as_bool) == Some(true)
+    {
+        let outcome = if ran {
+            "applied"
+        } else if !saw_mic {
+            "not_applicable"
+        } else {
+            "pending"
+        };
+        aec.insert("execution_outcome".into(), Value::String(outcome.into()));
+        // The following attach_quality supplies the actual scope's reference observations.
+        aec.insert("outcome".into(), Value::String(outcome.into()));
+    }
+}
+
+/// The deterministic segment-cleanup rules a transcript was produced under (#149), or `"off"`.
+/// Live additionally records whether its early drop was running (#149 phase 2).
 fn segment_cleanup(cleanup: &CleanupConfig, live: bool, audio_evidence: bool) -> Value {
     if cleanup.is_noop() {
         return Value::String("off".into());
@@ -1138,7 +1233,7 @@ mod tests {
             (
                 crate::transcribe::OfflineAecOutcome::Applied,
                 "offline",
-                "applied",
+                "applied_far_reference_unknown",
             ),
             (
                 crate::transcribe::OfflineAecOutcome::NotApplicable,
@@ -1164,6 +1259,268 @@ mod tests {
             );
             assert_eq!(provenance.configuration["aec"]["mode"], expected_mode);
             assert_eq!(provenance.configuration["aec"]["outcome"], expected_outcome);
+        }
+    }
+
+    fn activity_quality(
+        scope: corti_core::ActivityScope,
+        reference: corti_core::FarReference,
+    ) -> corti_core::QualityRecord {
+        use corti_core::{
+            ActivityBlock, ActivityInput, CaptureEpoch, CaptureEpochReason, ChannelActivity,
+            FarReference, QualityRecord,
+        };
+        let mut quality = QualityRecord::observed();
+        if reference == FarReference::Unknown {
+            return quality;
+        }
+        let epoch = CaptureEpoch {
+            id: 0,
+            source_start_ns: Some(0),
+            source_rate_hz: 8,
+            source_frame_base: 0,
+            retained_start_frame: 0,
+            retained_rate_hz: 8,
+            mic_channels: 1,
+            tap_channels: 1,
+            reason: CaptureEpochReason::Start,
+        };
+        quality.insert_epoch(epoch).unwrap();
+        let mic = [0.01; 48];
+        let mut tap = [0.0; 48];
+        if reference == FarReference::Present {
+            tap.fill(0.1);
+        }
+        if reference == FarReference::Intermittent {
+            tap[0] = 0.1;
+        }
+        let mut activity =
+            ChannelActivity::new(scope, ActivityInput::new([7; 32], 8).unwrap()).unwrap();
+        activity
+            .push(
+                ActivityBlock {
+                    epoch,
+                    retained_start: 0,
+                    mic: &mic,
+                    tap: &tap,
+                    unavailable: Some(&[]),
+                },
+                &mut quality,
+            )
+            .unwrap();
+        activity.finish(Some(48), &mut quality).unwrap();
+        assert_eq!(quality.activity.get(scope).far_reference(), reference);
+        quality
+    }
+
+    #[test]
+    fn every_aec_execution_arm_keeps_disposition_and_projects_only_its_input_scope() {
+        use crate::transcribe::{OfflineAecOutcome, RecordingStorageStatus};
+        use corti_capture::CaptureAecState;
+        use corti_core::{ActivityScope, FarReference};
+        let cfg = AppConfig::default();
+        let config = cfg.aec_config();
+        for (reference, label, applied) in [
+            (
+                FarReference::Unknown,
+                "unknown",
+                "applied_far_reference_unknown",
+            ),
+            (FarReference::Present, "present", "applied"),
+            (
+                FarReference::Intermittent,
+                "intermittent",
+                "applied_with_intermittent_far_reference",
+            ),
+            (FarReference::Absent, "absent", "no_far_reference"),
+        ] {
+            for (state, disposition) in [
+                (CaptureAecState::Disabled, "disabled"),
+                (CaptureAecState::NotApplicable, "not_applicable"),
+                (
+                    CaptureAecState::Applied {
+                        config: config.clone(),
+                        lookahead_seconds: 7.5,
+                    },
+                    "applied",
+                ),
+                (
+                    CaptureAecState::RawFallback {
+                        config: config.clone(),
+                        lookahead_seconds: 7.5,
+                    },
+                    "raw_fallback",
+                ),
+                (
+                    CaptureAecState::Degraded {
+                        config: config.clone(),
+                        lookahead_seconds: 7.5,
+                    },
+                    "degraded_mixed",
+                ),
+            ] {
+                let mut quality = activity_quality(ActivityScope::Capture, reference);
+                quality
+                    .merge_snapshot(&activity_quality(
+                        ActivityScope::Offline,
+                        FarReference::Present,
+                    ))
+                    .unwrap();
+                let processing = corti_capture::CaptureProcessing {
+                    schema_version: corti_capture::CAPTURE_PROCESSING_SCHEMA_VERSION,
+                    quality: Some(quality.clone()),
+                    aec: state,
+                };
+                let mut provenance = from_config_with_aec(
+                    &cfg,
+                    GenerationMode::Batch,
+                    AecExecution::Capture(&processing),
+                    false,
+                );
+                attach_quality(
+                    &mut provenance,
+                    &quality,
+                    Some(RecordingStorageStatus::AudioDurable),
+                )
+                .unwrap();
+                let aec = &provenance.configuration["aec"];
+                assert_eq!(aec["execution_outcome"], disposition);
+                assert_eq!(
+                    aec["outcome"],
+                    if disposition == "applied" {
+                        applied
+                    } else {
+                        disposition
+                    }
+                );
+                assert_eq!(aec["far_reference"], label);
+                assert_eq!(aec["observation_scope"], "capture");
+                assert_eq!(
+                    aec["suspected_silent_far_reference"],
+                    quality.activity.get(ActivityScope::Capture).suspected()
+                );
+                assert!(!quality.requires_batch_recovery());
+                assert_eq!(provenance.configuration["text_completeness"], "complete");
+            }
+            let mut quality = activity_quality(ActivityScope::Offline, reference);
+            quality
+                .merge_snapshot(&activity_quality(
+                    ActivityScope::Capture,
+                    FarReference::Present,
+                ))
+                .unwrap();
+            for (outcome, disposition) in [
+                (OfflineAecOutcome::Applied, "applied"),
+                (OfflineAecOutcome::NotApplicable, "not_applicable"),
+                (OfflineAecOutcome::Failed, "failed_raw_fallback"),
+                (OfflineAecOutcome::NotRequested, "disabled"),
+            ] {
+                let mut provenance = from_config_with_aec(
+                    &cfg,
+                    GenerationMode::Batch,
+                    AecExecution::Offline {
+                        config: &config,
+                        lookahead_seconds: 7.5,
+                        outcome,
+                        capture_fallback: true,
+                    },
+                    false,
+                );
+                attach_quality(&mut provenance, &quality, None).unwrap();
+                assert_eq!(
+                    provenance.configuration["aec"]["execution_outcome"],
+                    disposition
+                );
+                assert_eq!(
+                    provenance.configuration["aec"]["outcome"],
+                    if disposition == "applied" {
+                        applied
+                    } else {
+                        disposition
+                    }
+                );
+                assert_eq!(provenance.configuration["aec"]["far_reference"], label);
+                assert_eq!(
+                    provenance.configuration["aec"]["observation_scope"],
+                    "offline"
+                );
+            }
+            for (execution, disposition) in [
+                (AecExecution::Disabled, "disabled"),
+                (AecExecution::PreprocessedUnknown, "unknown"),
+            ] {
+                let mut provenance =
+                    from_config_with_aec(&cfg, GenerationMode::Batch, execution, false);
+                attach_quality(&mut provenance, &quality, None).unwrap();
+                assert_eq!(provenance.configuration["aec"]["outcome"], disposition);
+                assert_eq!(provenance.configuration["aec"]["far_reference"], "unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn live_activity_projection_requires_actual_execution_and_keeps_short_lookahead() {
+        use corti_core::{ActivityScope, FarReference};
+        let cfg = AppConfig::default();
+        let quality = activity_quality(ActivityScope::Live, FarReference::Absent);
+        let mut provenance =
+            from_config_with_aec(&cfg, GenerationMode::Live, AecExecution::Live, false);
+        attach_quality(&mut provenance, &quality, None).unwrap();
+        assert_eq!(provenance.configuration["aec"]["outcome"], "pending");
+        assert_eq!(
+            provenance.configuration["aec"]["lookahead_seconds"],
+            float_value(0.1)
+        );
+        observe_live_aec_execution(&mut provenance, false, false);
+        attach_quality(&mut provenance, &quality, None).unwrap();
+        assert_eq!(provenance.configuration["aec"]["outcome"], "not_applicable");
+        observe_live_aec_execution(&mut provenance, true, true);
+        attach_quality(&mut provenance, &quality, None).unwrap();
+        assert_eq!(
+            provenance.configuration["aec"]["execution_outcome"],
+            "applied"
+        );
+        assert_eq!(
+            provenance.configuration["aec"]["outcome"],
+            "no_far_reference"
+        );
+        let disabled = AppConfig {
+            aec_enabled: false,
+            ..cfg
+        };
+        let mut provenance =
+            from_config_with_aec(&disabled, GenerationMode::Live, AecExecution::Live, false);
+        observe_live_aec_execution(&mut provenance, true, true);
+        attach_quality(&mut provenance, &quality, None).unwrap();
+        assert_eq!(provenance.configuration["aec"]["outcome"], "disabled");
+    }
+
+    #[test]
+    fn legacy_aec_disposition_survives_refresh_without_borrowing_new_capture_observations() {
+        use corti_core::{ActivityScope, FarReference};
+        let quality = activity_quality(ActivityScope::Capture, FarReference::Absent);
+        for (prior, expected) in [
+            ("applied", "applied_far_reference_unknown"),
+            ("raw_fallback", "raw_fallback"),
+            ("degraded_mixed", "degraded_mixed"),
+            ("disabled", "disabled"),
+        ] {
+            let mut provenance = TranscriptProvenance::legacy_unknown(GenerationMode::Batch);
+            provenance.configuration.insert(
+                "aec".into(),
+                serde_json::json!({"enabled":true,"mode":"offline","outcome":prior}),
+            );
+            attach_quality(&mut provenance, &quality, None).unwrap();
+            assert_eq!(provenance.configuration["aec"]["execution_outcome"], prior);
+            assert_eq!(provenance.configuration["aec"]["outcome"], expected);
+            assert_eq!(provenance.configuration["aec"]["far_reference"], "unknown");
+            assert_eq!(
+                provenance.configuration["aec"]["suspected_silent_far_reference"],
+                false
+            );
+            let once = provenance.clone();
+            attach_quality(&mut provenance, &quality, None).unwrap();
+            assert_eq!(provenance, once);
         }
     }
 
