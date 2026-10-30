@@ -29,10 +29,10 @@
       "id": "budget",
       "text": "The budget for Ada is one thousand five hundred euros and not fifteen thousand euros.",
       "critical": [
-        {"id": "name", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
-        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"]]},
+        {"id": "name", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"], ["ADA"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"], ["1,500"]]},
         {"id": "negation", "authored": ["not"], "alternatives": [["not"]]},
-        {"id": "contrast", "authored": ["fifteen", "thousand", "euros."], "alternatives": [["fifteen", "thousand", "euros."], ["15,000", "euros."], ["15000", "euros."], ["€15,000."], ["€15000."], ["15,000€."], ["15000€."]]}
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros."], "alternatives": [["fifteen", "thousand", "euros."], ["15,000", "euros."], ["15000", "euros."], ["€15,000."], ["€15000."], ["15,000€."], ["15000€."], ["15,000."]]}
       ]
     },
     {
@@ -40,9 +40,9 @@
       "text": "Please ask Grace to measure fifteen millimeters and never replace that value with fifty millimeters.",
       "critical": [
         {"id": "name", "authored": ["Grace"], "alternatives": [["Grace"], ["grace"]]},
-        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"]]},
+        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"], ["15mm"]]},
         {"id": "negation", "authored": ["never"], "alternatives": [["never"]]},
-        {"id": "contrast-unit", "authored": ["fifty", "millimeters."], "alternatives": [["fifty", "millimeters."], ["50", "millimeters."], ["50", "mm."]]}
+        {"id": "contrast-unit", "authored": ["fifty", "millimeters."], "alternatives": [["fifty", "millimeters."], ["50", "millimeters."], ["50", "mm."], ["50mm."]]}
       ]
     },
     {
@@ -70,14 +70,14 @@
         {"id": "name-nora", "authored": ["Nora"], "alternatives": [["Nora"], ["nora"]]},
         {"id": "negation-release", "authored": ["not"], "alternatives": [["not"]]},
         {"id": "version", "authored": ["version", "one", "point", "five"], "alternatives": [["version", "one", "point", "five"], ["version", "1.5"]]},
-        {"id": "name-ada", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
-        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"]]},
+        {"id": "name-ada", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"], ["ADA"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"], ["1,500"]]},
         {"id": "negation-amount", "authored": ["not"], "alternatives": [["not"]]},
-        {"id": "contrast", "authored": ["fifteen", "thousand", "euros"], "alternatives": [["fifteen", "thousand", "euros"], ["15,000", "euros"], ["15000", "euros"], ["€15,000"], ["€15000"], ["15,000€"], ["15000€"]]},
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros"], "alternatives": [["fifteen", "thousand", "euros"], ["15,000", "euros"], ["15000", "euros"], ["€15,000"], ["€15000"], ["15,000€"], ["15000€"], ["15,000"]]},
         {"id": "name-grace", "authored": ["Grace"], "alternatives": [["Grace"], ["grace"]]},
-        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"]]},
+        {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"], ["15mm"]]},
         {"id": "negation-measure", "authored": ["never"], "alternatives": [["never"]]},
-        {"id": "contrast-unit", "authored": ["fifty", "millimeters"], "alternatives": [["fifty", "millimeters"], ["50", "millimeters"], ["50", "mm"]]},
+        {"id": "contrast-unit", "authored": ["fifty", "millimeters"], "alternatives": [["fifty", "millimeters"], ["50", "millimeters"], ["50", "mm"], ["50mm"]]},
         {"id": "repeat-first", "authored": ["please", "restart", "the", "gateway"], "alternatives": [["please", "restart", "the", "gateway"], ["Please", "restart", "the", "gateway."]]},
         {"id": "repeat-second", "authored": ["please", "restart", "the", "gateway"], "alternatives": [["please", "restart", "the", "gateway"], ["Please", "restart", "the", "gateway."]]}
       ],
