@@ -97,6 +97,15 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaises(CoverageError):
             bind_occurrences(words("NEVER"), [occurrence("negation", ["never"])], 10000, 1000)
 
+    def test_shorter_alternative_inside_a_longer_match_is_not_ambiguous(self):
+        annotation = occurrence("amount", ["1,500", "euros"], [["1,500", "euros"], ["1,500"]])
+        bound = bind_occurrences(words("budget 1,500 euros today"), [annotation], 10000, 1000)
+        self.assertEqual(bound[0]["indices"], (1, 2))
+        bound = bind_occurrences(words("budget 1,500 today"), [annotation], 10000, 1000)
+        self.assertEqual(bound[0]["indices"], (1,))
+        with self.assertRaises(CoverageError):  # two separate places remain ambiguous
+            bind_occurrences(words("1,500 and 1,500"), [annotation], 10000, 1000)
+
     def test_raw_case_difference_remains_critical_after_literal_binding(self):
         reference = words("15 mM")
         result = compare_cell(reference, words("15 mm"),

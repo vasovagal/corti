@@ -99,6 +99,10 @@ def bind_occurrences(words, occurrences, source_frames, sample_rate):
                     matches.add(indices)
         if not matches:
             raise CoverageError("missing authored critical occurrence")
+        # A shorter declared spelling inside a longer match is the same occurrence ("1,500" within
+        # "1,500 euros"); keep the longer one. Separate places remain ambiguous.
+        matches = {indices for indices in matches
+                   if not any(set(indices) < set(other) for other in matches)}
         candidates.append(tuple(sorted(matches)))
 
     @lru_cache(maxsize=None)
