@@ -175,55 +175,76 @@ def critical_crossings(coverage, words, frame, rate):
 
 
 # A forced or deadline cut splits a speech region without overlap re-decoding. The word straddling
-# the cut is decoded in two parts, and each part loses context, so formatting can differ elsewhere in
-# the region. The contract for such cells is no silent loss, not equality with the uncut batch:
+# the cut is decoded in two parts, and each part loses context, so number formatting can differ
+# elsewhere in the region. The contract for such cells is no silent loss and no changed value, not
+# equality with the uncut batch:
 SEAM_SECONDS = 1.0  # damage at a marked forced cut stays within this distance of it
 SEAM_EDIT_LIMIT = 4  # edit operations per forced cut and track
-OUTSIDE_DELETION_PERCENT = 2  # deleted batch tokens away from every seam
+OUTSIDE_EDIT_PERCENT = 5  # the ordinary word gate, away from seams and formatting-only spans
+
+
+def formatting_key(text):
+    """Equal only for formatting variants: case, sentence punctuation, digit grouping, euro sign."""
+    text = re.sub(r"(?<=\d),(?=\d{3})", "", text.lower())
+    text = re.sub(r"€(\d+)", r"\1 euros", text)
+    text = re.sub(r"(\d+)€", r"\1 euros", text)
+    return " ".join(piece.strip(".,!?;:") for piece in text.split())
 
 
 def forced_gate(score, reference_words, hypothesis_words, cuts):
-    """No-loss gate for a cell with forced cuts (seconds); natural-only cells keep the strict gate."""
+    """Gate for a cell with forced cuts (seconds); natural-only cells keep the strict gate."""
     from score import tokens
     result = score["score"]
     reference = tokens(word["text"] for word in reference_words)
     hypothesis = tokens(word["text"] for word in hypothesis_words)
+    path = result["alignment"]
 
     def midpoint(words, token):
         word = words[token.word_index]
         return (word["start"] + word["end"]) / 2
 
-    def seam(time):
+    def seam(step):
+        _, r, h = step
+        time = (midpoint(reference_words, reference[r]) if r is not None
+                else midpoint(hypothesis_words, hypothesis[h]))
         return next((cut for cut in cuts if abs(time - cut) <= SEAM_SECONDS), None)
 
-    seam_edits, outside_deletions, deleted = {cut: 0 for cut in cuts}, 0, set()
-    for operation, r, h in result["alignment"]:
-        if operation == "equal":
-            continue
-        cut = seam(midpoint(reference_words, reference[r]) if r is not None
-                   else midpoint(hypothesis_words, hypothesis[h]))
-        if operation == "delete":
-            deleted.add(r)
-        if cut is not None:
-            seam_edits[cut] += 1
-        elif operation == "delete":
-            outside_deletions += 1
-    degraded, lost, changed = [], [], []
+    exempt, degraded, lost, changed, formatting = set(), [], [], [], []
     for row in score["coverage"]:
         if result["critical_occurrences"][row["id"]]:
             continue
-        if any(seam(midpoint(reference_words, reference[index])) is not None for index in row["indices"]):
+        steps = [index for index, (_, r, _) in enumerate(path) if r in row["indices"]]
+        span = range(steps[0], steps[-1] + 1)
+        if any(seam(path[index]) is not None for index in span):
             degraded.append(row["id"])
-        elif all(index in deleted for index in row["indices"]):
+        elif all(path[index][0] == "delete" for index in steps):
             lost.append(row["id"])
+        elif (formatting_key(" ".join(reference[index].raw for index in row["indices"]))
+              == formatting_key(" ".join(hypothesis[path[index][2]].raw for index in span
+                                         if path[index][2] is not None))):
+            formatting.append(row["id"])
+            exempt.update(span)
         else:
             changed.append(row["id"])
+    seam_edits, outside_edits = {cut: 0 for cut in cuts}, 0
+    for index, step in enumerate(path):
+        if step[0] == "equal":
+            continue
+        cut = seam(step)
+        if cut is not None:
+            seam_edits[cut] += 1
+        elif index not in exempt:
+            outside_edits += 1
+    introduced = [h for index, (_, _, h) in enumerate(path)
+                  if h in result["introduced_critical_indices"] and index not in exempt
+                  and seam(path[index]) is None]
     return {"seam_edits": {str(cut): count for cut, count in seam_edits.items()},
-            "outside_deletions": outside_deletions, "degraded_critical": degraded,
+            "outside_edits": outside_edits, "degraded_critical": degraded,
             "lost_critical": lost, "changed_critical": changed,
+            "formatting_only_critical": formatting, "introduced_critical": introduced,
             "passed": (all(count <= SEAM_EDIT_LIMIT for count in seam_edits.values())
-                       and 100 * outside_deletions <= OUTSIDE_DELETION_PERCENT * len(reference)
-                       and not lost)}
+                       and 100 * outside_edits <= OUTSIDE_EDIT_PERCENT * len(reference)
+                       and not lost and not changed and not introduced)}
 
 
 def unique_index(rows, expected, label):

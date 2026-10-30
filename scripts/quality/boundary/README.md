@@ -27,12 +27,13 @@ batch baseline, with no changed, deleted or duplicated raw critical occurrence.
 A forced or deadline cut splits a speech region without overlap re-decoding: the
 word straddling the cut is decoded in two parts, and each part has less context,
 so number formatting or a homophone can also differ elsewhere in that region.
-Cells with such cuts are held to a no-silent-loss contract instead
-(`forced_gate` in `matrix.py`): at most 4 edits within one second of each forced
-cut, at most 2% of batch tokens deleted away from every cut, and no critical
-occurrence wholly deleted away from a cut. A critical occurrence damaged within
-a cut's second is reported as `degraded_critical`; the app marks every forced cut
-with a `ForcedBoundary` quality span. Decoding resumes exactly at the cut: after
+Cells with such cuts are held to a different contract instead (`forced_gate` in
+`matrix.py`). Within one second of each forced cut, at most 4 edits are allowed;
+a critical occurrence damaged there is reported as `degraded_critical`, and the
+app marks every forced cut with a `ForcedBoundary` quality span. Away from the
+cuts, every critical occurrence must be unchanged except for formatting (case,
+sentence punctuation, digit grouping, euro sign versus "euros"), no negator or
+digit token may be introduced, and other edits stay within the ordinary 5%. Decoding resumes exactly at the cut: after
 a VAD reset, one second of already-decoded audio is replayed on the VAD window
 grid to warm the model and is never decoded again.
 

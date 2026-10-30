@@ -168,6 +168,40 @@ class MatrixTests(unittest.TestCase):
         scored, rows = self.scored_forced(seal, result)
         self.assertFalse(next(row for row in rows if row["track"] == "mic")["passed"])
 
+    def test_forced_gate_away_from_seams_allows_only_formatting_equivalents(self):
+        from coverage import compare_cell
+        from matrix import forced_gate
+
+        def words(text):
+            return [{"text": word, "start": index, "end": index + 0.5}
+                    for index, word in enumerate(text.split())]
+
+        reference = words("Nora has 1,500 euros and not more today")
+        annotations = [{"id": "amount", "authored": ["1,500", "euros"],
+                        "alternatives": [["1,500", "euros"]], "source_window": [0, 10000]},
+                       {"id": "negation", "authored": ["not"], "alternatives": [["not"]],
+                        "source_window": [0, 10000]}]
+        cuts = [50.0]  # far from every word
+
+        def gate(text):
+            score = compare_cell(reference, words(text), annotations, 10000, 1000, ("Nora",))
+            return forced_gate(score, reference, words(text), cuts)
+
+        self.assertTrue(gate("Nora has 1500€ and not more today")["passed"])
+        self.assertTrue(gate("Nora has 1,500 Euros, and not more today")["passed"])
+        for changed in ("Nora has 1,500 euros and dot more today",   # negation flipped
+                        "Nora has 1,600 euros and not more today",   # value changed
+                        "Nora has 1,500 euros and not never more today",  # negator introduced
+                        "Nora has 1,500 euros and not more 7 today"):  # digit introduced
+            with self.subTest(changed=changed):
+                self.assertFalse(gate(changed)["passed"])
+
+    def test_forced_cell_fails_on_a_negation_flip_away_from_its_seams(self):
+        seal, result = synthetic_complete_run()
+        self.forced_cell(result)["tracks"]["mic"]["words"][2]["text"] = "dot"  # "not", 8-10 s
+        scored, rows = self.scored_forced(seal, result)
+        self.assertFalse(next(row for row in rows if row["track"] == "mic")["passed"])
+
     def test_one_failed_cell_cannot_be_averaged_into_success(self):
         seal, result = synthetic_complete_run()
         result["cells"][0]["tracks"]["mic"]["words"][3]["text"] = "15000"
