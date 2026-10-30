@@ -207,6 +207,8 @@ def diagnose(seal, result, context_seconds=1.5):
                 try:
                     bind_occurrences(words, [occurrence], fixture["frames"], rate)
                 except CoverageError as error:
+                    if "ambiguous" in str(error):
+                        continue  # repeated phrases bind only jointly with their siblings
                     low, high = (frame / rate for frame in occurrence["source_window"])
                     lines.append(f"baseline {identifier}: unbound {occurrence['id']} ({error}); "
                                  f"alternatives {occurrence['alternatives']}; window {low:.2f}-{high:.2f}s; "
@@ -222,11 +224,19 @@ def diagnose(seal, result, context_seconds=1.5):
                 score = compare([word["text"] for word in reference], [word["text"] for word in hypothesis], [])
                 lines.append(f"cell {cell['id']}/{track}: {score['edits']} edits / {score['denominator']} "
                              f"tokens {score['counts']}; decode_complete={actual['decode_complete']}")
+                batch_attempts = baselines[fixture_id]["native"]["batch"]["attempts"]
+
+                def spans(attempts, low, high):
+                    return " ".join(f"{row['start'] / 16000:.3f}-{row['end'] / 16000:.3f}" for row in attempts
+                                    if row["end"] > low * 16000 and row["start"] < high * 16000)
+
                 for event in cell["boundaries"]:
                     at = event["cut_frame"] / spec["sample_rate"]
                     low, high = at - context_seconds, at + context_seconds
                     lines.append(f"  {event['kind']} cut {at:.3f}s ref: {text(reference, low, high)}")
                     lines.append(f"  {event['kind']} cut {at:.3f}s hyp: {text(hypothesis, low, high)}")
+                    lines.append(f"  {event['kind']} cut {at:.3f}s regions ref: {spans(batch_attempts, at - 3, at + 3)}"
+                                 f" | hyp: {spans(actual['attempts'], at - 3, at + 3)}")
         except Exception as error:
             lines.append(f"cell {cell.get('id', '?') if isinstance(cell, dict) else '?'}: unreadable ({error!r})")
     return lines
