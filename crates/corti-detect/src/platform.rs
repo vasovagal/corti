@@ -191,7 +191,7 @@ fn deliver_finished(
     emit(DetectorEvent::RecordingFinished {
         meta,
         audio_path: finished.path,
-        capture_processing: finished.processing,
+        capture_processing: Box::new(finished.processing),
     });
 }
 

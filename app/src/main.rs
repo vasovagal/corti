@@ -773,7 +773,7 @@ pub(crate) mod imp {
             .send(PipelineMsg::Process {
                 meta,
                 audio_path: finished.path,
-                capture_processing: finished.processing,
+                capture_processing: Box::new(finished.processing),
             })
             .is_err()
         {

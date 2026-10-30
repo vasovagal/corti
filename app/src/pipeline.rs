@@ -117,7 +117,7 @@ pub enum PipelineMsg {
     Process {
         meta: RecordingMeta,
         audio_path: PathBuf,
-        capture_processing: corti_capture::CaptureProcessing,
+        capture_processing: Box<corti_capture::CaptureProcessing>,
     },
     /// The Recording Queue window's Retry button: reset a `Failed` recording and re-run it with a
     /// fresh attempt budget (a deliberate user action earns one).
