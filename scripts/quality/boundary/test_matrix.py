@@ -189,12 +189,20 @@ class MatrixTests(unittest.TestCase):
 
         self.assertTrue(gate("Nora has 1500€ and not more today")["passed"])
         self.assertTrue(gate("Nora has 1,500 Euros, and not more today")["passed"])
+        self.assertEqual(gate("Nora has 1,600 euros and not more today")["changed_text"],
+                         {"amount": "1,500 euros -> 1,600 euros"})
         for changed in ("Nora has 1,500 euros and dot more today",   # negation flipped
                         "Nora has 1,600 euros and not more today",   # value changed
                         "Nora has 1,500 euros and not never more today",  # negator introduced
                         "Nora has 1,500 euros and not more 7 today"):  # digit introduced
             with self.subTest(changed=changed):
                 self.assertFalse(gate(changed)["passed"])
+
+    def test_formatting_key_folds_unit_abbreviation_but_not_unit_case(self):
+        from matrix import formatting_key
+        self.assertEqual(formatting_key("50mm."), formatting_key("50 millimeters"))
+        self.assertNotEqual(formatting_key("50 mM"), formatting_key("50 millimeters"))
+        self.assertNotEqual(formatting_key("15,000 euros"), formatting_key("1500 euros"))
 
     def test_forced_cell_fails_on_a_negation_flip_away_from_its_seams(self):
         seal, result = synthetic_complete_run()

@@ -185,6 +185,7 @@ OUTSIDE_EDIT_PERCENT = 5  # the ordinary word gate, away from seams and formatti
 
 def formatting_key(text):
     """Equal only for formatting variants: case, sentence punctuation, digit grouping, euro sign."""
+    text = re.sub(r"(\d) ?mm\b", r"\1 millimeters", text)  # case-sensitive: mM is a different unit
     text = re.sub(r"(?<=\d),(?=\d{3})", "", text.lower())
     text = re.sub(r"€(\d+)", r"\1 euros", text)
     text = re.sub(r"(\d+)€", r"\1 euros", text)
@@ -209,7 +210,7 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
                 else midpoint(hypothesis_words, hypothesis[h]))
         return next((cut for cut in cuts if abs(time - cut) <= SEAM_SECONDS), None)
 
-    exempt, degraded, lost, changed, formatting = set(), [], [], [], []
+    exempt, degraded, lost, changed, formatting, changed_text = set(), [], [], [], [], {}
     for row in score["coverage"]:
         if result["critical_occurrences"][row["id"]]:
             continue
@@ -226,6 +227,9 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
             exempt.update(span)
         else:
             changed.append(row["id"])
+            changed_text[row["id"]] = (
+                " ".join(reference[index].raw for index in row["indices"]) + " -> "
+                + " ".join(hypothesis[path[index][2]].raw for index in span if path[index][2] is not None))
     seam_edits, outside_edits = {cut: 0 for cut in cuts}, 0
     for index, step in enumerate(path):
         if step[0] == "equal":
@@ -240,7 +244,7 @@ def forced_gate(score, reference_words, hypothesis_words, cuts):
                   and seam(path[index]) is None]
     return {"seam_edits": {str(cut): count for cut, count in seam_edits.items()},
             "outside_edits": outside_edits, "degraded_critical": degraded,
-            "lost_critical": lost, "changed_critical": changed,
+            "lost_critical": lost, "changed_critical": changed, "changed_text": changed_text,
             "formatting_only_critical": formatting, "introduced_critical": introduced,
             "passed": (all(count <= SEAM_EDIT_LIMIT for count in seam_edits.values())
                        and 100 * outside_edits <= OUTSIDE_EDIT_PERCENT * len(reference)

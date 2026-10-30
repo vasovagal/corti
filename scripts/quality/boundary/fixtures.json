@@ -92,11 +92,11 @@
   "input_chunks": [511, 1, 577, 4096, 73, 512, 2003],
   "matrix": [
     {"id": "paused-16-phase0", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
-    {"id": "paused-16-phase100", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 100, "mode": "ordinary"},
-    {"id": "paused-16-phase300", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 300, "mode": "ordinary"},
+    {"id": "paused-16-phase2330", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 2330, "mode": "ordinary"},
+    {"id": "paused-16-phase1930", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 1930, "mode": "ordinary"},
     {"id": "paused-16-phase700", "waveform": "paused", "sample_rate": 16000, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
     {"id": "paused-441-phase0", "waveform": "paused", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
-    {"id": "paused-441-phase700", "waveform": "paused", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
+    {"id": "paused-441-phase1550", "waveform": "paused", "sample_rate": 44100, "window_ms": 4000, "phase_ms": 1550, "mode": "ordinary"},
     {"id": "paused-48-phase0", "waveform": "paused", "sample_rate": 48000, "window_ms": 4000, "phase_ms": 0, "mode": "ordinary"},
     {"id": "paused-48-phase700", "waveform": "paused", "sample_rate": 48000, "window_ms": 4000, "phase_ms": 700, "mode": "ordinary"},
     {"id": "paused-real60", "waveform": "paused", "sample_rate": 16000, "window_ms": 60000, "phase_ms": 0, "mode": "ordinary"},
@@ -117,6 +117,7 @@
     "lexeme_expansion": "union of every declared raw alternative token plus extra_critical_lexemes; no output-derived additions",
     "empty_baseline": "reject for every speech cell",
     "boundary_local_reports": "report the same alignment restricted to annotated occurrences whose batch word times overlap +/-1 second around each observed cut; whole-run gate remains mandatory",
+    "crossing_phases": "phases 2330, 1930 and 1550 ms put the first nominal due frame inside the first name and negation of each track for the standard voice",
     "crossing_coverage": "across the paused short-phase matrix, each track must have a baseline name, negator and multi-token-number occurrence strictly straddling an observed nominal due frame; each track of the explicit forced probe must have a critical occurrence strictly straddling at least one fixed forced frame; actual deferred natural cuts need not divide a critical word",
     "maintenance": "arm in advance and reset only at an ordinary selected boundary; never move nominal due or shorten the window; impossible native epoch capacity fails before inference",
     "required_structure": ["every matrix cell and both tracks present", "no duplicate or missing required result", "source time monotonic", "attempted canonical PCM owned once", "source fence within unchanged nominal plus22seconds unless explicitly forced earlier", "at least one natural cut in paused ordinary cells", "at least one cut in real60 cell", "both explicit forced fences observed", "at least one proactive maintenance reset", "no AEC/VAD/model default changes", "raw words and timestamps retained", "every loss/metadata/cut/settlement record retained within declared bounded evidence"]
