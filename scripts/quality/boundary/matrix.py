@@ -7,7 +7,7 @@ import struct
 
 from coverage import CoverageError, bind_occurrences, compare_cell
 from generate import frame_count
-from score import compare
+from score import compare, tokens
 
 
 ACCEPTED_GUARD = 5727
@@ -299,6 +299,20 @@ def diagnose(seal, result, context_seconds=1.5):
                                  f"batch: {text(words, low - 0.5, high + 0.5)}")
         except Exception as error:
             lines.append(f"baseline {identifier}: unreadable ({error!r})")
+    lexemes = set(seal["definition"]["comparison"]["extra_critical_lexemes"])
+    for fixture in fixtures.values():
+        for occurrence in fixture["occurrences"]:
+            lexemes.update(token for alternative in occurrence["alternatives"] for token in alternative)
+    for identifier in ("paused-16000-mic", "paused-16000-tap"):
+        try:
+            fixture, words = fixtures[identifier], baselines[identifier]["batch_words"]
+            bound = bind_occurrences(words, fixture["occurrences"], fixture["frames"], fixture["sample_rate"])
+            reference = tokens(word["text"] for word in words)
+            lines.append(f"critical times {identifier}: " + " ".join(
+                f"{category(row['id'])}:{words[reference[row['indices'][0]].word_index]['start']:.2f}"
+                f"-{words[reference[row['indices'][-1]].word_index]['end']:.2f}" for row in bound))
+        except Exception as error:
+            lines.append(f"critical times {identifier}: unavailable ({error!r})")
     for cell in result["cells"]:
         try:
             spec = specs[cell["id"]]
@@ -308,6 +322,24 @@ def diagnose(seal, result, context_seconds=1.5):
                 score = compare([word["text"] for word in reference], [word["text"] for word in hypothesis], [])
                 lines.append(f"cell {cell['id']}/{track}: {score['edits']} edits / {score['denominator']} "
                              f"tokens {score['counts']}; decode_complete={actual['decode_complete']}")
+                try:
+                    fixture = fixtures[fixture_id]
+                    scored = compare_cell(reference, hypothesis, fixture["occurrences"], fixture["frames"],
+                                          fixture["sample_rate"], lexemes)
+                    cuts = [event["cut_frame"] / spec["sample_rate"] for event in cell["boundaries"]
+                            if event["kind"] in {"deadline", "explicit"}]
+                    if cuts:
+                        gate = forced_gate(scored, reference, hypothesis, cuts)
+                        lines.append(f"  verdict forced_gate passed={gate['passed']} " + json.dumps(
+                            {key: value for key, value in gate.items() if key != "passed"}, sort_keys=True))
+                    else:
+                        lines.append(f"  verdict strict passed={scored['passed']}")
+                    crossed = sorted({row["category"] for event in cell["boundaries"]
+                                      for row in critical_crossings(scored["coverage"], reference,
+                                                                    event["nominal_due_frame"], spec["sample_rate"])})
+                    lines.append(f"  nominal crossings {crossed}")
+                except Exception as error:
+                    lines.append(f"  verdict unavailable ({error!r})")
                 batch_attempts = baselines[fixture_id]["native"]["batch"]["attempts"]
 
                 def spans(attempts, low, high):
