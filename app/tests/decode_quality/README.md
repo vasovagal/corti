@@ -1,15 +1,23 @@
 # App decode fallback contract
 
-Run `python3 app/tests/decode_quality/run.py --clippy`. Python 3.11+, Rust, and the workspace's cached Cargo dependencies are required. The command runs strict Clippy checks and tests offline on macOS or Linux and must report **5 passed, 0 failed**. `--output-dir <directory>` retains the generated source and lock for inspection. `CARGO_TARGET_DIR` is honored; the default is `target/decode-quality-app`.
+`run.py` builds an offline test crate from the current production functions in `pipeline.rs`,
+`transcribe.rs`, `jobs.rs`, `live.rs` and their checkpoint/config/provenance helpers.
+`boundaries.rs` replaces only the GUI/tray/stats, hosted-service, lexicon and native boundaries.
+The test-only backend returns invented text and typed quality; no model, credentials, network or
+user audio are involved.
 
-The harness copies the current production functions from `pipeline.rs`, `transcribe.rs`, `jobs.rs`, and their checkpoint/config/provenance helpers, plus the actual `LiveOutcome` definition from `live.rs`. It exercises `transcribe_and_file → transcribe_without_checkpoint → transcribe_recording → Backend` and the production live-result dispatch, using real queue, quality-sidecar, checkpoint, and note files. Its receipt hashes all nine production input modules: checkpoint, config, jobs, live, pipeline, postprocess_app, private_file, provenance, and transcribe. `boundaries.rs` identifies the GUI/tray/stats, unused live manager, user lexicon, and hosted-service substitutes. The test-only backend returns invented transcript text and typed quality; no model, credentials, network, or user audio are used. Native decoder correctness is a separate native test gate.
+It is the base layer of the evidence harness, which adds the evidence module that production now
+depends on. Run the complete suite, including this directory's `full_path.rs` and `retention.rs`
+tests, with:
 
-The full-path test checks one actual backend invocation for the original local backend, zero for a changed backend, retained partial Batch losses, canonical rewrite of the same note inode without live-text splicing, and checkpoint replay with zero additional backend calls after the WAV is removed. It covers observed capture and legacy audio without a capture sidecar. Successful replay removes the checkpoint while retained history remains reloadable; legacy history never establishes capture or storage completeness. A second permanent app test exercises the production recording/Backend boundary directly. Duplicating either production ASR call has been checked to fail the corresponding invocation-count assertion.
+```sh
+python3 app/tests/evidence/run.py --clippy
+```
 
-Two retention tests exercise successful live results through the production dispatch. `Filed` preserves degradation metadata, including an exact positioned `ForcedBoundary`, through completion, checkpoint cleanup, and reopen without extra ASR; publication failures prevent completion and preserve the existing retry/checkpoint authority for replay. `NoNote` preserves the same metadata in the normal batch job and retains its existing backend and attempt budget. Clean results keep their prior route, and stale replay cannot erase newer retained facts.
+The tests cover one backend invocation per fresh batch (none for a changed backend), retained
+partial Batch losses, same-inode canonical rewrites, checkpoint replay without audio or another
+ASR call, and preservation of `ForcedBoundary`/`WindowNotFiled` quality through completion and
+recovery. Native decoder correctness is a separate native gate.
 
-The boundary recovery test consumes a `Fallback` containing an exact `WindowNotFiled` interval and a separate `ForcedBoundary` marker. A successful whole-file local decode resolves only the processing loss, preserves both source intervals, and rewrites the same note inode without live-text splicing. A synthetic completion failure leaves the checkpoint durable; reopening and recovering the Running job finishes with no second ASR call, then retains the quality after checkpoint cleanup. This checks downstream durability given a live outcome. The app's actual EOF and native boundary tests separately establish when that outcome must be produced; this harness does not simulate the VAD.
-
-The temporary harness starts from the workspace `Cargo.lock`. After offline resolution adds its root package and prunes unused entries, the runner verifies that every registry identity and checksum still exists in the workspace lock, then runs Cargo with `--locked --offline`. It never edits the workspace manifest or lock.
-
-The pipeline's core-type import is copied from production rather than supplied by the harness. Fixture-only types are imported inside the test module. This prevents a broader synthetic import from hiding a missing production type import; source import-shape drift fails the harness instead of silently widening its scope.
+The generated crate starts from the workspace `Cargo.lock`; the runner fails if offline resolution
+adds or changes any registry package, then runs Cargo with `--locked --offline`.

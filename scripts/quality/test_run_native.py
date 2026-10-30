@@ -11,9 +11,9 @@ import subprocess
 import sys
 import tempfile
 
-from run_native import (APP_PATH_REQUIRED_TESTS, APP_PATH_SOURCE_MODULES, CAPTURE_REQUIRED_TESTS,
+from run_native import (CAPTURE_REQUIRED_TESTS,
                         EVIDENCE_SOURCE_FILES, evidence_receipt, main,
-                        TAP_LIVE_REQUIRED_TESTS, TAP_INBOX_REQUIRED_TESTS, STREAM_REQUIRED_TESTS, app_path_receipt,
+                        TAP_LIVE_REQUIRED_TESTS, TAP_INBOX_REQUIRED_TESTS, STREAM_REQUIRED_TESTS,
                         capture_rate_receipt, capture_suite_passed, named_tests_passed, single_test_passed)
 
 
@@ -37,39 +37,6 @@ class NativeResultTests(unittest.TestCase):
                         for name in required]
                 for candidate in bad:
                     self.assertFalse(named_tests_passed(candidate, 0, required))
-
-    def test_app_path_receipt_requires_all_tests_and_exact_source_hash_inventory(self):
-        hashes = {name: "a" * 64 for name in APP_PATH_SOURCE_MODULES}
-        tests = "\n".join(f"test synthetic::tests::{name} ... ok"
-                          for name in APP_PATH_REQUIRED_TESTS)
-        count = len(APP_PATH_REQUIRED_TESTS)
-        summary = (f"\ntest result: ok. {count} passed; 0 failed; 0 ignored; "
-                   "0 measured; 0 filtered out;\n")
-        receipt = "decode-quality source sha256: " + json.dumps(hashes) + "\n"
-        output = receipt + tests + summary
-        self.assertEqual(app_path_receipt(output, 0), hashes)
-        bad_outputs = [
-            tests + summary, output + receipt, output + summary,
-            output.replace(APP_PATH_REQUIRED_TESTS[0], "unrelated_test"),
-            output + f"test synthetic::tests::{APP_PATH_REQUIRED_TESTS[0]} ... ok\n",
-            output.replace(f"{count} passed", "0 passed"),
-            output.replace(f"{count} passed", "2 passed"),
-            output.replace(f"{count} passed", f"{count + 10} passed"),
-            output.replace("0 ignored", "1 ignored"),
-            output.replace("0 failed", "1 failed"),
-            receipt.replace("a" * 64, "bad-hash") + tests + summary,
-            "decode-quality source sha256: {}\n" + tests + summary,
-        ]
-        for name in APP_PATH_REQUIRED_TESTS:
-            bad_outputs.append(output.replace(f"test synthetic::tests::{name} ... ok", ""))
-        for name in APP_PATH_SOURCE_MODULES:
-            missing = {key: value for key, value in hashes.items() if key != name}
-            bad_outputs.append("decode-quality source sha256: " + json.dumps(missing)
-                               + "\n" + tests + summary)
-        for candidate, status in [(output, 1)] + [(value, 0) for value in bad_outputs]:
-            with self.subTest(status=status, output=candidate):
-                with self.assertRaises(RuntimeError):
-                    app_path_receipt(candidate, status)
 
     def test_capture_suite_requires_every_regression_and_successful_exit(self):
         output = "\n".join(f"test synthetic::tests::{name} ... ok" for name in CAPTURE_REQUIRED_TESTS)
@@ -172,10 +139,6 @@ class EvidenceGateTests(unittest.TestCase):
                     if isinstance(evidence, OSError):
                         raise evidence
                     text, status = evidence, evidence_status
-                elif "app/tests/decode_quality/run.py" in command:
-                    text = ("decode-quality source sha256: "
-                            + json.dumps({name: "a" * 64 for name in APP_PATH_SOURCE_MODULES})
-                            + "\n" + self.suite([f"synthetic::{name}" for name in APP_PATH_REQUIRED_TESTS]))
                 elif "corti-app" in command:
                     text = self.suite([f"synthetic::{name}" for name in CAPTURE_REQUIRED_TESTS])
                 elif "corti-tap" in command and "test" in command:
@@ -281,7 +244,7 @@ class EvidenceGateTests(unittest.TestCase):
         self.assertIn({"check": "boundary-native-matrix", "passed": False}, report["results"])
         self.assertIn("- boundary-native-matrix: FAIL", artifacts["step-summary.md"])
         for check in ("capture-quality-native-suites", "live-word-stream-feature",
-                      "decode-quality-app-orchestration", "evidence-app-orchestration",
+                      "evidence-app-orchestration",
                       "metal-probe", "capture-rate-throughput"):
             with self.subTest(check=check):
                 self.assertIn({"check": check, "passed": True}, report["results"])

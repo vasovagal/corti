@@ -351,40 +351,10 @@ def capture_suite_passed(output, returncode):
                     for name in CAPTURE_REQUIRED_TESTS))
 
 
-APP_PATH_REQUIRED_TESTS = (
-    "unfiled_boundary_recovers_once_and_retains_source_intervals_after_restart",
-    "production_recording_path_invokes_scripted_backend_once_and_keeps_partial_output",
-    "full_production_chain_counts_backend_and_replays_checkpoint_without_audio",
-    "successful_live_quality_survives_completion_replay_and_publication_failure",
-    "note_less_quality_uses_existing_batch_payload_without_fallback",
-)
-APP_PATH_SOURCE_MODULES = {
-    "pipeline", "transcribe", "jobs", "config", "private_file", "checkpoint",
-    "provenance", "postprocess_app", "live",
-}
-
-
-def app_path_receipt(output, returncode):
-    """Require every actual orchestration check and the exact extracted-source inventory."""
-    summaries = re.findall(
-        r"(?m)^test result: ([A-Za-z]+)\. (\d+) passed; (\d+) failed; (\d+) ignored;.*$",
-        output)
-    executed = re.findall(r"(?m)^test [^\n]*::([^ :]+) \.\.\. ok$", output)
-    prefix = "decode-quality source sha256: "
-    receipts = [json.loads(line.removeprefix(prefix)) for line in output.splitlines()
-                if line.startswith(prefix)]
-    if (returncode != 0 or summaries != [("ok", str(len(APP_PATH_REQUIRED_TESTS)), "0", "0")]
-            or sorted(executed) != sorted(APP_PATH_REQUIRED_TESTS)
-            or len(receipts) != 1 or not isinstance(receipts[0], dict)
-            or receipts[0].keys() != APP_PATH_SOURCE_MODULES
-            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
-                   for value in receipts[0].values())):
-        raise RuntimeError("app decode orchestration did not verify all tests and source hashes")
-    return receipts[0]
-
-
 EVIDENCE_SOURCE_FILES = {
-    *(f"app/src/{name}.rs" for name in APP_PATH_SOURCE_MODULES | {"cli", "evidence"}),
+    *(f"app/src/{name}.rs" for name in ("pipeline", "transcribe", "jobs", "config", "private_file",
+                                         "checkpoint", "provenance", "postprocess_app", "live",
+                                         "cli", "evidence")),
     "app/src/evidence/integration.rs", "app/src/evidence/live.rs", "app/src/evidence/tests.rs",
     "app/tests/decode_quality/run.py", "app/tests/decode_quality/boundaries.rs",
     "app/tests/decode_quality/full_path.rs", "app/tests/decode_quality/retention.rs",
@@ -449,7 +419,6 @@ def main():
     results = []
     resample_comparison = []
     capture_rate = []
-    app_path_sources = {}
     evidence_sources = {}
 
     def run_test(name, label, features=(), release=False):
@@ -545,17 +514,6 @@ def main():
         if not passed:
             raise RuntimeError("stream feature tests failed or did not execute their exact inventory")
 
-    def decode_quality_stage():
-        nonlocal app_path_sources
-        command = [sys.executable, "app/tests/decode_quality/run.py", "--clippy"]
-        print("+ " + " ".join(command), flush=True)
-        app_path = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT)
-        print(app_path.stdout, flush=True)
-        (args.output_dir / "decode-quality-app-path.log").write_text(app_path.stdout)
-        app_path_sources = app_path_receipt(app_path.stdout, app_path.returncode)
-        results.append({"check": "decode-quality-app-orchestration", "passed": True})
-
     def evidence_stage():
         nonlocal evidence_sources
         for label, command in (
@@ -643,7 +601,7 @@ def main():
     # Stages are independent: one red stage records its failure and the rest still produce evidence.
     # Within a stage, a failed prerequisite still stops that stage's dependent checks.
     try:
-        for stage in (boundary_stage, capture_suites_stage, tap_features_stage, stream_stage, decode_quality_stage,
+        for stage in (boundary_stage, capture_suites_stage, tap_features_stage, stream_stage,
                       evidence_stage, metal_and_engines_stage, resampler_stage, capture_rate_stage):
             try:
                 stage()
@@ -653,7 +611,7 @@ def main():
     finally:
         report = {"metal": metal, "spanish_available": fixture_set["spanish_available"],
                   "results": results, "resample_comparison": resample_comparison,
-                  "capture_rate": capture_rate, "app_path_source_sha256": app_path_sources,
+                  "capture_rate": capture_rate,
                   "evidence_source_sha256": evidence_sources}
         (args.output_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
