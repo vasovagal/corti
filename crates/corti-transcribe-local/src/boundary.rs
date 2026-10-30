@@ -4,6 +4,13 @@ use super::*;
 use corti_transcribe::boundary::SourceInterval;
 
 const ACCEPTED_GUARD: u64 = 5727;
+/// A reset VAD needs context before it reports speech; replay this much already-owned audio before a
+/// forced cut so speech just after the cut is in a region. Replay also starts on the window grid,
+/// so the reset model sees the same windows as an uninterrupted run. Attempted audio is never
+/// decoded again.
+const FORCED_REPLAY_PREROLL: u64 = 16_000;
+/// Largest replay beyond settlement: the forced pre-roll plus grid alignment.
+const REPLAY_CONTEXT: u64 = FORCED_REPLAY_PREROLL + VAD_WINDOW as u64 - 1;
 
 /// Exact pinned filter-count terms, not a total memory limit. Source packet staging is separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,27 +93,28 @@ impl BoundaryResamplerBounds {
         )
         .map_err(|_| BoundaryError::EpochLimit)?;
         // Arming does not move the ordinary due/deadline: reserve one entire owned window Q,
-        // settlement S and the maximum next admission K. After replay (<=S), an epoch of
-        // Q+2S+K+1 can always leave this threshold before a later arm.
+        // settlement S and the maximum next admission K. After replay (<=S+C, C the replay
+        // context), an epoch of Q+2S+K+C+1 can always leave this threshold before a later arm.
         let trigger = owned
             .checked_add(settlement)
             .and_then(|n| n.checked_add(next))
             .ok_or(BoundaryError::RetentionLimit)?;
         let minimum_epoch = settlement
-            .checked_add(trigger)
+            .checked_add(REPLAY_CONTEXT)
+            .and_then(|n| n.checked_add(trigger))
             .and_then(|n| n.checked_add(1))
             .ok_or(BoundaryError::EpochLimit)?;
         if minimum_epoch > i32::MAX as u64 - VAD_WINDOW as u64 {
             return Err(BoundaryError::EpochLimit);
         }
         let retained = u128::from(trigger)
-            .checked_add(u128::from(ACCEPTED_GUARD + 511))
+            .checked_add(u128::from(ACCEPTED_GUARD + 511 + REPLAY_CONTEXT))
             .and_then(|n| usize::try_from(n).ok())
             .ok_or(BoundaryError::RetentionLimit)?;
         Ok(BoundaryCapacity {
             settlement_source_reserve: reserve,
             settlement_accept: settlement,
-            replay_samples: settlement,
+            replay_samples: settlement + REPLAY_CONTEXT,
             next_accept: next,
             maintenance_trigger: trigger,
             minimum_epoch_samples: minimum_epoch,
@@ -225,6 +233,9 @@ pub(super) struct BoundaryState {
     pub(super) limits: BoundaryLimits,
     pub(super) failed: Option<BoundaryError>,
     pub(super) last_attempt_end: u64,
+    /// End of already-attempted audio replayed only as VAD context after the last reset. A region
+    /// starting inside it is decoded from this point; any other overlap still fails closed.
+    pub(super) replay_context_end: u64,
     pub(super) last_attempt_source_end: Option<u64>,
     pub(super) proof_available: bool,
     retained: Vec<f32>,
@@ -302,6 +313,7 @@ impl LiveTranscriber {
             limits,
             failed: None,
             last_attempt_end: 0,
+            replay_context_end: 0,
             last_attempt_source_end: None,
             proof_available: true,
             retained,
@@ -519,7 +531,7 @@ impl LiveTranscriber {
             return Err(BoundaryError::InvalidTransition);
         }
         let reset = fence.kind != BoundaryKind::Natural;
-        let replay_start = if fence.kind == BoundaryKind::Forced {
+        let owned_start = if fence.kind == BoundaryKind::Forced {
             fence.canonical.ok_or(BoundaryError::MappingUnavailable)?
         } else {
             // The historical source cut C remains fixed; natural maintenance restarts at the
@@ -527,12 +539,23 @@ impl LiveTranscriber {
             // This proves ownership/retention, not model-inference equivalence after Reset.
             fence.natural_retire
         };
-        if replay_start < state.retained_start
-            || replay_start < state.last_attempt_end
-            || replay_start > state.accepted_end
+        if owned_start < state.retained_start
+            || owned_start < state.last_attempt_end
+            || owned_start > state.accepted_end
         {
             return Err(BoundaryError::AlreadyAttempted);
         }
+        let replay_start = if reset {
+            let preroll = if fence.kind == BoundaryKind::Forced {
+                FORCED_REPLAY_PREROLL
+            } else {
+                0
+            };
+            let window = VAD_WINDOW as u64;
+            (owned_start.saturating_sub(preroll) / window * window).max(state.retained_start)
+        } else {
+            owned_start
+        };
         let remove = usize::try_from(replay_start - state.retained_start)
             .map_err(|_| BoundaryError::RetentionLimit)?;
         let accepted_len = usize::try_from(state.accepted_end - replay_start)
@@ -562,6 +585,7 @@ impl LiveTranscriber {
             self.terminal.reset_epoch();
             self.vad_base_samples = replay_start;
             let state = self.boundary.as_mut().unwrap();
+            state.replay_context_end = state.last_attempt_end;
             state.native_accepted = 0;
             state.accepted_end = replay_start;
             for chunk in replay.chunks(VAD_WINDOW) {

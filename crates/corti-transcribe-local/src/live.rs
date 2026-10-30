@@ -536,6 +536,19 @@ impl LiveTranscriber {
                 }
                 return;
             };
+            // A reset replays already-attempted context to warm the VAD (see boundary.rs). Decode a
+            // region only from the attempted end so no audio is decoded twice.
+            let skip = boundary
+                .as_ref()
+                .map_or(0, |state| state.replay_context_end.saturating_sub(start));
+            if skip >= full_end - start {
+                return;
+            }
+            let (start, relative_start, samples) = (
+                start + skip,
+                relative_start + skip,
+                &samples[skip as usize..],
+            );
             // Native-only terminal padding never owns source samples or reaches ASR.
             let full_end = terminal.clip_end.map_or(full_end, |end| full_end.min(end));
             if full_end <= start {

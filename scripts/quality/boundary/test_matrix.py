@@ -5,7 +5,8 @@ from pathlib import Path
 import unittest
 
 from coverage import CoverageError
-from matrix import critical_crossings, diagnose, evaluate, expected_runtime, unique_index
+from matrix import (ACCEPTED_GUARD, FORCED_REPLAY_PREROLL, critical_crossings, diagnose, evaluate,
+                    expected_runtime, replay_origin, unique_index)
 
 RUNTIME_IDENTITY = {"synthetic_runner": "known"}
 
@@ -52,6 +53,7 @@ def synthetic_complete_run():
         runtime = expected_runtime(spec, definition["input_chunks"])
         boundaries, inputs = [], []
         received, step, origin, due, pending, explicit = 0, 0, 0, runtime["window_frames"] - runtime["phase_frames"], None, 0
+        retained = 0
         fixed = [value * rate // 1000 for value in spec.get("forced_source_ms", [])]
         while received < 100 * rate:
             accepted = (received * 16000 // rate) // 512 * 512
@@ -60,7 +62,8 @@ def synthetic_complete_run():
                 pending["settled_received_frame"] = received
                 pending["settled_canonical_accepted"] = [accepted] * 2
                 boundaries.append(pending)
-                origin = (pending["cut_frame"] * 16000 + rate - 1) // rate
+                origin = retained = replay_origin(
+                    retained, (pending["cut_frame"] * 16000 + rate - 1) // rate, FORCED_REPLAY_PREROLL)
                 pending = None
                 explicit += 1
                 continue
@@ -81,7 +84,9 @@ def synthetic_complete_run():
                     boundaries.append(event)
                     due = cut + runtime["window_frames"]
                     if maintenance:
-                        origin = accepted - 5727
+                        origin = retained = replay_origin(retained, accepted - ACCEPTED_GUARD, 0)
+                    else:
+                        retained = max(accepted - ACCEPTED_GUARD, 0)
                 continue
             count = min(definition["input_chunks"][step % len(definition["input_chunks"])], 100 * rate - received)
             if pending:

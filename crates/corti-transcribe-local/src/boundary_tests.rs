@@ -33,11 +33,14 @@ struct ModelTiming {
     temp_start: usize,
     temp_end: usize,
     triggered: bool,
+    /// Samples after a state reset before the model can report speech (real Silero needs context).
+    warmup: usize,
 }
 
 impl ModelTiming {
     fn is_speech(&mut self, positive: bool, min_silence: usize) -> bool {
         self.current += HOP;
+        let positive = positive && self.current > self.warmup;
         if positive && self.temp_end != 0 {
             self.temp_end = 0;
         }
@@ -177,7 +180,10 @@ impl Segmenter for PendingSegmenter {
         self.processed = 0;
         self.head = 0;
         self.start = None;
-        self.model = ModelTiming::default();
+        self.model = ModelTiming {
+            warmup: self.model.warmup,
+            ..ModelTiming::default()
+        };
         self.queue.clear();
         self.observe();
     }
@@ -621,6 +627,59 @@ fn forced_boundary_holds_suffix_until_old_poll_ack_and_preserves_nonhop_pcm() {
 }
 
 #[test]
+fn forced_reset_decodes_speech_from_the_cut_despite_vad_warmup() {
+    // After a reset the VAD needs context before it reports speech. Without a warm replay the
+    // speech just after a forced cut fell into no region and was never decoded.
+    let mut f = fixture(true);
+    let probe = Arc::new(Mutex::new(Probe::default()));
+    let mut segmenter = PendingSegmenter::new(probe);
+    segmenter.model.warmup = 8_000;
+    f.live.vad = Box::new(Counted {
+        inner: Box::new(segmenter),
+        calls: f.calls.clone(),
+    });
+    let silence = 16_000;
+    let cut = silence + 33_190;
+    let mut pcm = vec![0.0; silence];
+    pcm.resize(cut, 1.0);
+    push(&mut f.live, &pcm, 16_000);
+    let token = f
+        .live
+        .latch_boundary(cut as u64, BoundaryKind::Forced)
+        .unwrap();
+    let speech_after = 6238 + 377 + 24_000;
+    push(&mut f.live, &vec![1.0; 6238 + 377], 16_000);
+    assert_eq!(
+        f.live.advance_boundary(BoundaryInput::Continue),
+        BoundaryProgress::OldSettled(token)
+    );
+    f.live.poll_words().unwrap();
+    f.live.acknowledge_boundary(token).unwrap();
+    push(&mut f.live, &vec![1.0; 24_000], 16_000);
+    push(&mut f.live, &vec![0.0; 24_000], 16_000);
+    f.live.advance_boundary(BoundaryInput::SourceEnded);
+    let attempts = f.attempts.lock().unwrap();
+    assert!(attempts.windows(2).all(|a| a[0].end <= a[1].start));
+    assert_eq!(
+        attempts[1].start,
+        cut as u64,
+        "{:?}",
+        attempts
+            .iter()
+            .map(|a| (a.start, a.end))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        attempts
+            .iter()
+            .flat_map(|a| &a.pcm)
+            .filter(|s| **s != 0.0)
+            .count(),
+        cut - silence + speech_after
+    );
+}
+
+#[test]
 fn natural_boundary_preserves_native_calls_clock_report_and_capped_attempted_end() {
     for status in [
         RegionStatus::Complete,
@@ -948,13 +1007,14 @@ fn natural_boundary_matches_uncut_native_call_pcm_word_and_report_streams() {
 #[test]
 fn repeated_forced_boundaries_bound_replay_and_native_epoch_without_source_reset() {
     let mut f = fixture(false);
-    f.live.boundary.as_mut().unwrap().limits.max_epoch_samples = 16_000;
+    // A forced reset replays at most the settlement plus the warm-up context.
+    f.live.boundary.as_mut().unwrap().limits.max_epoch_samples = 16_000 + REPLAY_CONTEXT;
     f.live
         .boundary
         .as_mut()
         .unwrap()
         .limits
-        .max_retained_samples = 16_000;
+        .max_retained_samples = (16_000 + REPLAY_CONTEXT) as usize;
     for n in 1..=16 {
         let cut = n * 7000;
         let delivered = f.live.input_clock.frames;
@@ -972,8 +1032,8 @@ fn repeated_forced_boundaries_bound_replay_and_native_epoch_without_source_reset
         assert_eq!(f.live.input_clock.frames, delivered);
         assert_eq!(f.live.output_position(), output);
         let state = f.live.boundary.as_ref().unwrap();
-        assert!(state.native_accepted < 7000);
-        assert!(state.retained.len() <= 6238);
+        assert!(state.native_accepted < 7000 + REPLAY_CONTEXT);
+        assert!(state.retained.len() as u64 <= 6238 + REPLAY_CONTEXT);
         assert!(f.live.boundary_snapshot().unwrap().epoch_remaining > 9000);
     }
     assert_eq!(
@@ -1250,7 +1310,8 @@ fn natural_maintenance_replays_only_the_retained_future_guard_at_unchanged_histo
         let cut = snapshot.first;
         let state = f.live.boundary.as_ref().unwrap();
         let accepted = state.accepted_end;
-        let replay_start = accepted - ACCEPTED_GUARD;
+        // The replay starts on the VAD window grid at or before the certified future-start bound.
+        let replay_start = (accepted - ACCEPTED_GUARD) / VAD_WINDOW as u64 * VAD_WINDOW as u64;
         assert!(f.live.input_clock.canonical_fence(cut).unwrap() < replay_start);
         assert!(replay_start >= state.last_attempt_end);
         assert!(replay_start >= state.retained_start);
@@ -1294,13 +1355,13 @@ fn natural_maintenance_replays_only_the_retained_future_guard_at_unchanged_histo
                     _ => 0,
                 })
                 .sum::<u64>(),
-            ACCEPTED_GUARD
+            accepted - replay_start
         );
         drop(calls);
         let state = f.live.boundary.as_ref().unwrap();
         assert_eq!(state.owned_source_start, cut);
         assert_eq!(state.accepted_end, accepted);
-        assert_eq!(state.native_accepted, ACCEPTED_GUARD);
+        assert_eq!(state.native_accepted, accepted - replay_start);
         assert_eq!(state.retained_start, replay_start);
         assert_eq!(bits(&state.retained), retained);
         assert_eq!(f.live.vad_base_samples, replay_start);
@@ -1338,8 +1399,9 @@ fn natural_maintenance_uses_retained_guard_even_when_historical_cut_pcm_was_reti
     f.live.acknowledge_boundary(token).unwrap();
     let state = f.live.boundary.as_ref().unwrap();
     assert_eq!(state.owned_source_start, 24_000);
-    assert_eq!(state.retained_start, accepted - ACCEPTED_GUARD);
-    assert_eq!(state.native_accepted, ACCEPTED_GUARD);
+    let replay_start = (accepted - ACCEPTED_GUARD) / VAD_WINDOW as u64 * VAD_WINDOW as u64;
+    assert_eq!(state.retained_start, replay_start);
+    assert_eq!(state.native_accepted, accepted - replay_start);
     assert!(f.attempts.lock().unwrap().is_empty());
 }
 
@@ -1362,7 +1424,10 @@ fn ordinary_policy_boundaries_have_epoch_headroom_through_repeated_natural_and_f
             .unwrap()
             .rolling_capacity(0, 377, 377, policy.maximum_owned_frames())
             .unwrap();
-        let epoch_limit = capacity.minimum_epoch_samples;
+        // The tightest legal epoch for each kind: natural maintenance never replays the forced
+        // warm-up pre-roll, so it arms at every ordinary boundary without that reserve.
+        let epoch_limit =
+            capacity.minimum_epoch_samples - if voiced { 0 } else { FORCED_REPLAY_PREROLL };
         let mut f = fixture_with_limits(
             false,
             BoundaryLimits {
@@ -1494,9 +1559,9 @@ fn no_aec_short_window_capacity_matches_independent_matrix_pins() {
     // Frozen Python/native matrix pins, independently calculated from the pinned f32 filter.
     // Q is a four-second nominal window plus the unchanged 22-second deferral.
     for (rate, reserve, settlement, next, trigger, minimum) in [
-        (16_000, 10_851, 12_390, 5118, 433_508, 445_899),
-        (44_100, 21_818, 8806, 2183, 426_989, 435_796),
-        (48_000, 23_339, 8638, 2047, 426_685, 435_324),
+        (16_000, 10_851, 12_390, 5118, 433_508, 462_410),
+        (44_100, 21_818, 8806, 2183, 426_989, 452_307),
+        (48_000, 23_339, 8638, 2047, 426_685, 451_835),
     ] {
         let capacity = boundary_resampler_bounds(rate)
             .unwrap()
@@ -1532,7 +1597,7 @@ fn maintenance_capacity_reserves_an_ordinary_owned_window_before_the_next_settle
         );
         assert_eq!(
             capacity.minimum_epoch_samples,
-            owned + 2 * capacity.settlement_accept + capacity.next_accept + 1
+            owned + 2 * capacity.settlement_accept + capacity.next_accept + REPLAY_CONTEXT + 1
         );
         assert!(
             capacity.minimum_epoch_samples - capacity.replay_samples > capacity.maintenance_trigger

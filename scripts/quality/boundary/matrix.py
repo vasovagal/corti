@@ -10,6 +10,17 @@ from generate import frame_count
 from score import compare
 
 
+ACCEPTED_GUARD = 5727
+VAD_WINDOW = 512
+FORCED_REPLAY_PREROLL = 16000
+REPLAY_CONTEXT = FORCED_REPLAY_PREROLL + VAD_WINDOW - 1
+
+
+def replay_origin(retained, owned_start, preroll):
+    """The native reset replay: on the VAD window grid, never before retained PCM."""
+    return max(retained, max(owned_start - preroll, 0) // VAD_WINDOW * VAD_WINDOW)
+
+
 def expected_runtime(spec, chunks):
     """Pinned integer/f32 reserve calculation for this no-AEC native matrix, checked against Rust."""
     rate = spec["sample_rate"]
@@ -31,7 +42,7 @@ def expected_runtime(spec, chunks):
             "epoch_limit": spec.get("native_epoch_limit_samples", 2**31 - 1 - 512),
             "settlement_source_reserve": reserve, "settlement_accept": settlement,
             "next_accept": burst, "maintenance_trigger": trigger,
-            "minimum_epoch_samples": trigger + settlement + 1, "input_chunks": chunks,
+            "minimum_epoch_samples": trigger + settlement + REPLAY_CONTEXT + 1, "input_chunks": chunks,
             "vad_threshold": 0.5, "vad_min_silence": 1.0}
 
 
@@ -302,6 +313,7 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
                          for track in ("mic", "tap"))
         previous = -1
         epoch_origins = [0, 0]
+        retained = [0, 0]
         nominal_due = frame_count(spec["window_ms"] - spec["phase_ms"], spec["sample_rate"])
         last_settlement = -1
         for event in events:
@@ -333,9 +345,14 @@ def evaluate(seal, result, expected_models, expected_runtime_identity):
                         or remaining[index] != runtime["epoch_limit"] - (accepted - epoch_origins[index])):
                     raise CoverageError("native headroom is not bound to actual admitted canonical PCM")
                 if event["kind"] in {"deadline", "explicit"}:
-                    epoch_origins[index] = (event["cut_frame"] * 16000 + spec["sample_rate"] - 1) // spec["sample_rate"]
+                    cut = (event["cut_frame"] * 16000 + spec["sample_rate"] - 1) // spec["sample_rate"]
+                    epoch_origins[index] = retained[index] = replay_origin(
+                        retained[index], cut, FORCED_REPLAY_PREROLL)
                 elif event["maintenance_reset"]:
-                    epoch_origins[index] = accepted - 5727
+                    epoch_origins[index] = retained[index] = replay_origin(
+                        retained[index], accepted - ACCEPTED_GUARD, 0)
+                else:
+                    retained[index] = max(accepted - ACCEPTED_GUARD, 0)
             if (event["kind"] == "natural" and (event["selected_received_frame"] != event["settled_received_frame"]
                     or event["canonical_accepted"] != event["settled_canonical_accepted"])):
                 raise CoverageError("natural settlement admitted input after its immutable selection")
