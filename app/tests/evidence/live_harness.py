@@ -19,7 +19,7 @@ def live_source(runner):
     capture = (runner.ROOT / "crates/corti-coreaudio/src/capture.rs").read_text()
     start = capture.index("pub const FILTER_FRAMES_PER_CHUNK:")
     parts.append("mod corti_capture {" + item(capture, "pub struct CaptureChunk") + capture[start:capture.index(";", start)+1] + "}\nuse corti_capture::CaptureChunk;\n")
-    for name in ("MAX_DIARIZATION_AUDIO_BYTES", "MAX_BOUNDARY_EXTRA_AUDIO_BYTES", "MAX_BUFFERED_TRANSCRIPT_BYTES", "MAX_WINDOW_AEC_BLOCKS", "MAX_FINAL_TRANSCRIPT_BYTES", "LIVE_AEC_LOOKAHEAD_SECONDS", "LIVE_HOLD_MAX_REGION_SECONDS", "LIVE_HOLD_MAX_CONTENT_TOKENS", "MAX_HELD_MIC_REGIONS", "MAX_LIVE_ECHO_SOURCES"):
+    for name in ("MAX_DIARIZATION_AUDIO_BYTES", "MAX_BOUNDARY_EXTRA_AUDIO_BYTES", "MAX_BUFFERED_TRANSCRIPT_BYTES", "TEXT_CAP_HEADROOM", "MAX_WINDOW_AEC_BLOCKS", "MAX_FINAL_TRANSCRIPT_BYTES", "LIVE_AEC_LOOKAHEAD_SECONDS", "LIVE_HOLD_MAX_REGION_SECONDS", "LIVE_HOLD_MAX_CONTENT_TOKENS", "MAX_HELD_MIC_REGIONS", "MAX_LIVE_ECHO_SOURCES"):
         start = s.index("const " + name)
         parts.append(s[start:s.index(";", start)+1])
     parts.append(s[s.index("fn new_live_aec("):s.index("/// Owns live-session lifetimes.")])

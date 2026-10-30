@@ -90,6 +90,9 @@ const MAX_BOUNDARY_NATIVE_PCM_BYTES: usize = 128 * 1024 * 1024;
 /// Independent cap for recognized words awaiting the next durable append. ASR output per minute is tiny in
 /// practice, but a hard cap makes the memory contract hold even for malformed/model-pathological output.
 const MAX_BUFFERED_TRANSCRIPT_BYTES: usize = 1024 * 1024;
+/// Raw-poll charge kept free once the text cap arms: the polls that still arrive while its forced
+/// fence settles (one maximal 20 s region per channel, plus slack) must not overflow the bound.
+const TEXT_CAP_HEADROOM: usize = 128 * 1024;
 
 /// Hard cap on the per-block AEC statistics a window retains as cleanup evidence (#149 phase 3b). The
 /// working set is one window plus `echo_window_seconds` of lookback — at the default 8192-tap hop / 48 kHz
@@ -2440,13 +2443,18 @@ fn rolling_observation<C: LiveChannel, F: NoteFiler>(
     Ok(Observation {
         received_through,
         tracks,
-        text_full: window.buffered_text_bytes >= MAX_BUFFERED_TRANSCRIPT_BYTES
-            || window
-                .rolling
-                .as_ref()
-                .is_some_and(|owner| owner.text_charge >= MAX_BUFFERED_TRANSCRIPT_BYTES),
+        text_full: text_cap_reached(window),
         maintenance_armed,
     })
+}
+
+/// Arm the text cap while the remaining raw-poll budget can still admit settlement polls. Arming only at
+/// the bound itself never fired: a poll that would cross it is rejected first, abandoning live filing.
+fn text_cap_reached(window: &TranscriptWindow) -> bool {
+    window.buffered_text_bytes >= MAX_BUFFERED_TRANSCRIPT_BYTES
+        || window.rolling.as_ref().is_some_and(|owner| {
+            owner.text_charge >= MAX_BUFFERED_TRANSCRIPT_BYTES - TEXT_CAP_HEADROOM
+        })
 }
 
 fn publish_owned_poll<F: NoteFiler, P: TranscriptPublisher>(
@@ -6978,6 +6986,43 @@ mod tests {
         );
         assert!(mic.pushes.is_empty());
         assert!(writer.path().is_none());
+    }
+
+    #[test]
+    fn text_cap_arms_while_settlement_polls_still_fit() {
+        // A dense, maximal 20 s region: five 12-character words per second.
+        let poll = |start: f64| -> Vec<Word> {
+            (0..100)
+                .map(|index| {
+                    let at = start + f64::from(index) * 0.2;
+                    word(at, at + 0.2, "synthetically")
+                })
+                .collect()
+        };
+        let mut window =
+            TranscriptWindow::new(16_000, 10, false, CleanupConfig::default()).unwrap();
+        window
+            .enable_rolling(std::time::Duration::from_secs(1), 64)
+            .unwrap();
+        let mut writer = NoteWriter::new(TempFiler::new("text-cap-headroom"), meta(), None);
+        let mut start = 0.0;
+        while !text_cap_reached(&window) {
+            publish_owned_poll(
+                &mut window,
+                &mut writer,
+                &NoopPublisher,
+                poll(start),
+                corti_core::QualityTrack::Tap,
+            )
+            .expect("the text cap must arm before a raw poll is rejected");
+            start += 20.0;
+        }
+        for track in [corti_core::QualityTrack::Mic, corti_core::QualityTrack::Tap] {
+            publish_owned_poll(&mut window, &mut writer, &NoopPublisher, poll(start), track)
+                .expect("settlement polls after the cap arms must still fit");
+            start += 20.0;
+        }
+        std::fs::remove_dir_all(&writer.filer.dir).ok();
     }
 
     #[test]
