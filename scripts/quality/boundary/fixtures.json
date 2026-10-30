@@ -30,9 +30,9 @@
       "text": "The budget for Ada is one thousand five hundred euros and not fifteen thousand euros.",
       "critical": [
         {"id": "name", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
-        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"]]},
         {"id": "negation", "authored": ["not"], "alternatives": [["not"]]},
-        {"id": "contrast", "authored": ["fifteen", "thousand", "euros."], "alternatives": [["fifteen", "thousand", "euros."], ["15,000", "euros."], ["15000", "euros."]]}
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros."], "alternatives": [["fifteen", "thousand", "euros."], ["15,000", "euros."], ["15000", "euros."], ["€15,000."], ["€15000."], ["15,000€."], ["15000€."]]}
       ]
     },
     {
@@ -71,9 +71,9 @@
         {"id": "negation-release", "authored": ["not"], "alternatives": [["not"]]},
         {"id": "version", "authored": ["version", "one", "point", "five"], "alternatives": [["version", "one", "point", "five"], ["version", "1.5"]]},
         {"id": "name-ada", "authored": ["Ada"], "alternatives": [["Ada"], ["ada"]]},
-        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"]]},
+        {"id": "amount", "authored": ["one", "thousand", "five", "hundred", "euros"], "alternatives": [["one", "thousand", "five", "hundred", "euros"], ["1,500", "euros"], ["1500", "euros"], ["€1,500"], ["€1500"], ["1,500€"], ["1500€"]]},
         {"id": "negation-amount", "authored": ["not"], "alternatives": [["not"]]},
-        {"id": "contrast", "authored": ["fifteen", "thousand", "euros"], "alternatives": [["fifteen", "thousand", "euros"], ["15,000", "euros"], ["15000", "euros"]]},
+        {"id": "contrast", "authored": ["fifteen", "thousand", "euros"], "alternatives": [["fifteen", "thousand", "euros"], ["15,000", "euros"], ["15000", "euros"], ["€15,000"], ["€15000"], ["15,000€"], ["15000€"]]},
         {"id": "name-grace", "authored": ["Grace"], "alternatives": [["Grace"], ["grace"]]},
         {"id": "amount-unit", "authored": ["fifteen", "millimeters"], "alternatives": [["fifteen", "millimeters"], ["15", "millimeters"], ["15", "mm"]]},
         {"id": "negation-measure", "authored": ["never"], "alternatives": [["never"]]},

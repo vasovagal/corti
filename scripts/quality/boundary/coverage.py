@@ -1,4 +1,4 @@
-"""Finite pre-model occurrence binding. Literal alternatives locate, never normalize, words."""
+"""Finite pre-model occurrence binding. Declared alternatives locate words; scoring stays raw."""
 from functools import lru_cache
 import math
 
@@ -37,11 +37,22 @@ def validated_words(words, source_frames, sample_rate):
     return result
 
 
+def locate_key(token):
+    """Locating only: ASR sentence-casing and sentence punctuation never change a critical value.
+
+    Only a leading capital is folded, so unit case such as mM/mm stays distinct. Scoring still
+    compares the candidate's raw tokens with the batch's raw tokens.
+    """
+    token = token.strip(".,!?;:")
+    return token[:1].lower() + token[1:]
+
+
 def bind_occurrences(words, occurrences, source_frames, sample_rate):
     """Bind all ordered IDs uniquely within PREDECLARED source windows.
 
-    An alternative is a literal NFC token sequence, not a numeric/case equivalence rule. A
-    baseline may select a declared spelling; candidate scoring subsequently uses those exact raw
+    An alternative is a literal NFC token sequence, not a numeric equivalence rule. Locating ignores
+    only sentence punctuation and a leading capital (see locate_key). A baseline may select a
+    declared spelling; candidate scoring subsequently uses those exact raw
     tokens. No surface, order, window, or occurrence is derived from candidate output.
     """
     baseline = validated_words(words, source_frames, sample_rate)
@@ -77,7 +88,8 @@ def bind_occurrences(words, occurrences, source_frames, sample_rate):
         for surface in alternatives:
             for start in range(len(baseline) - len(surface) + 1):
                 indices = tuple(range(start, start + len(surface)))
-                if tuple(baseline[index].raw for index in indices) != tuple(surface):
+                if (tuple(locate_key(baseline[index].raw) for index in indices)
+                        != tuple(locate_key(piece) for piece in surface)):
                     continue
                 # Fixed source windows include only the predeclared timing margin, never a match-
                 # selected expansion. Multi-piece ASR words preserve their common native interval.

@@ -81,6 +81,22 @@ class CoverageTests(unittest.TestCase):
         bound = bind_occurrences(reference, [occurrence("amount", ["one", "thousand"])], 10000, 1000)
         self.assertEqual(bound[0]["indices"], (0, 1))
 
+    def test_sentence_case_and_punctuation_locate_but_raw_tokens_stay_critical(self):
+        reference = words("Never replace 50 millimeters! Not 1,500 euros.")
+        annotations = [occurrence("negation", ["never"]),
+                       occurrence("unit", ["50", "millimeters."]),
+                       occurrence("polarity", ["not"]),
+                       occurrence("amount", ["1,500", "euros"])]
+        result = compare_cell(reference, reference, annotations, 10000, 1000, ())
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["coverage"][0]["baseline_surface"], ["Never"])
+        # The candidate must still reproduce the batch's raw tokens exactly.
+        changed = compare_cell(reference, words("never replace 50 millimeters! Not 1,500 euros."),
+                               annotations, 10000, 1000, ())
+        self.assertFalse(changed["score"]["critical_gate"])
+        with self.assertRaises(CoverageError):
+            bind_occurrences(words("NEVER"), [occurrence("negation", ["never"])], 10000, 1000)
+
     def test_raw_case_difference_remains_critical_after_literal_binding(self):
         reference = words("15 mM")
         result = compare_cell(reference, words("15 mm"),
