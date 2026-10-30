@@ -142,7 +142,8 @@ class EvidenceGateTests(unittest.TestCase):
     def complete(self):
         return self.receipt() + self.suite(sorted(self.expected))
 
-    def native_run(self, evidence=None, evidence_status=0, controls=None, metal="unavailable"):
+    def native_run(self, evidence=None, evidence_status=0, controls=None, metal="unavailable",
+                   boundary="BOUNDARY_MATRIX PASS\n"):
         """Exercise real orchestration and receipt checks with synthetic subprocess results."""
         if evidence is None:
             evidence = self.complete()
@@ -164,7 +165,7 @@ class EvidenceGateTests(unittest.TestCase):
                 if "scripts/quality/boundary/generate.py" in command:
                     text = ""
                 elif "scripts/quality/boundary/run.py" in command:
-                    text = "BOUNDARY_MATRIX PASS\n"
+                    text = boundary
                 elif "app/tests/evidence/test_receipt.py" in command:
                     return controls
                 elif "app/tests/evidence/run.py" in command:
@@ -259,7 +260,8 @@ class EvidenceGateTests(unittest.TestCase):
                 self.assertIn({"check": "evidence-app-orchestration", "passed": False}, report["results"])
                 self.assertEqual(artifacts["evidence-app-orchestration.log"], candidate)
                 self.assertIn("- evidence-app-orchestration: FAIL", artifacts["step-summary.md"])
-                self.assertFalse(any("ggml::tests::quality_probe_metal" in cmd for cmd in commands))
+                # A red stage no longer hides later evidence; the job still fails.
+                self.assertIn({"check": "metal-probe", "passed": True}, report["results"])
 
     def test_native_gate_requires_both_receipt_controls_without_skips(self):
         for output, returncode in [("", 0), ("Ran 0 tests in 0s\nOK\n", 0),
@@ -272,6 +274,17 @@ class EvidenceGateTests(unittest.TestCase):
                 self.assertIn({"check": "evidence-receipt-controls", "passed": False}, report["results"])
                 self.assertEqual(artifacts["evidence-receipt-controls.log"], output)
                 self.assertFalse(any("app/tests/evidence/run.py" in cmd for cmd in commands))
+
+    def test_red_boundary_matrix_still_runs_and_reports_every_later_stage(self):
+        status, commands, report, artifacts = self.native_run(boundary="BOUNDARY_MATRIX FAIL\n")
+        self.assertEqual(status, 1)
+        self.assertIn({"check": "boundary-native-matrix", "passed": False}, report["results"])
+        self.assertIn("- boundary-native-matrix: FAIL", artifacts["step-summary.md"])
+        for check in ("capture-quality-native-suites", "live-word-stream-feature",
+                      "decode-quality-app-orchestration", "evidence-app-orchestration",
+                      "metal-probe", "capture-rate-throughput"):
+            with self.subTest(check=check):
+                self.assertIn({"check": check, "passed": True}, report["results"])
 
     def test_missing_evidence_command_keeps_failed_result_and_summary(self):
         status, commands, report, artifacts = self.native_run(evidence=FileNotFoundError("missing harness"))

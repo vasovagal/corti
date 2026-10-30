@@ -472,10 +472,11 @@ def main():
 
     metal = "not probed"
     failed = False
-    try:
+    cache = args.cache_dir or args.model_dir.parent / "quality-model-archives"
+
+    def boundary_stage():
         boundary_output = args.output_dir / "boundary"
         boundary_fixtures = boundary_output / "fixtures"
-        cache = args.cache_dir or args.model_dir.parent / "quality-model-archives"
         for label, command in (
             ("boundary-generate", [sys.executable, "scripts/quality/boundary/generate.py",
                 "--output-dir", str(boundary_fixtures)]),
@@ -495,6 +496,8 @@ def main():
             results.append({"check": label, "passed": passed})
             if not passed:
                 raise RuntimeError(f"authored boundary fixture or all-run word gate failed: {label}")
+
+    def capture_suites_stage():
         command = ["cargo", "test", "--locked", "-p", "corti-core", "-p", "corti-coreaudio",
                    "-p", "corti-capture", "-p", "corti-detect", "-p", "corti-app",
                    "-p", "corti-jobs", "-p", "corti-queue", "-p", "corti-transcribe",
@@ -508,6 +511,8 @@ def main():
         results.append({"check": "capture-quality-native-suites", "passed": passed})
         if not passed:
             raise RuntimeError("capture-quality native suites failed or required tests did not execute")
+
+    def tap_features_stage():
         for feature, required in (("live", TAP_LIVE_REQUIRED_TESTS),
                                   ("inbox-local", TAP_INBOX_REQUIRED_TESTS)):
             label = f"tap-{feature}-only"
@@ -526,6 +531,8 @@ def main():
                 results.append({"check": f"{label}-{verb}", "passed": passed})
                 if not passed:
                     raise RuntimeError(f"feature-specific check failed or did not execute its inventory: {label}-{verb}")
+
+    def stream_stage():
         command = ["cargo", "test", "--locked", "--lib", "-p", "corti-transcribe-local",
                    "--features", "stream", "live::stream::tests::"]
         print("+ " + " ".join(command), flush=True)
@@ -537,6 +544,9 @@ def main():
         results.append({"check": "live-word-stream-feature", "passed": passed})
         if not passed:
             raise RuntimeError("stream feature tests failed or did not execute their exact inventory")
+
+    def decode_quality_stage():
+        nonlocal app_path_sources
         command = [sys.executable, "app/tests/decode_quality/run.py", "--clippy"]
         print("+ " + " ".join(command), flush=True)
         app_path = subprocess.run(command, env=env, text=True, stdout=subprocess.PIPE,
@@ -545,6 +555,9 @@ def main():
         (args.output_dir / "decode-quality-app-path.log").write_text(app_path.stdout)
         app_path_sources = app_path_receipt(app_path.stdout, app_path.returncode)
         results.append({"check": "decode-quality-app-orchestration", "passed": True})
+
+    def evidence_stage():
+        nonlocal evidence_sources
         for label, command in (
             ("evidence-receipt-controls", [sys.executable, "app/tests/evidence/test_receipt.py"]),
             ("evidence-app-orchestration", [sys.executable, "app/tests/evidence/run.py", "--clippy",
@@ -565,6 +578,9 @@ def main():
                   or re.findall(r"(?m)^OK.*$", evidence.stdout) != ["OK"]):
                 raise RuntimeError("evidence receipt controls failed or did not execute both tests")
             check["passed"] = True
+
+    def metal_and_engines_stage():
+        nonlocal metal
         run_test("ggml::tests::quality_probe_metal", "metal-probe", ("ggml",))
         metal = result_path.read_text().strip()
         if metal not in {"available", "unavailable"}:
@@ -588,6 +604,8 @@ def main():
                 if engine == "ggml":
                     run_test("live::tests::ggml_checkpoint_keeps_call_relative_timestamps",
                              label + "-checkpoint", features)
+
+    def resampler_stage():
         comparison_output = run_test(
             "resample::comparison::benchmark_production_against_borrowed_packets",
             "resampler-buffering", release=True,
@@ -598,6 +616,9 @@ def main():
                 resample_comparison.append(json.loads(line[start:])["resample_comparison"])
         if not resample_comparison:
             raise RuntimeError("resampler comparison produced no measurements")
+
+    def capture_rate_stage():
+        nonlocal capture_rate
         # Compile before timing. Only the authored, model-free benchmark process is measured by time;
         # its JSON rows record paired order and variance inputs, with no machine-speed pass threshold.
         build = subprocess.run(
@@ -618,9 +639,17 @@ def main():
         (args.output_dir / "capture-rate.log").write_text(measured.stdout)
         capture_rate = capture_rate_receipt(measured.stdout, measured.returncode)
         results.append({"check": "capture-rate-throughput", "passed": True})
-    except (OSError, ValueError, RuntimeError, StopIteration) as error:
-        print(f"::error::{error}", flush=True)
-        failed = True
+
+    # Stages are independent: one red stage records its failure and the rest still produce evidence.
+    # Within a stage, a failed prerequisite still stops that stage's dependent checks.
+    try:
+        for stage in (boundary_stage, capture_suites_stage, tap_features_stage, stream_stage, decode_quality_stage,
+                      evidence_stage, metal_and_engines_stage, resampler_stage, capture_rate_stage):
+            try:
+                stage()
+            except (OSError, ValueError, RuntimeError, StopIteration) as error:
+                print(f"::error::{error}", flush=True)
+                failed = True
     finally:
         report = {"metal": metal, "spanish_available": fixture_set["spanish_available"],
                   "results": results, "resample_comparison": resample_comparison,
