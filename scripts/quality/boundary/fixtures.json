@@ -3,7 +3,7 @@
   "status": "pre-model proposal; independent manifest/wrapper review required",
   "generation": {
     "tool": "macOS say then afconvert",
-    "voice_selection": "installed English voices: lexicographic minimum of (locale != en_US, name, locale), identical to existing quality fixture selection",
+    "voice_selection": "Samantha (en_US) when installed, otherwise the lexicographic minimum of (locale != en_US, name, locale)",
     "words_per_minute": 165,
     "format": "mono signed 16-bit little-endian WAV",
     "sample_rates": [16000, 44100, 48000],

@@ -21,10 +21,17 @@ def run(command):
     return result.stdout
 
 
+# The standard macOS US voice. The alphabetically first voice is a novelty voice (Albert) whose
+# speech the model mostly mishears, which would leave no usable batch reference.
+PREFERRED_VOICE = ("Samantha", "en_US")
+
+
 def voice_from_listing(listing):
     matches = re.findall(r"^\s*(.+?)\s+(en_[A-Za-z_]+)\s+#", listing, re.MULTILINE)
     if not matches:
         raise ValueError("no installed English synthetic voice")
+    if PREFERRED_VOICE in matches:
+        return PREFERRED_VOICE
     return min(matches, key=lambda item: (item[1] != "en_US", item))
 
 

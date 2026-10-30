@@ -44,6 +44,13 @@ class DefinitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             voice_from_listing("Jorge es_ES # Sample")
 
+    def test_standard_voice_is_preferred_over_novelty_voices(self):
+        # macOS lists novelty voices such as Albert first; their speech is not a usable reference.
+        lines = ["Albert              en_US    # Hello! My name is Albert.",
+                 "Bad News            en_US    # Hello! My name is Bad News.",
+                 "Samantha            en_US    # Hello! My name is Samantha."]
+        self.assertEqual(voice_from_listing("\n".join(lines)), ("Samantha", "en_US"))
+
     def test_fractional_source_frame_is_refused_instead_of_rounded(self):
         self.assertEqual(frame_count(6250, 44100), 275625)
         with self.assertRaises(ValueError):
