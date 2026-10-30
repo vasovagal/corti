@@ -923,9 +923,7 @@ fn run_transcribe(args: TranscribeArgs) -> Result<()> {
         &meta,
         input,
     )
-    .map_err(|error| {
-        recording_quality.retain_failed_attempt(error, &job_id, input, args.print_only)
-    })?;
+    .context("transcription failed")?;
     recording_quality.quality = decoded.quality;
     let transcript = decoded.transcript;
     eprintln!(
