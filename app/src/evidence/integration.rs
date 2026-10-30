@@ -221,7 +221,9 @@ impl Run {
             } else {
                 previous.protected_output.clone()
             };
-            let signal = if provider || new_rows {
+            // Only rows the provider returned are provider text. The handoff input and a declined
+            // final prose are the same local rows, so they keep the previous lineage.
+            let signal = if new_rows {
                 SignalIdentity {
                     source: SignalSource::ProviderText,
                     aec: AecOrigin::None,

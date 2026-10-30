@@ -880,6 +880,22 @@ fn actual_live_selected_and_fallback_prose_precede_note_rewrite_crash() {
             "Original synthetic statement."
         };
         assert!(note.contains(selected));
+        // Only rows the provider actually returned are provider text; the handoff input and a
+        // declined (local) final prose keep their live lineage.
+        let source = |stage: &serde_json::Value| {
+            document["ledger"]["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|group| group["stages"].as_array().unwrap().contains(stage))
+                .unwrap()["signal"]["source"]
+                .clone()
+        };
+        assert_eq!(source(provider), "live_stream");
+        assert_eq!(
+            source(final_stage),
+            if mode == 1 { "provider_text" } else { "live_stream" }
+        );
         assert!(String::from_utf8(bytes).unwrap().contains(selected));
         assert!(document["ledger"]["truncation"]["cause"].is_null());
         std::fs::remove_dir_all(&writer.filer.dir).unwrap();
