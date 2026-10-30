@@ -273,6 +273,22 @@ fn actual_live_aec_consume_and_finish_record_track_specific_short_lookahead() {
                 assert!(group["signal"]["lookahead_frames"].is_null());
             }
         }
+        // Only mic audio passes through live AEC. Window assembly, its cleanup and the final prose
+        // combine both tracks, so their lineage cannot claim it.
+        let mixed: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group["stages"].as_array().unwrap().iter().any(|stage| {
+                    matches!(stage["kind"]["kind"].as_str(), Some("final_prose" | "provider_input"))
+                        || stage["kind"]["pass"] == "sort"
+                })
+            })
+            .collect();
+        assert!(!mixed.is_empty());
+        for group in mixed {
+            assert_eq!(group["signal"]["aec"], "none", "{group}");
+            assert!(group["signal"]["lookahead_frames"].is_null(), "{group}");
+        }
         std::fs::remove_dir_all(&writer.filer.dir).unwrap();
     }
 }

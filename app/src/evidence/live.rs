@@ -48,7 +48,9 @@ impl LiveRun {
     }
 
     fn info(&self, kind: StageKind, track: Option<QualityTrack>) -> RecordingIdentity {
-        let applied = self.aec_ran && track != Some(QualityTrack::Tap);
+        // The signal describes the rows' audio lineage. Only mic audio passes through live AEC, so a
+        // stage that combines both tracks (track None) cannot claim it.
+        let applied = self.aec_ran && track == Some(QualityTrack::Mic);
         RecordingIdentity {
             window: self.window,
             kind,
