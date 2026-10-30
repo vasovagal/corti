@@ -103,6 +103,7 @@ impl LiveRun {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // only the app/tests/evidence harness calls this
     pub(crate) fn set_test_wire_cap(&mut self, cap: usize) {
         self.run.session.ledger = corti_transcribe::evidence::Ledger::with_limits(
             cap,

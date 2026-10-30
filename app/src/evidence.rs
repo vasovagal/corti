@@ -196,6 +196,8 @@ pub(crate) struct Session {
 impl Session {
     /// A fresh transcription always starts a fresh generation. Never load a pre-checkpoint ledger:
     /// #93 retries ASR after that crash and atomically replaces the previous attempt instead.
+    #[cfg(test)]
+    #[allow(dead_code)] // only the app/tests/evidence harness calls this
     pub(crate) fn begin(id: &str, meta: &RecordingMeta) -> Result<Self, Error> {
         Self::with_provenance(
             id,

@@ -329,7 +329,7 @@ enum AwaitingFinish {
     /// gate closed until that join actually returns.
     Collecting,
     /// The thread has been joined and its model/session state released.
-    Ready(LiveOutcome),
+    Ready(Box<LiveOutcome>),
 }
 
 impl Inner {
@@ -351,8 +351,10 @@ impl Inner {
             let Some(AwaitingFinish::Running(handle)) = self.awaiting.remove(&id) else {
                 continue;
             };
-            self.awaiting
-                .insert(id, AwaitingFinish::Ready(join_live_thread(handle)));
+            self.awaiting.insert(
+                id,
+                AwaitingFinish::Ready(Box::new(join_live_thread(handle))),
+            );
         }
 
         let discarded: Vec<String> = self
@@ -605,7 +607,7 @@ impl LiveManager {
     pub fn collect(&self, id: &str) -> Option<LiveOutcome> {
         enum Collection {
             Join(JoinHandle<LiveOutcome>),
-            Ready(LiveOutcome),
+            Ready(Box<LiveOutcome>),
         }
 
         let collection = {
@@ -632,7 +634,7 @@ impl LiveManager {
         };
 
         Some(match collection {
-            Collection::Ready(outcome) => outcome,
+            Collection::Ready(outcome) => *outcome,
             Collection::Join(handle) => {
                 let outcome = join_live_thread(handle);
                 let removed = self.inner.lock().unwrap().awaiting.remove(id);
@@ -942,6 +944,7 @@ fn discover_models(cfg: &AppConfig) -> Result<()> {
 /// Thread body: run the session with panics contained; any failure carries the partial note path so
 /// the caller can persist (fallback) or delete (discard) it.
 #[cfg(feature = "local")]
+#[allow(clippy::too_many_arguments)]
 fn session_thread(
     rx: Receiver<CaptureChunk>,
     verdict_rx: Receiver<Verdict>,
