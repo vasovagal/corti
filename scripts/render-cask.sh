@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Render Casks/corti.rb for a published release, to stdout.
 # Computes sha256 from the PUBLIC GitHub release dmg (no token needed for public repos).
-# RUN MANUALLY after each release publishes — CI NEVER writes the tap (ADR 0006). Pipe the output into the
-# shared tap repo vasovagal/homebrew-tap and commit it by hand:
+# Called by the release workflow after public asset validation; also usable manually for recovery.
+# Pipe output into the shared tap repo vasovagal/homebrew-tap if repairing a failed publication:
 #
 #   VERSION=0.1.0 scripts/render-cask.sh > <path-to>/homebrew-tap/Casks/corti.rb
 #   VERSION=0.1.0 REPO=vasovagal/corti scripts/render-cask.sh > Casks/corti.rb

@@ -7,16 +7,13 @@ GitHub release (no signing/notarization; no PAT). Once the public two-asset cont
 updates `vasovagal.github.io` through the Corti-specific `LANDING_PAGE_DEPLOY_KEY`; that key can write only
 the site repository, and the idempotent site commit is `corti bumped to X.Y.Z`.
 
-**You must still update the Homebrew tap by hand — CI never writes it.** Regenerate the cask and commit it to
-the shared tap `vasovagal/homebrew-tap`:
-
-    VERSION=X.Y.Z scripts/render-cask.sh > ~/code/vasovagal/homebrew-tap/Casks/corti.rb
-
-Then commit and push the tap:
-
-    cd ~/code/vasovagal/homebrew-tap
-    git commit -am "corti X.Y.Z"
-    git push
+After the public two-asset contract passes, an independent release job renders the cask and updates
+`vasovagal/homebrew-tap/Casks/corti.rb` automatically. Re-runs are idempotent; older releases cannot
+downgrade the tap. Provision the org GitHub App with **Contents: write** installed only on
+`vasovagal/homebrew-tap`; set repository variable `HOMEBREW_PUBLISHER_CLIENT_ID` and secret
+`HOMEBREW_PUBLISHER_PRIVATE_KEY` in this source repo. The short-lived token is minted only after the
+public assets pass validation and the cask renders. If the job fails, repair it by re-running the release
+workflow (or manually render with `VERSION=X.Y.Z scripts/render-cask.sh`). No PAT is required.
 
 The tap also holds vagus's formula. Install UX: `brew tap vasovagal/tap` then
 `brew install --cask corti`. See
