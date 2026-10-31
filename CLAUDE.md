@@ -30,3 +30,8 @@ Marketing screenshots are generated from the real React frontend with determinis
 `./screenshots/update_site.py` captures and copies the PNGs into the sibling
 `vasovagal.github.io/assets/screenshots/` checkout. Generated `screenshots/output/` files stay ignored;
 commit the harness here and the copied images in the website repo. See [`screenshots/README.md`](./screenshots/README.md).
+
+## Documentation
+
+Write and review documentation with the [succinct-docs skill](.claude/skills/succinct-docs/SKILL.md)
+and follow [AGENTS.md](AGENTS.md#documentation). Preserve the existing invariants above.

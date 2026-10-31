@@ -72,3 +72,12 @@ Names below omit their module prefix; the complete inventory is pinned in `verif
 No existing behavioral expectation is weakened. Shared source5/6 imports retain their reviewed tests and API changes; the source6 mutable-quality backend-failure fixture adopts affirmative raw CaptureProcessing authority. Added fields in live test fixtures start empty. The early-echo integration originally used missing ordinals and failed its actual lineage test; the repaired caller passes the actual global source ordinal. Reviewed opt-out failures and their original immutable archives remain separate review receipts.
 
 The documentation in [local transcript evidence](../../../docs/local-transcript-evidence.md) records persistence, ownership, identity, bounds and native-gate limitations. Native macOS CI and the full application are separate required gates, not results of this model-free suite.
+
+## Allocation fixture observations
+
+The synthetic allocation probe holds caller input, the original ledger, an encoded file buffer,
+and the newly parsed ledger simultaneously. A 16,476,055-byte file measured 16,476,567 additional
+bytes during encode and 32,953,617 during readback, with 82,380,864 total accounted payload bytes
+at that read peak. The 8,192-row fixture measured 5,506,471 additional read bytes. These recorded
+debug-build observations are fixtures, not universal bounds or latency guarantees. They count
+allocator payload, not RSS, allocator overhead or native model memory.

@@ -1,40 +1,116 @@
 # Local transcript evidence (#164)
 
-Corti retains one optional `<recording>.evidence.json` beside each retained recording. It contains transcript text before cleanup, typed edit decisions, explicit stage and parent identities, and the final bounded quality record. It contains no audio. The vault note, exported note, hosted request, queue schema, and mandatory quality sidecar do not contain this record.
+Corti can retain `<recording>.evidence.json` beside each retained recording to explain how its
+transcript changed. This optional file contains pre-cleanup transcript text, typed edit decisions,
+stage/parent identities and the final bounded quality record. It contains no audio. This page
+covers disabling it, replay, identity and resource limits.
 
-The additive setting defaults to enabled, including when loading an older settings file:
+The file can contain text removed from the note. It is separate from the vault/exported note,
+hosted request, queue schema and mandatory quality sidecar; none of those embeds this record.
+The setting defaults to enabled, including when an older settings file omits it. To disable it,
+quit Corti, add or edit this section in `~/.local/share/corti/config.toml` (or
+`$CORTI_DATA_DIR/config.toml` when that override is set), then restart Corti:
 
 ```toml
 [evidence]
 enabled = false
 ```
 
-Disabled sessions write no evidence. The next retention sweep removes existing evidence and registered temporary files, including active recordings before their first note/queue row and AWS-owned rows. It scans only the configured capture directory's flat, production-named evidence files and exact private-file temporary names, then the existing queue-owned paths. Unknown names, subdirectories, audio and mandatory quality are untouched; symlinks are unlinked without following their targets. This discovery also covers interrupted publication after restart without registering an early queue row. It runs before AWS cleanup enqueue, so an unrelated enqueue failure cannot prevent opt-out. Audio and mandatory quality remain under their existing retention authority. A live session that observes opt-out releases its evidence owners and cannot recreate the file later in that session. Explicit discard and its post-worker reaper also remove evidence. Done keeps the file; ordinary recording deletion removes it.
+Disabled sessions write no evidence. The next retention sweep removes existing evidence and
+registered temporary files, including active recordings before their first note/queue row and
+AWS-owned rows:
+
+- Discovery scans the configured capture directory without recursion, accepting only production
+  evidence names and exact private-file temporary names, then checks queue-owned paths. This also
+  finds interrupted publication after restart without creating an early queue row.
+- Unknown names, subdirectories, audio and mandatory quality are untouched. Symlinks are unlinked
+  without following their targets. Audio and quality retain their existing deletion authority.
+- Opt-out cleanup runs before AWS cleanup enqueue; an enqueue failure cannot bypass it. A live
+  session that observes opt-out releases its evidence owners and cannot recreate evidence later
+  in that session.
+- Explicit discard and its post-worker reaper remove evidence. Done keeps it; ordinary recording
+  deletion removes it.
 
 ## Durability and replay
 
-The existing private-file helper creates a 0600 sibling temporary, syncs it, renames it atomically, and syncs the directory. Temporary names participate in the existing checkpoint scan. Write, file-sync, and rename failures leave prior canonical bytes intact. Directory-sync failure occurs after rename: the new complete bytes may already be visible, and the result remains unavailable. Cleanup attempts the known canonical unlink even when directory enumeration fails, and reports incomplete temporary cleanup instead of claiming success.
+The private-file helper writes a 0600 sibling temporary, syncs it, atomically renames it and syncs
+the directory. Temporary names participate in the checkpoint scan. Write, file-sync and rename
+failures preserve prior canonical bytes. A directory-sync failure follows rename: complete new
+bytes may already be visible, but the result remains unavailable. Cleanup tries the canonical
+unlink even if directory enumeration fails and reports incomplete temporary cleanup.
 
-Batch publishes evidence before the existing filing checkpoint. The current settings guard spans its enabled check and publication, so a concurrent disable/sweep cannot complete between them and be followed by recreation. The checkpoint carries an optional content-free receipt binding the recording ID/start time and a random attempt generation. PendingNote validates that receipt without changing evidence or invoking ASR, including when audio has disappeared. Missing, corrupt, disabled, or mismatched optional evidence does not defeat the filing checkpoint. A crash before the checkpoint uses the existing retry and replaces the evidence generation; it does not append a second ASR generation. There is no new retry scheduler or queue column.
+Batch publishes evidence before the filing checkpoint. The settings guard covers both the enabled
+check and publication, preventing a concurrent disable/sweep from completing before a later
+recreation. The checkpoint carries an optional content-free receipt bound to the recording ID,
+start time and random attempt generation.
 
-Live publication atomically replaces the same bounded file after each logical window, before note append. Persistence errors or evidence truncation never discard transcript words or fail filing. Truncation is sticky and has bounded omission counts; an incomplete ledger is never silently presented as complete.
+`PendingNote` validates that receipt without changing evidence or invoking ASR, even if audio is
+gone. Missing, corrupt, disabled or mismatched evidence does not invalidate the filing checkpoint.
+A pre-checkpoint crash uses the existing retry and replaces the generation instead of appending
+another ASR generation. Evidence adds no retry scheduler or queue column.
+
+Live atomically replaces the same bounded file after each logical window, before note append.
+Persistence errors and truncation do not discard transcript words or fail filing. Truncation is
+sticky, with bounded omission counts; an incomplete ledger is labelled incomplete.
 
 ## Stage and processing identity
 
-Batch records the actual backend output once, then the real cleanup passes. Live retains exact parent IDs when early echo releases or withholds mic rows, when raw echo compares far polls, and when the actual segment/diarization emitter produces descendants. Early echo captures its classifier's own source inventory at assessment time, before later pruning; immediate publication without classification records no comparison context. The emitter supplies UTF-8 source ranges directly. Cleanup assembles those retained parents without reminting ASR snapshots. Raw mic polls used as external comparison context are explicitly ContextSnapshot inputs. Missing lineage is unavailable; text/time matching never invents a parent.
+Batch records backend output once, followed by the actual cleanup passes. Live retains parent IDs
+through early echo, raw-echo comparison, segmentation and diarization:
 
-The app records the immutable transcript offered to an enabled existing finalizer as ProviderInput, without sending the evidence record. This is an application handoff identity, not proof of a network request or provider acceptance. The finalizer can decline or fall back. FinalProse records accepted selected application output, not an atomic note-commit certificate. After the hosted acceptance fence succeeds, live persists that selected stage before rewriting the note; typed fallback follows the same order. A crash or note failure can therefore leave selected output in evidence before its note commit. Rejected hosted generations are excluded. Live final input sorts already-known parent IDs with the same stable ordering as the writer, propagates their protections, and verifies the complete ordered rows against the actual finalizer input.
+- Early echo records the classifier's source inventory at assessment time, before later pruning.
+  Immediate publication without classification has no comparison context.
+- Emitters supply UTF-8 source ranges. Cleanup assembles retained parents without creating another
+  ASR snapshot. Raw mic polls used for external comparison are `ContextSnapshot` inputs.
+- Missing lineage is unavailable. Text/time similarity never invents a parent.
 
-The bounded identity document retains existing allowlisted configuration, selected model identifiers, package version, backend and mode. Its SHA-256 values are explicitly identity-document fingerprints, not model artifact digests or verified executable hashes. AWS's acoustic model remains opaque. Credentials, buckets, profiles, directory paths, arbitrary settings and duplicate quality data are excluded. Readback validates both the document and every group's fingerprints.
+`ProviderInput` identifies the immutable transcript handed to an enabled finalizer. It proves an
+application handoff, not a network request or provider acceptance; the evidence file is not sent.
+The finalizer can decline or fall back.
 
-Each stage separately records actual signal processing. Successful live mic AEC records the existing 0.1-second short lookahead and its actual frame count; far audio records no AEC. Capture and offline-file processing are distinct. A retained processed WAV never claims raw input or exact live replay. Live's immutable configuration descriptor starts with the existing pending execution value; stage signal identity and final quality carry actual execution and activity observations.
+`FinalProse` records selected application output, not a note-commit certificate. After hosted
+acceptance succeeds, live persists that stage before rewriting the note; typed fallback follows
+the same order. A crash or write failure can leave selected output in evidence before note commit.
+Rejected generations are excluded. Live final input sorts known parent IDs in writer order,
+propagates protections and checks the complete ordered rows against the offered finalizer input.
+
+The identity document retains allowlisted configuration, selected model identifiers, package
+version, backend and mode. Its SHA-256 values fingerprint that document; they are not model
+artifact digests or verified executable hashes. AWS's acoustic model is opaque. Credentials,
+buckets, profiles, directory paths, arbitrary settings and duplicate quality data are excluded.
+Readback validates the document and every group's fingerprints.
+
+Each stage records actual signal processing. Live mic AEC records its 0.1-second requested
+lookahead and actual frame count; far audio records no AEC. Capture and offline processing are
+distinct. A processed WAV cannot claim raw input or exact live replay. Live's immutable
+configuration starts with pending execution; stage identity and final quality carry the actual
+execution and activity observations.
 
 ## Bounds and validation
 
-The whole file is at most 16 MiB, including a 4 KiB app identity/receipt envelope, portable 4 KiB truncation metadata, and 256 KiB quality reserve. Portable retained ownership is capped at 32 MiB, with a 64 KiB owned quality reserve. An invocation admits at most 8 MiB and 8,192 source rows. App parent vectors and terminal inputs have independent bounded admission. Early echo admits at most 257 comparison IDs per assessed region and 1 MiB of retained comparison-ID vector capacity across one returned release batch, including a split poll releasing more than 64 regions. Allocation, lineage or capacity failure marks evidence incomplete while preserving the original words and verdict. The exact-size allocation request must fit the remaining budget; an allocation whose returned capacity exceeds it is immediately dropped. Encoding uses one exact-length buffer and borrowed JSON envelopes, without an additional `serde_json::Value` document.
+| Resource | Bound |
+| --- | --- |
+| Whole file | 16 MiB, including a 4 KiB app identity/receipt envelope, 4 KiB portable truncation metadata and 256 KiB quality reserve |
+| Portable retained ownership | 32 MiB, including a 64 KiB owned quality reserve |
+| One invocation | 8 MiB and 8,192 source rows |
+| Early-echo comparison IDs | 257 per assessed region; 1 MiB retained vector capacity across one returned release batch, including split polls releasing more than 64 regions |
 
-Caller-owned backend transcripts are accounted separately: evidence rejects an oversized optional snapshot before cloning it, while the existing transcription still files its words. This is not an unconditional whole-process or arbitrary-backend-input cap. Conservative portable parse/validation accounting plus the app file buffer remains 592 MiB for readback; retaining an original ledger, encoded buffer and caller input alongside that adds their own ownership. No bound here claims allocator overhead, RSS, or native model memory.
+App parent vectors and terminal inputs have separate admission bounds. Allocation, lineage or
+capacity failure marks evidence incomplete while preserving words and verdicts. An exact-size
+allocation request must fit the remaining budget; a returned capacity exceeding it is dropped.
+Encoding uses one exact-length buffer and borrowed JSON envelopes, without a second
+`serde_json::Value` document.
 
-The synthetic allocation probe holds caller input, original ledger, an encoded file buffer, and the newly parsed ledger simultaneously. A 16,476,055-byte file measured 16,476,567 additional bytes during encode and 32,953,617 during readback, with 82,380,864 total accounted payload bytes at that read peak. The 8,192-row fixture measured 5,506,471 additional read bytes. These debug-build observations are fixtures, not stronger universal bounds or latency guarantees.
+Backend transcripts are caller-owned: evidence rejects an oversized optional snapshot before
+cloning, while transcription still files its words. These limits are not a whole-process or
+arbitrary-backend-input cap. Conservative portable parse/validation accounting plus the app file
+buffer is 592 MiB. An original ledger, encoded buffer and caller input retained alongside readback
+add their own ownership. The bounds exclude allocator overhead, RSS and native model memory.
 
-The actual-function Linux harness and named falsifiers are documented in [the evidence test guide](../app/tests/evidence/README.md). It runs real batch cleanup, live consume/flush/finish, persistence, checkpoint replay and retention against invented inputs. Native macOS feature builds, real native decoder gates and application integration remain separate required checks; a model-free harness result does not certify them.
+The [evidence test guide](../app/tests/evidence/README.md) defines the actual-function harness;
+its [allocation fixture observations](../app/tests/evidence/README.md#allocation-fixture-observations)
+retain the measured encode/readback payloads. The probe holds caller input, the original ledger, encoded file and parsed
+ledger together; its measured fixtures are not universal memory or latency guarantees. The
+model-free harness exercises real batch cleanup, live consume/flush/finish, persistence,
+checkpoint replay and retention with invented inputs. Native macOS builds, decoder gates and
+full application integration remain separate checks.
