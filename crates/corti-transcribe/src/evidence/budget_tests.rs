@@ -1,7 +1,8 @@
+//! Owned-capacity budgets, reload limits and capacity errors.
 use super::*;
 
 #[test]
-fn rereview_admitted_document_reloads_with_the_same_owned_limit() {
+fn admitted_document_reloads_with_the_same_owned_limit() {
     let mut measured = Ledger::new(DEFAULT_CAP).unwrap();
     assert_eq!(
         measured.append(base(1, "Synthetic boundary.")),
@@ -30,34 +31,6 @@ fn rereview_admitted_document_reloads_with_the_same_owned_limit() {
         result, "ok",
         "a retained serialized record should reload under its unchanged limits"
     );
-}
-
-#[test]
-fn rereview_valid_unicode_case_expansion_from_existing_cleanup_is_recordable() {
-    let input = "Um, ßeta.";
-    let (output, fillers, stutters) = crate::segment::strip_fillers_text(input);
-    assert_eq!((output.as_str(), fillers, stutters), ("SSeta.", 1, 0));
-    let edits = vec![
-        TextEdit {
-            before: ByteSpan { start: 0, end: 4 },
-            after: ByteSpan { start: 0, end: 0 },
-            action: EditKind::Filler,
-        },
-        TextEdit {
-            before: ByteSpan { start: 4, end: 6 },
-            after: ByteSpan { start: 0, end: 2 },
-            action: EditKind::Case,
-        },
-    ];
-    let result = Ledger::new(DEFAULT_CAP).unwrap().append(transform(
-        1,
-        input,
-        &output,
-        CleanupStage::Fillers,
-        edits,
-    ));
-    println!("actual_cleanup_unicode_case_trace={result:?}");
-    assert_eq!(result, Ok(Append::Retained));
 }
 
 fn nested_groups() -> Vec<Group> {
@@ -134,7 +107,7 @@ fn assert_length_sized_allocations(ledger: &Ledger) {
 }
 
 #[test]
-fn rereview_nested_ownership_and_settled_quality_reload_at_identical_limits() {
+fn nested_ownership_and_settled_quality_reload_at_identical_limits() {
     for count in 0..=3 {
         let mut measured = Ledger::new(DEFAULT_CAP).unwrap();
         for group in nested_groups().into_iter().take(count) {
@@ -168,7 +141,7 @@ fn rereview_nested_ownership_and_settled_quality_reload_at_identical_limits() {
 }
 
 #[test]
-fn rereview_external_capacity_is_not_corruption_and_invalid_groups_are_not_omitted() {
+fn external_capacity_is_not_corruption_and_invalid_groups_are_not_omitted() {
     let mut ledger = Ledger::new(DEFAULT_CAP).unwrap();
     for group in nested_groups() {
         ledger.append(group).unwrap();
@@ -204,78 +177,115 @@ fn rereview_external_capacity_is_not_corruption_and_invalid_groups_are_not_omitt
     ));
 }
 
-fn first_case_trace(before: &str, after: &str) -> Group {
-    let original = format!("Um, {before}eta.");
-    let output = format!("{after}eta.");
-    transform(
-        1,
-        &original,
-        &output,
-        CleanupStage::Fillers,
-        vec![
-            TextEdit {
-                before: ByteSpan { start: 0, end: 4 },
-                after: ByteSpan { start: 0, end: 0 },
-                action: EditKind::Filler,
-            },
-            TextEdit {
-                before: ByteSpan {
-                    start: 4,
-                    end: 4 + before.len() as u32,
-                },
-                after: ByteSpan {
-                    start: 0,
-                    end: after.len() as u32,
-                },
-                action: EditKind::Case,
-            },
-        ],
-    )
+#[test]
+fn tiny_wire_record_cannot_retain_unbudgeted_string_capacity() {
+    let cap = QUALITY_RESERVE + METADATA_RESERVE + 4096;
+    let mut group = base(1, "unused");
+    let mut text = String::with_capacity(1024 * 1024);
+    text.push_str("Synthetic input.");
+    group.rows[0].segment.text = text;
+    let mut ledger = Ledger::new(cap).unwrap();
+    assert_eq!(ledger.append(group), Ok(Append::Omitted));
+    assert!(ledger.groups().is_empty());
+    assert_eq!(
+        ledger.truncation().cause,
+        Some(TruncationCause::OwnedMemoryCap)
+    );
+    assert!(ledger.owned_bytes() <= ledger.owned_limit());
 }
 
 #[test]
-fn rereview_unicode_case_mapping_keeps_positions_and_rejects_non_case_rewrites() {
-    // The first three expansions are outputs of the actual existing cleanup, not a new policy.
-    for (before, after) in [("ß", "SS"), ("ﬃ", "FFI"), ("ǰ", "J\u{30c}"), ("a", "A")] {
-        let original = format!("Um, {before}eta.");
-        let (actual, fillers, stutters) = crate::segment::strip_fillers_text(&original);
-        assert_eq!(
-            (actual.as_str(), fillers, stutters),
-            (format!("{after}eta.").as_str(), 1, 0)
-        );
-        let mut ledger = Ledger::new(DEFAULT_CAP).unwrap();
-        assert_eq!(
-            ledger.append(first_case_trace(before, after)),
-            Ok(Append::Retained)
-        );
-        let restored = Ledger::read_json(&bytes(&ledger), DEFAULT_CAP).unwrap();
-        assert_eq!(
-            restored.reconstruct_input(InvocationId(2)).unwrap()[0]
-                .segment
-                .text,
-            original
-        );
-    }
-    // Same helper as production lower_first; its multi-scalar Unicode output is representable.
-    assert!(is_first_scalar_case_mapping("İeta.", "i\u{307}eta."));
-    assert!(is_first_scalar_case_mapping("ßeta.", "SSeta."));
-    for (before, after) in [("ß", "SX"), ("ß", "ss"), ("SS", "ß"), ("a", "b"), ("", "A")] {
-        assert!(matches!(
-            Ledger::new(DEFAULT_CAP)
+fn every_nested_owned_capacity_is_budgeted_even_when_not_serialized() {
+    let cap = QUALITY_RESERVE + METADATA_RESERVE + 4096;
+    for variant in 0..13 {
+        let mut group = transform(1, "rust", "REST", CleanupStage::Lexicon, vec![]);
+        match variant {
+            0 => group.rows.reserve_exact(8192),
+            1 => group.stages.reserve_exact(8192),
+            2 => group.rows[0].segment.text.reserve_exact(1024 * 1024),
+            3 => {
+                let mut label = String::with_capacity(1024 * 1024);
+                label.push_str("Synthetic speaker");
+                group.rows[0].segment.speaker = Speaker::Other(label);
+                group.rows[1].segment.speaker = Speaker::Other("Synthetic speaker".into());
+            }
+            4 => group
+                .identity
+                .configuration_hash
+                .as_mut()
                 .unwrap()
-                .append(first_case_trace(before, after)),
-            Err(Error::InvalidEdit)
-        ));
-    }
-    for mutation in 0..4 {
-        let mut bad = first_case_trace("ß", "SS");
-        match mutation {
-            0 => bad.stages[1].decisions[0].edits[1].before.end = 5,
-            1 => bad.stages[1].decisions[0].edits[1].after.end = 1,
-            2 => bad.rows[1].segment.text.push('!'),
-            _ => bad.stages[1].decisions[0].reason = CleanupReason::TextRule,
+                .reserve_exact(1024 * 1024),
+            5 => group.stages[1].assembled_input.reserve_exact(65536),
+            6 => group.stages[1].output.reserve_exact(65536),
+            7 => group.stages[1].decisions.reserve_exact(8192),
+            8 => group.stages[1].decisions[0]
+                .input_indices
+                .reserve_exact(131072),
+            9 => group.stages[1].decisions[0].originals.reserve_exact(65536),
+            10 => group.stages[1].decisions[0]
+                .replacements
+                .reserve_exact(65536),
+            11 => group.stages[1].decisions[0].edits.reserve_exact(65536),
+            _ => {
+                if let EditKind::Lexicon { rule_id } =
+                    &mut group.stages[1].decisions[0].edits[0].action
+                {
+                    rule_id.reserve_exact(1024 * 1024);
+                }
+            }
         }
-        assert!(Ledger::new(DEFAULT_CAP).unwrap().append(bad).is_err());
+        assert!(wire_size(&group, 4096).is_ok());
+        let mut ledger = Ledger::new(cap).unwrap();
+        assert_eq!(
+            ledger.append(group),
+            Ok(Append::Omitted),
+            "capacity variant {variant}"
+        );
+        assert_eq!(
+            ledger.truncation().cause,
+            Some(TruncationCause::OwnedMemoryCap)
+        );
+        assert!(ledger.owned_bytes() <= ledger.owned_limit());
     }
-    assert!(!is_first_scalar_case_mapping("ßeta.", "SSETA."));
+}
+
+#[test]
+fn owned_budget_is_exact_across_growth_and_reserves_final_quality() {
+    let first = base(1, "Synthetic owned budget.");
+    let owned = std::mem::size_of::<Ledger>()
+        + std::mem::size_of::<Group>()
+        + first.heap_bytes()
+        + QUALITY_OWNED_RESERVE;
+    let mut ledger = Ledger::with_limits(DEFAULT_CAP, owned).unwrap();
+    assert_eq!(ledger.append(first), Ok(Append::Retained));
+    let retained_before = ledger.owned_bytes();
+    assert_eq!(
+        ledger.append(base(2, "Another group.")),
+        Ok(Append::Omitted)
+    );
+    assert_eq!(ledger.owned_bytes(), retained_before);
+    ledger.set_final_quality(full_quality()).unwrap();
+    assert!(ledger.owned_bytes() <= owned);
+    let mut oversized = full_quality();
+    oversized.epochs.reserve_exact(8192);
+    assert_eq!(
+        ledger.set_final_quality(oversized),
+        Err(Error::InvalidQuality)
+    );
+    assert_eq!(ledger.final_quality(), Some(&full_quality()));
+    let encoded = bytes(&ledger);
+    assert!(
+        Ledger::read_json_with_limits(
+            &encoded,
+            DEFAULT_CAP,
+            std::mem::size_of::<Ledger>() + QUALITY_OWNED_RESERVE
+        )
+        .is_err()
+    );
+    let restored = Ledger::read_json_with_limits(&encoded, DEFAULT_CAP, owned).unwrap();
+    assert!(restored.owned_bytes() <= restored.owned_limit());
+    assert_eq!(
+        restored.truncation().cause,
+        Some(TruncationCause::OwnedMemoryCap)
+    );
 }

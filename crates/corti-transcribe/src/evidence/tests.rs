@@ -4,14 +4,14 @@ use corti_core::{
     QualityStage, Speaker,
 };
 
+#[path = "budget_tests.rs"]
+mod budget_tests;
 #[path = "lineage_tests.rs"]
 mod lineage_tests;
 #[path = "production.rs"]
 mod production;
-#[path = "review_extra.rs"]
-mod review_extra;
-#[path = "review_regressions.rs"]
-mod review_regressions;
+#[path = "validation_tests.rs"]
+mod validation_tests;
 
 #[test]
 fn borrowed_row_index_and_budget_fallback_preserve_unordered_ids_and_missing_rows() {

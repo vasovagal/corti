@@ -166,9 +166,8 @@ path as fail-closed. Failed-job GC retains recording retry authority while its r
 including long audio retention and failed unlink. Confirmed artifact removal or explicit discard deletes
 the exact owned retry metadata. Malformed/unbound identities are retained conservatively.
 
-The [regression inventory](../../docs/live-alignment-regressions.md) maps all 34 new tests to their faults,
-records behavioral failure-first receipts, and distinguishes portable source proofs from pending native
-validation. This amendment does not add a note-read API, new startup discovery, a new scheduler, a second
+The [quality accounting page](../../docs/quality.md) describes the resulting behaviour and where each
+part is tested; `scripts/quality/run_native.py` lists every required native test by name. This amendment does not add a note-read API, new startup discovery, a new scheduler, a second
 quality model, or new egress permission.
 
 ### Retain settled history through redo and successful cleanup

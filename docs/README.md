@@ -25,3 +25,4 @@ anchors into the shipped code. This is the "as-built" companion to the "as-desig
 | [transcription.md](transcription.md) | The `Transcriber` trait, local Parakeet (sherpa/CPU or transcribe.cpp/Metal) and AWS backends, the queue + durable jobs, crash-safe live inbox filing, and vagus filing. |
 | [app.md](app.md) | Tauri app surface: tray, windows, commands, threads. |
 | [streaming.md](streaming.md) | The chunked `LiveTranscriber` API + tokio `Stream` adapter, the capture tee, and the in-app live-filing consumer. |
+| [quality.md](quality.md) | Transcript quality accounting: the bounded `QualityRecord`, capture gaps, decode failures, live boundaries, far-end and echo handling, and where each is tested. |

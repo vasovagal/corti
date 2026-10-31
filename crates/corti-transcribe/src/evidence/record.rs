@@ -56,26 +56,11 @@ pub struct RecordedCleanup {
     pub evidence: Result<RecordedWindow, Error>,
 }
 
-fn identity_copy(identity: &Identity) -> Identity {
-    Identity {
-        configuration_hash: identity.configuration_hash.clone(),
-        model_hash: identity.model_hash.clone(),
-        runtime_hash: identity.runtime_hash.clone(),
-    }
-}
-fn signal_copy(signal: &SignalIdentity) -> SignalIdentity {
-    SignalIdentity {
-        source: signal.source,
-        aec: signal.aec,
-        source_rate_hz: signal.source_rate_hz,
-        lookahead_frames: signal.lookahead_frames,
-    }
-}
 pub(super) fn empty_group(info: &RecordingIdentity) -> Group {
     Group {
         window: info.window,
-        identity: identity_copy(&info.identity),
-        signal: signal_copy(&info.signal),
+        identity: info.identity.clone(),
+        signal: info.signal,
         rows: Vec::new(),
         stages: Vec::new(),
     }
