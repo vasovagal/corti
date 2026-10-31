@@ -1,9 +1,8 @@
 # Contributing to corti
 
-Thanks for hacking on corti. This file covers the workspace layout, building, testing, and
-the dev-only setup (signing, AWS, models). Design rationale and the binding invariants live
-in [`design/`](./design/) — read the ADRs and [`design/guardrails.md`](./design/guardrails.md)
-before any architectural change, and update the matching ADR when you change a decision.
+Build and test Corti on an Apple Silicon Mac. Check prerequisites, build the frontend, then run
+the Rust checks below. Read [the guardrails](design/guardrails.md) and relevant [ADRs](design/adr/)
+before an architectural change; update the matching ADR when a decision changes.
 
 ## Prerequisites
 
@@ -11,22 +10,25 @@ before any architectural change, and update the matching ADR when you change a d
   binaries, no older OS (`minimumSystemVersion = 15.0`).
 - **Rust 1.96+** (pinned via `rust-version` in `Cargo.toml`).
 - **Node.js 24+** and a current **Xcode / macOS SDK** for the Tauri frontend.
-- **cmake** (`brew install cmake`) — builds the vendored, statically-linked libopus behind
-  `corti-audio` (see the `LIBOPUS_*` pins in `.cargo/config.toml`; preinstalled on CI runners).
+- **CMake** (`brew install cmake`) — builds the pinned transcribe.cpp C++/Metal backend.
+- **sccache** (`brew install sccache`) — the Rust compiler wrapper selected in `.cargo/config.toml`.
+- **Tauri 2 CLI** — required for the `cargo tauri` commands.
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `corti-core` | Shared domain types (no platform deps) |
+| `corti-core` | Platform-free domain types and transcript Markdown renderer |
 | `corti-coreaudio` | Owned CoreAudio bindings: mic-in-use listener, process attribution, process taps |
 | `corti-detect` | Start/stop trigger + attribution state machine |
-| `corti-capture` | Aggregate-device capture graph → streamed 2-track Ogg-Opus (WAV via `CORTI_CAPTURE_FORMAT=wav`) |
-| `corti-audio` | Ogg-Opus codec seam: streaming encoder + universal decoder (WAV or Opus → f32 tracks) |
-| `corti-transcribe` | `Transcriber` trait + diarized-transcript Markdown renderer |
+| `corti-capture` | Aggregate-device capture graph, streamed two-track WAV, and in-flight AEC |
+| `corti-transcribe` | Transcription contract, cleanup, boundary policy, and local evidence |
 | `corti-transcribe-aws` | AWS Transcribe batch backend (`aws` feature) |
-| `corti-transcribe-local` | Local offline backend — Parakeet-TDT via ONNX/sherpa-onnx (`local` feature) |
-| `corti-aec` | Offline NLMS/FDAF echo canceller — removes speaker bleed from the mic track |
+| `corti-transcribe-local` | Parakeet through sherpa/CPU or transcribe.cpp/Metal (`local` feature) |
+| `corti-aec` | Streaming and offline echo cancellation |
+| `corti-postprocess` / `corti-postprocess-providers` | Hosted text contracts and provider adapters |
+| `corti-chat` | Hosted conversation and subscription coordinator |
+| `corti-lexicon` | Explicitly approved transcript correction rules |
 | `corti-tap` | Standalone CLI: force-tap system audio to a WAV on demand (`--inbox` to file a note) |
 | `corti-queue` | Durable job store + crash recovery |
 | `corti-jobs` | Small background-job layer in queue.db: retries with backoff + periodic schedules |
@@ -36,8 +38,17 @@ before any architectural change, and update the matching ADR when you change a d
 
 ## Build / test
 
+Install frontend dependencies and build `app/ui/dist` before invoking Cargo: Tauri reads this
+directory through `frontendDist` in `app/tauri.conf.json`.
+
 ```sh
-cargo build                              # build all library crates
+npm --prefix app/ui ci
+npm --prefix app/ui run build
+npm --prefix app/ui test
+```
+
+```sh
+cargo build                              # build the workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check                        # formatting (run cargo fmt before pushing)
 cargo test
@@ -61,11 +72,7 @@ The app defaults are `aws`, `local`, and `local-ggml`. Select the active backend
 `sherpa`-only build is `cargo build -p corti-app --no-default-features --features local`.
 transcribe.cpp compiles pinned native C++/Metal source and requires CMake on the build machine.
 
-Build the frontend first: the app crate's `generate_context!()` reads `frontendDist`
-(`app/ui/dist`) from `tauri.conf.json`, so `cargo` won't compile the workspace until
-`npm --prefix app/ui run build` has produced it — CI enforces this ordering (`ci.yml`).
-
-### Local backend models
+## Local backend models
 
 The offline backend needs one selected Parakeet artifact (sherpa's ONNX set or transcribe.cpp's Q8_0
 GGUF), shared Silero VAD, and — for opt-in far-end diarization — pyannote segmentation + an English
@@ -89,9 +96,9 @@ cargo run -p corti-queue --example inspect                     # inspect the dur
 ## Dev setup
 
 - **TCC / signing.** Running the bundled `.app` needs the macOS Microphone + System Audio
-  Recording grants. Because ad-hoc signing's cdhash changes per build, macOS re-prompts on
-  each run; for repeated dev runs create a stable self-signed cert and pass
-  `CORTI_SIGN_ID=<cert-name>`. CLI examples and tests don't need the grant.
+  Recording grants. Because ad-hoc signing's cdhash changes per build, macOS may ask for grants again; use a stable signing identity for repeated local capture tests. Any CLI that captures
+  audio also needs a signed TCC identity and the appropriate grants. Pure decoding and queue
+  examples do not capture audio. See [guardrail 10](design/guardrails.md).
 - **AWS.** The `aws` backend uses the standard credential chain (env vars, `~/.aws/config`,
   or an IAM role). The minimal IAM policy:
 
@@ -115,8 +122,12 @@ cargo run -p corti-queue --example inspect                     # inspect the dur
 
 ## CI / release
 
-- **CI** (`ci.yml`) runs on `macos-26` only — `corti-coreaudio`'s bindings link CoreAudio
-  and don't build elsewhere.
+- **CI** ([`ci.yml`](.github/workflows/ci.yml)) builds/tests the frontend, checks formatting, and
+  runs strict Clippy and Rust tests on `macos-26`, including AWS-only and local-only app builds.
+- **Native validation** ([`mac-validation.yml`](.github/workflows/mac-validation.yml)) checks each PR
+  commit, verifies model downloads, generates synthetic speech, and runs native ASR and boundary
+  checks on macOS. This does not establish real microphone, device-change, TCC, or call behavior;
+  those need an actual-Mac acceptance run.
 - **Release** (`release.yml`) is tag-triggered (`v*`): it creates a draft, verifies the pinned native
   input and signed app bundle, uploads only `.dmg` + `.app.zip`, then publishes. The shared Homebrew cask
   is regenerated and pushed manually per `CLAUDE.md`; CI never writes the tap. `warm-cache.yml` pre-seeds
@@ -125,4 +136,4 @@ cargo run -p corti-queue --example inspect                     # inspect the dur
 See [`design/adr/`](./design/adr) for the rationale (distribution, signing, backend
 selection, AEC) and [`design/STATUS.md`](./design/STATUS.md) for current state.
 
-This is a personal repo under the **`vasovagal`** GitHub org.
+The repository belongs to the **`vasovagal`** GitHub organization.

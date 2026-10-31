@@ -1,9 +1,7 @@
 # Transcript quality accounting
 
-> Verified against v0.17.0 plus #166 (`f7d7e35`: #155, #156, #161, #162, #163, #164 and #138).
-
-corti never drops a fact about missing or degraded audio or text to make a note look complete.
-Every recording carries one bounded `QualityRecord`
+Use this page to interpret missing audio, failed decoding and degraded transcript spans.
+Recordings carry a bounded `QualityRecord`
 ([`corti-core/src/quality.rs`](../crates/corti-core/src/quality.rs)) through capture, live filing,
 batch recovery, retries and redo. This page describes what it records and the limits it accepts.
 Decisions are in [ADR 0010](../design/adr/0010-live-inbox-filing.md) and
@@ -31,8 +29,7 @@ rate is normalized off the callback to the fixed initial rate; unchanged-rate PC
 
 When an epoch expects both tracks, the shorter track is padded with silence and the missing interval
 is recorded as `MicTapMismatches`. Each tee chunk carries its retained start and epoch, so
-positions survive dropped chunks. AEC algorithms and defaults are unchanged; unavailable mic samples
-are masked to zero after filtering.
+positions survive dropped chunks. Unavailable samples are masked to zero after filtering.
 
 Retries are armed before the first batch ASR so the original backend survives a crash. A fresh batch
 or first live-to-batch fallback gets six attempts; changed or unknown backend origins refuse before
@@ -66,10 +63,10 @@ to an explicit contract and lists the observed exceptions exactly; seam re-decod
 
 A bounded tracker ([`corti-core/src/activity.rs`](../crates/corti-core/src/activity.rs)) watches
 pre-AEC mic and tap levels. Sustained mic activity (-60 dBFS, five one-second bins) against a silent
-tap is recorded as a *suspected silent far reference*. This detects a dead far-end channel; it does
-not recover its audio. Echo removal deletes a mic segment only on acoustic evidence and never removes
-protected critical words (names, numbers, negations); without acoustic evidence (always on AWS) a
-suspected duplicate stays in the note.
+tap is recorded as a *suspected silent far reference*. This flags suspected missing far-end audio;
+it cannot prove the cause or recover that audio. Echo removal requires acoustic evidence and
+preserves critical-word differences identified by the shared classifier (including names, numbers
+and negations). Without acoustic evidence, including AWS, suspected duplicates stay in the note.
 
 ## Evidence (#164)
 
@@ -77,9 +74,13 @@ The optional audit file is described in [local transcript evidence](local-transc
 
 ## Tests
 
-- Portable Rust and Python suites run on Linux in CI; `scripts/quality/**` and `bench/scoring` hold
-  the Python checks.
-- `.github/workflows/mac-validation.yml` runs the native suites, the boundary matrix
-  ([`scripts/quality/boundary/README.md`](../scripts/quality/boundary/README.md)) and the
-  app-orchestration harness ([`app/tests/evidence/README.md`](../app/tests/evidence/README.md)) on
-  macOS, and lints every PR commit. `scripts/quality/run_native.py` lists every required test name.
+- [CI](../.github/workflows/ci.yml) runs frontend build/tests, Rust formatting, strict Clippy and
+  Rust tests on macOS, including independent AWS-only and local-only app configurations.
+- [mac-validation](../.github/workflows/mac-validation.yml) is path-filtered for code, harness,
+  benchmark, lockfile and workflow changes, with manual dispatch also available. It runs Python
+  validator/scoring checks, pinned native models, authored speech, the boundary matrix and the
+  app-orchestration harness. Its commit matrix lints the selected PR commits.
+- [`scripts/quality/run_native.py`](../scripts/quality/run_native.py) defines required native tests.
+  The [evidence harness](../app/tests/evidence/README.md) can also run model-free on Linux; that
+  does not certify native decoding, device behavior or the full app. Passing the boundary matrix
+  includes its declared exceptions; it does not prove seam errors are fixed.

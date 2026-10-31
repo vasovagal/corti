@@ -1,22 +1,16 @@
 # Transcription — trait, backends, queue, filing
 
-> Verified against main + transcribe.cpp integration PR #92, crash-safe rolling live commits (#85, #87,
-> #93, #103), and segment cleanup (#149).
+This guide describes Corti's transcription contracts: backend dispatch, cleanup, local and AWS
+recognition, durable retries, and filing. Local detector recordings can sync transcript windows
+while a call runs; batch transcription handles other recordings and live fallback.
 
-Transcription is one synchronous, blocking trait over a finished 2-track WAV, with two
-interchangeable backends behind it (local Parakeet, AWS Transcribe). The pipeline worker runs
-`enqueue → transcribe → file → Done` serially; the `Queue` is a durable SQLite store, and #85 added a
-`corti-jobs` layer on top of it for durable retry-with-backoff and an hourly retention sweep (see
-_The queue_ and _The pipeline worker_ below). #87 adds a **live** first-class path for detector
-recordings: when the local backend + models are available, bounded transcribed/diarized windows are
-OS-synced to the note *during* the call and this whole batch machinery becomes the fallback (§Live inbox
-filing). Filing shells out to the
-external `vagus` CLI, the only subprocess in the note path; after creation corti may also append to /
-state-flip / delete that one note (ADR 0010).
+The pipeline serializes queue work on one thread. Vagus creates notes; Corti's later writes are
+limited to the note returned for that recording. See [ADR 0010](../design/adr/0010-live-inbox-filing.md)
+for write authority and [quality accounting](quality.md) for missing or degraded audio/text.
 
 ## The `Transcriber` trait
 
-`crates/corti-transcribe/src/lib.rs:23`:
+The base method in [`corti-transcribe`](../crates/corti-transcribe/src/lib.rs) is synchronous:
 
 ```rust
 pub trait Transcriber {
@@ -25,39 +19,41 @@ pub trait Transcriber {
 ```
 
 - **Batch, whole-WAV.** Input is a `&Path` to a complete on-disk 2-track WAV; output is one
-  fully-formed `DiarizedTranscript`. No chunk/partial surface — the batch shape is the contract.
+  `DiarizedTranscript`. Streaming uses the separate `LiveTranscriber` API.
 - **Synchronous by design** (no `async-trait`/tokio in the trait). Async backends run a private
   runtime internally (§AWS).
+- **Quality-aware batch.** `transcribe_with_quality` returns `TranscriptionOutcome`: transcript,
+  settled `QualityRecord`, and `decode_complete`. The default preserves incoming quality; the local
+  override records failed/partial regions rather than treating them as silence. A complete decode
+  does not imply complete source capture.
 - The 2-track layout **is** the diarization prior: ch0 → `Speaker::Me`, ch1 → `Speaker::Other`.
 
-Shared post-processing lives in `corti_transcribe::segment` (`segment.rs`): `Word{start,end,text}`
-(`:23`), `SpeakerTurn` (`:31`), `words_to_segments` (`:45`), `merge_by_time` (`:80`),
-`diarize_words` (`:90`), `SEGMENT_GAP = 1.5s` (`:40`), and `cleanup` (`:268`) — see §Segment cleanup.
-Both backends emit timestamped `Word`s and reuse these to shape the final transcript.
+Both backends emit timestamped `Word`s and use [`corti_transcribe::segment`](../crates/corti-transcribe/src/segment.rs)
+for word grouping (`SEGMENT_GAP = 1.5 s`), speaker shaping, time merge, and cleanup.
 
 ## Backend dispatch
 
 `app/src/transcribe.rs` selects a backend at runtime from config
-(`AppConfig::transcribe_backend`, env `CORTI_TRANSCRIBE_BACKEND`). `Backend::init` (`:37`) resolves
-`BackendChoice::{Aws,Local}` behind cfg-gated features; unavailable backends degrade to a stringly
-error rather than failing the build. `Backend::transcribe` (`:60`) dispatches to the AWS or local
+(`AppConfig::transcribe_backend`, env `CORTI_TRANSCRIBE_BACKEND`). `Backend::init` resolves
+`BackendChoice::{Aws,Local}` behind cfg-gated features; a backend absent from the build returns an explicit error. `Backend::transcribe` dispatches to the AWS or local
 arm; `transcribe_recording` is the pipeline entry point. Its optional `OfflineAec` request is used
 for foreign audio (`corti --input`), marker-less pre-upgrade rows, and a writer filter that failed
 before emitting any clean frame. Ordinary recordings carry a versioned `CaptureProcessing` record
 in `queue.db`, so retries skip the file pass only when capture positively identifies the WAV as
 processed/disabled. The request includes the original lookahead rather than re-reading environment.
 
+<a id="segment-cleanup--echo-fragments-backchannels-149"></a>
+
 ## Segment cleanup — protect words, retain suspected duplicates (#149, #161)
 
 Cleanup runs on the merged channel timeline, before filing or hosted post-processing: after batch
 recognition in app/src/transcribe.rs and at each live window flush in app/src/live.rs. The live early-drop
-path uses the same echo verdict before publishing a held mic region. Rules version 4 fixes text-only
-deletion of genuine corrections and repeated commands; tuning values remain unchanged.
+path uses the same echo verdict before publishing a held mic region. Rules version 4 requires acoustic evidence for echo deletion and protects critical words.
 
 The deterministic passes run in this order:
 
 1. **Sort, then judge echoes.** Cross-channel text containment identifies a suspected duplicate, never
-   permission to delete one. The existing candidate window is
+   permission to delete one. The candidate window is
    O.start ≤ S.start ≤ O.end + echo_window_seconds. Three or more content tokens use the containment
    threshold; one or two require total containment and a subject span inside the source. Current-window
    segments and retained raw live decoder polls supply candidates. A later-starting overlapping source
@@ -70,7 +66,7 @@ The deterministic passes run in this order:
    backchannel, such as “Yeah.”, may be removed when it overlaps the other channel. An answer to the
    nearest earlier other-channel question is kept. Raw numbers, identifiers and protected unit tokens
    prevent an alphabetic normalization from turning an answer into a backchannel.
-4. **Strip fillers and stutters.** The existing optional pass removes filler tokens, collapses repeated
+4. **Strip fillers and stutters.** The optional pass removes filler tokens, collapses repeated
    words/bigrams and repairs punctuation and capitalization. It preserves quantity-adjacent tokens,
    meaningful case and markers that normalization would erase, so “15 Ah” is not a filler and “15 mm
    15 mM” is not a stutter. Unmarked medial filler spellings are retained as ambiguous content, including
@@ -79,7 +75,7 @@ The deterministic passes run in this order:
    existing sentence-repair behavior. Case-only stutter equivalence is limited to closed grammar,
    subject pronouns and “very”: “Very very important.” still collapses, while “May may approve” stays.
    The pass remains optional.
-5. **Apply the lexicon.** The existing TextRule seam runs last on surviving segments, including when
+5. **Apply the lexicon.** The TextRule seam runs last on surviving segments, including when
    structural cleanup is disabled.
 
 ### Echo decisions require acoustic evidence
@@ -128,9 +124,8 @@ accessor maps a segment's start/end seconds to an optional summary. The transcri
 production DSP dependency: the caller converts corti_aec span statistics into that summary.
 
 The double-talk flag comes from the AEC's raw-energy adaptation gate. It is a conservative guard for
-this policy, not proof of a person's identity or a calibrated near-speech detector. The synthetic #107
-receipts expose gain-sensitive false gating and near-end attenuation. This change preserves the
-specified acoustic predicate and does not tune AEC defaults or claim to solve those defects.
+this policy, not proof of a person's identity or a calibrated near-speech detector. Gain-sensitive false gating and near-end attenuation remain known limits; the predicate does not
+claim to solve them. See [the AEC limits](../design/04-corti-aec.md).
 
 ### Evidence, decisions and live publication
 
@@ -166,14 +161,15 @@ specified acoustic predicate and does not tune AEC defaults or claim to solve th
   the acoustic requirement explicitly.
 
 Cleanup decisions are available in memory with the input stage/span, change, reason and acoustic
-evidence where applicable. These content-bearing decisions are not tracing fields. This commit does not
-persist a new evidence file; #164 adds that bounded local store separately.
+evidence where applicable. These content-bearing decisions are not tracing fields. The optional
+[local evidence store](local-transcript-evidence.md) persists bounded original rows and decisions.
 
 ### Settings and provenance
 
 The defaults remain echo_drop = true, echo_window_seconds = 6.0, echo_containment = 0.7,
 merge_gap_seconds = 2.5, drop_backchannels = true, echo_audio_margin_db = 3.0 and strip_fillers = true.
-The app's existing cleanup settings/environment overrides and clamping behavior remain unchanged.
+The app reads cleanup settings and environment overrides with the bounds in
+[`config.rs`](../app/src/config.rs).
 A sufficiently negative acoustic margin disables echo deletion while leaving suspected-duplicate
 decisions and other enabled passes available. Turning off echo_drop also disables live early-drop.
 
@@ -221,16 +217,15 @@ deletion.
 per-region inference runtime behind `Asr::{Sherpa,Ggml}`:
 
 - `sherpa` (compatibility/default): int8 ONNX through the official `sherpa-onnx` Rust crate / ONNX
-  Runtime on CPU — the only ONNX provider, and not configurable. CoreML measured 2.7–11× slower and its
-  opt-in knob was removed (ADR 0003).
+  Runtime on CPU, the fixed ONNX execution provider (ADR 0003).
 - `ggml`: the official Q8_0 GGUF through transcribe.cpp/GGML on Metal (ADR 0011), included in standard
-  app builds and selected in Settings or with `CORTI_LOCAL_ASR_ENGINE=ggml`. Corti pins upstream revision
-  `553f1099…` exactly while 0.2.0 is unreleased.
+  app builds and selected in Settings or with `CORTI_LOCAL_ASR_ENGINE=ggml`. The exact native
+  revision is pinned in [`corti-transcribe-local/Cargo.toml`](../crates/corti-transcribe-local/Cargo.toml).
 
 Only ASR decode changes. Resampling, Silero VAD, optional pyannote/embedding diarization, speaker shaping,
 and timeline merge remain on the shared sherpa-backed path.
 
-Per job, `LocalTranscriber::transcribe` (`src/lib.rs:145`) runs:
+Per job, [`LocalTranscriber::transcribe_with_quality`](../crates/corti-transcribe-local/src/lib.rs) runs:
 
 1. **Discover models** — `models::resolve_dir` → `~/Library/Caches/corti/models/` (guardrail 5,
    outside any vault). Engine-aware discovery requires either the Parakeet
@@ -240,22 +235,23 @@ Per job, `LocalTranscriber::transcribe` (`src/lib.rs:145`) runs:
    size/SHA-256; missing files fail clearly.
 2. **Decode the WAV** — `audio::read_two_track` (`audio.rs`) `hound`-decodes the whole file (int16
    or float32) and deinterleaves to `mic`/`them` f32 at source rate. Mono → all `them`.
-3. **Per channel** (`lib.rs:171-208`): `engine::resample_to_16k` (`engine.rs:35`) via sherpa
+3. **Per channel** (`lib.rs`): `engine::resample_to_16k` (`engine.rs`) via sherpa
    `LinearResampler` (VAD/diarizer don't resample internally, so 16k is fed everywhere); a fresh
-   Silero VAD (`build_vad`, `:92`); then `transcribe_channel` (`:185`).
-4. **VAD chunking** — `transcribe_channel` now drives a `LiveTranscriber` (one whole-channel `push`
-   + `finish`; batch and live share a single decode path — see [streaming.md](streaming.md)), which
-   feeds one Silero VAD in **512-sample windows** (`VAD_WINDOW = 512`, `:30`) and drains completed
-   speech regions, each capped at `MAX_SPEECH_SECONDS = 20` (`:32`). **No overlap** — regions are
-   non-overlapping and VAD-delimited, sidestepping Parakeet's ~30 s clip limit and its
-   empty-on-silence bug.
+   Silero VAD (`build_vad`); then `transcribe_resampled_channel` with source-frame/rate metadata.
+4. **VAD chunking** — the production wrapper drives a `LiveTranscriber` with one whole-channel
+   `push_resampled` + `finish` and retains the decode report and completeness result. The test-only
+   `transcribe_channel` wrapper uses `push` at 16 kHz and returns words. Both share the live decode
+   path ([streaming.md](streaming.md)), feeding one Silero VAD in **512-sample windows**
+   (`VAD_WINDOW = 512`). `MAX_SPEECH_SECONDS = 20` is the configured maximum speech duration;
+   native settlement is not a hard cut at 20 seconds. Regions are non-overlapping and VAD-delimited.
+   Failed or partial regions retain explicit quality outcomes.
 5. **Per-region ASR** — `Asr::asr_segment` dispatches the same 16 kHz VAD region. Sherpa creates an
    offline recognizer stream and reassembles timestamped SentencePiece tokens. transcribe.cpp runs one
    resident mutex-serialized session with word timestamps, falling back to segment/text rows rather than
    silently losing speech. Both lift region-relative times by the same call offset.
 6. **Token/result → word** — sherpa reassembles subwords at the `▁` (U+2581) boundary; GGML maps owned
    transcribe.cpp word rows. Both produce the shared `Word { start, end, text }` type.
-7. **Shape** (`lib.rs:179-212`): ch0 → `words_to_segments(.., Speaker::Me, ..)`; ch1 →
+7. **Shape** (`lib.rs`): ch0 → `words_to_segments(.., Speaker::Me, ..)`; ch1 →
    `words_to_segments(.., Other("Them"), ..)` by default, or opt-in `diarize_words` when
    `diarize_far_end` is set; then `merge_by_time` → `DiarizedTranscript::new`.
 
@@ -264,14 +260,15 @@ by live filing. `checkpoint()` resets bounded resampler/VAD state while retainin
 and a cumulative timestamp epoch (ADRs 0009/0012).
 
 Tunable `LocalConfig` defaults include `asr_engine = "sherpa"` (upgrade-safe compatibility),
-`provider = "cpu"`, `num_threads = 4`, `diarize_far_end = false`, `vad_threshold = 0.5`, and
+`num_threads = 4`, `diarize_far_end = false`, `vad_threshold = 0.5`, and
 `vad_min_silence = 1.0`. On the M1 Pro excerpt benchmark, transcribe.cpp/Metal was 4.09× faster with 19%
-lower peak RSS at identical normalized WER; see ADR 0011 and `bench/results/transcribe_cpp_round1.jsonl`.
+lower peak RSS at identical normalized excerpt WER; these measurements do not establish general
+accuracy. See [ADR 0011](../design/adr/0011-spike-transcribe-cpp-ggml-asr.md#m1-pro-benchmark-result).
 Far-end diarization over-clusters on English audio (issue #18); it stays off by default.
 
 ## AWS backend
 
-`crates/corti-transcribe-aws`. Implements the same sync trait (`src/lib.rs:338`) by building a
+`crates/corti-transcribe-aws`. Implements the same sync trait (`src/lib.rs`) by building a
 private `new_current_thread` tokio runtime and `block_on`-ing an attach-or-upload → start → poll →
 fetch → parse flow against the async SDK. `AwsOptions.job_name` is the stable name persisted on the
 recording row, so a retry probes AWS first and re-attaches without re-encoding or uploading the full call.
@@ -288,13 +285,13 @@ From the pipeline thread's view this remains an ordinary blocking call.
 
 `crates/corti-queue`: one SQLite DB in **WAL** at `~/.local/share/corti/queue.db` (override
 `$CORTI_DATA_DIR`; outside any vault, guardrail 5). One `recordings` row per recording mirrors `Job`;
-`job_id` is the recording filename stem, making everything idempotent on it. #85 added a
-`transcribe_secs` for the Recording Queue window's "transcribed 55 min in 30 s" line. Schema v3 adds
-`capture_processing`, a bounded versioned JSON record containing only AEC disposition/config/lookahead;
-existing NULL rows are deliberately raw/unknown and retain compatibility cleaning. Earlier migration also
+`job_id` is the recording filename stem and queue deduplication key. `transcribe_secs` supplies
+the Recording Queue's elapsed-transcription display. `capture_processing` stores bounded, versioned
+AEC disposition/config/lookahead and capture quality;
+NULL rows remain raw/unknown and retain compatibility cleaning. Earlier migration also
 rewrites stored timestamps to fixed-width UTC `…Z` so string ordering is chronological.
 
-`JobStatus` (`corti-core recording.rs:119`) is the state machine:
+`JobStatus` (`corti-core recording.rs`) is the state machine:
 
 ```
 Recording → PendingTranscription → Transcribing → PendingNote → Done
@@ -308,31 +305,33 @@ and any exact AWS staging location still awaiting deletion. A canonical path
 means vagus/live filing already completed the note body, so only SQLite completion remains even if the path
 has moved. Only cloud cleanup (when marked) and filing/completion remain.
 
-API the app uses: `enqueue` (`:155`, `INSERT OR IGNORE` — preserves progress on re-enqueue),
+API the app uses: `enqueue` (`INSERT OR IGNORE` — preserves progress on re-enqueue),
 `set_status`, `update` (partial via SQL `COALESCE` — only `Some` fields change), `retry_reset`, `all`,
 and per-row terminal deletion after artifact cleanup. `queue.jobs()` hands out a `corti_jobs::Jobs`
 borrowing the same live `Connection` for the background-job table.
 
-**Durability is delivered by `corti-jobs` (#85), on top of the queue.** `crates/corti-jobs/src/lib.rs` is
+**`corti-jobs` owns durable retries on the queue connection.** `crates/corti-jobs/src/lib.rs` is
 a small background-job layer sharing `queue.db`: kinds are strings with JSON payloads; `claim_due`
-(`:142`) marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
-(`:250`) can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
+marks a row `running` and bumps `attempts` *before* the handler runs, so `recover_running`
+can flip any still-`running` row back to due-now at startup — crash recovery of jobs. The
 pipeline seeds tray history and then calls `recover_running` on boot; `corti --list` and the tray
 `History ▸` submenu survive restarts. It also scans for valid filing checkpoints and schedules them
-immediately, including the checkpoint-written/`PendingNote`-write-failed window. A crash during a
-recording's *first* in-process attempt **before** the post-ASR checkpoint can still strand that row — this
-is not a full sweep of non-terminal recordings. Rows stranded at `Recording` are the other narrow
-exception: #87's startup reaper revives or fails them — see §Live inbox filing.
+immediately, including the checkpoint-written/`PendingNote`-write-failed window.
+
+Before the first batch ASR call, the pipeline persists and claims a retry job carrying the original
+backend and attempt budget. Unknown or changed automatic origins refuse before staging or decoding.
+Rows left at `Recording` are handled by the [startup reaper](#live-inbox-filing-87).
 
 ## The pipeline worker
 
-`app/src/pipeline.rs` — a single `corti-pipeline` thread, the sole `Queue` owner (rusqlite
-`Connection` is `Send`, not `Sync`). Its loop (`run`, `:101`) is a **tick**:
-`rx.recv_timeout(next_wake(..))` (`:185`) blocks for a new message or until the next background job is
-due (clamped to `MAX_IDLE_WAIT = 60 s`, `:45`), then `drain_due_jobs` (`:324`) claims and runs every due
-job. Messages are `PipelineMsg::{Process, Retry, ReloadConfig}` plus #87's live-filing messages (`:48`).
+`app/src/pipeline.rs` — a single `corti-pipeline` thread, the sole owner of the writable `Queue` connection (rusqlite
+`Connection` is `Send`, not `Sync`). Its loop (`run`) is a **tick**:
+`rx.recv_timeout(next_wake(..))` blocks for a new message or until the next background job is
+due (clamped to `MAX_IDLE_WAIT = 60 s`), then `drain_due_jobs` claims and runs every due
+job. Messages include `PipelineMsg::{Process, Retry, ReloadConfig}` and live-filing updates.
 
-Per `Process` job, `transcribe_and_file`: `queue.update(Transcribing)` → publish any exact pre-ASR AWS
+A `Process` message either completes a canonical live note or arms a durable batch job.
+The batch handler calls `transcribe_and_file`: `queue.update(Transcribing)` → publish any exact pre-ASR AWS
 owner → choose capture identity / legacy-safe offline fallback → `transcribe::transcribe_recording`
 (`Backend::transcribe`, a **blocking** call on this thread) → atomically write the filing checkpoint →
 `queue.update(PendingNote, transcribe_secs)` → clean AWS staging (when applicable) → file. Cloud cleanup
@@ -344,14 +343,16 @@ removed, while audio remains for the configured retention sweep.
 failed/crashed adjacent `PendingNote` write cannot repeat ASR. Without one, `PendingTranscription` and
 `Transcribing` run ASR from retained raw audio; `PendingNote` is a legacy row and falls back once using a
 new persisted stable AWS name. Failed attempts back off
-`1 m → 2 m → … → 1 h` cap over `RETRY_MAX_ATTEMPTS = 5`; filing backoff remains visibly `PendingNote`,
+`1 m → 2 m → … → 1 h`. A fresh batch or initial live fallback has six total attempts
+(the first plus `RETRY_MAX_ATTEMPTS = 5` retries); a fresh manual retry budget has five attempts.
+Filing backoff remains visibly `PendingNote`,
 while transcription backoff returns to `PendingTranscription`. Exhaustion persists the recording's terminal
 state before parking its job; unresolved AWS cleanup continues under its own durable job. The Recording
 Queue window's Retry button starts a fresh manual attempt budget and remains available when raw audio is
 gone but a validated filing checkpoint survives.
 
-**Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs:107`), armed by
-`enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs:175` (also fires at startup),
+**Retention sweep.** An hourly periodic singleton `sweep_expired` (`jobs.rs`), armed by
+`enqueue_periodic(SWEEP_EXPIRED, SWEEP_PERIOD = 3600 s)` at `pipeline.rs` (also fires at startup),
 deletes raw audio older than `retention_days` (config, default 7), plus clean/checkpoint leftovers and
 crash-left atomic-write temps, then GCs terminal recording rows after `max(90, retention_days)` days and
 parked job rows after 30. One timestamp defines both horizons, and a failed artifact deletion retains the
@@ -362,8 +363,8 @@ the exact cloud address remains until deletion is acknowledged.
 
 ## Live inbox filing (#87)
 
-For detector recordings, transcription + filing now happen **while the call records**, so `tail -f`
-on the note shows the conversation arriving. The wiring (tee → AEC → `LiveTranscriber`s → note) is in
+Eligible local detector recordings transcribe and file **during the call**; `tail -f` on the note
+shows each committed window. The wiring (tee → AEC → `LiveTranscriber`s → note) is in
 [streaming.md](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010); the write authority is
 [ADR 0010](../design/adr/0010-live-inbox-filing.md). ADR 0013 adds a separate transient reader: each closed
 VAD region reaches the timestamped Live Transcript window immediately, before the configured durable-note
@@ -384,11 +385,16 @@ The filing semantics:
   the session deletes it. Corti retains the path before the fallible first sync, then publishes it to the
   queue only after syncing the file and directory (`PipelineMsg::LiveNoteCreated`, status `Recording`).
 - **Configurable bounded windows.** `live_buffer_minutes` / `CORTI_LIVE_BUFFER_MINUTES` defaults to 1 and
-  is clamped to 1–10. Input is split at the boundary; `LiveTranscriber::checkpoint` force-closes both VAD
-  tails without reloading models and preserves call-relative timestamps. The one optional far-end PCM window
-  is capped at 128 MiB and pending text at 1 MiB; either commits early. The capture tee is fixed at at most
-  ~64 MiB. No audio/text collection grows with call duration. After the first commit, a crash preserves every
-  prior window; ordinary uncommitted note loss is the configured interval, plus any fixed/bounded decoder-tee lag.
+  is clamped to 1–10. After that nominal interval, the boundary policy waits for a shared drained
+  speech gap, with at most 22 seconds of deferral at current VAD settings. A forced cut records
+  degradation; timestamp continuity is preserved without reloading ASR models. The one optional far-end PCM window
+  is capped at 128 MiB, including a 32 MiB deferral reserve. Pending text has a 1 MiB cap with
+  settlement headroom; text pressure forces a boundary. Unsupported configured windows fail setup.
+  The capture tee holds at most about 72 MiB of PCM/availability plus less than 1 MiB of metadata;
+  [streaming](streaming.md#in-app-consumer--live-inbox-filing-87-adr-0010) owns the full memory bounds.
+  No audio/text collection grows with call duration. After the first commit, a crash preserves every
+  prior window; uncommitted note loss includes the configured interval, bounded boundary deferral,
+  and decoder/tee lag. See [boundary limits](quality.md#live-boundaries-155).
 - **Diarize, merge, append once.** If far-end diarization is enabled, its models are loaded once and only the
   active tap window is processed; words become `Them N` before any bytes for that window are written. Mic +
   far segments are merged by start, rendered with the batch formatter, and appended in one synced write.
@@ -396,13 +402,13 @@ The filing semantics:
 - **Finish ownership and quality.** After the recorder closes its tee, the detector calls
   `LiveHook::finished(meta)` before emitting `RecordingFinished`. `LiveManager::finish(id)` freezes the
   dropped-chunk count and keeps the handle/outcome by ID while it flushes AEC and both transcriber tails.
-  The later `Process` calls `collect(id)`. Only a zero-drop result flips the state line and skips batch;
+  The later `Process` calls `collect(id)`. Only a result with no dropped tee chunks and complete settled quality skips batch;
   its `note_path + Done` completion is one fallible SQL update, and raw audio remains revealable until
   retention expiry. A collecting/finishing sentinel prevents a second model-backed session from
   overlapping the tail join. Live work adds no telemetry stage; it remains under `Recording`.
 - **Fallback — no double notes, no repeated ASR after checkpoint.** Factory ineligible (config off,
-  non-local backend, any configured model missing), no note created (silent call), a live-path error, or a dropped tee
-  chunk ⇒ batch runs from the lossless WAV. A returned partial path is passed directly as the preferred
+  non-local backend, any configured model missing), no note created, a live-path error, dropped tee chunks, or incomplete settled quality
+  sends the recording to batch from the WAV. A returned partial path is passed directly as the preferred
   rewrite target and persisted in the retry payload before fallible row repair. Successful batch ASR puts
   that path, transcript, and generation identity in the post-ASR checkpoint; subsequent filing/completion
   retries load the checkpoint, replace/insert that note's one Corti-owned frontmatter field with
@@ -419,15 +425,15 @@ The filing semantics:
   queue row, checkpoint, note, or cleanup job exists.
 - **Startup reaper.** A quit/crash mid-call can strand a row at `Recording` (created by the live
   note's mid-call persist). At startup the worker reaps them (`reap_recording_rows`,
-  `app/src/pipeline.rs:623`): audio still on disk → reset to `PendingTranscription` + a due-now
+  `app/src/pipeline.rs`): audio still on disk → reset to `PendingTranscription` + a due-now
   durable retry (which rewrites the note in place); audio gone → terminal `Failed`, with the note's
-  state line flipped and an "incomplete" annotation appended (`close_out_note`, `pipeline.rs:676` —
+  state line flipped and an "incomplete" annotation appended (`close_out_note`, `pipeline.rs` —
   every terminal failure path does this) so no inbox agent waits on `State: transcribing` forever.
 
 ## Filing to vagus (batch path)
 
-`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs:134`) →
-`add_note` (`:102`), which **shells out** to the external `vagus` binary:
+`file_and_done` calls `corti_vagus::Vagus::file_recording` (`crates/corti-vagus/src/lib.rs`) →
+`add_note`, which **shells out** to the external `vagus` binary:
 
 ```
 VAGUS_ADD_NOTE_FRONTMATTER_JSON='{"corti":{...}}' \
@@ -440,9 +446,9 @@ version/mode/config term) can retrieve the transcript by generation provenance. 
 out of chunk text. An older Vagus ignores the environment variable and still files the transcript.
 `--print-path` skips the editor and prints the
 created note path, which corti captures. The body
-(`recording_body`, `:186`) is the `State: transcribed ` line (#87), an auto-capture context line, and
+(`recording_body`) is the `State: transcribed ` line (#87), an auto-capture context line, and
 `DiarizedTranscript::to_markdown()`. The binary is resolved via `$VAGUS_BIN` → `vagus` on `PATH` →
-Homebrew/cargo locations (`discover`, `:39`), re-probed on each filing attempt so a mid-session
+Homebrew/cargo locations (`discover`), re-probed on each filing attempt so a mid-session
 install works without relaunch.
 
 ADR 0014's versioned `corti` schema records package version, final `live`/`batch` mode, backend,
@@ -466,7 +472,7 @@ Platform-free, depended on by every crate:
   `DiarizedTranscript` + `to_markdown()` (renders `**[mm:ss] Speaker:** text`) — the common backend
   output and filing input.
 - `recording.rs`: `RecordingMeta` (+ `mode()`, `note_title()`, `source()`), `RecordingMode{Call,
-  Webinar}`, `JobStatus` (`:119`) + `is_terminal()`.
+  Webinar}`, `JobStatus` + `is_terminal()`.
 
 `Word`/`SpeakerTurn` are **not** in core — they are per-backend intermediates in
 `corti_transcribe::segment`.
