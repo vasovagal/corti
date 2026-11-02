@@ -31,6 +31,8 @@ JOBS_FUNCTIONS = (
 )
 PIPELINE_ITEMS = (
     "pub(crate) struct Ctx",
+    "fn record_shutdown_error(",
+    "fn push_quit_error(",
     "enum LiveResolution",
     "struct LiveFallback",
     "fn resolve_live(",
@@ -121,7 +123,7 @@ def harness_source():
     parts.append("}\n")
     parts.append("""mod pipeline {
 use anyhow::{Context, Result};
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::AtomicBool}};
 use corti_queue::{Queue, JobUpdate, Job};
 use chrono::Utc;
 use corti_jobs::Backoff;

@@ -211,16 +211,31 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         None::<&str>,
     )?));
     items.push(Box::new(PredefinedMenuItem::separator(app)?));
+    let (quit_id, quit_label, quit_enabled) = quit_menu_item(crate::imp::quit_phase(app));
     items.push(Box::new(MenuItem::with_id(
         app,
-        "quit",
-        "Quit Corti",
-        true,
+        quit_id,
+        quit_label,
+        quit_enabled,
         None::<&str>,
     )?));
 
     let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|b| &**b).collect();
     Menu::with_items(app, &refs)
+}
+
+/// Menu id of the acknowledgement offered only after a settled failed Quit. It differs from "quit", so a
+/// stale or repeated ordinary Quit click can never acknowledge the failure.
+const QUIT_FAILED_ACK: &str = "quit_failed_ack";
+
+/// The last menu item for each explicit-Quit phase. Draining shows progress and accepts no click.
+fn quit_menu_item(phase: crate::imp::QuitPhase) -> (&'static str, &'static str, bool) {
+    use crate::imp::QuitPhase;
+    match phase {
+        QuitPhase::Idle => ("quit", "Quit Corti", true),
+        QuitPhase::Draining => ("quit", "Finish writes before exiting…", false),
+        QuitPhase::Failed => (QUIT_FAILED_ACK, "Quit anyway — recording failed", true),
+    }
 }
 
 fn live_transcript_menu_state(
@@ -432,7 +447,8 @@ pub fn spawn_blink(app: AppHandle) {
 pub fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     let id = event.id().as_ref();
     match id {
-        "quit" => app.exit(0),
+        "quit" => crate::imp::request_quit(app),
+        QUIT_FAILED_ACK => crate::imp::acknowledge_quit_failure(app),
         "open_privacy" => open_url(PRIVACY_SCREEN_CAPTURE),
         "open_settings" => open_settings_window(app),
         "open_queue" => open_queue_window(app),
@@ -803,7 +819,7 @@ mod tests {
     use super::{
         NOTE_PREFIX, PreferencesNavigation, format_duration, history_entry_label,
         live_transcript_menu_state, mode_tag, note_menu_id, note_path_from_id, preferences_section,
-        relative_time, status_label,
+        quit_menu_item, relative_time, status_label,
     };
     use crate::imp::HistoryEntry;
     use chrono::{DateTime, Duration, Local, TimeZone};
@@ -869,6 +885,26 @@ mod tests {
         assert_eq!(note_path_from_id("quit"), None);
         assert_eq!(note_path_from_id("open_privacy"), None);
         assert_eq!(note_path_from_id("status"), None);
+    }
+
+    #[test]
+    fn quit_item_exposes_failure_action_only_after_settled_failure() {
+        use crate::imp::QuitPhase;
+        assert_eq!(
+            quit_menu_item(QuitPhase::Idle),
+            ("quit", "Quit Corti", true)
+        );
+        assert_eq!(
+            quit_menu_item(QuitPhase::Draining),
+            ("quit", "Finish writes before exiting…", false)
+        );
+        let (id, label, enabled) = quit_menu_item(QuitPhase::Failed);
+        assert_ne!(
+            id, "quit",
+            "a stale ordinary Quit cannot acknowledge the failure"
+        );
+        assert_eq!((label, enabled), ("Quit anyway — recording failed", true));
+        assert_eq!(note_path_from_id(id), None);
     }
 
     /// A `now` to anchor relative-time tests on: 2026-06-01 12:00:00 local.

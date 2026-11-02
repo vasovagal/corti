@@ -155,6 +155,9 @@ mod tests {
                 config: Arc::new(Mutex::new(cfg)),
                 live: Arc::new(crate::live::LiveManager),
                 hosted: crate::postprocess_app::HostedHandle,
+                quitting: Arc::new(AtomicBool::new(false)),
+                shutdown_errors: Mutex::new(Vec::new()),
+                fresh_first_batches: Vec::new(),
             };
             let error = transcribe_and_file(
                 &mut ctx,

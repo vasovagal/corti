@@ -13,8 +13,11 @@
 //! recovers every valid post-ASR checkpoint; broader first-attempt reconciliation remains deferred.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -151,6 +154,8 @@ pub enum PipelineMsg {
     /// Wake the sole queue writer to import and acknowledge content-free hosted telemetry. The durable
     /// outbox remains authoritative when this best-effort wake races recording-row creation.
     ImportPostprocessOutbox,
+    /// FIFO receipt after already accepted capture and live messages have settled.
+    Drain(Sender<Result<(), String>>),
 }
 
 /// Everything the worker owns. Built once on the worker thread; never shared.
@@ -176,6 +181,23 @@ pub(crate) struct Ctx {
     /// Managed hosted coordinator handle. It owns no provider runtime on this serial queue thread; only the
     /// bounded final wait and content-free outbox import cross this seam.
     pub(crate) hosted: crate::postprocess_app::HostedHandle,
+    pub(crate) quitting: Arc<AtomicBool>,
+    /// Persistence failures recorded after the Quit gate closed; taken by the next drain receipt.
+    shutdown_errors: Mutex<Vec<String>>,
+    /// Recordings accepted by this process whose armed first batch job has not been claimed yet.
+    fresh_first_batches: Vec<String>,
+}
+
+/// Count a persistence failure against the explicit Quit only when it happens after the gate closed.
+/// Earlier failures were already surfaced in the tray/history and must not block a later Quit.
+fn record_shutdown_error(ctx: &Ctx, detail: String) {
+    push_quit_error(&ctx.quitting, &ctx.shutdown_errors, detail);
+}
+
+fn push_quit_error(quitting: &AtomicBool, ledger: &Mutex<Vec<String>>, detail: String) {
+    if quitting.load(std::sync::atomic::Ordering::Acquire) {
+        ledger.lock().unwrap().push(detail);
+    }
 }
 
 /// Worker entry point. Opens the queue, seeds the tray history, then drains the channel until the app
@@ -188,6 +210,7 @@ pub fn run(
     stats: crate::stats::StatsBuffer,
     live: Arc<crate::live::LiveManager>,
     hosted: crate::postprocess_app::HostedHandle,
+    quitting: Arc<AtomicBool>,
 ) {
     let queue = match Queue::open() {
         Ok(q) => q,
@@ -216,6 +239,9 @@ pub fn run(
         config: config.clone(),
         live,
         hosted,
+        quitting,
+        shutdown_errors: Mutex::new(Vec::new()),
+        fresh_first_batches: Vec::new(),
     };
 
     seed_history(&ctx);
@@ -282,8 +308,22 @@ pub fn run(
     // Messages take priority (they're user-facing); due background jobs drain after each wake, so a
     // recording never queues behind a backlog of background work. Everything stays serial on this one
     // thread — a job mid-run delays the next message exactly like a long transcription always has.
+    let mut pending_drains = Vec::new();
     loop {
-        match rx.recv_timeout(next_wake(&ctx)) {
+        let next = if pending_drains.is_empty() {
+            rx.recv_timeout(next_wake(&ctx))
+        } else if let Some(message) = receive_before_drain_receipt(
+            &rx,
+            &mut pending_drains,
+            &mut ctx,
+            run_fresh_first_batches,
+            |ctx| std::mem::take(&mut *ctx.shutdown_errors.lock().unwrap()),
+        ) {
+            Ok(message)
+        } else {
+            continue;
+        };
+        match next {
             Ok(PipelineMsg::Process {
                 meta,
                 audio_path,
@@ -365,6 +405,13 @@ pub fn run(
                         }
                         Some(crate::live::LiveOutcome::NoNote { .. }) | None => {}
                     }
+                    record_shutdown_error(
+                        &ctx,
+                        format!(
+                            "recording {} could not be queued: {e:#}",
+                            audio_path.display()
+                        ),
+                    );
                     // No job id yet, so `fail()` (which resets the stage) is never reached — reset here so
                     // the diagram doesn't sit on Transcribing forever.
                     set_stage(&ctx.app, Stage::Idle);
@@ -384,6 +431,7 @@ pub fn run(
                 error,
             }) => live_discard_cleanup(&ctx, &meta, &note_path, &error),
             Ok(PipelineMsg::ImportPostprocessOutbox) => import_hosted_outbox(&ctx),
+            Ok(PipelineMsg::Drain(reply)) => pending_drains.push(reply),
             // Nothing arrived before the next background job came due — fall through to the drain.
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the app is shutting down.
@@ -393,6 +441,87 @@ pub fn run(
         // acknowledges only rows whose recording already exists.
         import_hosted_outbox(&ctx);
         drain_due_jobs(&mut ctx);
+    }
+}
+
+/// Process messages emitted while collecting a live tail before acknowledging its marker.
+/// All capture producers and discard reapers have stopped before the marker is sent. Once the channel
+/// is empty, first batch ASR armed for this process's recordings runs; the channel is then re-checked
+/// before the receipt reports (and clears) the failures recorded since the gate closed.
+fn receive_before_drain_receipt<C>(
+    rx: &Receiver<PipelineMsg>,
+    pending: &mut Vec<Sender<Result<(), String>>>,
+    context: &mut C,
+    run_fresh: impl FnOnce(&mut C) -> bool,
+    take_errors: impl FnOnce(&mut C) -> Vec<String>,
+) -> Option<PipelineMsg> {
+    match rx.try_recv() {
+        Ok(message) => Some(message),
+        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+            if run_fresh(context) {
+                return None;
+            }
+            let errors = take_errors(context);
+            let receipt = if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            };
+            for reply in pending.drain(..) {
+                let _ = reply.send(receipt.clone());
+            }
+            None
+        }
+    }
+}
+
+/// While quitting, claim only first batch jobs armed for recordings this process accepted. Unrelated
+/// due retries and the sweep stay pending for the next launch. An entry with no due pending job was
+/// already attempted (durable backoff) or settled, so it needs no work here.
+fn claim_fresh_first_batch(
+    queue: &Queue,
+    fresh: &mut Vec<String>,
+) -> Result<Option<ClaimedJob>, String> {
+    while !fresh.is_empty() {
+        let id = fresh.remove(0);
+        match queue
+            .jobs()
+            .claim_due_recording(crate::jobs::RETRY_TRANSCRIPTION, &id, Utc::now())
+        {
+            Ok(Some(job)) => return Ok(Some(job)),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(format!(
+                    "could not start first transcription for {id}: {e:#}"
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Attempt each fresh first batch once. Success files the note; a failed attempt settles through the
+/// existing durable retry/terminal path. Only an unpersisted outcome counts against the Quit.
+fn run_fresh_first_batches(ctx: &mut Ctx) -> bool {
+    let mut ran = false;
+    loop {
+        match claim_fresh_first_batch(&ctx.queue, &mut ctx.fresh_first_batches) {
+            Ok(Some(job)) => {
+                ran = true;
+                let result = crate::jobs::run(ctx, &job);
+                if !finish_job(ctx, &job, result) {
+                    record_shutdown_error(
+                        ctx,
+                        format!(
+                            "first transcription for {} ran but its outcome was not persisted",
+                            job.payload["id"].as_str().unwrap_or("recording")
+                        ),
+                    );
+                }
+            }
+            Ok(None) => return ran,
+            Err(error) => record_shutdown_error(ctx, error),
+        }
     }
 }
 
@@ -424,12 +553,22 @@ fn import_hosted_outbox(ctx: &Ctx) {
 /// How long to block on the channel: until the next pending background job is due, clamped to
 /// `[0, MAX_IDLE_WAIT]`. No pending jobs (or a read error) ⇒ the max — the drain re-checks anyway.
 fn next_wake(ctx: &Ctx) -> Duration {
-    if crate::imp::live_test_active(&ctx.app) {
-        // A due retry must not spin at zero timeout while the explicit mic test owns the local model slot;
-        // poll the flag cheaply so cleanup can hand work back without a new pipeline message variant.
-        return Duration::from_millis(250);
+    let skip = ctx.quitting.load(Ordering::Acquire) || crate::imp::live_test_active(&ctx.app);
+    wake_after(skip, || ctx.queue.jobs().next_due_at())
+}
+
+/// Due jobs are deferred while the mic test owns the model slot or Quit is draining; a zero timeout
+/// would spin. Channel messages, including the Drain marker, still wake the worker immediately.
+const SUPPRESSED_JOBS_WAIT: Duration = Duration::from_millis(250);
+
+fn wake_after(
+    jobs_suppressed: bool,
+    next_due: impl FnOnce() -> Result<Option<chrono::DateTime<Utc>>>,
+) -> Duration {
+    if jobs_suppressed {
+        return SUPPRESSED_JOBS_WAIT;
     }
-    match ctx.queue.jobs().next_due_at() {
+    match next_due() {
         Ok(Some(due)) => (due - Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO)
@@ -446,10 +585,13 @@ fn next_wake(ctx: &Ctx) -> Duration {
 fn drain_due_jobs(ctx: &mut Ctx) {
     // Test mode is deliberately exclusive with model-backed work. Deferring all durable jobs is simpler and
     // safe: retention/filing can wait too, and the 250 ms wake above resumes immediately after the test.
-    if crate::imp::live_test_active(&ctx.app) {
+    if ctx.quitting.load(Ordering::Acquire) || crate::imp::live_test_active(&ctx.app) {
         return;
     }
     loop {
+        if ctx.quitting.load(Ordering::Acquire) {
+            return;
+        }
         let job = match ctx.queue.jobs().claim_due(Utc::now()) {
             Ok(Some(j)) => j,
             Ok(None) => return,
@@ -458,14 +600,21 @@ fn drain_due_jobs(ctx: &mut Ctx) {
                 return;
             }
         };
+        if job.kind == crate::jobs::RETRY_TRANSCRIPTION
+            && let Some(id) = job.payload["id"].as_str()
+        {
+            ctx.fresh_first_batches.retain(|fresh| fresh != id);
+        }
         let result = crate::jobs::run(ctx, &job);
         finish_job(ctx, &job, result);
     }
 }
 
 /// Settle a finished job: completed ⇒ delete (or re-arm a periodic); failed ⇒ backoff or park (and let
-/// the kind surface the exhaustion on whatever artifact it was working for).
-fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
+/// the kind surface the exhaustion on whatever artifact it was working for). Returns false only when a
+/// failed attempt's retry/terminal outcome could not be persisted. A completed handler already committed
+/// its own durable state; a leftover `running` row is re-queued at startup and replays as stale.
+fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) -> bool {
     match result {
         Ok(()) => {
             if let Err(e) = ctx.queue.jobs().complete(job) {
@@ -474,6 +623,7 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
                     job.id, job.kind
                 );
             }
+            true
         }
         Err(err) => {
             let msg = format!("{err:#}");
@@ -521,18 +671,23 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
                     .map(|outcome| (outcome, msg.clone()))
             };
 
-            match settlement {
+            let persisted = match settlement {
                 Ok((FailOutcome::Rescheduled { next_run_at }, retry_error)) => {
                     eprintln!("[corti]   will retry at {next_run_at}");
                     if settled_job.kind == crate::jobs::RETRY_TRANSCRIPTION {
                         record_retry_backoff(ctx, &settled_job, &retry_error);
                     }
+                    true
                 }
                 Ok((FailOutcome::Exhausted, _)) => {
                     eprintln!("[corti]   out of attempts — parked as failed");
+                    true
                 }
-                Err(e) => eprintln!("[corti] cannot record job failure: {e:#}"),
-            }
+                Err(e) => {
+                    eprintln!("[corti] cannot record job failure: {e:#}");
+                    false
+                }
+            };
             // A retry attempt's `transcribe_and_file` left the stage at Transcribing/Filing; that attempt
             // just ended (parked in backoff, exhausted → `fail`, or a bookkeeping error), so drop back to
             // Idle. Gated to the transcription retry so the retention sweep never disturbs the stage — it
@@ -540,6 +695,7 @@ fn finish_job(ctx: &Ctx, job: &ClaimedJob, result: Result<()>) {
             if job.kind == crate::jobs::RETRY_TRANSCRIPTION {
                 set_stage(&ctx.app, Stage::Idle);
             }
+            persisted
         }
     }
 }
@@ -705,6 +861,10 @@ fn schedule_retry(
     if let Err(e) = enqueue {
         eprintln!("[corti] cannot schedule retry for {id}: {e:#}");
         if let Err(fail_error) = fail_with_note(ctx, id, meta, msg, preferred_note.as_ref()) {
+            record_shutdown_error(
+                ctx,
+                format!("could not persist retry or failure for {id}: {fail_error:#}"),
+            );
             eprintln!("[corti] cannot persist terminal failure for {id}: {fail_error:#}");
         }
         return;
@@ -818,16 +978,22 @@ fn process_live_result(
                         Utc::now(),
                     )
                 });
-            if let Err(e) = enqueue
-                && let Err(failure) = fail_with_note(
-                    ctx,
-                    id,
-                    meta,
-                    format!("could not persist first ASR origin: {e:#}"),
-                    preferred_note.as_ref(),
-                )
-            {
-                error!(target: "corti::pipeline", error = %failure, "could not settle unarmed transcription");
+            match enqueue {
+                // A Quit drain runs this exact armed job before its receipt (see run_fresh_first_batches).
+                Ok(_) => {
+                    if !ctx.fresh_first_batches.iter().any(|fresh| fresh == id) {
+                        ctx.fresh_first_batches.push(id.to_string());
+                    }
+                }
+                Err(e) => {
+                    let detail = format!("could not persist first ASR origin: {e:#}");
+                    record_shutdown_error(ctx, format!("recording {id} {detail}"));
+                    if let Err(failure) =
+                        fail_with_note(ctx, id, meta, detail, preferred_note.as_ref())
+                    {
+                        error!(target: "corti::pipeline", error = %failure, "could not settle unarmed transcription");
+                    }
+                }
             }
         }
     }
@@ -978,12 +1144,11 @@ fn live_note_created(ctx: &Ctx, meta: &RecordingMeta, note_path: PathBuf) {
         // The history entry gains the note path, so the tray's line is clickable and opens the
         // (possibly still growing) note.
         Ok(()) => tray::update_history(&ctx.app, &id, history_status, None, None, Some(note_path)),
-        Err(e) => warn!(
-            target: "corti::live",
-            job_id = %id,
-            error = %format!("{e:#}"),
-            "could not persist the live note path"
-        ),
+        Err(e) => {
+            record_shutdown_error(ctx, format!("could not persist live note {id}: {e:#}"));
+            warn!(target: "corti::live", job_id = %id, error = %format!("{e:#}"),
+                "could not persist the live note path");
+        }
     }
 }
 
@@ -1060,13 +1225,12 @@ fn live_discard_cleanup(ctx: &Ctx, meta: &RecordingMeta, note_path: &Path, previ
                 )
             });
             if let Err(persist_error) = persisted {
-                warn!(
-                    target: "corti::live",
-                    job_id = %id,
-                    note_path = %note_path.display(),
-                    error = %format!("{persist_error:#}"),
-                    "could not persist failed discarded-note cleanup"
+                record_shutdown_error(
+                    ctx,
+                    format!("could not persist discarded note {id}: {persist_error:#}"),
                 );
+                warn!(target: "corti::live", job_id = %id, note_path = %note_path.display(),
+                    error = %format!("{persist_error:#}"), "could not persist failed discarded-note cleanup");
             }
             close_out_note(note_path, &reason);
             tray::emit_queue_changed(&ctx.app, &id);
@@ -2684,6 +2848,161 @@ mod tests {
 
         // Idempotent: nothing left at Recording.
         assert!(reap_recording_rows(&queue).is_empty());
+    }
+
+    /// Synthetic drain context: queued fresh first batches and the quit-scoped error ledger.
+    #[derive(Default)]
+    struct DrainProbe {
+        fresh: Vec<&'static str>,
+        attempted: Vec<&'static str>,
+        errors: Vec<String>,
+    }
+
+    fn probe_receipt(
+        rx: &Receiver<PipelineMsg>,
+        pending: &mut Vec<Sender<Result<(), String>>>,
+        probe: &mut DrainProbe,
+    ) -> Option<PipelineMsg> {
+        receive_before_drain_receipt(
+            rx,
+            pending,
+            probe,
+            |probe| {
+                let ran = !probe.fresh.is_empty();
+                probe.attempted.append(&mut probe.fresh);
+                ran
+            },
+            |probe| std::mem::take(&mut probe.errors),
+        )
+    }
+
+    #[test]
+    fn drain_receipt_waits_for_late_live_message_and_reports_failure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+        let mut pending = vec![receipt_tx];
+        let mut probe = DrainProbe::default();
+        tx.send(PipelineMsg::LiveDiscardReap { id: "late".into() })
+            .unwrap();
+        assert!(matches!(
+            probe_receipt(&rx, &mut pending, &mut probe),
+            Some(PipelineMsg::LiveDiscardReap { .. })
+        ));
+        assert!(receipt_rx.try_recv().is_err());
+        probe.errors.push("queue failed".into());
+        assert!(probe_receipt(&rx, &mut pending, &mut probe).is_none());
+        assert_eq!(receipt_rx.recv().unwrap().unwrap_err(), "queue failed");
+        // The reported failure belongs to that drain; a retried drain starts a clean ledger.
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        pending.push(second_tx);
+        assert!(probe_receipt(&rx, &mut pending, &mut probe).is_none());
+        assert!(second_rx.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn drain_receipt_waits_for_fresh_first_batch_attempt() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+        let mut pending = vec![receipt_tx];
+        let mut probe = DrainProbe {
+            fresh: vec!["finished-during-quit"],
+            ..Default::default()
+        };
+        assert!(probe_receipt(&rx, &mut pending, &mut probe).is_none());
+        assert_eq!(probe.attempted, ["finished-during-quit"]);
+        assert!(
+            receipt_rx.try_recv().is_err(),
+            "arming without the attempt is not a completed flush"
+        );
+        assert!(probe_receipt(&rx, &mut pending, &mut probe).is_none());
+        assert!(receipt_rx.recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn quit_claims_only_fresh_first_batch_and_leaves_historic_backlog() {
+        let dir = test_dir("quit-fresh-first-batch");
+        let queue = Queue::open_at(dir.join("queue.db")).unwrap();
+        let now = Utc::now();
+        let arm = |id: &str, run_at| {
+            queue
+                .jobs()
+                .enqueue_recording(
+                    crate::jobs::RETRY_TRANSCRIPTION,
+                    &crate::jobs::id_payload(id),
+                    crate::jobs::RETRY_MAX_ATTEMPTS,
+                    run_at,
+                )
+                .unwrap();
+        };
+        arm("historic", now - chrono::Duration::hours(2));
+        arm("fresh", now);
+        arm("backoff", now + chrono::Duration::minutes(5));
+        queue
+            .jobs()
+            .enqueue_periodic(crate::jobs::SWEEP_EXPIRED, crate::jobs::SWEEP_PERIOD)
+            .unwrap();
+
+        let mut fresh = vec!["fresh".to_string(), "backoff".to_string()];
+        let claimed = claim_fresh_first_batch(&queue, &mut fresh)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.payload["id"], "fresh");
+        assert_eq!(claimed.attempts, 1);
+        assert_eq!(fresh, ["backoff"]);
+        assert!(
+            claim_fresh_first_batch(&queue, &mut fresh)
+                .unwrap()
+                .is_none(),
+            "a fresh id already in durable backoff needs no quit-time work"
+        );
+        assert!(fresh.is_empty());
+
+        let mut attempts: Vec<_> = queue
+            .jobs()
+            .active_for(crate::jobs::RETRY_TRANSCRIPTION)
+            .unwrap()
+            .into_iter()
+            .map(|(payload, attempts)| (payload["id"].as_str().unwrap().to_string(), attempts))
+            .collect();
+        attempts.sort();
+        assert_eq!(
+            attempts,
+            [
+                ("backoff".to_string(), 0),
+                ("fresh".to_string(), 1),
+                ("historic".to_string(), 0)
+            ]
+        );
+        let next = queue.jobs().claim_due(Utc::now()).unwrap().unwrap();
+        assert!(
+            next.kind == crate::jobs::SWEEP_EXPIRED || next.payload["id"] == "historic",
+            "unrelated due backlog remains for the next launch"
+        );
+        drop(queue);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn errors_before_quit_never_enter_the_drain_ledger() {
+        let quitting = AtomicBool::new(false);
+        let ledger = Mutex::new(Vec::new());
+        push_quit_error(&quitting, &ledger, "reported hours earlier".into());
+        assert!(ledger.lock().unwrap().is_empty());
+        quitting.store(true, Ordering::Release);
+        push_quit_error(&quitting, &ledger, "queue write during quit".into());
+        assert_eq!(*ledger.lock().unwrap(), ["queue write during quit"]);
+    }
+
+    #[test]
+    fn suppressed_due_jobs_wait_instead_of_spinning() {
+        let overdue = || Ok(Some(Utc::now() - chrono::Duration::seconds(5)));
+        assert_eq!(wake_after(false, overdue), Duration::ZERO);
+        assert_eq!(wake_after(true, overdue), SUPPRESSED_JOBS_WAIT);
+        assert!(SUPPRESSED_JOBS_WAIT >= Duration::from_millis(250));
+        assert_eq!(
+            wake_after(true, || panic!("suppressed wake must not read due jobs")),
+            SUPPRESSED_JOBS_WAIT
+        );
     }
 
     /// #87: a late `LiveNoteCreated` must never regress an existing row's tray status (a short

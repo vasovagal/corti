@@ -5,7 +5,7 @@
 //! preventing Corti's own orange-dot edge from creating a duplicate detected call. The same one-model gate
 //! used by live filing excludes overlap with calls and finishing/discarding sessions.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -39,6 +39,7 @@ pub(crate) struct LiveTestManager {
     config: SharedConfig,
     transcript: LiveTranscriptStore,
     hosted: Option<crate::postprocess_app::HostedHandle>,
+    quitting: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -139,6 +140,7 @@ impl LiveTestManager {
         config: SharedConfig,
         transcript: LiveTranscriptStore,
         hosted: Option<crate::postprocess_app::HostedHandle>,
+        quitting: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner: Mutex::new(None),
@@ -148,6 +150,7 @@ impl LiveTestManager {
             config,
             transcript,
             hosted,
+            quitting,
         }
     }
 
@@ -226,6 +229,9 @@ impl LiveTestManager {
 
     fn reserve_start_slot(&self, window_generation: u64) -> Result<u64> {
         let mut inner = self.inner.lock().unwrap();
+        if self.quitting.load(Ordering::Acquire) {
+            anyhow::bail!("Corti is finishing writes before exiting");
+        }
         if inner.is_some() {
             anyhow::bail!("the previous microphone test is still stopping");
         }
@@ -335,7 +341,7 @@ impl LiveTestManager {
     }
 
     fn starting_canceled(&self, generation: u64, window_generation: u64) -> bool {
-        if !self.window.is_current(window_generation) {
+        if self.quitting.load(Ordering::Acquire) || !self.window.is_current(window_generation) {
             return true;
         }
         let inner = self.inner.lock().unwrap();
@@ -363,6 +369,18 @@ impl LiveTestManager {
             }) if *current == generation
         ) {
             *inner = None;
+        }
+    }
+
+    /// Off-main-thread wait for Starting preflight, microphone close, ASR tail and configured final.
+    pub(crate) fn stop_and_wait(&self) {
+        self.stop();
+        loop {
+            self.reap_finished();
+            if self.inner.lock().unwrap().is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -514,7 +532,7 @@ fn run_microphone_test(
     let mut channel = engine
         .channel()
         .context("building the microphone transcriber")?;
-    if stop_rx.try_recv().is_ok() {
+    if stop_rx.try_recv().is_ok() || crate::imp::is_quitting(app) {
         return Ok("Microphone test stopped before capture began.".to_string());
     }
 
@@ -776,7 +794,55 @@ mod tests {
             Arc::new(Mutex::new(AppConfig::default())),
             LiveTranscriptStore::detached(),
             None,
+            Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn quit_rejects_new_test_without_starting_capture() {
+        let manager = manager_for_lifecycle_test();
+        let window = manager.begin_live_window();
+        manager.quitting.store(true, Ordering::Release);
+        assert!(manager.reserve_start_slot(window).is_err());
+        manager.stop_and_wait();
+        assert!(manager.inner.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn quit_waits_for_starting_reservation_to_release() {
+        let manager = Arc::new(manager_for_lifecycle_test());
+        let window = manager.begin_live_window();
+        let generation = manager.reserve_start_slot(window).unwrap();
+        let waiter = manager.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            waiter.stop_and_wait();
+            done_tx.send(()).unwrap();
+        });
+        loop {
+            if matches!(
+                manager.inner.lock().unwrap().as_ref(),
+                Some(TestSlot::Starting {
+                    stop_requested: true,
+                    ..
+                })
+            ) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(done_rx.try_recv().is_err());
+        {
+            let mut inner = manager.inner.lock().unwrap();
+            assert!(
+                matches!(inner.as_ref(), Some(TestSlot::Starting { generation: g, .. }) if *g == generation)
+            );
+            *inner = None;
+        }
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
