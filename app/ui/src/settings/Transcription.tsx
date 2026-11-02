@@ -228,8 +228,10 @@ export function Transcription({ cfg, backends, onChange }: Props) {
               </label>
             </div>
             <p className="muted small">
-              Metal measured 4.09× faster with 19% lower peak memory on the M1 Pro benchmark at equal WER.
-              Download the matching model below before saving. Sherpa remains the upgrade-safe default.
+              Metal measured 4.09× faster with 19% lower peak memory on the M1 Pro benchmark at equal WER,
+              and is the default as of a cleared real-call soak test (ADR 0011). Download the matching
+              model below before saving if it isn't already present. Sherpa remains available for
+              compatibility.
             </p>
           </div>
           <div className="settings-field">

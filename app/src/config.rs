@@ -534,10 +534,11 @@ fn default_embedding_model() -> String {
     "titanet".to_string()
 }
 
-/// Default local ASR engine: sherpa-onnx, today's shipping path. A literal for the same
+/// Default local ASR engine: transcribe.cpp/GGML on Metal (ADR 0011's default-flip gate — a real
+/// detector-call soak with live filing — cleared 2026-11-02). A literal for the same
 /// compiles-without-`local` reason as [`default_embedding_model`].
 fn default_asr_engine() -> String {
-    "sherpa".to_string()
+    "ggml".to_string()
 }
 
 /// Default backend for this build: prefer the on-device `local` backend so a fresh install transcribes out

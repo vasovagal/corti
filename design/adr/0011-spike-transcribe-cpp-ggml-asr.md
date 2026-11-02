@@ -1,6 +1,7 @@
 # ADR 0011 — transcribe.cpp (GGML/Metal) as a selectable local ASR engine
 
-- **Status:** Accepted as an accelerated opt-in engine (2026-08-04); sherpa remains the compatibility default
+- **Status:** Accepted as an accelerated opt-in engine (2026-08-04); default flipped to GGML/Metal
+  (2026-11-02) after decision 5's soak gate cleared — see addendum below. sherpa remains selectable.
 - **References:** ADR 0003 (local ASR via sherpa-onnx and the CoreML rejection), ADR 0009 (pull-based live
   core), ADR 0012 (bounded crash-safe live checkpoints), issues #91/#103, PRs #92/#104.
 
@@ -124,3 +125,35 @@ the sherpa recognizer leaves that configuration with no ASR engine at all, so co
 what the minimal build is before it can compile — a build-topology decision, not a measurement.
 
 Status therefore unchanged: sherpa stays the persisted default, both engines stay selectable.
+
+## Addendum (2026-11-02): single real-call soak — decision 5's gate cleared, default flipped
+
+A detector-recorded Zoom call exercised the GGML/Metal live path end to end on an M1 (macOS, standard
+build, GGUF already downloaded via Settings): `duration_secs=2370.00691175`. `corti::live` logged durable
+transcript chunks synced throughout with monotonically increasing, non-overlapping `start_sec`
+(360.0, 420.632, 497.688, 557.688, 639.688, 703.576, …, 2296.76), each with `echo_dropped_audio=0` except
+one window with `echo_dropped_audio=1` (an AEC echo-classification counter, not a tee/backpressure drop).
+The call ended cleanly: `corti::capture` wrote AEC block statistics `blocks=13877 dropped=0`, `corti::live`
+logged `live note finalized — final chunk and state are synced`, and `corti::pipeline` logged `note filed
+live during the recording — skipping batch transcription` — the existing same-inode fallback was not
+needed, meaning the app's own quality gate (decision/Consequences, "a zero-drop live result is canonical")
+judged the live result complete. The corti process did not crash or restart across the call. The filed
+transcript's last timestamped line lands within ~13 s of the logged call end, consistent with no
+truncation.
+
+This is **N=1**, not a multi-run soak, and does not by itself prove behavior across longer calls, thermal
+throttling, concurrent GPU load from other apps, or sleep/wake mid-recording — those remain unexercised.
+Decision 5's literal checklist (no tee drops, timestamp continuity, note completion, no crash/truncation),
+however, is exactly what this call exercised, and it passed clean on every point. Combined with the
+already-cleared accuracy/speed gate (2026-08-21 addendum, above), this is enough to flip the default for
+this project's actual install base (a personal/small tap, not a wide release): `default_asr_engine()`
+(`app/src/config.rs`) now returns `"ggml"`. sherpa-onnx/CPU remains fully compiled in and selectable
+(Settings → Transcription, or `CORTI_LOCAL_ASR_ENGINE=sherpa`) — nothing is deleted; decision 4's minimal
+sherpa-only build lane is unaffected.
+
+Known accepted consequence: a completely fresh install now defaults to needing the 740 MB GGUF rather than
+the 487 MB ONNX artifact before first local transcription works, surfaced the same way either engine's
+missing model already is (`discover_models`/`validate_models` in `app/src/live.rs`, a cheap file-existence
+check that fails closed with a clear reason rather than crashing — this is pre-existing behavior for
+*either* engine, not new). Continued real-call monitoring is still worthwhile; this addendum documents the
+first pass, not an exhaustive soak.
