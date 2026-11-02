@@ -425,6 +425,61 @@ impl<'c> Jobs<'c> {
         }))
     }
 
+    /// Claim one due pending one-shot recording job by recording id, leaving every other due job
+    /// untouched (same `running` + attempt bump as [`Self::claim_due`]). `None` means that recording has
+    /// no due pending job: it is in backoff, already settled, or absent.
+    pub fn claim_due_recording(
+        &self,
+        kind: &str,
+        recording_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ClaimedJob>> {
+        let found = {
+            let mut statement = self.conn.prepare(
+                "SELECT id, payload, attempts, max_attempts FROM jobs
+                 WHERE kind = ?1 AND state = 'pending' AND period_secs IS NULL AND next_run_at <= ?2
+                 ORDER BY next_run_at",
+            )?;
+            let mut rows = statement.query(params![kind, fmt_utc(now)])?;
+            let mut found = None;
+            while let Some(row) = rows.next()? {
+                let raw: String = row.get(1)?;
+                let payload: serde_json::Value = serde_json::from_str(&raw)
+                    .map_err(|_| anyhow::anyhow!("invalid_recording_job_payload"))?;
+                if payload.get("id").and_then(serde_json::Value::as_str) == Some(recording_id) {
+                    found = Some((
+                        row.get::<_, i64>(0)?,
+                        payload,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u32>(3)?,
+                    ));
+                    break;
+                }
+            }
+            found
+        };
+        let Some((id, payload, attempts, max_attempts)) = found else {
+            return Ok(None);
+        };
+        let claimed = self
+            .conn
+            .execute(
+                "UPDATE jobs SET state = 'running', attempts = attempts + 1, updated_at = ?2
+                 WHERE id = ?1 AND state = 'pending'",
+                params![id, fmt_utc(Utc::now())],
+            )
+            .context("claiming recording job")?;
+        ensure!(claimed == 1, "stale_recording_claim");
+        Ok(Some(ClaimedJob {
+            id,
+            kind: kind.to_string(),
+            payload,
+            attempts: attempts + 1,
+            max_attempts,
+            period_secs: None,
+        }))
+    }
+
     /// Mark a claimed job done: one-shots are deleted; periodics re-arm at `now + period` with a
     /// fresh attempt budget.
     pub fn complete(&self, job: &ClaimedJob) -> Result<()> {
@@ -743,6 +798,60 @@ mod tests {
         assert_eq!(reopened.payload["preferred_note"], "/synthetic/owned.md");
         drop(conn);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn targeted_recording_claim_leaves_unrelated_due_work_pending() {
+        let conn = jobs_conn();
+        let jobs = Jobs::new(&conn);
+        let now = Utc::now();
+        let earlier = now - chrono::Duration::hours(1);
+        jobs.enqueue_recording("retry", &json!({"id":"historic"}), 5, earlier)
+            .unwrap();
+        jobs.enqueue_periodic("sweep", Duration::from_secs(3600))
+            .unwrap();
+        jobs.enqueue_recording("retry", &json!({"id":"fresh", "first_batch":true}), 6, now)
+            .unwrap();
+        jobs.enqueue_recording(
+            "retry",
+            &json!({"id":"backoff"}),
+            5,
+            now + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+
+        let claimed = jobs
+            .claim_due_recording("retry", "fresh", now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.payload["id"], "fresh");
+        assert_eq!((claimed.attempts, claimed.max_attempts), (1, 6));
+        assert!(claimed.period_secs.is_none());
+        assert!(
+            jobs.claim_due_recording("retry", "fresh", now)
+                .unwrap()
+                .is_none(),
+            "a running first batch is claimed once"
+        );
+        assert!(
+            jobs.claim_due_recording("retry", "backoff", now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            jobs.claim_due_recording("retry", "absent", now)
+                .unwrap()
+                .is_none()
+        );
+        let untouched: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE state = 'pending' AND attempts = 0
+                 AND (payload LIKE '%historic%' OR kind = 'sweep')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 2, "historic retry and sweep stay unclaimed");
     }
 
     #[test]

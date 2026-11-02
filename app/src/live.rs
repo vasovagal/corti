@@ -289,6 +289,11 @@ struct Inner {
     /// Discarded sessions remain manager-owned until their model thread and cleanup reaper finish. Keeping
     /// them in the same gate prevents a second local model from loading while discard drains its tee.
     discarding: HashMap<String, Discarding>,
+    /// A panicked cleanup reaper cannot prove that its partial note was deleted/reported. Recorded only
+    /// after explicit Quit begins; an earlier panic is logged when reaped and never blocks a later Quit.
+    discard_cleanup_failure: Option<String>,
+    /// Set when explicit Quit claims its gate; cleared only if the quit worker never starts.
+    quit_accounting: bool,
 }
 
 struct Pending {
@@ -373,12 +378,20 @@ impl Inner {
             match self.discarding.remove(&id) {
                 Some(Discarding::Reaper(handle)) => {
                     if handle.join().is_err() {
-                        warn!(target: "corti::live", job_id = %id, "discard reaper panicked");
+                        self.record_reaper_panic(&id);
                     }
                 }
                 Some(Discarding::Inline(work)) => reap_discard_work(work),
                 Some(Discarding::Collecting) | None => {}
             }
+        }
+    }
+
+    /// A panicked cleanup reaper counts against Quit only once Quit accounting has begun.
+    fn record_reaper_panic(&mut self, id: &str) {
+        warn!(target: "corti::live", job_id = %id, "discard reaper panicked");
+        if self.quit_accounting {
+            self.discard_cleanup_failure = Some(format!("discard cleanup for {id} panicked"));
         }
     }
 
@@ -389,6 +402,14 @@ impl Inner {
                 AwaitingFinish::Running(_) | AwaitingFinish::Collecting
             )
         }) || !self.discarding.is_empty()
+    }
+
+    /// A live model thread may still write its note: an unfinished active session, or a finish or
+    /// discard handle not yet proven joined. After `reap_completed`, `Running` means unfinished;
+    /// `Ready` and a finished active handle prove that writes stopped.
+    fn live_writer_unproven(&self) -> bool {
+        let active_running = matches!(&self.active, Some(active) if !active.handle.is_finished());
+        active_running || self.has_finishing_thread()
     }
 }
 
@@ -678,6 +699,82 @@ impl LiveManager {
         reap_discard_work(work);
         let removed = self.inner.lock().unwrap().discarding.remove(id);
         debug_assert!(matches!(removed, Some(Discarding::Collecting)));
+    }
+
+    /// Explicit Quit claims cleanup failures from this point on. Earlier reaper panics were logged when
+    /// reaped and never block a later Quit.
+    pub(crate) fn set_quit_accounting(&self, enabled: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.quit_accounting = enabled;
+        if !enabled {
+            inner.discard_cleanup_failure = None;
+        }
+    }
+
+    /// Wait off the UI thread for discard cleanup/reporters before the queue drain receipt.
+    /// The pipeline may concurrently own an Inline fallback; wait for its Collecting sentinel.
+    pub(crate) fn join_discards(&self) -> Result<(), String> {
+        loop {
+            let work = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.reap_completed();
+                let id = inner.discarding.iter().find_map(|(id, state)| {
+                    if matches!(state, Discarding::Collecting) {
+                        None
+                    } else {
+                        Some(id.clone())
+                    }
+                });
+                id.and_then(|id| inner.discarding.remove(&id).map(|state| (id, state)))
+            };
+            match work {
+                Some((id, Discarding::Reaper(handle))) => {
+                    if handle.join().is_err() {
+                        self.inner.lock().unwrap().record_reaper_panic(&id);
+                    }
+                }
+                Some((_, Discarding::Inline(work))) => reap_discard_work(work),
+                Some((_, Discarding::Collecting)) => unreachable!(),
+                None => {
+                    // Release the manager before sleeping: the pipeline needs this lock to retire its
+                    // Collecting sentinel.
+                    let settled = {
+                        let inner = self.inner.lock().unwrap();
+                        inner
+                            .discarding
+                            .is_empty()
+                            .then(|| inner.discard_cleanup_failure.clone())
+                    };
+                    match settled {
+                        Some(failure) => return failure.map_or(Ok(()), Err),
+                        None => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Explicit Quit waits here off the UI thread, before its `Drain` marker, until no live
+    /// model thread can still write. It never joins or collects: the pipeline's `collect` keeps
+    /// sole ownership of each outcome; only already-finished threads are reaped to `Ready`. With
+    /// no collector (detector panic, dead pipeline) a finish thread still ends on its own. A
+    /// `Collecting` join the pipeline abandoned, or an active session that never got its
+    /// verdict, cannot be proven quiet, so Quit stays Draining instead of offering the
+    /// acknowledgement.
+    pub(crate) fn wait_for_live_writers(&self) {
+        loop {
+            let unproven = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.reap_completed();
+                inner.live_writer_unproven()
+            };
+            if !unproven {
+                return;
+            }
+            // The guard is already dropped: the pipeline needs this lock to collect and to retire
+            // its Collecting sentinel.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Whether a live note for `id` still belongs to a session that will be collected. Includes a
@@ -11716,6 +11813,200 @@ mod tests {
             !note.exists(),
             "discard reaper left the partial note behind"
         );
+    }
+
+    #[test]
+    fn quit_waits_for_detached_discard_reaper() {
+        let manager = Arc::new(LiveManager::new());
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        manager.inner.lock().unwrap().discarding.insert(
+            "discard".into(),
+            Discarding::Reaper(std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+            })),
+        );
+        let quitting = manager.clone();
+        let waiter = std::thread::spawn(move || {
+            done_tx.send(quitting.join_discards()).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn panicked_discard_reaper_blocks_successful_quit() {
+        let manager = LiveManager::new();
+        manager.set_quit_accounting(true);
+        manager.inner.lock().unwrap().discarding.insert(
+            "lost".into(),
+            Discarding::Reaper(std::thread::spawn(|| panic!("synthetic cleanup panic"))),
+        );
+        let error = manager.join_discards().unwrap_err();
+        assert!(error.contains("discard cleanup for lost panicked"));
+        assert!(
+            manager.join_discards().is_err(),
+            "failure must survive repeat Quit"
+        );
+    }
+
+    #[test]
+    fn reaper_panic_before_quit_does_not_block_a_later_quit() {
+        let manager = LiveManager::new();
+        let reaper: std::thread::JoinHandle<()> =
+            std::thread::spawn(|| panic!("synthetic earlier cleanup panic"));
+        while !reaper.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        {
+            let mut inner = manager.inner.lock().unwrap();
+            inner
+                .discarding
+                .insert("earlier".into(), Discarding::Reaper(reaper));
+            inner.reap_completed(); // the detector's ordinary non-blocking reap
+            assert!(inner.discarding.is_empty());
+        }
+        manager.set_quit_accounting(true);
+        assert!(
+            manager.join_discards().is_ok(),
+            "an already-logged panic must not poison a later Quit"
+        );
+    }
+
+    #[test]
+    fn join_discards_releases_manager_while_waiting_for_collecting_sentinel() {
+        use std::time::Duration;
+
+        let manager = Arc::new(LiveManager::new());
+        manager
+            .inner
+            .lock()
+            .unwrap()
+            .discarding
+            .insert("inline".into(), Discarding::Collecting);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let quitting = manager.clone();
+        let waiter = std::thread::spawn(move || done_tx.send(quitting.join_discards()).unwrap());
+        std::thread::sleep(Duration::from_millis(50));
+        // The pipeline must be able to take the lock to retire its sentinel while Quit waits. A guard
+        // held across the 10 ms sleep leaves only nanosecond gaps, so these probes would all fail.
+        let mut retired = false;
+        for _ in 0..200 {
+            if let Ok(mut inner) = manager.inner.try_lock() {
+                retired = inner.discarding.remove("inline").is_some();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            retired,
+            "join_discards held the manager mutex while waiting"
+        );
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    /// B1: Quit's writer wait must outlast an active or finishing session even with no pipeline
+    /// collector, release the manager between checks, and leave the outcome for `collect`.
+    #[test]
+    fn quit_writer_wait_outlasts_uncollected_session_without_stealing_outcome() {
+        use std::time::Duration;
+
+        let manager = Arc::new(LiveManager::new());
+        let (finishing_tx, finishing_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        install_active(&manager, "a", 0, move |verdicts| {
+            // A dropped sender (failed assertion) also ends this thread; nothing outlives the test.
+            if matches!(verdicts.recv(), Ok(Verdict::Finish(_))) {
+                let _ = finishing_tx.send(());
+                let _ = release_rx.recv();
+            }
+            LiveOutcome::NoNote {
+                settled_quality: None,
+            }
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let quitting = manager.clone();
+        let waiter = std::thread::spawn(move || {
+            quitting.wait_for_live_writers();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "an unfinished active session is not proof that writes stopped"
+        );
+        // finish() takes the manager lock, so the waiter must release it between checks.
+        manager.finish("a");
+        finishing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the waiter returned while an uncollected finish thread could still write"
+        );
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
+        let outcome = manager.collect("a");
+        assert!(
+            matches!(outcome, Some(LiveOutcome::NoNote { .. })),
+            "the pipeline must still collect the outcome after Quit waited"
+        );
+    }
+
+    /// A pipeline that dies mid-`collect` strands a detached join that cannot be proven finished, so
+    /// the quit wait keeps Quit Draining. It must not take the sentinel, and it releases the manager
+    /// between checks so a live pipeline can retire it.
+    #[test]
+    fn quit_writer_wait_holds_for_collecting_sentinel_without_holding_manager() {
+        use std::time::Duration;
+
+        let manager = Arc::new(LiveManager::new());
+        manager
+            .inner
+            .lock()
+            .unwrap()
+            .awaiting
+            .insert("a".into(), AwaitingFinish::Collecting);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let quitting = manager.clone();
+        let waiter = std::thread::spawn(move || {
+            quitting.wait_for_live_writers();
+            let _ = done_tx.send(());
+        });
+        let returned_early = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        let mut retired = false;
+        for _ in 0..200 {
+            if let Ok(mut inner) = manager.inner.try_lock() {
+                retired = inner.awaiting.remove("a").is_some();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if !retired {
+            // Clean up before asserting so a broken waiter cannot spin past the test.
+            manager.inner.lock().unwrap().awaiting.remove("a");
+        }
+        assert!(
+            !returned_early,
+            "a Collecting sentinel is not proof that writes stopped"
+        );
+        assert!(
+            retired,
+            "quit wait held the manager mutex or took the sentinel"
+        );
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        waiter.join().unwrap();
     }
 
     #[test]

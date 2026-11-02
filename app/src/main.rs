@@ -103,8 +103,9 @@ pub(crate) mod imp {
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-    use std::sync::mpsc::Sender;
+    use std::sync::mpsc::{self, Sender};
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
 
     use anyhow::{Context, Result};
     use chrono::{DateTime, Local};
@@ -238,6 +239,9 @@ pub(crate) mod imp {
     struct Webinar(Mutex<WebinarState>);
 
     struct WebinarState {
+        /// Stop workers remain owned until shutdown, including earlier user-initiated stops.
+        finishing: Vec<JoinHandle<std::result::Result<(), String>>>,
+        pending_finishes: usize,
         /// The in-flight tap-only recorder; `Some` while a webinar is being recorded.
         recorder: Option<Recorder>,
         /// When the in-flight recording started (for the filed note's `RecordingMeta`).
@@ -249,6 +253,8 @@ pub(crate) mod imp {
     impl Webinar {
         fn new(tx: Sender<PipelineMsg>) -> Self {
             Self(Mutex::new(WebinarState {
+                finishing: Vec::new(),
+                pending_finishes: 0,
                 recorder: None,
                 started_at: None,
                 tx,
@@ -263,14 +269,306 @@ pub(crate) mod imp {
         }
     }
 
+    /// The gate is set before any capture producer is stopped. The pipeline reads the same flag
+    /// to avoid unrelated due-job backlog while waiting for the FIFO drain receipt.
+    pub(crate) struct Shutdown {
+        quitting: Arc<AtomicBool>,
+        phase: Mutex<QuitPhase>,
+        permit_exit: AtomicBool,
+        detector_result: Mutex<Option<std::result::Result<Option<PathBuf>, String>>>,
+        pipe_tx: Sender<PipelineMsg>,
+        live: Arc<crate::live::LiveManager>,
+    }
+
+    pub(crate) fn is_quitting(app: &tauri::AppHandle) -> bool {
+        app.try_state::<Shutdown>()
+            .is_some_and(|s| s.quitting.load(Ordering::Acquire))
+    }
+
+    /// Explicit tray Quit progress. `Failed` is entered only after `finish_for_quit` returns, so every
+    /// capture producer, live/discard thread and the pipeline drain has stopped; only then may the
+    /// distinct "Quit anyway — recording failed" action exit.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum QuitPhase {
+        Idle,
+        Draining,
+        Failed,
+    }
+
+    pub(crate) fn quit_phase(app: &tauri::AppHandle) -> QuitPhase {
+        app.try_state::<Shutdown>()
+            .map_or(QuitPhase::Idle, |state| *lock_phase(&state.phase))
+    }
+
+    fn lock_phase(phase: &Mutex<QuitPhase>) -> std::sync::MutexGuard<'_, QuitPhase> {
+        phase.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Only an idle coordinator starts a drain. An ordinary Quit repeated (or queued) while draining
+    /// or after a failure is ignored; it never acknowledges the failure.
+    fn claim_quit(phase: &Mutex<QuitPhase>, quitting: &AtomicBool) -> bool {
+        let mut phase = lock_phase(phase);
+        if *phase != QuitPhase::Idle {
+            return false;
+        }
+        *phase = QuitPhase::Draining;
+        quitting.store(true, Ordering::Release);
+        true
+    }
+
+    /// The acknowledgement action is honored only in the settled `Failed` phase.
+    fn claim_failure_ack(phase: &Mutex<QuitPhase>) -> bool {
+        *lock_phase(phase) == QuitPhase::Failed
+    }
+
+    /// Remove and join the handles that already returned. Their outcome was reported when they
+    /// finished, so it belongs to no later Quit.
+    fn take_finished<T>(handles: &mut Vec<JoinHandle<T>>) -> Vec<std::thread::Result<T>> {
+        let mut finished = Vec::new();
+        let mut index = 0;
+        while index < handles.len() {
+            if handles[index].is_finished() {
+                finished.push(handles.swap_remove(index).join());
+            } else {
+                index += 1;
+            }
+        }
+        finished
+    }
+
+    /// Combine producer failures with the drain receipt. Called only after the receipt arrives or the
+    /// pipeline thread is proven gone.
+    fn settle_quit(
+        mut errors: Vec<String>,
+        receipt: std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
+        if let Err(error) = receipt {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Close the nonblocking log writer, then permit the one programmatic exit. Existing recordings,
+    /// notes and queue rows stay in place.
+    fn exit_after_quit(app: &tauri::AppHandle, state: &Shutdown) {
+        // The static otherwise never drops; process termination does not run static destructors.
+        if let Some(guard) = LOG_GUARD.get() {
+            drop(guard.lock().unwrap().take());
+        }
+        state.permit_exit.store(true, Ordering::Release);
+        app.exit(0);
+    }
+
+    /// The distinct tray action shown only after a settled failed Quit; ignored in every other phase.
+    pub(crate) fn acknowledge_quit_failure(app: &tauri::AppHandle) {
+        let Some(state) = app.try_state::<Shutdown>() else {
+            return;
+        };
+        if !claim_failure_ack(&state.phase) {
+            return;
+        }
+        tracing::warn!(target: "corti::shutdown", "exiting after acknowledged recording failure; existing files kept");
+        exit_after_quit(app, &state);
+    }
+
+    fn failed_quit_status(detail: &str) -> String {
+        let summary: String = detail
+            .lines()
+            .next()
+            .unwrap_or("write failed")
+            .chars()
+            .take(100)
+            .collect();
+        format!("⚠ Recording failed: {summary}")
+    }
+
+    /// Preserve an owned recorder when thread creation fails: Builder::spawn consumes and
+    /// drops its closure on error, so the producer retains a separate reference to the slot.
+    fn spawn_owned<T: Send + 'static, R: Send + 'static>(
+        value: T,
+        work: impl FnOnce(T) -> R + Send + 'static,
+        spawn: impl FnOnce(Box<dyn FnOnce() -> R + Send>) -> std::io::Result<JoinHandle<R>>,
+    ) -> std::result::Result<JoinHandle<R>, (std::io::Error, T)> {
+        let slot = Arc::new(Mutex::new(Some(value)));
+        let worker_slot = slot.clone();
+        let task: Box<dyn FnOnce() -> R + Send> = Box::new(move || {
+            let value = worker_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("finish runs once");
+            work(value)
+        });
+        match spawn(task) {
+            Ok(handle) => Ok(handle),
+            Err(error) => Err((
+                error,
+                slot.lock().unwrap().take().expect("worker did not start"),
+            )),
+        }
+    }
+
+    /// Only an explicit tray Quit enters this path; ordinary window closure remains tray-only.
+    pub(crate) fn request_quit(app: &tauri::AppHandle) {
+        let Some(state) = app.try_state::<Shutdown>() else {
+            return;
+        };
+        if !claim_quit(&state.phase, &state.quitting) {
+            return;
+        }
+        // Reaper panics count from here on; earlier ones were logged when reaped.
+        state.live.set_quit_accounting(true);
+        // A webinar finish that returned before Quit already reported itself; only finishes still
+        // writing at the gate count toward this Quit.
+        let historical = take_finished(&mut app.state::<Webinar>().lock().finishing);
+        for result in historical {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::info!(target: "corti::shutdown", %error, "earlier webinar failure already reported; not counted against Quit")
+                }
+                Err(_) => {
+                    tracing::error!(target: "corti::shutdown", "earlier webinar finish worker panicked; not counted against Quit")
+                }
+            }
+        }
+        tray::set_status(app, "Finish writes before exiting…".to_string());
+        let app = app.clone();
+        let worker_app = app.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("corti-quit".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    finish_for_quit(&worker_app)
+                }));
+                let state = worker_app.state::<Shutdown>();
+                match result {
+                    Ok(Ok(())) => exit_after_quit(&worker_app, &state),
+                    Ok(Err(detail)) => {
+                        // Settled: every writer has returned, so the acknowledgement may be offered.
+                        tracing::error!(target: "corti::shutdown", %detail, "recording failed during quit");
+                        *lock_phase(&state.phase) = QuitPhase::Failed;
+                        tray::set_status(&worker_app, failed_quit_status(&detail));
+                    }
+                    Err(_) => {
+                        // Quiescence is unproven; only an ordinary Quit that reruns the drain may follow.
+                        tracing::error!(target: "corti::shutdown", "shutdown worker panicked");
+                        *lock_phase(&state.phase) = QuitPhase::Idle;
+                        tray::set_status(
+                            &worker_app,
+                            "⚠ Quit incomplete: shutdown worker panicked; see Diagnostics — Quit to retry"
+                                .to_string(),
+                        );
+                    }
+                }
+            })
+        {
+            // The worker never ran and no producer was stopped: reopen capture for a clean retry.
+            state.live.set_quit_accounting(false);
+            state.quitting.store(false, Ordering::Release);
+            *lock_phase(&state.phase) = QuitPhase::Idle;
+            tray::set_status(
+                &app,
+                format!("⚠ Cannot start quit worker: {error} — Quit to retry"),
+            );
+        }
+    }
+
+    /// Returns only after the detector, webinar finishes, mic test, discard reapers and live writers
+    /// have stopped and the pipeline drain has returned (or the pipeline thread is gone), so an `Err`
+    /// is a settled failure.
+    fn finish_for_quit(app: &tauri::AppHandle) -> std::result::Result<(), String> {
+        let state = app.state::<Shutdown>();
+        // Detector ack follows its terminal event; no app mutex is held across any pipeline wait.
+        let detector_result = {
+            let mut saved = state.detector_result.lock().unwrap();
+            saved
+                .get_or_insert_with(|| {
+                    let detector = app.state::<DetectorHandle>();
+                    detector
+                        .0
+                        .lock()
+                        .unwrap()
+                        .finish_and_shutdown()
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .clone()
+        };
+        let mut errors = Vec::new();
+        if let Err(error) = detector_result {
+            errors.push(format!("call capture could not finish: {error:#}"));
+        }
+        tray::set_status(
+            app,
+            "Finish writes before exiting… waiting for recordings".to_string(),
+        );
+        let webinar = app.state::<Webinar>();
+        let (active, finishes) = loop {
+            let mut w = webinar.lock();
+            if w.pending_finishes == 0 {
+                break (
+                    w.recorder.take().map(|recorder| {
+                        (
+                            recorder,
+                            w.started_at.take().unwrap_or_else(Local::now),
+                            w.tx.clone(),
+                        )
+                    }),
+                    std::mem::take(&mut w.finishing),
+                );
+            }
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if let Some((recorder, started_at, tx)) = active
+            && let Err(error) = finish_webinar(app, recorder, started_at, tx)
+        {
+            errors.push(error);
+        }
+        for finish in finishes {
+            match finish.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => errors.push(error),
+                Err(_) => errors.push("webinar finish worker panicked".to_string()),
+            }
+        }
+        if let Some(test) = app.try_state::<crate::live_test::LiveTestManager>() {
+            test.stop_and_wait();
+        }
+        if let Err(error) = state.live.join_discards() {
+            errors.push(error);
+        }
+        // Every producer has stopped. Drain even after a capture failure so the failure action is
+        // never offered while an accepted recording is still transcribing or persisting.
+        tray::set_status(
+            app,
+            "Finish writes before exiting… waiting for transcription".to_string(),
+        );
+        // A finish thread that no `Process` will collect (detector panic, dead pipeline) may still be
+        // flushing its note. Wait before the marker so its late messages queue ahead of `Drain`; an
+        // unprovable writer keeps Quit Draining instead of offering the acknowledgement.
+        state.live.wait_for_live_writers();
+        let (tx, rx) = mpsc::channel();
+        let receipt = match state.pipe_tx.send(PipelineMsg::Drain(tx)) {
+            Ok(()) => rx
+                .recv()
+                .unwrap_or_else(|_| Err("pipeline stopped without confirming writes".to_string())),
+            Err(_) => Err("pipeline unavailable; verify recording queue".to_string()),
+        };
+        settle_quit(errors, receipt)
+    }
+
     // The manual webinar's owning-app name (`corti_core::WEBINAR_NAME`) is the single signal `RecordingMeta::mode`
     // derives the webinar/call distinction from — kept in corti-core so the producer here and the consumer agree.
 
-    /// Holds the file-appender's non-blocking `WorkerGuard` for the process lifetime. Dropping the guard
-    /// would stop the background writer thread and lose any buffered log lines, so it lives in this static
-    /// (set once in [`run_app`]) and is never dropped while the app runs.
-    static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-        std::sync::OnceLock::new();
+    /// Keep the nonblocking writer alive until the successful quit coordinator drops its guard.
+    static LOG_GUARD: std::sync::OnceLock<
+        Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>,
+    > = std::sync::OnceLock::new();
 
     pub fn run_app() -> Result<()> {
         // Install the global tracing subscriber FIRST so every later line (including config-load warnings
@@ -278,8 +576,7 @@ pub(crate) mod imp {
         // `eprintln!` for any pre-subscriber failure (e.g. an unwritable log dir).
         let (console_buffer, log_guard) = console::init_tracing();
         if let Some(guard) = log_guard {
-            // Keep the non-blocking writer's worker thread alive for the whole process.
-            let _ = LOG_GUARD.set(guard);
+            let _ = LOG_GUARD.set(Mutex::new(Some(guard)));
         }
 
         let cfg = AppConfig::load();
@@ -349,22 +646,25 @@ pub(crate) mod imp {
             .build(tauri::generate_context!())
             .context("building the tauri app")?;
 
-        // Tray-agent policy: closing the final utility window (and other user-driven/Cmd-Q requests) emits
-        // `ExitRequested { code: None }`; veto it so Corti returns to menu-bar-only mode. The tray's explicit
-        // `app.exit(0)` carries `Some(0)` and is still allowed to terminate the process.
-        app.run(|_app, event| {
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = event
-                && should_prevent_implicit_exit(code)
-            {
-                api.prevent_exit();
+        // Window closes remain tray-only; ExitRequested does not identify whether code=None came
+        // from closing a window or a keyboard Quit. Only an explicit drained tray Quit may exit.
+        app.run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                let permit = app
+                    .try_state::<Shutdown>()
+                    .is_some_and(|state| state.permit_exit.load(Ordering::Acquire));
+                if should_prevent_exit(code, permit) {
+                    api.prevent_exit();
+                }
             }
         });
         Ok(())
     }
 
-    /// Menu-bar agents ignore user-driven implicit exits; only explicit programmatic exit codes terminate.
-    fn should_prevent_implicit_exit(code: Option<i32>) -> bool {
-        code.is_none()
+    /// Implicit closes (including an indistinguishable Cmd-Q) remain tray-only. Only the
+    /// coordinator's successful drain can allow the programmatic exit.
+    fn should_prevent_exit(_code: Option<i32>, permit: bool) -> bool {
+        !permit
     }
 
     /// All fallible startup wiring, in dependency order. Runs on the main thread (Tauri's setup hook).
@@ -399,6 +699,7 @@ pub(crate) mod imp {
         // the config via `ConfigState`) and before the worker (which holds the shared config to rebuild its
         // backend when the Settings screen saves).
         let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<PipelineMsg>();
+        let quitting = Arc::new(AtomicBool::new(false));
         let shared_cfg: crate::settings::SharedConfig = Arc::new(Mutex::new(cfg.clone()));
         app.manage(crate::settings::ConfigState {
             config: shared_cfg.clone(),
@@ -430,7 +731,16 @@ pub(crate) mod imp {
             shared_cfg.clone(),
             live_transcript.clone(),
             Some(hosted.clone()),
+            quitting.clone(),
         ));
+        app.manage(Shutdown {
+            quitting: quitting.clone(),
+            phase: Mutex::new(QuitPhase::Idle),
+            permit_exit: AtomicBool::new(false),
+            detector_result: Mutex::new(None),
+            pipe_tx: pipe_tx.clone(),
+            live: live_manager.clone(),
+        });
 
         // Pipeline worker (sole Queue owner). Seeds tray history from the queue, recovers orphaned
         // background jobs, then drains recordings + due durable jobs (retry/sweep) serially (#85).
@@ -440,9 +750,20 @@ pub(crate) mod imp {
             let stats = stats_buffer.clone();
             let live = live_manager.clone();
             let hosted = hosted.clone();
+            let worker_quitting = quitting.clone();
             std::thread::Builder::new()
                 .name("corti-pipeline".to_string())
-                .spawn(move || pipeline::run(handle, shared_cfg, pipe_rx, stats, live, hosted))
+                .spawn(move || {
+                    pipeline::run(
+                        handle,
+                        shared_cfg,
+                        pipe_rx,
+                        stats,
+                        live,
+                        hosted,
+                        worker_quitting,
+                    )
+                })
                 .context("spawning pipeline worker")?;
         }
 
@@ -465,9 +786,10 @@ pub(crate) mod imp {
         let live_hook =
             crate::live::AppLiveHook::new(live_manager, shared_cfg.clone(), pipe_tx.clone());
         let handle = app.handle().clone();
-        let detector = Detector::start_with_live_hook(
+        let detector = Detector::start_with_live_hook_and_quit_gate(
             move |event| handle_detector_event(&handle, &pipe_tx, event),
             Some(Box::new(live_hook)),
+            quitting,
         )
         .context("starting detector")?;
         app.manage(DetectorHandle(Mutex::new(detector)));
@@ -662,12 +984,16 @@ pub(crate) mod imp {
             /// No webinar running and no call in flight: start one (outside the lock).
             StartRequested,
             Busy,
+            Quitting,
         }
 
         let next = {
             let mut w = state.lock();
-            if let Some(recorder) = w.recorder.take() {
-                // Stop: hand the recorder off to a worker thread (finish writes the whole WAV).
+            if is_quitting(app) {
+                Next::Quitting
+            } else if let Some(recorder) = w.recorder.take() {
+                // Reserve the finish under the lock so Quit cannot overtake its handoff.
+                w.pending_finishes += 1;
                 let started_at = w.started_at.take().unwrap_or_else(chrono::Local::now);
                 Next::Stopping {
                     recorder: Box::new(recorder),
@@ -692,12 +1018,40 @@ pub(crate) mod imp {
                 set_webinar_recording(app, false);
                 set_stage(app, Stage::Transcribing);
                 tray::set_status(app, format!("Transcribing — {WEBINAR_NAME}…"));
-                let app = app.clone();
-                std::thread::Builder::new()
-                    .name("corti-webinar-finish".to_string())
-                    .spawn(move || finish_webinar(&app, *recorder, started_at, tx))
-                    .expect("spawning webinar-finish thread");
+                let worker_app = app.clone();
+                let worker_started = started_at;
+                let spawned = spawn_owned(
+                    recorder,
+                    move |recorder| finish_webinar(&worker_app, *recorder, worker_started, tx),
+                    |task| {
+                        std::thread::Builder::new()
+                            .name("corti-webinar-finish".to_string())
+                            .spawn(task)
+                    },
+                );
+                let mut w = state.lock();
+                match spawned {
+                    Ok(handle) => w.finishing.push(handle),
+                    Err((error, recorder)) => {
+                        w.recorder = Some(*recorder);
+                        w.started_at = Some(started_at);
+                        tracing::error!(target: "corti::shutdown", %error, "could not spawn webinar finish worker; capture retained");
+                    }
+                }
+                w.pending_finishes -= 1;
+                let failed = w.recorder.is_some();
+                drop(w);
+                if failed {
+                    set_webinar_recording(app, true);
+                    set_stage(app, Stage::Recording);
+                    tray::set_status(
+                        app,
+                        "⚠ Webinar finish unavailable; capture retained — Quit to retry"
+                            .to_string(),
+                    );
+                }
             }
+            Next::Quitting => {}
             Next::Busy => tray::set_status(
                 app,
                 "Can't start webinar — the microphone is already in use by Corti".to_string(),
@@ -748,7 +1102,7 @@ pub(crate) mod imp {
         recorder: Recorder,
         started_at: DateTime<Local>,
         tx: Sender<PipelineMsg>,
-    ) {
+    ) -> std::result::Result<(), String> {
         // `webinar_recording` was already cleared by the toggle's Stopping branch before this thread spawned.
         let finished = match recorder.finish_tap_only_with_processing() {
             Ok(finished) => finished,
@@ -757,7 +1111,7 @@ pub(crate) mod imp {
                 // The toggle already bridged the stage to Transcribing; nothing will transcribe now.
                 set_stage(app, Stage::Idle);
                 tray::set_status(app, format!("⚠ webinar capture failed: {e:#}"));
-                return;
+                return Err(format!("webinar capture could not finish: {e:#}"));
             }
         };
         let meta = RecordingMeta {
@@ -779,7 +1133,9 @@ pub(crate) mod imp {
         {
             tracing::error!(target: "corti::detector", "pipeline worker gone; dropped a finished webinar recording");
             set_stage(app, Stage::Idle);
+            return Err("pipeline unavailable after webinar capture".to_string());
         }
+        Ok(())
     }
 
     /// A plain `std::error::Error` so the anyhow setup error coerces cleanly into the `Box<dyn Error>` the
@@ -795,13 +1151,112 @@ pub(crate) mod imp {
 
     #[cfg(test)]
     mod lifecycle_tests {
-        use super::should_prevent_implicit_exit;
+        use super::{
+            QuitPhase, claim_failure_ack, claim_quit, settle_quit, should_prevent_exit,
+            spawn_owned, take_finished,
+        };
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
 
         #[test]
-        fn implicit_exit_is_vetoed_but_tray_exit_is_allowed() {
-            assert!(should_prevent_implicit_exit(None));
-            assert!(!should_prevent_implicit_exit(Some(0)));
-            assert!(!should_prevent_implicit_exit(Some(1)));
+        fn implicit_close_and_unpermitted_exit_are_vetoed() {
+            assert!(should_prevent_exit(None, false));
+            assert!(should_prevent_exit(Some(0), false));
+            assert!(should_prevent_exit(Some(1), false));
+            assert!(!should_prevent_exit(Some(0), true));
+        }
+
+        #[test]
+        fn failed_webinar_finish_spawn_retains_capture_ownership() {
+            let result = spawn_owned(
+                "owned recording".to_string(),
+                |value| value,
+                |_task| Err(std::io::Error::other("synthetic thread exhaustion")),
+            );
+            let (error, recorder) = result.err().unwrap();
+            assert!(error.to_string().contains("thread exhaustion"));
+            assert_eq!(recorder, "owned recording");
+        }
+
+        #[test]
+        fn repeated_quit_does_not_restart_or_force_exit() {
+            let phase = Mutex::new(QuitPhase::Idle);
+            let quitting = AtomicBool::new(false);
+            assert!(
+                !claim_failure_ack(&phase),
+                "no failure action before a Quit"
+            );
+            assert!(claim_quit(&phase, &quitting));
+            assert!(!claim_quit(&phase, &quitting));
+            assert!(quitting.load(Ordering::Acquire));
+            assert!(
+                !claim_failure_ack(&phase),
+                "draining never exposes the failure action"
+            );
+            assert!(should_prevent_exit(Some(0), false));
+            // A coordinator panic leaves quiescence unproven: only a full ordinary retry is allowed.
+            *phase.lock().unwrap() = QuitPhase::Idle;
+            assert!(!claim_failure_ack(&phase));
+            assert!(claim_quit(&phase, &quitting));
+        }
+
+        #[test]
+        fn stale_ordinary_quit_after_failure_does_not_acknowledge() {
+            let phase = Mutex::new(QuitPhase::Failed);
+            let quitting = AtomicBool::new(true);
+            assert!(
+                !claim_quit(&phase, &quitting),
+                "a queued ordinary Quit is ignored"
+            );
+            assert_eq!(*phase.lock().unwrap(), QuitPhase::Failed);
+            assert!(claim_failure_ack(&phase), "only the distinct action exits");
+            assert!(
+                should_prevent_exit(None, false),
+                "window close stays tray-only"
+            );
+        }
+
+        #[test]
+        fn producer_and_drain_failures_settle_together() {
+            assert_eq!(settle_quit(Vec::new(), Ok(())), Ok(()));
+            assert_eq!(
+                settle_quit(vec!["webinar capture could not finish".into()], Ok(())),
+                Err("webinar capture could not finish".to_string())
+            );
+            assert_eq!(
+                settle_quit(
+                    vec!["call capture could not finish".into()],
+                    Err("queue write failed".into())
+                ),
+                Err("call capture could not finish; queue write failed".to_string())
+            );
+        }
+
+        #[test]
+        fn finishes_returned_before_quit_do_not_count_against_it() {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let historical = std::thread::spawn(|| Err::<(), String>("no audio captured".into()));
+            let running = std::thread::spawn(move || {
+                let _ = release_rx.recv();
+                Ok::<(), String>(())
+            });
+            while !historical.is_finished() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let mut handles = vec![historical, running];
+            let finished = take_finished(&mut handles);
+            assert!(
+                matches!(finished.as_slice(), [Ok(Err(error))] if error == "no audio captured")
+            );
+            assert_eq!(
+                handles.len(),
+                1,
+                "a finish still writing at the gate stays counted"
+            );
+            release_tx.send(()).unwrap();
+            assert!(handles.pop().unwrap().join().unwrap().is_ok());
         }
     }
 }
