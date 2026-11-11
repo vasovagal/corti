@@ -5,6 +5,8 @@
 //! the [`Machine`], the [`MicMonitor`], the [`DefaultInputDeviceMonitor`], and the in-flight
 //! [`Recorder`], and is the only place that touches capture or invokes the user's event callback.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -18,6 +20,10 @@ use corti_coreaudio::{DefaultInputDeviceMonitor, MicMonitor, mic_owner, other_ap
 use crate::machine::{Action, Machine};
 use crate::{COALESCE, DEBOUNCE, DetectorEvent, MIN_RECORDING, POLL_INTERVAL};
 
+fn accepts_new_capture(quitting: &AtomicBool) -> bool {
+    !quitting.load(Ordering::Acquire)
+}
+
 /// Messages from the HAL callbacks (and `Detector::drop`) to the worker thread.
 enum Msg {
     /// Mic-in-use transitioned (`true` = now in use).
@@ -29,6 +35,8 @@ enum Msg {
     Pause(Sender<bool>),
     /// Resume detection after the test microphone has closed.
     Resume,
+    /// Finish a user-initiated quit on the worker, then acknowledge after the terminal event.
+    FinishAndShutdown(Sender<std::result::Result<Option<std::path::PathBuf>, String>>),
     /// Stop the worker (sent by `Detector::drop`).
     Shutdown,
 }
@@ -98,6 +106,15 @@ impl Detector {
         on_event: impl Fn(DetectorEvent) + Send + 'static,
         live: Option<Box<dyn LiveHook>>,
     ) -> Result<Self> {
+        Self::start_with_live_hook_and_quit_gate(on_event, live, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Share the app's explicit-Quit gate with the worker so a queued start cannot race its stop command.
+    pub fn start_with_live_hook_and_quit_gate(
+        on_event: impl Fn(DetectorEvent) + Send + 'static,
+        live: Option<Box<dyn LiveHook>>,
+        quitting: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
 
         // Default-device-change listener: created once (it watches the system object, which never
@@ -126,6 +143,7 @@ impl Detector {
                     self_pid: std::process::id() as i32,
                     current: None,
                     paused: false,
+                    quitting,
                     on_event,
                     live,
                 };
@@ -155,6 +173,19 @@ impl Detector {
                 Err(anyhow::anyhow!("detector worker did not acknowledge pause"))
             }
         }
+    }
+
+    /// Finish any active call before quitting. This waits off the UI thread; the reply follows the
+    /// recording-specific live verdict and the finished event handed to the app pipeline.
+    pub fn finish_and_shutdown(&self) -> Result<Option<std::path::PathBuf>> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.ctrl
+            .send(Msg::FinishAndShutdown(reply_tx))
+            .map_err(|_| anyhow::anyhow!("detector worker is unavailable"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("detector stopped without acknowledging capture"))?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Resume normal detection. The worker re-seeds from the current microphone state, so a call that began
@@ -233,6 +264,7 @@ struct Worker<F: Fn(DetectorEvent)> {
     /// True only while Corti's explicit microphone test owns the default input. HAL edges are ignored and
     /// no debounce deadline runs in this state.
     paused: bool,
+    quitting: Arc<AtomicBool>,
     on_event: F,
     /// Optional live-transcription hook (issue #87), consulted at every recording start.
     live: Option<Box<dyn LiveHook>>,
@@ -253,7 +285,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                 Ok(Msg::Signal(_)) => {}
                 Ok(Msg::DeviceChanged) => self.rebind(),
                 Ok(Msg::Pause(reply)) => {
-                    let accepted = self.current.is_none();
+                    let accepted = self.current.is_none() && accepts_new_capture(&self.quitting);
                     if accepted {
                         self.paused = true;
                         self.machine.reset();
@@ -261,12 +293,46 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
                     let _ = reply.send(accepted);
                 }
                 Ok(Msg::Resume) => self.resume_detection(),
+                Ok(Msg::FinishAndShutdown(reply)) => {
+                    self.paused = true;
+                    self.machine.reset();
+                    let result = self.finish_for_shutdown();
+                    let _ = reply.send(result);
+                    break;
+                }
                 Ok(Msg::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => self.on_wakeup(),
             }
         }
         // Falling out of `run` drops `mic_monitor` and `device_monitor` (removing their HAL listeners)
         // and any in-flight `current` recorder (capture torn down, no partial WAV written).
+    }
+
+    fn finish_for_shutdown(&mut self) -> std::result::Result<Option<std::path::PathBuf>, String> {
+        let Some((recorder, mut meta)) = self.current.take() else {
+            return Ok(None);
+        };
+        meta.ended_at = Some(Local::now());
+        match recorder.finish_with_processing() {
+            Ok(finished) => {
+                let path = finished.path.clone();
+                deliver_finished(self.live.as_deref(), meta, finished, |event| {
+                    self.emit(event)
+                });
+                Ok(Some(path))
+            }
+            Err(error) => {
+                if let Some(hook) = &self.live {
+                    hook.failed(&meta);
+                }
+                let detail = format!(
+                    "could not finish call at {}: {error:#}",
+                    meta.audio_path.display()
+                );
+                self.emit(DetectorEvent::Error(detail.clone()));
+                Err(detail)
+            }
+        }
     }
 
     /// How long to block before the next wake-up. The machine's debounce/coalesce deadline normally
@@ -329,7 +395,7 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
         self.paused = false;
         // A compensating Resume can arrive after a timed-out Pause that the worker ultimately rejected
         // because a real recorder had started. Never reset that recorder's state machine underneath it.
-        if self.current.is_some() {
+        if self.current.is_some() || !accepts_new_capture(&self.quitting) {
             return;
         }
         self.machine.reset();
@@ -342,6 +408,10 @@ impl<F: Fn(DetectorEvent)> Worker<F> {
     fn apply(&mut self, action: Action) {
         match action {
             Action::Start => {
+                if !accepts_new_capture(&self.quitting) {
+                    self.machine.reset();
+                    return;
+                }
                 // Attribution is best-effort and never blocks capture (guardrail 8): a missing PID just
                 // means a global tap.
                 let owner = mic_owner();
@@ -472,6 +542,14 @@ mod tests {
     use corti_core::OwningApp;
 
     use super::*;
+
+    #[test]
+    fn quit_gate_rejects_new_capture_even_before_stop_command_is_received() {
+        let quitting = AtomicBool::new(false);
+        assert!(accepts_new_capture(&quitting));
+        quitting.store(true, Ordering::Release);
+        assert!(!accepts_new_capture(&quitting));
+    }
 
     struct OrderedHook(Arc<Mutex<Vec<&'static str>>>);
 
